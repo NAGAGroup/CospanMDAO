@@ -63,24 +63,59 @@ fixed point:
 The coupling cycle is closed with a single `connect()` plus an entry-point
 mark; the optimizer differentiates through the settled system.
 
-## Building
+## Using CospanMDAO
 
-Requirements are managed by [pixi](https://pixi.sh) — the only host
-dependency. Toolchain: AdaptiveCpp (SSCP / `generic` target), CMake + Ninja,
-C++20.
+CospanMDAO is a [pixi](https://pixi.sh) **source package** — dependency
+management lives in pixi, not in CMake. pixi is the one host dependency; it
+builds the entire dependency chain (SlabKit, cereal, the AdaptiveCpp
+toolchain) hermetically from pinned sources, the same way on every machine.
+If you haven't met pixi-build yet: your project declares this repo as a
+dependency, and `pixi install` does the rest — no submodules, no
+FetchContent, no system SYCL install.
+
+**From a pixi project (recommended):**
+
+```toml
+# pixi.toml
+[workspace]
+preview = ["pixi-build"]
+
+[dependencies]
+cospanmdao = { git = "https://github.com/NAGAGroup/CospanMDAO.git", tag = "v0.1.0" }
+```
+
+then in CMake: `find_package(cospanmdao CONFIG REQUIRED)` and link
+`cospanmdao::naga`.
+
+**From a non-pixi project:** use pixi once to build the package, then
+consume the result like any installed CMake package:
+
+```sh
+pixi publish --target-channel ./channel   # builds + indexes a local conda channel
+```
+
+Point your build at the install prefix (e.g. add it to
+`CMAKE_PREFIX_PATH`) and use the same `find_package(cospanmdao CONFIG)` —
+the packages ship proper CMake config files.
+
+**Support policy:** the pixi pipeline is the only officially supported way
+to build and consume CospanMDAO. Conda's hermetic builds are the point:
+what pixi produces is compatible with your project without you fighting
+toolchain flags. Traditional embeddings (FetchContent, CPM, add_subdirectory
+of a raw clone) may happen to work, but issues specific to them will be
+closed.
+
+## Developing CospanMDAO
 
 ```sh
 pixi run configure dev
 pixi run build dev
+pixi run test
 ACPP_VISIBILITY_MASK=omp ./build/dev/examples/sellar   # CPU
-./build/dev/examples/sellar                            # default device (GPU if visible)
 ```
 
-Dependencies ([SlabKit](https://github.com/NAGAGroup/SlabKit), cereal) are
-**pixi-build source packages** — `pixi install` fetches and builds them from
-source automatically. No submodules, no vendoring. CospanMDAO is itself a
-source package: depend on it with
-`cospanmdao = { git = "https://github.com/NAGAGroup/CospanMDAO.git" }`.
+A `dev` environment (`pixi run -e dev ...`) provides the package's full
+dependency closure for ad-hoc work inside the build-time environment.
 
 ## Status
 
