@@ -117,3 +117,9 @@ solve-group = "default"
 [environments.dev-amd]
 features = ["amd", "dev"]
 solve-group = "default"
+
+# CPU-only: no GPU backend feature — AdaptiveCpp's built-in OpenMP host
+# backend needs nothing beyond the toolchain itself.
+[environments.dev-omp]
+features = ["dev"]
+solve-group = "default"
