@@ -1,0 +1,3 @@
+[submodule "ext/slabkit"]
+	path = ext/slabkit
+	url = https://github.com/NAGAGroup/SlabKit.git

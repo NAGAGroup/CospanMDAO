@@ -1,0 +1,2 @@
+export ACPP_VISIBILITY_MASK="omp;cuda"
+export ACPP_ADAPTIVITY_LEVEL=2
