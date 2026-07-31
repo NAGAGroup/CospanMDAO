@@ -13,11 +13,6 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 find_package(AdaptiveCpp REQUIRED)
 
 # ------------------------------------------------------------------------------
-# Package manager
-# ------------------------------------------------------------------------------
-include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/CPM.cmake)
-
-# ------------------------------------------------------------------------------
 # Options
 # ------------------------------------------------------------------------------
 option(NAGA_BUILD_TESTS "Build unit tests" ON)
@@ -26,9 +21,10 @@ option(NAGA_BUILD_EXAMPLES "Build example apps" ON)
 # ------------------------------------------------------------------------------
 # Dependencies
 # ------------------------------------------------------------------------------
-add_subdirectory(ext/slabkit)
-set(SKIP_PERFORMANCE_COMPARISON ON CACHE BOOL "Skip Boost requirement" FORCE)
-CPMAddPackage("gh:USCiLab/cereal@1.3.2")
+# slabkit and cereal are provided as pixi-build source dependencies (see
+# pixi.toml); pixi builds them into conda packages installed in the prefix.
+find_package(slabkit CONFIG REQUIRED)
+find_package(cereal CONFIG REQUIRED)
 
 # ------------------------------------------------------------------------------
 # Library
@@ -49,7 +45,7 @@ target_include_directories(naga PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
 )
-target_link_libraries(naga PUBLIC slabkit cereal::cereal)
+target_link_libraries(naga PUBLIC slabkit::slabkit cereal::cereal)
 add_sycl_to_target(TARGET naga SOURCES
     src/naga/core/equilibrium_executor.cpp
 )
