@@ -90,3 +90,16 @@ cereal = { path = "packages/cereal" }
 [package.run-dependencies]
 slabkit = { git = "https://github.com/NAGAGroup/SlabKit.git", rev = "024d01e0ae9f3209e6ea7931c33d5d028a1b23d1" }
 cereal = { path = "packages/cereal" }
+
+# ------------------------------------------------------------------------------
+# Dev environment (fleet convention): dependency closure of the package
+# installs WITHOUT building it — project-scoped agents run unstructured
+# commands via `pixi run -e dev ...` and inspect dependency headers at
+# .pixi/envs/dev/include/.
+# ------------------------------------------------------------------------------
+[feature.dev.dev]
+cospanmdao = { path = "." }
+
+[environments.dev]
+features = ["base", "cuda", "dev"]
+solve-group = "default"
