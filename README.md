@@ -96,7 +96,7 @@ then in CMake: `find_package(cospanmdao CONFIG REQUIRED)` and link
 relocatable environment, then consume it like any installed CMake package:
 
 ```sh
-pixi exec pixi-pack --environment pack --create-executable
+pixi exec pixi-pack --create-executable
 ./environment.sh        # self-extracting: creates ./env, no pixi/conda needed
 ```
 
@@ -113,15 +113,18 @@ closed.
 
 ## Developing CospanMDAO
 
+All development happens in the `dev` environments — the package's full
+dependency closure (toolchain included) without building the package:
+
 ```sh
-pixi run configure dev
-pixi run build dev
-pixi run test
-ACPP_VISIBILITY_MASK=omp ./build/dev/examples/sellar   # CPU
+pixi run -e dev sellar        # configure → build → run the example
+pixi run -e dev test          # build + ctest
+pixi run -e dev-omp sellar    # CPU-only (built-in OpenMP host backend)
+pixi run -e dev "cmake --build build/dev -t sellar"   # ad-hoc, same env
 ```
 
-A `dev` environment (`pixi run -e dev ...`) provides the package's full
-dependency closure for ad-hoc work inside the build-time environment.
+Hardware flavors: `dev` (CUDA, default), `dev-cuda`, `dev-l0`, `dev-amd`,
+`dev-omp`.
 
 ## Status
 
