@@ -10,12 +10,10 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-find_package(AdaptiveCpp REQUIRED)
+include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
 
-# ------------------------------------------------------------------------------
-# Package manager
-# ------------------------------------------------------------------------------
-include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/CPM.cmake)
+find_package(AdaptiveCpp REQUIRED)
 
 # ------------------------------------------------------------------------------
 # Options
@@ -24,11 +22,10 @@ option(NAGA_BUILD_TESTS "Build unit tests" ON)
 option(NAGA_BUILD_EXAMPLES "Build example apps" ON)
 
 # ------------------------------------------------------------------------------
-# Dependencies
+# Dependencies — provided by pixi as source packages (SlabKit, cereal).
 # ------------------------------------------------------------------------------
-add_subdirectory(ext/slabkit)
-set(SKIP_PERFORMANCE_COMPARISON ON CACHE BOOL "Skip Boost requirement" FORCE)
-CPMAddPackage("gh:USCiLab/cereal@1.3.2")
+find_package(slabkit CONFIG REQUIRED)
+find_package(cereal CONFIG REQUIRED)
 
 # ------------------------------------------------------------------------------
 # Library
@@ -45,13 +42,46 @@ add_library(naga STATIC
     src/naga/core/executor.cpp
     src/naga/core/component.cpp
 )
+add_library(cospanmdao::naga ALIAS naga)
 target_include_directories(naga PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
 )
-target_link_libraries(naga PUBLIC slabkit cereal::cereal)
+target_link_libraries(naga PUBLIC slabkit::slabkit cereal::cereal)
 add_sycl_to_target(TARGET naga SOURCES
     src/naga/core/equilibrium_executor.cpp
+)
+
+# ------------------------------------------------------------------------------
+# Install / export — consumers do find_package(cospanmdao CONFIG) and link
+# cospanmdao::naga.
+# ------------------------------------------------------------------------------
+install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+
+install(TARGETS naga EXPORT cospanmdaoTargets)
+
+install(EXPORT cospanmdaoTargets
+    FILE cospanmdaoTargets.cmake
+    NAMESPACE cospanmdao::
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/cospanmdao
+)
+
+write_basic_package_version_file(
+    "${CMAKE_CURRENT_BINARY_DIR}/cospanmdaoConfigVersion.cmake"
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY SameMajorVersion
+)
+
+configure_package_config_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/cospanmdaoConfig.cmake.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/cospanmdaoConfig.cmake"
+    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/cospanmdao
+)
+
+install(FILES
+    "${CMAKE_CURRENT_BINARY_DIR}/cospanmdaoConfig.cmake"
+    "${CMAKE_CURRENT_BINARY_DIR}/cospanmdaoConfigVersion.cmake"
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/cospanmdao
 )
 
 # ------------------------------------------------------------------------------

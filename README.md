@@ -76,8 +76,11 @@ ACPP_VISIBILITY_MASK=omp ./build/dev/examples/sellar   # CPU
 ./build/dev/examples/sellar                            # default device (GPU if visible)
 ```
 
-`ext/slabkit` is a git submodule — clone with `--recursive` or run
-`git submodule update --init`.
+Dependencies ([SlabKit](https://github.com/NAGAGroup/SlabKit), cereal) are
+**pixi-build source packages** — `pixi install` fetches and builds them from
+source automatically. No submodules, no vendoring. CospanMDAO is itself a
+source package: depend on it with
+`cospanmdao = { git = "https://github.com/NAGAGroup/CospanMDAO.git" }`.
 
 ## Status
 
@@ -90,7 +93,6 @@ Roadmap, roughly in order:
 
 - Test suite rebuild (the research-era suite predates several core API
   revisions and did not make the extraction cut)
-- `pixi-build` source dependencies (replacing CPM + submodules)
 - Spatial/nonlocal compute toolboxes (LBVH, meshless operators) as
   companion libraries
 - Namespace/include-path rename (`naga` → `cospanmdao`); the current root

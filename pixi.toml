@@ -4,6 +4,7 @@ channels = ["https://prefix.dev/code-accelerate", "conda-forge"]
 name = "cospanmdao"
 platforms = ["linux-64"]
 version = "0.1.0"
+preview = ["pixi-build"]
 
 [activation]
 scripts = ["env.sh"]
@@ -16,6 +17,12 @@ configure = "nu scripts/configure.nu"
 build = "nu scripts/build.nu"
 test = "ACPP_VISIBILITY_MASK=omp ctest --test-dir build/dev --output-on-failure"
 clean = "rm -rf build/"
+sellar = "./build/dev/examples/sellar"
+
+[dependencies]
+# Source dependencies — built by pixi-build and installed into the env.
+slabkit = { git = "https://github.com/NAGAGroup/SlabKit.git", rev = "024d01e0ae9f3209e6ea7931c33d5d028a1b23d1" }
+cereal = { path = "packages/cereal" }
 
 [feature.base.dependencies]
 acpp-toolchain = ">=20.1.8_acpp25.10.0,<21"
@@ -41,8 +48,38 @@ rocm-device-libs = ">=6,<7"
 features = ["base", "cuda"]
 solve-group = "default"
 
-[dependencies]
-python = ">=3.14.5,<3.15"
-pip = ">=26.1.1,<27"
-gdb = ">=17.1,<18"
+# ------------------------------------------------------------------------------
+# pixi-build package definition: CospanMDAO as a source package, so consumers
+# (Mycelium, the LBM project, anyone) can depend on
+#   cospanmdao = { git = "https://github.com/NAGAGroup/CospanMDAO.git", ... }
+# and get the framework + its transitive source deps built automatically.
+# ------------------------------------------------------------------------------
+[package]
+name = "cospanmdao"
+version = "0.1.0"
 
+[package.build.backend]
+name = "pixi-build-cmake"
+version = "0.*"
+channels = [
+  "https://prefix.dev/pixi-build-backends",
+  "https://prefix.dev/code-accelerate",
+  "https://prefix.dev/conda-forge",
+]
+
+[package.build.config]
+# We bring our own SYCL compiler (AdaptiveCpp) instead of the backend's
+# conda-forge default toolchain.
+compilers = []
+extra-args = [
+  "-DNAGA_BUILD_TESTS=OFF",
+  "-DNAGA_BUILD_EXAMPLES=OFF",
+]
+
+[package.build-dependencies]
+acpp-toolchain = ">=20.1.8_acpp25.10.0,<21"
+
+[package.host-dependencies]
+acpp-toolchain = ">=20.1.8_acpp25.10.0,<21"
+slabkit = { git = "https://github.com/NAGAGroup/SlabKit.git", rev = "024d01e0ae9f3209e6ea7931c33d5d028a1b23d1" }
+cereal = { path = "packages/cereal" }
