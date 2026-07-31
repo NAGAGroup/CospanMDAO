@@ -83,3 +83,10 @@ acpp-toolchain = ">=20.1.8_acpp25.10.0,<21"
 acpp-toolchain = ">=20.1.8_acpp25.10.0,<21"
 slabkit = { git = "https://github.com/NAGAGroup/SlabKit.git", rev = "024d01e0ae9f3209e6ea7931c33d5d028a1b23d1" }
 cereal = { path = "packages/cereal" }
+
+# Static lib with PUBLIC header/CMake-config deps: consumers need these at
+# their own compile time, so they propagate as run-dependencies
+# (manual run-exports).
+[package.run-dependencies]
+slabkit = { git = "https://github.com/NAGAGroup/SlabKit.git", rev = "024d01e0ae9f3209e6ea7931c33d5d028a1b23d1" }
+cereal = { path = "packages/cereal" }
