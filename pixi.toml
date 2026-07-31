@@ -12,27 +12,15 @@ scripts = ["env.sh"]
 [system-requirements]
 libc = { family = "glibc", version = "2.28" }
 
-[tasks]
-configure = "nu scripts/configure.nu"
-build = "nu scripts/build.nu"
-test = "ACPP_VISIBILITY_MASK=omp ctest --test-dir build/dev --output-on-failure"
-clean = "rm -rf build/"
-sellar = "./build/dev/examples/sellar"
-
+# ------------------------------------------------------------------------------
+# CONSUMER environment (default): consumes the developed package itself.
+# `pixi install` builds cospanmdao + its chain into the env; pixi-pack packs
+# this env directly (`pixi exec pixi-pack --create-executable`).
+# Toolchains/compilers NEVER appear here — they come from the package's own
+# dependency tables via the dev environment below.
+# ------------------------------------------------------------------------------
 [dependencies]
-# Source dependencies — built by pixi-build and installed into the env.
-slabkit = { git = "https://github.com/NAGAGroup/SlabKit.git", rev = "024d01e0ae9f3209e6ea7931c33d5d028a1b23d1" }
-cereal = { path = "packages/cereal" }
-
-[feature.base.dependencies]
-acpp-toolchain = ">=20.1.8_acpp25.10.0,<21"
-cmake = ">=3.28,<4"
-nushell = ">=0.110.0,<0.111"
-ninja = ">=1.12"
-catch2 = ">=3.8"
-
-[feature.level-zero.dependencies]
-level-zero = ">=1.28.2,<2"
+cospanmdao = { path = "." }
 
 [feature.cuda.dependencies]
 cuda-nvvm = ">=12.9.86,<13"
@@ -40,19 +28,20 @@ cuda-runtime = ">=12.9.2,<13"
 cuda-nvcc-tools = ">=12.9.86,<13"
 cuda-sanitizer-api = ">=12.9.79,<13"
 
+[feature.level-zero.dependencies]
+level-zero = ">=1.28.2,<2"
+
 [feature.amd.dependencies]
 hip-runtime-amd = ">=6,<7"
 rocm-device-libs = ">=6,<7"
 
 [environments.default]
-features = ["base", "cuda"]
+features = ["cuda"]
 solve-group = "default"
 
 # ------------------------------------------------------------------------------
-# pixi-build package definition: CospanMDAO as a source package, so consumers
-# (Mycelium, the LBM project, anyone) can depend on
+# The package: what consumers get when they declare
 #   cospanmdao = { git = "https://github.com/NAGAGroup/CospanMDAO.git", ... }
-# and get the framework + its transitive source deps built automatically.
 # ------------------------------------------------------------------------------
 [package]
 name = "cospanmdao"
@@ -78,41 +67,53 @@ extra-args = [
 
 [package.build-dependencies]
 acpp-toolchain = ">=20.1.8_acpp25.10.0,<21"
+cmake = ">=3.28,<4"
+ninja = ">=1.12"
 
 [package.host-dependencies]
 acpp-toolchain = ">=20.1.8_acpp25.10.0,<21"
-slabkit = { git = "https://github.com/NAGAGroup/SlabKit.git", rev = "024d01e0ae9f3209e6ea7931c33d5d028a1b23d1" }
+slabkit = { git = "https://github.com/NAGAGroup/SlabKit.git", rev = "3d4d04ac8f21b9b822935f9f75d3014c721c3b9c" }
 cereal = { path = "packages/cereal" }
 
 # Static lib with PUBLIC header/CMake-config deps: consumers need these at
 # their own compile time, so they propagate as run-dependencies
 # (manual run-exports).
 [package.run-dependencies]
-slabkit = { git = "https://github.com/NAGAGroup/SlabKit.git", rev = "024d01e0ae9f3209e6ea7931c33d5d028a1b23d1" }
+slabkit = { git = "https://github.com/NAGAGroup/SlabKit.git", rev = "3d4d04ac8f21b9b822935f9f75d3014c721c3b9c" }
 cereal = { path = "packages/cereal" }
 
 # ------------------------------------------------------------------------------
-# Dev environment (fleet convention): dependency closure of the package
-# installs WITHOUT building it — project-scoped agents run unstructured
-# commands via `pixi run -e dev ...` and inspect dependency headers at
-# .pixi/envs/dev/include/.
+# DEV environment: the package's dependency closure (toolchain included)
+# WITHOUT building the package, plus dev-only tools and tasks. Unstructured
+# work runs inside the build-time env: `pixi run -e dev <anything>`.
 # ------------------------------------------------------------------------------
 [feature.dev.dev]
 cospanmdao = { path = "." }
 
+[feature.dev.dependencies]
+nushell = ">=0.110.0,<0.111"
+catch2 = ">=3.8"
+
+[feature.dev.tasks]
+configure = "nu scripts/configure.nu dev"
+build = { cmd = "nu scripts/build.nu dev", depends-on = ["configure"] }
+test = { cmd = "ACPP_VISIBILITY_MASK=omp ctest --test-dir build/dev --output-on-failure", depends-on = ["build"] }
+sellar = { cmd = "./build/dev/examples/sellar", depends-on = ["build"] }
+
+# Hardware-flavored dev envs: `-e dev` is the daily (CUDA) default;
+# dev-l0 / dev-amd / dev-cuda select the backend explicitly.
 [environments.dev]
-features = ["base", "cuda", "dev"]
+features = ["cuda", "dev"]
 solve-group = "default"
 
-# ------------------------------------------------------------------------------
-# Pack environment: self-includes the built package so non-pixi consumers can
-# ship it — `pixi exec pixi-pack --environment pack --create-executable`
-# yields a self-extracting env (no pixi/conda needed on the target); point
-# CMAKE_PREFIX_PATH at ./env and find_package(cospanmdao CONFIG).
-# ------------------------------------------------------------------------------
-[feature.pack.dependencies]
-cospanmdao = { path = "." }
+[environments.dev-cuda]
+features = ["cuda", "dev"]
+solve-group = "default"
 
-[environments.pack]
-features = ["base", "cuda", "pack"]
+[environments.dev-l0]
+features = ["level-zero", "dev"]
+solve-group = "default"
+
+[environments.dev-amd]
+features = ["amd", "dev"]
 solve-group = "default"
