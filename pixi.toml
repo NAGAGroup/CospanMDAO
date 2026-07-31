@@ -103,3 +103,16 @@ cospanmdao = { path = "." }
 [environments.dev]
 features = ["base", "cuda", "dev"]
 solve-group = "default"
+
+# ------------------------------------------------------------------------------
+# Pack environment: self-includes the built package so non-pixi consumers can
+# ship it — `pixi exec pixi-pack --environment pack --create-executable`
+# yields a self-extracting env (no pixi/conda needed on the target); point
+# CMAKE_PREFIX_PATH at ./env and find_package(cospanmdao CONFIG).
+# ------------------------------------------------------------------------------
+[feature.pack.dependencies]
+cospanmdao = { path = "." }
+
+[environments.pack]
+features = ["base", "cuda", "pack"]
+solve-group = "default"

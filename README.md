@@ -87,16 +87,17 @@ cospanmdao = { git = "https://github.com/NAGAGroup/CospanMDAO.git", tag = "v0.1.
 then in CMake: `find_package(cospanmdao CONFIG REQUIRED)` and link
 `cospanmdao::naga`.
 
-**From a non-pixi project:** use pixi once to build the package, then
-consume the result like any installed CMake package:
+**From a non-pixi project:** use pixi once to produce a fully-installed,
+relocatable environment, then consume it like any installed CMake package:
 
 ```sh
-pixi publish --target-channel ./channel   # builds + indexes a local conda channel
+pixi exec pixi-pack --environment pack --create-executable
+./environment.sh        # self-extracting: creates ./env, no pixi/conda needed
 ```
 
-Point your build at the install prefix (e.g. add it to
-`CMAKE_PREFIX_PATH`) and use the same `find_package(cospanmdao CONFIG)` —
-the packages ship proper CMake config files.
+Add the unpacked env to `CMAKE_PREFIX_PATH` and use the same
+`find_package(cospanmdao CONFIG)` — the packages ship proper CMake config
+files.
 
 **Support policy:** the pixi pipeline is the only officially supported way
 to build and consume CospanMDAO. Conda's hermetic builds are the point:
