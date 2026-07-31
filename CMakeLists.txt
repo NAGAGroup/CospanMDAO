@@ -30,26 +30,27 @@ find_package(cereal CONFIG REQUIRED)
 # ------------------------------------------------------------------------------
 # Library
 # ------------------------------------------------------------------------------
-add_library(naga STATIC
-    src/naga/core/context_core.cpp
-    src/naga/core/context_io.cpp
-    src/naga/core/context_execution.cpp
-    src/naga/core/context_finalization.cpp
-    src/naga/core/context_graph.cpp
-    src/naga/core/context_serialization.cpp
-    src/naga/core/equilibrium_executor.cpp
-    src/naga/core/system.cpp
-    src/naga/core/executor.cpp
-    src/naga/core/component.cpp
+add_library(naga-cospan STATIC
+    src/naga/cospan/core/context_core.cpp
+    src/naga/cospan/core/context_io.cpp
+    src/naga/cospan/core/context_execution.cpp
+    src/naga/cospan/core/context_finalization.cpp
+    src/naga/cospan/core/context_graph.cpp
+    src/naga/cospan/core/context_serialization.cpp
+    src/naga/cospan/core/equilibrium_executor.cpp
+    src/naga/cospan/core/system.cpp
+    src/naga/cospan/core/executor.cpp
+    src/naga/cospan/core/component.cpp
 )
-add_library(cospanmdao::naga ALIAS naga)
-target_include_directories(naga PUBLIC
+add_library(naga::cospan ALIAS naga-cospan)
+target_include_directories(naga-cospan PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
 )
-target_link_libraries(naga PUBLIC slabkit::slabkit cereal::cereal)
-add_sycl_to_target(TARGET naga SOURCES
-    src/naga/core/equilibrium_executor.cpp
+target_link_libraries(naga-cospan PUBLIC slabkit::slabkit cereal::cereal)
+set_target_properties(naga-cospan PROPERTIES EXPORT_NAME cospan)
+add_sycl_to_target(TARGET naga-cospan SOURCES
+    src/naga/cospan/core/equilibrium_executor.cpp
 )
 
 # ------------------------------------------------------------------------------
@@ -58,11 +59,11 @@ add_sycl_to_target(TARGET naga SOURCES
 # ------------------------------------------------------------------------------
 install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
-install(TARGETS naga EXPORT cospanmdaoTargets)
+install(TARGETS naga-cospan EXPORT cospanmdaoTargets)
 
 install(EXPORT cospanmdaoTargets
     FILE cospanmdaoTargets.cmake
-    NAMESPACE cospanmdao::
+    NAMESPACE naga::
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/cospanmdao
 )
 

@@ -6,6 +6,11 @@ systems to equilibrium, and differentiate through the fixed point — all on
 the GPU, all through open standards (SYCL via
 [AdaptiveCpp](https://github.com/AdaptiveCpp/AdaptiveCpp)).
 
+CospanMDAO is part of the **NAGA ecosystem**
+([NAGAGroup](https://github.com/NAGAGroup)) — ecosystem code shares the
+`naga::` namespace umbrella and `include/naga/` root; this framework is
+`naga::cospan`.
+
 ## Lineage
 
 CospanMDAO is a GPU-native successor to the ideas in
@@ -85,7 +90,7 @@ cospanmdao = { git = "https://github.com/NAGAGroup/CospanMDAO.git", tag = "v0.1.
 ```
 
 then in CMake: `find_package(cospanmdao CONFIG REQUIRED)` and link
-`cospanmdao::naga`.
+`naga::cospan`.
 
 **From a non-pixi project:** use pixi once to produce a fully-installed,
 relocatable environment, then consume it like any installed CMake package:
@@ -96,7 +101,7 @@ pixi exec pixi-pack --environment pack --create-executable
 ```
 
 Add the unpacked env to `CMAKE_PREFIX_PATH` and use the same
-`find_package(cospanmdao CONFIG)` — the packages ship proper CMake config
+`find_package(cospanmdao CONFIG)` / `naga::cospan` — the packages ship proper CMake config
 files.
 
 **Support policy:** the pixi pipeline is the only officially supported way
@@ -131,8 +136,6 @@ Roadmap, roughly in order:
   revisions and did not make the extraction cut)
 - Spatial/nonlocal compute toolboxes (LBVH, meshless operators) as
   companion libraries
-- Namespace/include-path rename (`naga` → `cospanmdao`); the current root
-  include path is inherited from the research tree
 - CI
 
 ## License

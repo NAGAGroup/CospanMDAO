@@ -31,11 +31,11 @@
 // Run (CPU):  ACPP_VISIBILITY_MASK=omp ./build/dev/examples/sellar
 // =============================================================================
 
-#include <naga/core/component.hpp>
-#include <naga/core/system.hpp>
-#include <naga/core/equilibrium_executor.hpp>
-#include <naga/core/transfer.hpp>
-#include <naga/opt/adam.hpp>
+#include <naga/cospan/core/component.hpp>
+#include <naga/cospan/core/system.hpp>
+#include <naga/cospan/core/equilibrium_executor.hpp>
+#include <naga/cospan/core/transfer.hpp>
+#include <naga/cospan/opt/adam.hpp>
 
 #include <slabkit/slabkit.hpp>
 #include <sycl/sycl.hpp>
@@ -43,7 +43,7 @@
 #include <cstdio>
 #include <memory>
 
-namespace nc = naga::core;
+namespace nc = naga::cospan::core;
 
 // Penalty weight for constraints/bounds (quadratic exterior penalty).
 constexpr float kPenalty = 100.0f;
@@ -285,12 +285,12 @@ int main() {
     nc::fill(q, sys->get_initializer<1>(*ctx, "z1"), 5.0f);
     nc::fill(q, sys->get_initializer<1>(*ctx, "z2"), 2.0f);
 
-    naga::opt::AdamConfig acfg;
+    naga::cospan::opt::AdamConfig acfg;
     acfg.learning_rate            = 2e-2f;
     acfg.max_iterations           = 1000;
     acfg.reset_between_iterations = false;
     acfg.callback_interval        = 100;
-    naga::opt::AdamOptimizer adam(acfg);
+    naga::cospan::opt::AdamOptimizer adam(acfg);
 
     auto res = adam.optimize(*exec);
 
