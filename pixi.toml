@@ -35,11 +35,8 @@ level-zero = ">=1.28.2,<2"
 hip-runtime-amd = ">=6,<7"
 rocm-device-libs = ">=6,<7"
 
-# Consumer envs per backend; `all` carries every runtime.
-[environments.default]
-features = ["cuda"]
-solve-group = "default"
-
+# Consumer envs per backend (the implicit default env = the bare package,
+# CPU/OMP-capable); `all` carries every runtime.
 [environments.cuda]
 features = ["cuda"]
 solve-group = "default"
