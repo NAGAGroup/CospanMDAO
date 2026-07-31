@@ -5,7 +5,7 @@
 #include "naga/cospan/core/context.hpp"
 #include "naga/cospan/core/unsafe.hpp"
 #include <sycl/sycl.hpp>
-#include <slabkit/array.hpp>
+#include <naga/slabkit/array.hpp>
 #include <functional>
 #include <vector>
 #include <cmath>
@@ -96,12 +96,12 @@ public:
             if (!entry.is_design_variable || entry.is_frozen) continue;
             size_t sz = entry.shape3[0] * entry.shape3[1] * entry.shape3[2];
 
-            auto m_unique = slabkit::malloc_device<float>(
+            auto m_unique = naga::slabkit::malloc_device<float>(
                 sz, ctx.sk_ctx_shared(), ctx.device_index());
             float* m_buf = m_unique.get();
             aux_bufs_.push_back(std::shared_ptr<float>(std::move(m_unique)));
 
-            auto v_unique = slabkit::malloc_device<float>(
+            auto v_unique = naga::slabkit::malloc_device<float>(
                 sz, ctx.sk_ctx_shared(), ctx.device_index());
             float* v_buf = v_unique.get();
             aux_bufs_.push_back(std::shared_ptr<float>(std::move(v_unique)));
@@ -113,7 +113,7 @@ public:
         }
 
         // allocate device scratch for grad norm squared
-        auto gns_unique = slabkit::malloc_device<float>(
+        auto gns_unique = naga::slabkit::malloc_device<float>(
             1, ctx.sk_ctx_shared(), ctx.device_index());
         float* gns_ptr = gns_unique.get();
         aux_bufs_.push_back(std::shared_ptr<float>(std::move(gns_unique)));

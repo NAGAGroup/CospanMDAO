@@ -5,7 +5,7 @@
 
 namespace naga::cospan::core {
 
-Context::Context(std::shared_ptr<slabkit::Context> sk_ctx, size_t device_index)
+Context::Context(std::shared_ptr<naga::slabkit::Context> sk_ctx, size_t device_index)
     : sk_ctx_(std::move(sk_ctx))
     , device_index_(device_index)
     , phase_(Phase::Declaring)

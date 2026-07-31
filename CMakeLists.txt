@@ -47,7 +47,7 @@ target_include_directories(naga-cospan PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
 )
-target_link_libraries(naga-cospan PUBLIC slabkit::slabkit cereal::cereal)
+target_link_libraries(naga-cospan PUBLIC naga::slabkit cereal::cereal)
 set_target_properties(naga-cospan PROPERTIES EXPORT_NAME cospan)
 add_sycl_to_target(TARGET naga-cospan SOURCES
     src/naga/cospan/core/equilibrium_executor.cpp

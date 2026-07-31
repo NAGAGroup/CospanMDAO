@@ -4,8 +4,8 @@
 #include <cstdint>
 #include <memory>
 #include <sycl/sycl.hpp>
-#include <slabkit/array.hpp>
-#include <slabkit/context.hpp>
+#include <naga/slabkit/array.hpp>
+#include <naga/slabkit/context.hpp>
 
 namespace naga::cospan::algo {
 
@@ -24,7 +24,7 @@ static constexpr std::size_t kDefaultWorkgroupSize = 256;
 template <typename T>
 sycl::event exclusive_scan(const T* input, T* output, std::size_t n,
                            sycl::queue& q,
-                           std::shared_ptr<slabkit::Context> ctx,
+                           std::shared_ptr<naga::slabkit::Context> ctx,
                            int device_idx = 0,
                            T init = T{0});
 
@@ -41,7 +41,7 @@ sycl::event exclusive_scan(const T* input, T* output, std::size_t n,
 /// \pre keys and values point to valid USM memory of size >= n
 template <typename KeyT, typename ValueT>
 sycl::event sort_by_key(KeyT* keys, ValueT* values, std::size_t n, sycl::queue& q,
-                        std::shared_ptr<slabkit::Context> ctx, int device_idx = 0);
+                        std::shared_ptr<naga::slabkit::Context> ctx, int device_idx = 0);
 
 // =============================================================================
 // exclusive_scan Implementation
@@ -50,7 +50,7 @@ sycl::event sort_by_key(KeyT* keys, ValueT* values, std::size_t n, sycl::queue& 
 template <typename T>
 sycl::event exclusive_scan(const T* input, T* output, std::size_t n,
                            sycl::queue& q,
-                           std::shared_ptr<slabkit::Context> ctx,
+                           std::shared_ptr<naga::slabkit::Context> ctx,
                            int device_idx,
                            T init) {
   if (n == 0) {
@@ -71,7 +71,7 @@ sycl::event exclusive_scan(const T* input, T* output, std::size_t n,
   std::size_t wg_size = std::min(max_wg, kDefaultWorkgroupSize);
   std::size_t num_groups = (n + wg_size - 1) / wg_size;
 
-  auto block_sums = slabkit::make_device_array<T>(sycl::range<1>(num_groups), ctx, device_idx);
+  auto block_sums = naga::slabkit::make_device_array<T>(sycl::range<1>(num_groups), ctx, device_idx);
   auto block_sums_view = block_sums.view();
 
   const T* in_ptr = input;
@@ -164,7 +164,7 @@ sycl::event exclusive_scan(const T* input, T* output, std::size_t n,
 
 template <typename KeyT, typename ValueT>
 sycl::event sort_by_key(KeyT* keys, ValueT* values, std::size_t n, sycl::queue& q,
-                        std::shared_ptr<slabkit::Context> ctx, int device_idx) {
+                        std::shared_ptr<naga::slabkit::Context> ctx, int device_idx) {
   if (n <= 1) {
     return q.single_task([](){});
   }
@@ -184,15 +184,15 @@ sycl::event sort_by_key(KeyT* keys, ValueT* values, std::size_t n, sycl::queue& 
   std::size_t num_groups = (n + wg_size - 1) / wg_size;
 
   // Ping-pong buffers
-  auto alt_keys = slabkit::make_device_array<KeyT>(sycl::range<1>(n), ctx, device_idx);
-  auto alt_values = slabkit::make_device_array<ValueT>(sycl::range<1>(n), ctx, device_idx);
+  auto alt_keys = naga::slabkit::make_device_array<KeyT>(sycl::range<1>(n), ctx, device_idx);
+  auto alt_values = naga::slabkit::make_device_array<ValueT>(sycl::range<1>(n), ctx, device_idx);
 
   // hist_matrix[g * RADIX + d] = count of digit d in WG g
   auto hist_matrix =
-      slabkit::make_device_array<uint32_t>(sycl::range<1>(num_groups * RADIX), ctx, device_idx);
+      naga::slabkit::make_device_array<uint32_t>(sycl::range<1>(num_groups * RADIX), ctx, device_idx);
   // scan_out[g * RADIX + d] = absolute output base for WG g, digit d
   auto scan_out =
-      slabkit::make_device_array<uint32_t>(sycl::range<1>(num_groups * RADIX), ctx, device_idx);
+      naga::slabkit::make_device_array<uint32_t>(sycl::range<1>(num_groups * RADIX), ctx, device_idx);
 
   auto alt_keys_view = alt_keys.view();
   auto alt_values_view = alt_values.view();

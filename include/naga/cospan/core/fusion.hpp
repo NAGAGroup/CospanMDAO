@@ -61,7 +61,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include <slabkit/memory.hpp>
+#include <naga/slabkit/memory.hpp>
 
 #include <naga/cospan/core/kernel.hpp>
 
@@ -171,11 +171,11 @@ class HorizontalFuser {
 public:
     // Allocate the device param arena. Call once, after the queue pool
     // exists (finalize). No-op when disabled.
-    void init(const std::shared_ptr<slabkit::Context>& sk_ctx,
+    void init(const std::shared_ptr<naga::slabkit::Context>& sk_ctx,
               size_t device_index) {
         if (!enabled() || arena_)
             return;
-        arena_ = slabkit::malloc_device<uint8_t>(kArenaBytes, sk_ctx,
+        arena_ = naga::slabkit::malloc_device<uint8_t>(kArenaBytes, sk_ctx,
                                                  device_index);
         arena_cap_ = kArenaBytes;
     }
@@ -354,7 +354,7 @@ private:
 
     // Device param arena (ring reset per pass) + host blobs kept alive until
     // the pass's terminal waits.
-    slabkit::unique_device_ptr<uint8_t> arena_;
+    naga::slabkit::unique_device_ptr<uint8_t> arena_;
     size_t                              arena_cap_ = 0;
     size_t                              arena_off_ = 0;
     std::deque<std::vector<std::byte>>  inflight_blobs_;

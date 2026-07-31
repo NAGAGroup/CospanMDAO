@@ -34,12 +34,12 @@ void EquilibriumExecutor::setup() {
 
   recurrent_fqns_ = ctx_->recurrent_entries();
 
-  auto fa = slabkit::malloc_device<float>(1, ctx_->sk_ctx_shared(),
+  auto fa = naga::slabkit::malloc_device<float>(1, ctx_->sk_ctx_shared(),
                                           ctx_->device_index());
   ctx_->queue().fill(fa.get(), 0.0f, 1);
   fwd_acc_ = std::shared_ptr<float>(std::move(fa));
 
-  auto fp = slabkit::malloc_device<uint64_t>(1, ctx_->sk_ctx_shared(),
+  auto fp = naga::slabkit::malloc_device<uint64_t>(1, ctx_->sk_ctx_shared(),
                                              ctx_->device_index());
   ctx_->queue().fill(fp.get(), uint64_t{0}, 1);
   fwd_argmax_acc_ = std::shared_ptr<uint64_t>(std::move(fp));

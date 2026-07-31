@@ -19,7 +19,7 @@
 #include "naga/cospan/math/rng.hpp"
 #include <cmath>
 #include <iostream>
-#include <slabkit/array.hpp>
+#include <naga/slabkit/array.hpp>
 #include <vector>
 
 namespace naga::cospan::opt {
@@ -62,7 +62,7 @@ public:
                 for (int d = 0; d < 3; ++d) count *= entry.shape3[d];
 
                 // Allocate momentum buffer on device
-                auto mom_unique = slabkit::malloc_device<float>(
+                auto mom_unique = naga::slabkit::malloc_device<float>(
                     count, ctx.sk_ctx_shared(), ctx.device_index());
                 float* mom_ptr = mom_unique.get();
                 momentum_bufs_.push_back(std::shared_ptr<float>(std::move(mom_unique)));
@@ -75,13 +75,13 @@ public:
         }
 
         // Allocate device scalar for grad_norm_squared computation
-        auto gns_buf = slabkit::malloc_device<float>(
+        auto gns_buf = naga::slabkit::malloc_device<float>(
             1, ctx.sk_ctx_shared(), ctx.device_index());
         float* gns_ptr = gns_buf.get();
         momentum_bufs_.push_back(std::shared_ptr<float>(std::move(gns_buf)));
 
         // Allocate device scalar for objective value readback
-        auto obj_buf = slabkit::malloc_device<float>(
+        auto obj_buf = naga::slabkit::malloc_device<float>(
             1, ctx.sk_ctx_shared(), ctx.device_index());
         float* obj_ptr = obj_buf.get();
         momentum_bufs_.push_back(std::shared_ptr<float>(std::move(obj_buf)));

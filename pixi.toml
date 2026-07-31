@@ -35,8 +35,29 @@ level-zero = ">=1.28.2,<2"
 hip-runtime-amd = ">=6,<7"
 rocm-device-libs = ">=6,<7"
 
+# Consumer envs per backend; `all` carries every runtime.
 [environments.default]
 features = ["cuda"]
+solve-group = "default"
+
+[environments.cuda]
+features = ["cuda"]
+solve-group = "default"
+
+[environments.l0]
+features = ["level-zero"]
+solve-group = "default"
+
+[environments.amd]
+features = ["amd"]
+solve-group = "default"
+
+[environments.omp]
+features = []
+solve-group = "default"
+
+[environments.all]
+features = ["cuda", "level-zero", "amd"]
 solve-group = "default"
 
 # ------------------------------------------------------------------------------
@@ -105,21 +126,26 @@ sellar = { cmd = "./build/dev/examples/sellar", depends-on = ["build"] }
 [environments.dev]
 features = ["cuda", "dev"]
 solve-group = "default"
+no-default-feature = true
 
 [environments.dev-cuda]
 features = ["cuda", "dev"]
 solve-group = "default"
+no-default-feature = true
 
 [environments.dev-l0]
 features = ["level-zero", "dev"]
 solve-group = "default"
+no-default-feature = true
 
 [environments.dev-amd]
 features = ["amd", "dev"]
 solve-group = "default"
+no-default-feature = true
 
 # CPU-only: no GPU backend feature — AdaptiveCpp's built-in OpenMP host
 # backend needs nothing beyond the toolchain itself.
 [environments.dev-omp]
 features = ["dev"]
 solve-group = "default"
+no-default-feature = true

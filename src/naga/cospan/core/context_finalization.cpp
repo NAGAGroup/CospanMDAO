@@ -83,7 +83,7 @@ void Context::finalize() {
         // the first sweep writes slot 0.
         std::vector<std::shared_ptr<float>> dslots;
         for (size_t s = 0; s < 2; ++s) {
-          auto d = slabkit::malloc_device<float>(count, sk_ctx_, device_index_);
+          auto d = naga::slabkit::malloc_device<float>(count, sk_ctx_, device_index_);
           queue_pool_[0].fill(d.get(), 0.0f, count);
           dslots.push_back(std::shared_ptr<float>(std::move(d)));
         }
@@ -94,7 +94,7 @@ void Context::finalize() {
       } else if (entry.dtype == DType::f32) {
         // f32 path unchanged (same pool call, same behavior as pre-dtype).
         auto unique =
-            slabkit::malloc_device<float>(count, sk_ctx_, device_index_);
+            naga::slabkit::malloc_device<float>(count, sk_ctx_, device_index_);
         entry.data = unique.get();
         buffers_.push_back(std::shared_ptr<float>(std::move(unique)));
       } else {
@@ -105,7 +105,7 @@ void Context::finalize() {
         // dtype-checked accessors.
         const size_t bytes = count * dtype_size(entry.dtype);
         auto unique =
-            slabkit::malloc_device<uint8_t>(bytes, sk_ctx_, device_index_);
+            naga::slabkit::malloc_device<uint8_t>(bytes, sk_ctx_, device_index_);
         queue_pool_[0].memset(unique.get(), 0, bytes);
         entry.data = reinterpret_cast<float *>(unique.get());
         buffers_.push_back(std::shared_ptr<void>(std::move(unique)));
@@ -141,7 +141,7 @@ void Context::finalize() {
       size_t num_slots = 2;
       std::vector<std::shared_ptr<float>> gslots;
       for (size_t k = 0; k < num_slots; ++k) {
-        auto g = slabkit::malloc_device<float>(count, sk_ctx_, device_index_);
+        auto g = naga::slabkit::malloc_device<float>(count, sk_ctx_, device_index_);
         queue_pool_[0].fill(
             g.get(), 0.0f,
             count); // explicit zero (malloc_device is uninitialized)
@@ -157,7 +157,7 @@ void Context::finalize() {
     } else {
       // Existing single-slot allocation unchanged
       auto grad_unique =
-          slabkit::malloc_device<float>(count, sk_ctx_, device_index_);
+          naga::slabkit::malloc_device<float>(count, sk_ctx_, device_index_);
       entry.grad = grad_unique.get();
       grad_buffers_.push_back(std::shared_ptr<float>(std::move(grad_unique)));
     }
@@ -181,7 +181,7 @@ void Context::finalize() {
   // depth)
   if (total_recurrent_size_ > 0) {
     auto &q = queue_pool_[0];
-    auto na = slabkit::malloc_device<float>(1, sk_ctx_, device_index_);
+    auto na = naga::slabkit::malloc_device<float>(1, sk_ctx_, device_index_);
     q.fill(na.get(), 0.0f, 1);
     anderson_norm_acc_ = std::shared_ptr<float>(std::move(na));
     q.wait();
@@ -196,36 +196,36 @@ void Context::finalize() {
     anderson_residuals_.resize(m);
     anderson_iterates_.resize(m);
     for (size_t i = 0; i < m; ++i) {
-      auto h = slabkit::malloc_device<float>(n, sk_ctx_, device_index_);
+      auto h = naga::slabkit::malloc_device<float>(n, sk_ctx_, device_index_);
       q.fill(h.get(), 0.0f, n);
       anderson_history_[i] = std::shared_ptr<float>(std::move(h));
 
-      auto r = slabkit::malloc_device<float>(n, sk_ctx_, device_index_);
+      auto r = naga::slabkit::malloc_device<float>(n, sk_ctx_, device_index_);
       q.fill(r.get(), 0.0f, n);
       anderson_residuals_[i] = std::shared_ptr<float>(std::move(r));
 
-      auto it = slabkit::malloc_device<float>(n, sk_ctx_, device_index_);
+      auto it = naga::slabkit::malloc_device<float>(n, sk_ctx_, device_index_);
       q.fill(it.get(), 0.0f, n);
       anderson_iterates_[i] = std::shared_ptr<float>(std::move(it));
     }
 
     {
-      auto flat = slabkit::malloc_device<float>(n, sk_ctx_, device_index_);
+      auto flat = naga::slabkit::malloc_device<float>(n, sk_ctx_, device_index_);
       q.fill(flat.get(), 0.0f, n);
       anderson_flat_ = std::shared_ptr<float>(std::move(flat));
     }
     {
-      auto gram = slabkit::malloc_device<float>(m * m, sk_ctx_, device_index_);
+      auto gram = naga::slabkit::malloc_device<float>(m * m, sk_ctx_, device_index_);
       q.fill(gram.get(), 0.0f, m * m);
       anderson_gram_ = std::shared_ptr<float>(std::move(gram));
     }
     {
-      auto coeffs = slabkit::malloc_device<float>(m, sk_ctx_, device_index_);
+      auto coeffs = naga::slabkit::malloc_device<float>(m, sk_ctx_, device_index_);
       q.fill(coeffs.get(), 0.0f, m);
       anderson_coeffs_ = std::shared_ptr<float>(std::move(coeffs));
     }
     {
-      auto rhs = slabkit::malloc_device<float>(m, sk_ctx_, device_index_);
+      auto rhs = naga::slabkit::malloc_device<float>(m, sk_ctx_, device_index_);
       q.fill(rhs.get(), 0.0f, m);
       anderson_rhs_ = std::shared_ptr<float>(std::move(rhs));
     }

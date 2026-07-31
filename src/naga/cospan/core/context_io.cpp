@@ -52,9 +52,9 @@ void Context::build_fill_batch(FillBatch& batch,
     h_prefix[batch.n] = batch.total;
 
     batch.ptrs = std::shared_ptr<float*>(
-        std::move(slabkit::malloc_device<float*>(batch.n, sk_ctx_shared(), device_index_)));
+        std::move(naga::slabkit::malloc_device<float*>(batch.n, sk_ctx_shared(), device_index_)));
     batch.prefix = std::shared_ptr<size_t>(
-        std::move(slabkit::malloc_device<size_t>(batch.n + 1, sk_ctx_shared(), device_index_)));
+        std::move(naga::slabkit::malloc_device<size_t>(batch.n + 1, sk_ctx_shared(), device_index_)));
     queue_pool_[0].memcpy(batch.ptrs.get(), h_ptrs.data(), batch.n * sizeof(float*));
     queue_pool_[0].memcpy(batch.prefix.get(), h_prefix.data(), (batch.n + 1) * sizeof(size_t));
     queue_pool_[0].wait();

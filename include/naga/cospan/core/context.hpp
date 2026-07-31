@@ -54,9 +54,9 @@
 #include <sycl/sycl.hpp>
 
 // SlabKit
-#include <slabkit/array.hpp>   // slabkit::DeviceView
-#include <slabkit/context.hpp> // slabkit::Context
-#include <slabkit/memory.hpp>  // slabkit::malloc_device, unique_device_ptr
+#include <naga/slabkit/array.hpp>   // naga::slabkit::DeviceView
+#include <naga/slabkit/context.hpp> // naga::slabkit::Context
+#include <naga/slabkit/memory.hpp>  // naga::slabkit::malloc_device, unique_device_ptr
 
 // Naga Core
 #include "naga/cospan/core/detail/composable.hpp" // Composable, IOMetadata
@@ -134,7 +134,7 @@ public:
   // Construction
   // =========================================================================
 
-  Context(std::shared_ptr<slabkit::Context> sk_ctx, size_t device_index = 0);
+  Context(std::shared_ptr<naga::slabkit::Context> sk_ctx, size_t device_index = 0);
 
   // Flushes the kernel profile (NAGA_KERNEL_PROF=1) while the queue pool and
   // SYCL runtime are still alive — see kernel_profile.hpp for why this must
@@ -375,9 +375,9 @@ public:
     // t_{k+1} = Jᵀ t_k). Non-recurrent owners have a single grad buffer.
     float *accum_grad_ptr = resolve_accum_grad(*entry);
 
-    slabkit::DeviceView<float, Dim> data_view(resolve_read_data(*entry), range);
-    slabkit::DeviceView<float, Dim> read_grad_view(rg, range);
-    slabkit::DeviceView<float, Dim> accum_grad_view(accum_grad_ptr, range);
+    naga::slabkit::DeviceView<float, Dim> data_view(resolve_read_data(*entry), range);
+    naga::slabkit::DeviceView<float, Dim> read_grad_view(rg, range);
+    naga::slabkit::DeviceView<float, Dim> accum_grad_view(accum_grad_ptr, range);
 
     return Input<Dim>(data_view, read_grad_view, accum_grad_view);
   }
@@ -415,9 +415,9 @@ public:
     // slot: the total gradient consumed this adjoint iteration).
     float *rg = resolve_read_grad(*entry);
 
-    slabkit::DeviceView<float, Dim> data_view(resolve_write_data(*entry),
+    naga::slabkit::DeviceView<float, Dim> data_view(resolve_write_data(*entry),
                                               range);
-    slabkit::DeviceView<float, Dim> read_grad_view(rg, range);
+    naga::slabkit::DeviceView<float, Dim> read_grad_view(rg, range);
 
     return Output<Dim>(data_view, read_grad_view);
   }
@@ -446,7 +446,7 @@ public:
       require_dtype(*entry, DT, "get_input()");
       using T = dtype_t<DT>;
       sycl::range<Dim> range = collapse_shape3<Dim>(entry->shape3);
-      return Input<Dim, DT>(slabkit::DeviceView<T, Dim>(
+      return Input<Dim, DT>(naga::slabkit::DeviceView<T, Dim>(
           reinterpret_cast<T *>(resolve_read_data(*entry)), range));
     }
   }
@@ -469,7 +469,7 @@ public:
       require_dtype(*entry, DT, "get_output()");
       using T = dtype_t<DT>;
       sycl::range<Dim> range = collapse_shape3<Dim>(entry->shape3);
-      return Output<Dim, DT>(slabkit::DeviceView<T, Dim>(
+      return Output<Dim, DT>(naga::slabkit::DeviceView<T, Dim>(
           reinterpret_cast<T *>(resolve_write_data(*entry)), range));
     }
   }
@@ -529,9 +529,9 @@ public:
     require_dtype(*entry, DType::f32, "get_passthrough()");
     sycl::range<Dim> range = collapse_shape3<Dim>(entry->shape3);
     float *rg = resolve_read_grad(*entry);
-    slabkit::DeviceView<float, Dim> data_view(resolve_write_data(*entry),
+    naga::slabkit::DeviceView<float, Dim> data_view(resolve_write_data(*entry),
                                               range);
-    slabkit::DeviceView<float, Dim> read_grad_view(rg, range);
+    naga::slabkit::DeviceView<float, Dim> read_grad_view(rg, range);
     return Output<Dim>(data_view, read_grad_view);
   }
 
@@ -711,15 +711,15 @@ public:
 
   const sycl::queue &queue() const { return queue_pool_[0]; }
 
-  std::shared_ptr<slabkit::Context> sk_ctx_shared() { return sk_ctx_; }
+  std::shared_ptr<naga::slabkit::Context> sk_ctx_shared() { return sk_ctx_; }
 
-  const std::shared_ptr<slabkit::Context> &sk_ctx_shared() const {
+  const std::shared_ptr<naga::slabkit::Context> &sk_ctx_shared() const {
     return sk_ctx_;
   }
 
   size_t device_index() const { return device_index_; }
 
-  std::shared_ptr<slabkit::Context> sk_ctx() const { return sk_ctx_; }
+  std::shared_ptr<naga::slabkit::Context> sk_ctx() const { return sk_ctx_; }
 
   // Back-edge traversal (for EquilibriumExecutor)
   const std::vector<BackEdge> &back_edges() const { return back_edges_; }
@@ -1156,7 +1156,7 @@ private:
 
   // sk_ctx_ and device_index_ must be declared before queue_pool_ so they are
   // initialized first (C++ initializes members in declaration order)
-  std::shared_ptr<slabkit::Context> sk_ctx_;
+  std::shared_ptr<naga::slabkit::Context> sk_ctx_;
   size_t device_index_;
   Phase phase_ = Phase::Declaring;
   std::vector<sycl::queue> queue_pool_;

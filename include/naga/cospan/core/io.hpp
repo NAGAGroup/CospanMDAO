@@ -40,7 +40,7 @@
 #pragma once
 
 #include <sycl/sycl.hpp>
-#include <slabkit/array.hpp>
+#include <naga/slabkit/array.hpp>
 #include <cstddef>
 #include <type_traits>
 
@@ -126,13 +126,13 @@ struct Input {
 
     // Full window (differentiable use — grads may still be null views when the
     // entry carries no grad storage, e.g. f64 in P1..P3).
-    Input(slabkit::DeviceView<value_type, Dim> data,
-          slabkit::DeviceView<value_type, Dim> read_grad,
-          slabkit::DeviceView<value_type, Dim> accum_grad) noexcept
+    Input(naga::slabkit::DeviceView<value_type, Dim> data,
+          naga::slabkit::DeviceView<value_type, Dim> read_grad,
+          naga::slabkit::DeviceView<value_type, Dim> accum_grad) noexcept
         : data_(data), grad_(read_grad), accum_grad_(accum_grad) {}
 
     // Data-only window (data tier).
-    explicit Input(slabkit::DeviceView<value_type, Dim> data) noexcept
+    explicit Input(naga::slabkit::DeviceView<value_type, Dim> data) noexcept
         : data_(data),
           grad_{nullptr, data.get_range()},
           accum_grad_{nullptr, data.get_range()} {}
@@ -172,9 +172,9 @@ struct Input {
     size_t size() const noexcept { return data_.size(); }
 
 private:
-    slabkit::DeviceView<value_type, Dim> data_;
-    slabkit::DeviceView<value_type, Dim> grad_;        // grad curr slot (read)
-    slabkit::DeviceView<value_type, Dim> accum_grad_;  // accumulation slot: grad
+    naga::slabkit::DeviceView<value_type, Dim> data_;
+    naga::slabkit::DeviceView<value_type, Dim> grad_;        // grad curr slot (read)
+    naga::slabkit::DeviceView<value_type, Dim> accum_grad_;  // accumulation slot: grad
                                                        // curr for fresh consumers,
                                                        // grad prev when this input
                                                        // is a back-edge (deferred)
@@ -201,12 +201,12 @@ struct Output {
         : data_{nullptr, sycl::range<Dim>{}},
           grad_{nullptr, sycl::range<Dim>{}} {}
 
-    Output(slabkit::DeviceView<value_type, Dim> data,
-           slabkit::DeviceView<value_type, Dim> read_grad) noexcept
+    Output(naga::slabkit::DeviceView<value_type, Dim> data,
+           naga::slabkit::DeviceView<value_type, Dim> read_grad) noexcept
         : data_(data), grad_(read_grad) {}
 
     // Data-only window (data tier).
-    explicit Output(slabkit::DeviceView<value_type, Dim> data) noexcept
+    explicit Output(naga::slabkit::DeviceView<value_type, Dim> data) noexcept
         : data_(data), grad_{nullptr, data.get_range()} {}
 
     // Forward data access
@@ -238,8 +238,8 @@ struct Output {
     size_t size() const noexcept { return data_.size(); }
 
 private:
-    slabkit::DeviceView<value_type, Dim> data_;
-    slabkit::DeviceView<value_type, Dim> grad_;  // grad curr slot (read)
+    naga::slabkit::DeviceView<value_type, Dim> data_;
+    naga::slabkit::DeviceView<value_type, Dim> grad_;  // grad curr slot (read)
 
     friend struct detail::RawAccess;
 };
@@ -275,17 +275,17 @@ struct StateVar {
     // adjoint — semantically a normal input gradient.
     Input<Dim, DT> prev() const noexcept {
         return Input<Dim, DT>(
-            slabkit::DeviceView<value_type, Dim>(prev_data_, range_),
-            slabkit::DeviceView<value_type, Dim>(grad_read_, range_),
-            slabkit::DeviceView<value_type, Dim>(adj_write_, range_));
+            naga::slabkit::DeviceView<value_type, Dim>(prev_data_, range_),
+            naga::slabkit::DeviceView<value_type, Dim>(grad_read_, range_),
+            naga::slabkit::DeviceView<value_type, Dim>(adj_write_, range_));
     }
 
     // Current-tick window: write()/atomic_add() the new value; get_grad()
     // reads the accumulated gradient — semantically a normal output.
     Output<Dim, DT> current() const noexcept {
         return Output<Dim, DT>(
-            slabkit::DeviceView<value_type, Dim>(current_data_, range_),
-            slabkit::DeviceView<value_type, Dim>(grad_read_, range_));
+            naga::slabkit::DeviceView<value_type, Dim>(current_data_, range_),
+            naga::slabkit::DeviceView<value_type, Dim>(grad_read_, range_));
     }
 
     sycl::range<Dim> range() const noexcept { return range_; }

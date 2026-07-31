@@ -37,7 +37,7 @@
 #include <naga/cospan/core/transfer.hpp>
 #include <naga/cospan/opt/adam.hpp>
 
-#include <slabkit/slabkit.hpp>
+#include <naga/slabkit/slabkit.hpp>
 #include <sycl/sycl.hpp>
 
 #include <cstdio>
@@ -256,7 +256,7 @@ int main() {
     std::printf("[sellar] device: %s\n",
                 dev.get_info<sycl::info::device::name>().c_str());
 
-    auto sk_ctx = slabkit::ContextBuilder()
+    auto sk_ctx = naga::slabkit::ContextBuilder()
                       .devices({dev})
                       .node_size(256)
                       .slab_size_per_device(8ull << 20)  // 8 MiB is plenty

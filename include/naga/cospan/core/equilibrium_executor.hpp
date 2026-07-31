@@ -32,7 +32,7 @@
 #include "naga/cospan/core/context.hpp"
 #include "naga/cospan/core/executor.hpp"
 
-#include <slabkit/memory.hpp>
+#include <naga/slabkit/memory.hpp>
 #include <sycl/sycl.hpp>
 
 #include <cmath>
