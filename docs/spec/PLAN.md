@@ -14,6 +14,9 @@ spec is assembled (phase 11).
   modular modeling, not just compute patterns).
 - Open items forward-link to the phase that owns them. A genuinely new
   pattern amends the ledger loudly, never silently.
+- Spec documents stay ~500 lines or less; a phase that outgrows one file
+  becomes a directory of chunk documents. Agents read short docs whole and
+  filter long ones — the cap is what keeps the contract actually read.
 - Seed material: three canonical user stories written and maintained as
   *ideal user code*, evolving as phases lock — **Sellar** (baseline),
   **B/C mycelium composite** (parallel + shared I/O), **LBM operator
@@ -24,7 +27,7 @@ spec is assembled (phase 11).
 
 | # | Phase | Closes as |
 |---|---|---|
-| 1 | **Components & I/O foundations** — I/O structs (metadata, dtype system with atomic variants, enumerability, lifetime attribute), the one-kernel contract, the three map abstractions + general-map floor, dynamic and value-driven sizing | `01-components-io.md` |
+| 1 | **Components & I/O foundations** — I/O structs (metadata, dtype system with atomic variants, enumerability, lifetime attribute), the one-kernel contract, the three map abstractions + general-map floor, dynamic and value-driven sizing | `01-components-io/` (chunked: 01a dtypes+wrappers, 01b metadata+shapes+declaration, 01c kernel machinery, 01d component base+helpers, 01e execution slice) |
 | 2 | **Memory substrate & the slabkit boundary** — slabkit's slimmed surface (pools, smart-pointer deletes, scratch's fate), the local aliasing struct, the allocation pass, ownership incl. non-durable lifetimes; **slabkit allocation support for multi-device queues** (`q.get_devices()` → context) | `02-memory-substrate.md` |
 | 3 | **Topology semantics** — connection spectrum (identity/slice/index-map, index-map-valued I/O), promote/tie rules and blocking, resolution chains, DV/constraint/objective algebra | `03-topology.md` |
 | 4 | **The System base contract** — virtual interface (declare/allocate/forward/adjoint surface), opacity law, extension rules incl. the declared host-locus property, observation/enumerability plumbing | `04-system-contract.md` |
