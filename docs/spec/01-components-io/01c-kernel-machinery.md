@@ -78,7 +78,15 @@ struct KernelImplWrapper {
     ///   * id-only bodies: the wrapper ALSO masks the padding tail
     ///     (return when local >= flat_extent) — legal because the
     ///     signature proves the body group-free. Such bodies contain
-    ///     ZERO guards and see exactly their logical range.
+    ///     ZERO guards and see exactly their logical range. THE POINT
+    ///     OF THE id-ONLY FORM IS UX AND NOTHING ELSE: work-groups are
+    ///     opt-in for users while the root kernel always operates via
+    ///     work-groups — the wrapper hands the impl its component-scoped
+    ///     global id and returns before the impl ever sees a thread
+    ///     index beyond what it asked for. Clean group boundaries stay
+    ///     enforced regardless: not splitting groups among tasks is good
+    ///     practice even where the spec minimally permits it, and an
+    ///     early-returning tail is the absence of a task, not a task.
     ///   * nd_item bodies: receive their full padded slice, tail
     ///     included — the wrapper cannot see whether the body barriers,
     ///     so it must not exit items on the body's behalf. The body's
