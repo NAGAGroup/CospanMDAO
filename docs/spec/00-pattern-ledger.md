@@ -25,12 +25,12 @@ Every pattern axis carries two obligations:
 A missing abstraction costs users convenience. A missing floor is a
 designed-in corner. Both tiers are named for every axis below.
 
-**Standing rider on every phase:** *transparent multi-device splitting*
-(user programs single-device; framework splits kernels/data — Celerity-class,
-possibly via contribution to AdaptiveCpp's multi-device queue) is a future
-feature, NOT bare-minimum now — but every phase must ask: **"would this
-decision block automatic splitting later?"** Connections, shape semantics,
-and index-map-valued I/O are where that corner would get poured.
+**Standing rider on every phase:** *transparent multi-device splitting* is
+a future feature, NOT bare-minimum now — but every phase must ask: **"would
+this decision block running on an AdaptiveCpp multi-device queue,
+unchanged, later?"** Connections, shape semantics, and index-map-valued I/O
+are where that corner would get poured. (Delivery path ruled 2026-08-31 —
+see §2.5.)
 
 ---
 
@@ -139,8 +139,14 @@ their own components, composed in Systems.
 
 ### 2.5 Deployment
 
-- **Abstraction (future):** transparent multi-device splitting, acceptance
-  test "a few user lines, never a model rewrite." Rider in §1 applies NOW.
+- **Abstraction (future) — DECIDED 2026-08-31 (Jack, executive):**
+  transparent multi-device splitting is delivered by **direct contribution
+  to AdaptiveCpp's multi-device queue implementation** (currently
+  experimental/placeholder upstream). No cospan-specific splitter will be
+  designed — upstream is already positioned to own this, and duplicating
+  it would be absurd. Acceptance test in its final form: the user swaps a
+  standard queue for a multi-device queue — **one line**. Rider in §1
+  applies NOW.
 - **Possibility floor:** explicit device/queue control stays reachable.
 - Heterogeneous single-binary portability (AdaptiveCpp generic SSCP) is
   table stakes beneath both.
