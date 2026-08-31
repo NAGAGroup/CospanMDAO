@@ -123,6 +123,10 @@ struct DimRecord {
     std::string_view input; ///< from_input_*: sibling input name
     uint8_t  dim;           ///< from_source_dim / from_input_dim
     size_t   value_index;   ///< from_input
+    sycl::range<3> dim_scratch; ///< always-valid device-to-host copy
+                            ///  destination for from_input reads (01.C);
+                            ///  unused for other specs — uniform by
+                            ///  design, no detection logic anywhere
 };
 
 /// IOEntry — the metadata record behind one declared I/O. One instance
