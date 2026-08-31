@@ -37,9 +37,10 @@ enum class DType : uint8_t {
 // Common contract:
 //   * Trivially copyable; captured by value into kernels
 //     (static_assert-enforced per instantiation).
-//   * The declared name is a host-meaning-only std::string_view
-//     (device-copyable; its character data SHALL NOT be dereferenced in
-//     device code).
+//   * Wrappers carry NO identity — they are pure device payload
+//     {shape, stride, data}. Component APIs that take a member reference
+//     (e.g. reshape) resolve it to its IOEntry through the member-address
+//     map (spec 01.B); nothing host-only rides into kernel captures.
 //   * Raw pointers are private. The metadata layer (spec 01.B,
 //     detail::IOEntry) is the sole writer of wrapper fields, via
 //     friendship. User code never sees a pointer.
@@ -76,7 +77,6 @@ struct Input {
     size_t            size() const;   ///< flat element count
 
 private:
-    std::string_view  name_;
     sycl::range<Rank> shape_;
     sycl::range<Rank> stride_;
     const value_type* data_;
@@ -112,7 +112,6 @@ struct Output {
     size_t            size() const;
 
 private:
-    std::string_view  name_;
     sycl::range<Rank> shape_;
     sycl::range<Rank> stride_;
     value_type*       data_;

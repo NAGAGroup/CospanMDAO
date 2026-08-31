@@ -74,8 +74,12 @@ constexpr auto from_input_array(std::string_view input);
 // -----------------------------------------------------------------------------
 // Declaration API (declared on the Component/System base — full base:
 // 01.D). Declaration performs ZERO allocation; it records metadata and
-// registers the member wrapper's address for sync_wrapper. Rank = the
-// member's Rank; the spec count must equal it, at compile time.
+// registers the member wrapper's address. The Component maintains TWO
+// resolution maps over the same entries: declared name -> IOEntry (path
+// resolution, enumeration, connections) and member address -> IOEntry
+// (member-reference APIs: reshape and friends). Wrappers themselves carry
+// no identity (01.A). Rank = the member's Rank; the spec count must equal
+// it, at compile time.
 // -----------------------------------------------------------------------------
 
 template <DType DT, int Rank, DimSpec... Specs>
@@ -98,7 +102,7 @@ void declare_output(Output<DT, Rank>& member, std::string name,
                     /* from_input_array marker */, Lifetime life = Lifetime::durable);
 
 /// The escape hatch — and the ONLY resize spelling. Resolves the entry by
-/// the member's registered name. Legal ONLY during the pre-forward step;
+/// the member's registered ADDRESS (the member-address map). Legal ONLY during the pre-forward step;
 /// it uses the same underlying setter as automatic derivation, and a
 /// manual call runs after the automatic pass, so it wins by ordering.
 /// (Users deriving shapes manually SHOULD declare fixed extents to avoid
