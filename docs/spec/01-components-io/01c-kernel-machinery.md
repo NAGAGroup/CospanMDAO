@@ -24,7 +24,7 @@ namespace naga::cospan {
 ///   * static constexpr int kernel_rank;   // iteration-space rank
 ///   * exactly ONE body, in exactly one of two signatures:
 ///       void operator()(sycl::id<kernel_rank>) const;
-///       void operator()(sycl::nd_item<3>, sycl::id<kernel_rank>) const;
+///       void operator()(sycl::nd_item<1>, sycl::id<kernel_rank>) const;
 ///     THE SIGNATURE IS THE DECLARATION: a body without the nd_item
 ///     cannot touch group abstractions (it has no group object), so the
 ///     framework derives the masking discipline structurally — no flags,
@@ -105,12 +105,12 @@ struct KernelImplWrapper {
     /// Localization: local = g - slice_offset; id<kernel_rank> by
     /// row-major divmod against range. Bodies never see flattening,
     /// slices, or fusion.
-    void operator()(sycl::nd_item<3> it) const;
+    void operator()(sycl::nd_item<1> it) const;
 };
 
 /// The placeholder — THE single dynamic-function call site in the entire
 /// framework. Declaration only; definitions replace it at JIT time.
-void stage(ParamCursor& cur, sycl::nd_item<3> it);
+void stage(ParamCursor& cur, sycl::nd_item<1> it);
 
 /// Per-KernelImpl-TYPE generated wrapper (SYCL_EXTERNAL free function):
 ///   { auto& blk = cur.next<KernelImplWrapper<KI>>(); blk(it); }
@@ -132,8 +132,8 @@ template <KernelImplC KI> KernelRegistration createKernelWrapper();
 ONE outer kernel in the whole framework, nd_range<1>:
 
 ```cpp
-q.parallel_for(launch_geometry,            // nd_range<3>, see below
-    cfg.apply([=](sycl::nd_item<3> it){
+q.parallel_for(sycl::nd_range<1>{padded_launch, wg},
+    cfg.apply([=](sycl::nd_item<1> it){
         ParamCursor cur{params_base};
         stage(cur, it);
     }));
@@ -153,33 +153,12 @@ q.parallel_for(launch_geometry,            // nd_range<3>, see below
   `(cur, it)`; cursor consumption assigns blocks positionally.
   Per-element cost is N slice guards plus only the work that survives
   them — part of FusedSystem's documented cost model (spec 05).
-- **Launch geometry — the machinery rank is 3, mirroring range<3>.** All
-  launches are `nd_range<3>`; the default geometry is degenerate-flat:
-  `{{computed_flat_extent, 1, 1}, {default_wg_size, 1, 1}}`. A degenerate
-  group<3> of {wg,1,1} is semantically a wg-sized linear group — barriers
-  and collectives behave identically. Localization uses
-  `get_global_linear_id()`. `nd_item` is NOT rank-convertible or
-  user-constructible (verified against the spec and acpp's headers), so
-  ONE machinery rank is the only design that needs no conversion anywhere.
-- **Component geometry overrides.** A Component MAY override its launch's
-  `nd_range<3>` (true 3D work-group tiling, custom WG sizes); absent an
-  override, the default-flat geometry applies. Individual launches honor
-  the override. FUSEDSYSTEM IGNORES COMPONENT OVERRIDES — geometry is set
-  at the system level there, if at all.
-- **Fused geometry is FLAT (1D groups), always.** Under a 3D local range,
-  one work-group's global linear ids are NOT contiguous, so linear slice
-  ranges could not be group-uniform — the padded-slice guarantee requires
-  flat groups. A component needing true 3D group geometry runs unfused,
-  where its override applies: the possibility floor is preserved by the
-  individual-launch path, and fuse boundaries respect geometry boundaries
-  exactly as they respect dynamic-shape boundaries.
 - **Launch extents**: individual = the stage's padded extent;
   fused-sequential = max stage padded extent; fused-parallel = Σ padded
   extents. All padding is to work-group multiples: whole-group slice
   membership is the collective-safety guarantee.
-- **Work-group size** is System-owned per launch (subject to the override
-  above); stages are WG-size-agnostic by contract; group-using bodies
-  adapt to any size.
+- **Work-group size** is System-owned per launch; stages are
+  WG-size-agnostic by contract; group-using bodies adapt to any size.
 - **One dynamic_function_config per launch** (acpp law). The System
   caches configs keyed by the ordered dynamic_function_id sequence; acpp
   caches the JIT result per configuration, persistently across runs.
