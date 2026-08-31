@@ -64,20 +64,36 @@ struct KernelImplWrapper {
     size_t                        slice_offset;  ///< System-stamped
     size_t                        padded_extent; ///< System-stamped
 
-    /// Masking (the collectives law made mechanical, structurally):
-    ///   ALWAYS: return unless
-    ///     slice_offset <= g < slice_offset + padded_extent
-    ///     — GROUP-UNIFORM by the padded-slice guarantee (slices are
-    ///     work-group multiples; no component straddles a group).
-    ///   ADDITIONALLY, iff KI has the id-only body (structurally proven
-    ///     group-free): return when local >= flat_extent (per-element —
-    ///     safe, nothing convergent exists to break).
-    ///   nd_item bodies receive every work-item in their padded slice,
-    ///     extent tail included, and SHALL guard their loads by their own
-    ///     wrappers' shapes, participating in collectives with identity:
-    ///     guard the loads, never the participation.
+    /// Masking. THE INVARIANT IS TWO LINES:
+    ///   1. Slices are work-group multiples — a group never straddles
+    ///      components. The wrapper's slice check
+    ///      (slice_offset <= g < slice_offset + padded_extent) is
+    ///      therefore GROUP-UNIFORM: whole groups enter or skip together.
+    ///      Group barriers are group-scoped in SYCL — groups owe each
+    ///      other nothing — so nothing further exists to check at
+    ///      orchestration level.
+    ///   2. Each KernelImpl is correct from its own scoped view, exactly
+    ///      as if launched standalone.
+    /// KERNELS ARE NEVER WRITTEN DIFFERENTLY FOR FUSION. Concretely:
+    ///   * id-only bodies: the wrapper ALSO masks the padding tail
+    ///     (return when local >= flat_extent) — legal because the
+    ///     signature proves the body group-free. Such bodies contain
+    ///     ZERO guards and see exactly their logical range.
+    ///   * nd_item bodies: receive their full padded slice, tail
+    ///     included — the wrapper cannot see whether the body barriers,
+    ///     so it must not exit items on the body's behalf. The body's
+    ///     own freedom is full: divergence is always legal; early
+    ///     return is legal unless it would skip a group barrier or
+    ///     collective that groupmates execute (the one UB, per the SYCL
+    ///     spec — we spec to the spec, not to hardware tolerance).
+    ///     Barrier-free nd_item bodies may early-return their tail;
+    ///     barrier-bearing bodies guard the loads, never the
+    ///     participation. Handling ragged n % wg is the standard
+    ///     obligation of any group-using nd_range kernel in any
+    ///     framework, identical fused or standalone.
     /// Localization: local = g - slice_offset; id<kernel_rank> by
-    /// row-major divmod against range. Bodies never see flattening.
+    /// row-major divmod against range. Bodies never see flattening,
+    /// slices, or fusion.
     void operator()(sycl::nd_item<1> it) const;
 };
 
