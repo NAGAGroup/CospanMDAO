@@ -82,10 +82,13 @@ struct KernelImplWrapper {
     ///   * nd_item bodies: receive their full padded slice, tail
     ///     included — the wrapper cannot see whether the body barriers,
     ///     so it must not exit items on the body's behalf. The body's
-    ///     own freedom is full: divergence is always legal; early
-    ///     return is legal unless it would skip a group barrier or
-    ///     collective that groupmates execute (the one UB, per the SYCL
-    ///     spec — we spec to the spec, not to hardware tolerance).
+    ///     own freedom is bounded by SYCL 2020 §4.17.3, verbatim: group
+    ///     functions "must be encountered in converged control flow by
+    ///     all work-items in the group ... under the same set of
+    ///     conditions" — skipping one via early exit, OR calling it from
+    ///     divergent branches/iterations, is undefined behavior.
+    ///     Divergence is legal in code free of group functions. We spec
+    ///     to the spec, not to hardware tolerance.
     ///     Barrier-free nd_item bodies may early-return their tail;
     ///     barrier-bearing bodies guard the loads, never the
     ///     participation. Handling ragged n % wg is the standard
