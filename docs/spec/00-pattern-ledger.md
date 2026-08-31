@@ -1,6 +1,5 @@
 # CospanMDAO Redesign — Phase 0a: The Pattern Ledger
 
-**Status: LOCKED 2026-08-31** (Jack + Research Lead alignment sessions).
 This document enumerates every pattern the redesigned CospanMDAO must serve,
 separated into **primitives** (must be designed directly) and **composites**
 (expressible from primitives; candidates for helper abstractions). It
@@ -138,7 +137,7 @@ their own components, composed in Systems.
 
 ### 2.5 Deployment
 
-- **Multi-device — DECIDED 2026-08-31 (Jack, executive):** delivered by
+- **Multi-device:** delivered by
   **direct contribution to AdaptiveCpp's multi-device queue implementation**
   (`ACPP_EXT_MULTI_DEVICE_QUEUE`, currently experimental with a placeholder
   scheduler). No cospan-specific splitter will be designed — upstream owns
@@ -182,7 +181,7 @@ AD-phase material) are composites — see §3.
 | Stencil | surjective neighborhood read + bijective write |
 | Scan, sort, compaction | multi-pass map compositions — shipped library abstractions; compaction also exercises data-dependent extent |
 | Segmented reduction | surjective + index-map metadata |
-| **Ragged shapes (CSR/SELL)** | flat data + index-map-valued I/O. RULED composite; the abstraction must be a **typed wrapper** carrying structure as metadata (connection checks, segmented helpers, adjoint layouts need to see it), never a naming convention |
+| **Ragged shapes (CSR/SELL)** | flat data + index-map-valued I/O. Composite; the abstraction must be a **typed wrapper** carrying structure as metadata (connection checks, segmented helpers, adjoint layouts need to see it), never a naming convention |
 | RNG streams | recurrence of a resource (input/output pair across invocations) |
 | Recurrence, history windows | march + connection-across-iterations (window = k-deep) |
 | Subcycling / multi-rate | nested march |
@@ -195,7 +194,7 @@ AD-phase material) are composites — see §3.
 | NNs / DNNs | components + connections, full stop — the generalized-modeling thesis |
 | Surrogate lifecycle | sweeps (data gen) + fit component + variant swap |
 | Multi-fidelity | variant swap |
-| **Model-variant swap** | RULED composite: models are declared **in code** — swapping subsystems behind fixed connections is ordinary programming; helpers optional |
+| **Model-variant swap** | Composite: models are declared **in code** — swapping subsystems behind fixed connections is ordinary programming; helpers optional |
 | Nested/bilevel optimization | optimizers are components/systems; nesting is free |
 | UQ / sensitivity products | AD forward mode as product surface |
 | Standalone subsystem testing | opacity (any System runs alone) + observation |
