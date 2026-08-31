@@ -25,12 +25,11 @@ Every pattern axis carries two obligations:
 A missing abstraction costs users convenience. A missing floor is a
 designed-in corner. Both tiers are named for every axis below.
 
-**Standing rider on every phase:** *transparent multi-device splitting* is
-a future feature, NOT bare-minimum now — but every phase must ask: **"would
-this decision block running on an AdaptiveCpp multi-device queue,
-unchanged, later?"** Connections, shape semantics, and index-map-valued I/O
-are where that corner would get poured. (Delivery path ruled 2026-08-31 —
-see §2.5.)
+**Multi-device note (no rider needed):** transparent multi-device compute
+arrives upstream via AdaptiveCpp's multi-device queue (§2.5). Because a
+multi-device queue IS a `sycl::queue` and all cospan submission goes
+through `sycl::queue`, the cospan-side cost of that future is ~zero by
+construction; the only touchpoint is slabkit allocation support (§2.5).
 
 ---
 
@@ -139,14 +138,20 @@ their own components, composed in Systems.
 
 ### 2.5 Deployment
 
-- **Abstraction (future) — DECIDED 2026-08-31 (Jack, executive):**
-  transparent multi-device splitting is delivered by **direct contribution
-  to AdaptiveCpp's multi-device queue implementation** (currently
-  experimental/placeholder upstream). No cospan-specific splitter will be
-  designed — upstream is already positioned to own this, and duplicating
-  it would be absurd. Acceptance test in its final form: the user swaps a
-  standard queue for a multi-device queue — **one line**. Rider in §1
-  applies NOW.
+- **Multi-device — DECIDED 2026-08-31 (Jack, executive):** delivered by
+  **direct contribution to AdaptiveCpp's multi-device queue implementation**
+  (`ACPP_EXT_MULTI_DEVICE_QUEUE`, currently experimental with a placeholder
+  scheduler). No cospan-specific splitter will be designed — upstream owns
+  this, and a multi-device queue is just a `sycl::queue`, so cospan needs
+  NOTHING when it matures. The user-facing change is literally one line:
+  construct a multi-device queue (vector of devices, or selectors like
+  `system_selector_v`) instead of a standard one.
+- **The one real touchpoint — slabkit:** enable creating allocations for a
+  multi-device queue's device set (`q.get_devices()`), with USM pointers
+  valid on every device the queue may dispatch to. Upstream's current
+  restrictions (queue-argument USM management unsupported in multi-device
+  mode) mean explicit context+device allocation — slabkit's existing style
+  — is exactly the right shape. Phase-2 agenda item.
 - **Possibility floor:** explicit device/queue control stays reachable.
 - Heterogeneous single-binary portability (AdaptiveCpp generic SSCP) is
   table stakes beneath both.
