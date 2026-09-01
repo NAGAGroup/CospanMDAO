@@ -151,9 +151,29 @@ struct KernelRegistration {
 ## The pipeline
 
 Three outer kernels — one per launch rank, each the single call site of
-its placeholder:
+its placeholder. The full launch mechanism, end to end:
 
 ```cpp
+// Once at startup, per rank: the placeholder's type-erased handle.
+//   auto stage_rR_id = sycl::AdaptiveCpp_jit::dynamic_function<
+//       void, ParamCursor&, sycl::nd_item<R>>{&stage_rR}.id();
+// (Wrapper ids come from createKernelWrapper<KI>() at setup.)
+
+// Per launch: obtain the config — from the System's cache, keyed by
+// (rank, ordered wrapper-id sequence); construct + define only on miss.
+// acpp laws: one config per launch; construction has overhead (reuse);
+// the config object must outlive kernel completion.
+sycl::AdaptiveCpp_jit::dynamic_function_config& cfg =
+    config_cache.get_or_create(key, [&](auto& c){
+        // individual launch — one stage:
+        c.define(stage_rR_id, wrapper_KI_id);
+        // fused launch — the wave, in execution order:
+        // c.define_as_call_sequence(stage_rR_id, {w1_id, ..., wN_id});
+    });
+
+// The launch — identical shape for individual and fused; the JIT
+// expands the placeholder call site per cfg (a single wrapper call, or
+// the sequence inlined in order):
 q.parallel_for(sycl::nd_range<R>{padded_global, wg_shape},
     cfg.apply([=](sycl::nd_item<R> it){
         ParamCursor cur{params_base};
