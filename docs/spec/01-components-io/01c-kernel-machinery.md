@@ -21,15 +21,15 @@ namespace naga::cospan {
 /// THE KERNELIMPL CONTRACT — the user's one kernel, as a type.
 ///   * A trivially copyable struct; members are I/O wrappers (01.A) plus
 ///     POD configuration. It is copied byte-wise into its param block.
-///   * static constexpr int kernel_rank;   // iteration-space rank
+///   * static constexpr int kernel_rank;   // iteration-space rank, 1..3
 ///   * exactly ONE body, in exactly one of two signatures:
 ///       void operator()(sycl::id<kernel_rank>) const;
-///       void operator()(sycl::nd_item<1>, sycl::id<kernel_rank>) const;
+///       void operator()(sycl::nd_item<kernel_rank>,
+///                       sycl::id<kernel_rank>) const;
 ///     THE SIGNATURE IS THE DECLARATION: a body without the nd_item
-///     cannot touch group abstractions (it has no group object), so the
-///     framework derives the masking discipline structurally — no flags,
-///     no classification. Bodies wanting group collectives take the
-///     nd_item form and use group abstractions as they wish.
+///     cannot touch group abstractions (it has no group object). Bodies
+///     wanting group semantics take the nd_item form — at the rank they
+///     mean it: an nd_item body's rank IS its group-geometry rank.
 ///   * REQUIREMENT (phase-8 keystone): the struct SHALL be a template
 ///     over its value mode, using wrapper `value_type` exclusively in
 ///     the body. Opt-out: components supplying an analytical adjoint.
@@ -51,34 +51,38 @@ struct ParamCursor {
 
 /// The typed param block. FIELD OWNERSHIP IS SPLIT:
 ///   component-bound (written by bind(), 01.D): impl, range, flat_extent
-///   System-stamped (written at launch preparation): slice_offset,
-///     padded_extent. For an individual launch the stamp is the
-///     degenerate {0, padded_launch}; sequential-mode fusion stamps
-///     {0, launch_extent} for every stage; parallel-mode stamps true
-///     padded slices. Components never know their slice.
+///   System-stamped (written at launch preparation): the GROUP-INDEX
+///     slice {group_offset, group_count} — slices are counted in whole
+///     work-groups, so a group never straddles components under ANY
+///     geometry. For an individual launch the stamp is the degenerate
+///     {0, all_groups}.
 template <KernelImplC KI>
 struct KernelImplWrapper {
     KI                            impl;
-    sycl::range<KI::kernel_rank>  range;         ///< logical iteration space
-    size_t                        flat_extent;   ///< product of range
-    size_t                        slice_offset;  ///< System-stamped
-    size_t                        padded_extent; ///< System-stamped
+    sycl::range<KI::kernel_rank>  range;        ///< LOGICAL iteration space
+    size_t                        flat_extent;  ///< product of range
+    size_t                        group_offset; ///< System-stamped
+    size_t                        group_count;  ///< System-stamped
 
     /// Masking. THE INVARIANT IS TWO LINES:
-    ///   1. Slices are work-group multiples — a group never straddles
-    ///      components. The wrapper's slice check
-    ///      (slice_offset <= g < slice_offset + padded_extent) is
-    ///      therefore GROUP-UNIFORM: whole groups enter or skip together.
-    ///      Group barriers are group-scoped in SYCL — groups owe each
-    ///      other nothing — so nothing further exists to check at
-    ///      orchestration level.
+    ///   1. Slices are group-index slices — the wrapper's check
+    ///      (group_offset <= get_group_linear_id() < group_offset +
+    ///      group_count) is GROUP-UNIFORM by construction, under any
+    ///      launch geometry. Group barriers are group-scoped in SYCL —
+    ///      groups owe each other nothing — so nothing further exists to
+    ///      check at orchestration level.
     ///   2. Each KernelImpl is correct from its own scoped view, exactly
     ///      as if launched standalone.
     /// KERNELS ARE NEVER WRITTEN DIFFERENTLY FOR FUSION. Concretely:
-    ///   * id-only bodies: the wrapper ALSO masks the padding tail
-    ///     (return when local >= flat_extent) — legal because the
-    ///     signature proves the body group-free. Such bodies contain
-    ///     ZERO guards and see exactly their logical range. THE POINT
+    ///   * id-only bodies: the wrapper converts the launch nd_item to the
+    ///     impl's declared-rank global sycl::id (stage-local flat index =
+    ///     (group_linear_id - group_offset) * prod(local_range) +
+    ///     local_linear_id, then row-major divmod against `range`;
+    ///     sycl::id is constructible — verified, unlike nd_item) and ALSO
+    ///     masks the padding tail (return when stage-local flat >=
+    ///     flat_extent) — legal because the signature proves the body
+    ///     group-free. Such bodies contain ZERO guards, see exactly
+    ///     their logical range, and run under ANY launch rank. THE POINT
     ///     OF THE id-ONLY FORM IS UX AND NOTHING ELSE: work-groups are
     ///     opt-in for users while the root kernel always operates via
     ///     work-groups — the wrapper hands the impl its component-scoped
@@ -102,63 +106,88 @@ struct KernelImplWrapper {
     ///     participation. Handling ragged n % wg is the standard
     ///     obligation of any group-using nd_range kernel in any
     ///     framework, identical fused or standalone.
-    /// Localization: local = g - slice_offset; id<kernel_rank> by
-    /// row-major divmod against range. Bodies never see flattening,
-    /// slices, or fusion.
-    void operator()(sycl::nd_item<1> it) const;
+    void operator()(sycl::nd_item<KI::kernel_rank> it) const; // nd_item rank
+                                    // = launch rank; see rank rules below
 };
 
-/// The placeholder — THE single dynamic-function call site in the entire
-/// framework. Declaration only; definitions replace it at JIT time.
-void stage(ParamCursor& cur, sycl::nd_item<1> it);
+/// The placeholders — the dynamic-function call sites, ONE PER LAUNCH
+/// RANK (the nd_item in the signature fixes the rank):
+void stage_r1(ParamCursor& cur, sycl::nd_item<1> it);
+void stage_r2(ParamCursor& cur, sycl::nd_item<2> it);
+void stage_r3(ParamCursor& cur, sycl::nd_item<3> it);
+/// This split costs nothing at rest: the SSCP flow lowers a kernel to
+/// device code only when its codepath is first invoked — an unhit
+/// placeholder rank never becomes device code.
 
-/// Per-KernelImpl-TYPE generated wrapper (SYCL_EXTERNAL free function):
+/// Kernel registration and geometry. Called from the component's setup
+/// (01.D), once per KernelImpl type.
+///
+///   createKernelWrapper<KI>(sycl::range<R> global_range)
+///     — R must equal KI's argument rank (compile-checked). global_range
+///     is the kernel's LOGICAL extent; the framework pads to work-group
+///     multiples in all paths. Stored internally as nd_range<3> + rank.
+///     A rank-appropriate default work-group shape applies
+///     (implementation-tunable, not a contract constant).
+///
+///   createKernelWrapper<KI>(sycl::range<R> global_range,
+///                           sycl::range<R> wg_shape)
+///     — replaces the default work-group shape. Available ONLY for
+///     nd_item-taking KernelImpls (same rank, compile-checked).
+///
+/// The generated SYCL_EXTERNAL wrapper is registered against the
+/// placeholder of its launch rank:
 ///   { auto& blk = cur.next<KernelImplWrapper<KI>>(); blk(it); }
-/// createKernelWrapper<KI>() emits it and returns the registration
-/// record; called from the component's setup (01.D). The type-erased
-/// dynamic_function_id is stored centrally by the owning System.
 struct KernelRegistration {
     sycl::AdaptiveCpp_jit::dynamic_function_id id;
-    size_t block_size;
-    size_t block_align;
+    int             launch_rank;
+    sycl::nd_range<3> geometry;   ///< logical global + wg shape, 1-padded
+    size_t          block_size;
+    size_t          block_align;
 };
-template <KernelImplC KI> KernelRegistration createKernelWrapper();
 
 } // namespace naga::cospan
 ```
 
 ## The pipeline
 
-ONE outer kernel in the whole framework, nd_range<1>:
+Three outer kernels — one per launch rank, each the single call site of
+its placeholder:
 
 ```cpp
-q.parallel_for(sycl::nd_range<1>{padded_launch, wg},
-    cfg.apply([=](sycl::nd_item<1> it){
+q.parallel_for(sycl::nd_range<R>{padded_global, wg_shape},
+    cfg.apply([=](sycl::nd_item<R> it){
         ParamCursor cur{params_base};
-        stage(cur, it);
+        stage_rR(cur, it);
     }));
 ```
 
+- **Rank dispatch**: the System executor switches on the stored rank and
+  issues the correctly-typed launch. For id-only stages the choice of
+  launch rank is immaterial (the wrapper converts); for nd_item stages
+  the launch rank is the body's declared rank.
 - **Individual launches** (all Components outside a FusedSystem, whether
   under plain Systems or ParallelSystems): the Component uploads its OWN
-  single param block at its own turn — Component-local, no shared arena,
-  no packing machinery — and the launch uses
-  `cfg.define(&stage, wrapper_KI)`.
-- **FusedSystem launches** are the ONLY multi-block case: the wave's
-  blocks are packed into one arena in execution order, once per wave
-  (legal because every stage's extents are already resolved — see the
-  dynamic-shape rules), and the launch uses
-  `cfg.define_as_call_sequence(&stage, {w1..wN})`. The single call site
-  expands inline at JIT time; every expanded call receives the same
-  `(cur, it)`; cursor consumption assigns blocks positionally.
-  Per-element cost is N slice guards plus only the work that survives
-  them — part of FusedSystem's documented cost model (spec 05).
-- **Launch extents**: individual = the stage's padded extent;
-  fused-sequential = max stage padded extent; fused-parallel = Σ padded
-  extents. All padding is to work-group multiples: whole-group slice
-  membership is the collective-safety guarantee.
-- **Work-group size** is System-owned per launch; stages are
-  WG-size-agnostic by contract; group-using bodies adapt to any size.
+  single param block at its own turn — Component-local, no shared arena —
+  and the launch uses `cfg.define(&stage_rR, wrapper_KI)` with the
+  component's registered geometry (default or overridden).
+- **FusedSystem launches** are the ONLY multi-block case. Rank and
+  work-group shape are specified AT SYSTEM LEVEL; component wg-shape
+  overrides are ignored inside a fuse. Rank agreement: an nd_item stage
+  whose rank differs from the fuse's rank is a hard error at fuse
+  assembly; id-only stages are rank-exempt. The wave's blocks are packed
+  into one arena in execution order, once per wave (legal because every
+  stage's extents are already resolved — see the dynamic-shape rules),
+  and the launch uses `cfg.define_as_call_sequence(&stage_rR, {w1..wN})`.
+  The single call site expands inline at JIT time; every expanded call
+  receives the same `(cur, it)`; cursor consumption assigns blocks
+  positionally. Per-element cost is N slice guards plus only the work
+  that survives them — part of FusedSystem's documented cost model
+  (spec 05).
+- **Slices and extents are counted in whole work-groups**: per-stage
+  padding rounds the logical extent up to groups of the launch geometry;
+  individual = the stage's own group count; fused-sequential = max stage
+  group count; fused-parallel = Σ stage group counts, with group_offset
+  the prefix sum. A group never straddles components, under any geometry.
 - **One dynamic_function_config per launch** (acpp law). The System
   caches configs keyed by the ordered dynamic_function_id sequence; acpp
   caches the JIT result per configuration, persistently across runs.
