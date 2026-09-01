@@ -1,9 +1,9 @@
 # CospanMDAO Redesign — Spec Discussion Plan (Phase 0b)
 
-**Approved 2026-08-31.** Companion to `00-pattern-ledger.md` (phase 0a,
+**Approved 2026-08-31; reshaped for spec-as-code 2026-09-01** (phases carved by declaration surface, not topic; AD and batching are amendment phases). Companion to `00-pattern-ledger.md` (phase 0a,
 locked). Each phase is a Jack + Research Lead discussion that closes with a
 numbered spec document in this directory. No implementation until the full
-spec is assembled (phase 11).
+spec is assembled (phase 10).
 
 ## Mechanics
 
@@ -27,17 +27,16 @@ spec is assembled (phase 11).
 
 | # | Phase | Closes as |
 |---|---|---|
-| 1 | **Components & I/O foundations** — I/O structs (metadata, dtype system with atomic variants, enumerability, lifetime attribute), the one-kernel contract, the three map abstractions + general-map floor, dynamic and value-driven sizing | `01-components-io/` (chunked: 01a dtypes+wrappers, 01b metadata+shapes+declaration, 01c kernel machinery, 01d component base+helpers, 01e execution slice) |
-| 2 | **Memory substrate & the slabkit boundary** — slabkit's slimmed surface (pools, smart-pointer deletes, scratch's fate), the local aliasing struct, the allocation pass, ownership incl. non-durable lifetimes; **slabkit allocation support for multi-device queues** (`q.get_devices()` → context) | `02-memory-substrate.md` |
-| 3 | **Topology semantics** — connection spectrum (identity/slice/index-map, index-map-valued I/O), promote/tie rules and blocking, resolution chains, DV/constraint/objective algebra | `03-topology.md` |
-| 4 | **The System base contract** — virtual interface (declare/allocate/forward/adjoint surface), opacity law, extension rules incl. the declared host-locus property, observation/enumerability plumbing | `04-system-contract.md` |
-| 5 | **Structural Systems** — ParallelSystem (queue assignment, shared-I/O rules, checks + overrides), FusedSystem (both modes, legality checks, dynamic-function splice), conditional, change-tracked execution | `05-structural-systems.md` |
-| 6 | **Implicit & solvers** — tied lhs/rhs UX, solver attachment and configuration, convergence semantics, first solver library shape | `06-implicit-solvers.md` |
-| 7 | **Temporal** — march, recurrence wiring, history windows; subcycling/events/hybrid-commit confirmed as composites via worked examples | `07-temporal.md` |
-| 8 | **AD** — engine (map-class adjoints ∘ element-op differentiation), zero-declaration UX, FD/CS/analytical floor, rematerialization policy, gradient dtypes incl. fp64 | `08-ad.md` |
-| 9 | **Batching** — batched shapes, batched connections, batched AD, ensemble execution | `09-batching.md` |
-| 10 | **Helpers & observation** — reductions/scans/sorts, ragged typed wrappers, batched small solves; observation API; docs-from-declarations | `10-helpers-observation.md` |
-| 11 | **Decisions, audit, assembly** — units/scaling, determinism, precision, memory budgeting ruled; full-spec consistency audit; consolidation + examples plan | `11-assembly.md` + unified spec |
+| 1 | **Components & I/O foundations** — dtypes+wrappers, metadata+shapes+declaration API, kernel machinery (KernelBody, chained executor, Local scratch), Component, System execution slice + structural APIs | `01-components-io/` (01a–01e) — DONE |
+| 2 | **Model, memory & finalize** — `Model` (setup driver, queue creation, run, final wait); the finalize pass as ONE walk: alias resolution order + allocation pass; slabkit's slimmed surface (pools, smart pointers); pool ownership flavor; multi-device-queue allocation | `02-model-memory/` |
+| 3 | **Topology semantics & optimization marks** — index-map connections and index-map-valued I/O, subarray composition, cross-level ties, the marks API (design vars / constraints / objectives with bounds and scaling slots) | `03-topology.md` |
+| 4 | **System types** — remaining base contract (host-locus property, observation hooks), conditional execution, change-tracked execution | `04-system-types.md` |
+| 5 | **Implicit & solvers** — ImplicitComponent, the Solver hierarchy, attachment API, convergence contract | `05-implicit-solvers.md` |
+| 6 | **Temporal** — temporal System type(s), recurrence wiring, history windows; composites proven by samples | `06-temporal.md` |
+| 7 | **AD** — engine document + AMENDMENTS to 01a (grad wrapper forms), 01d (adjoint verb), 01e (backward walk), 05 (solver adjoints); consistency audit inside the phase | `07-ad.md` + amendments |
+| 8 | **Batching** — batched shapes/connections/AD as AMENDMENTS to 01b, 03, 07; ensemble execution System | `08-batching.md` + amendments |
+| 9 | **Helpers & observation** — kernels roster (scans, sorts, ragged, batched small solves), observation API, docs-from-declarations | `09-helpers-observation.md` |
+| 10 | **Decisions, audit, assembly** — units/scaling, determinism, precision, memory budgeting ruled; final consistency audit; consolidation + examples plan | `10-assembly.md` + unified spec |
 
 Multi-device is not a phase: it arrives upstream (acpp multi-device queue
 contribution, ruled — ledger §2.5); the sole spec touchpoint is phase 2's
