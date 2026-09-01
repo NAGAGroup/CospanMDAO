@@ -1,8 +1,8 @@
 # Spec 01.C — kernel machinery
 
 Part of the phase-1 spec (`docs/spec/01-components-io/`). Binding contract;
-declarations only. Wrappers: 01.A. Metadata/shapes: 01.B. Component base
-and provided kernels: 01.D. System-side execution: 01.E.
+declarations only. Wrappers: 01.A. Metadata/shapes: 01.B. Component: 01.D.
+System-side execution: 01.E.
 
 ## The map taxonomy is doctrine, not metadata
 
@@ -13,219 +13,258 @@ Kernels are NEVER classified by their authors; no class field exists.
 The general case is guaranteed by construction: indexed access plus atomic
 dtypes (01.A), available in every kernel body.
 
-## The KernelImpl contract
+## 1. The KernelBody contract
 
 ```cpp
 namespace naga::cospan {
 
-/// THE KERNELIMPL CONTRACT — the user's one kernel, as a type.
-///   * A trivially copyable struct; members are I/O wrappers (01.A) plus
-///     POD configuration. It is copied byte-wise into its param block.
-///   * static constexpr int kernel_rank;   // iteration-space rank, 1..3
-///   * exactly ONE body, in exactly one of two signatures:
-///       void operator()(sycl::id<kernel_rank>) const;
-///       void operator()(sycl::nd_item<kernel_rank>,
-///                       sycl::id<kernel_rank>) const;
-///     THE SIGNATURE IS THE DECLARATION: a body without the nd_item
-///     cannot touch group abstractions (it has no group object). Bodies
-///     wanting group semantics take the nd_item form — at the rank they
-///     mean it: an nd_item body's rank IS its group-geometry rank.
-///   * REQUIREMENT (phase-8 keystone): the struct SHALL be a template
-///     over its value mode, using wrapper `value_type` exclusively in
-///     the body. Opt-out: components supplying an analytical adjoint.
-template <class KI>
-concept KernelImplC =
-    std::is_trivially_copyable_v<KI> &&
-    requires { { KI::kernel_rank } -> std::convertible_to<int>; } &&
-    (PlainBody<KI> || GroupBody<KI>);   // exactly one of the signatures
+/// A kernel is a TYPE with nested argument structs and one call operator:
+///
+///   struct MyBody {                      // POD config lives as members
+///       struct Inputs  { Input<...>  a; Input<...> b; };
+///       struct Outputs { Output<...> y; };
+///       struct Scratch { Local<...>  tile; };     // OPTIONAL (local mem)
+///       void operator()(sycl::id<R> idx, Inputs, Outputs) const;
+///          // or (sycl::nd_item<R>, Inputs, Outputs)
+///          // or (sycl::nd_item<R>, Inputs, Outputs, Scratch)
+///   };
+///
+/// THE SIGNATURE IS THE DECLARATION, three ways:
+///   * first parameter id<R> vs nd_item<R>  => group semantics opt-in
+///     (a body without the nd_item cannot touch group abstractions);
+///   * R                                    => kernel rank, deduced
+///     (kernel_rank_v<KB>; no static member);
+///   * trailing Scratch parameter           => local-memory opt-in
+///     (nd_item bodies only — local memory without a group is
+///     meaningless).
+/// Inputs, Outputs, KB itself, and Scratch (if present) SHALL be
+/// trivially copyable — concept-enforced; they are copied byte-wise
+/// into the launch's device streams.
+/// REQUIREMENT (phase-8 keystone): KB SHALL be a template over its value
+/// mode, using wrapper `value_type` exclusively in the body. Opt-out:
+/// components supplying an analytical adjoint.
+template <class KB> concept PlainBody   = /* operator()(id<R>, In, Out) */;
+template <class KB> concept GroupBody   = /* operator()(nd_item<R>, In, Out [, Scratch]) */;
+template <class KB> concept HasScratch  = /* trailing Scratch parameter */;
+template <class KB> concept KernelBodyC =
+    std::is_trivially_copyable_v<KB> &&
+    std::is_trivially_copyable_v<typename KB::Inputs> &&
+    std::is_trivially_copyable_v<typename KB::Outputs> &&
+    (PlainBody<KB> != GroupBody<KB>);        // exactly one form
+template <class KB> inline constexpr int kernel_rank_v = /* from signature */;
 
-/// Device-side positional reader of a param block region. Position IS
-/// identity: each stage in a fused sequence consumes its own block in
-/// arena order — no stage ids exist anywhere (which is also what makes
-/// the same KernelImpl type legal twice in one wave).
-struct ParamCursor {
-    const std::byte* pos;
-    /// Align up to alignof(Block), return the block, advance past it.
-    template <class Block> const Block& next();
+## 2. Local<DT, Rank> — local memory with wrapper ergonomics
+
+/// Same accessor discipline as Output (bare references; plain dtypes
+/// only in v1), but the storage is GROUP-LOCAL and the wrapper carries a
+/// byte OFFSET instead of a pointer — local memory has no host address.
+/// The user shapes it host-side in compute_forward() like any other
+/// launch parameter:
+///     MyBody::Scratch s;  s.tile.reshape({17, 16});
+/// create_launch_config() lays out all Locals in a Scratch (aligned,
+/// summed -> the stage's scratch_bytes); the device function fixes up
+/// each Local's pointer as local_base + offset before the body runs.
+/// Per-group instance semantics are local memory's own; the framework
+/// adds nothing.
+template <DType DT, int Rank>
+    requires(!is_atomic_v<DT>)
+struct Local {
+    using value_type = cpp_type_t<DT>;
+
+    void reshape(sycl::range<Rank> shape);        // host, compute_forward
+    value_type& operator[](sycl::id<Rank> idx) const;  // device, post-fixup
+    value_type& operator[](size_t flat) const;
+    sycl::range<Rank> shape() const;
+    size_t size() const;
+
+private:
+    sycl::range<Rank> shape_;
+    size_t            offset_;   // into the launch's local allocation
+    value_type*       ptr_;      // null until device-side fixup
+    friend struct detail::ScratchLayout;
 };
 
-/// The typed param block. FIELD OWNERSHIP IS SPLIT:
-///   component-bound (written by bind(), 01.D): impl, range, flat_extent
-///   System-stamped (written at launch preparation): the GROUP-INDEX
-///     slice {group_offset, group_count} — slices are counted in whole
-///     work-groups, so a group never straddles components under ANY
-///     geometry. For an individual launch the stamp is the degenerate
-///     {0, all_groups}.
-template <KernelImplC KI>
-struct KernelImplWrapper {
-    KI                            impl;
-    sycl::range<KI::kernel_rank>  range;        ///< LOGICAL iteration space
-    size_t                        flat_extent;  ///< product of range
-    size_t                        group_offset; ///< System-stamped
-    size_t                        group_count;  ///< System-stamped
+## 3. StageRecord and FnOffsetInfo
 
-    /// Masking. THE INVARIANT IS TWO LINES:
-    ///   1. Slices are group-index slices — the wrapper's check
-    ///      (group_offset <= get_group_linear_id() < group_offset +
-    ///      group_count) is GROUP-UNIFORM by construction, under any
-    ///      launch geometry. Group barriers are group-scoped in SYCL —
-    ///      groups owe each other nothing — so nothing further exists to
-    ///      check at orchestration level.
-    ///   2. Each KernelImpl is correct from its own scoped view, exactly
-    ///      as if launched standalone.
-    /// KERNELS ARE NEVER WRITTEN DIFFERENTLY FOR FUSION. Concretely:
-    ///   * id-only bodies: the wrapper converts the launch nd_item to the
-    ///     impl's declared-rank global sycl::id (stage-local flat index =
-    ///     (group_linear_id - group_offset) * prod(local_range) +
-    ///     local_linear_id, then row-major divmod against `range`;
-    ///     sycl::id is constructible — verified, unlike nd_item) and ALSO
-    ///     masks the padding tail (return when stage-local flat >=
-    ///     flat_extent) — legal because the signature proves the body
-    ///     group-free. Such bodies contain ZERO guards, see exactly
-    ///     their logical range, and run under ANY launch rank. THE POINT
-    ///     OF THE id-ONLY FORM IS UX AND NOTHING ELSE: work-groups are
-    ///     opt-in for users while the root kernel always operates via
-    ///     work-groups — the wrapper hands the impl its component-scoped
-    ///     global id and returns before the impl ever sees a thread
-    ///     index beyond what it asked for. Clean group boundaries stay
-    ///     enforced regardless: not splitting groups among tasks is good
-    ///     practice even where the spec minimally permits it, and an
-    ///     early-returning tail is the absence of a task, not a task.
-    ///   * nd_item bodies: receive their full padded slice, tail
-    ///     included — the wrapper cannot see whether the body barriers,
-    ///     so it must not exit items on the body's behalf. The body's
-    ///     own freedom is bounded by SYCL 2020 §4.17.3, verbatim: group
-    ///     functions "must be encountered in converged control flow by
-    ///     all work-items in the group ... under the same set of
-    ///     conditions" — skipping one via early exit, OR calling it from
-    ///     divergent branches/iterations, is undefined behavior.
-    ///     Divergence is legal in code free of group functions. We spec
-    ///     to the spec, not to hardware tolerance.
-    ///     Barrier-free nd_item bodies may early-return their tail;
-    ///     barrier-bearing bodies guard the loads, never the
-    ///     participation. Handling ragged n % wg is the standard
-    ///     obligation of any group-using nd_range kernel in any
-    ///     framework, identical fused or standalone.
-    void operator()(sycl::nd_item<KI::kernel_rank> it) const; // nd_item rank
-                                    // = launch rank; see rank rules below
+/// One StageRecord per stage per launch, fixed-size, packed into a
+/// device array in EXECUTION ORDER. Field ownership:
+///   component-bound (create_launch_config): rank, range, flat_extent,
+///     stream offsets, scratch_off/scratch_bytes;
+///   System-stamped (launch pack): group_offset, group_count — the
+///     GROUP-INDEX slice: slices are counted in whole work-groups, so a
+///     group never straddles stages under ANY geometry.
+struct StageRecord {
+    sycl::range<3> range;         // logical iteration space, 1-padded
+    size_t   flat_extent;         // product of range
+    size_t   group_offset;        // System-stamped
+    size_t   group_count;         // System-stamped
+    uint32_t input_off;           // into the inputs stream
+    uint32_t output_off;          // into the outputs stream
+    uint32_t body_off;            // into the bodies stream
+    uint32_t scratch_off;         // into the bodies stream (Scratch bytes)
+    uint32_t scratch_bytes;       // this stage's local-memory requirement
+    uint8_t  rank;
 };
 
-/// The placeholders — the dynamic-function call sites, ONE PER LAUNCH
-/// RANK (the nd_item in the signature fixes the rank):
-void stage_r1(ParamCursor& cur, sycl::nd_item<1> it);
-void stage_r2(ParamCursor& cur, sycl::nd_item<2> it);
-void stage_r3(ParamCursor& cur, sycl::nd_item<3> it);
-/// This split costs nothing at rest: the SSCP flow lowers a kernel to
-/// device code only when its codepath is first invoked — an unhit
-/// placeholder rank never becomes device code.
-
-/// Kernel registration and geometry. Called from the component's setup
-/// (01.D), once per KernelImpl type.
-///
-///   createKernelWrapper<KI>(sycl::range<R> global_range)
-///     — R must equal KI's argument rank (compile-checked). global_range
-///     is the kernel's LOGICAL extent; the framework pads to work-group
-///     multiples in all paths. Stored internally as nd_range<3> + rank.
-///     A rank-appropriate default work-group shape applies
-///     (implementation-tunable, not a contract constant).
-///
-///   createKernelWrapper<KI>(sycl::range<R> global_range,
-///                           sycl::range<R> wg_shape)
-///     — replaces the default work-group shape. Available ONLY for
-///     nd_item-taking KernelImpls (same rank, compile-checked).
-///
-/// The generated SYCL_EXTERNAL wrapper is registered against the
-/// placeholder of its launch rank:
-///   { auto& blk = cur.next<KernelImplWrapper<KI>>(); blk(it); }
-struct KernelRegistration {
-    sycl::AdaptiveCpp_jit::dynamic_function_id id;
-    int             launch_rank;
-    sycl::nd_range<3> geometry;   ///< logical global + wg shape, 1-padded
-    size_t          block_size;
-    size_t          block_align;
+/// FnOffsetInfo — position-as-identity for the chained executor. Every
+/// definition in an acpp call sequence receives IDENTICAL arguments (one
+/// call site, expanded), so a stage can only know WHICH stage it is by
+/// advancing shared mutable state in call order. This is that state.
+struct FnOffsetInfo {
+    const StageRecord* records;   // device array, execution order
+    uint32_t           i;         // per-work-item cursor, starts at 0
+    const StageRecord& next() { return records[i++]; }
 };
+
+## 4. The generated device function — one per (KernelBody type, rank)
+
+/// compile_kernel() (01.D) emits, for KB at launch rank R:
+SYCL_EXTERNAL void kb_fn(sycl::nd_item<R> it, FnOffsetInfo& info,
+                         const std::byte* inputs, std::byte* outputs,
+                         const std::byte* bodies, std::byte* local_base)
+{
+    // LAW: THE CURSOR ADVANCE IS THE FIRST STATEMENT AND UNCONDITIONAL.
+    // Every stage function consumes exactly one record before any
+    // possible return; a masked-out stage still advances. Violating
+    // this desynchronizes every stage after it.
+    const StageRecord& r = info.next();
+
+    // Group-index slice check — group-uniform by construction: whole
+    // groups skip together; SYCL group barriers are group-scoped, so
+    // skipped groups violate nothing (verified: SYCL 2020 §4.17.3 and
+    // the execution model's weakly-parallel work-item guarantee).
+    const size_t glid = it.get_group_linear_id();
+    if (glid < r.group_offset || glid - r.group_offset >= r.group_count)
+        return;
+
+    // Stage-local flat index — contiguous per stage under any geometry:
+    const size_t flat = (glid - r.group_offset) * it.get_local_range().size()
+                      + it.get_local_linear_id();
+
+    // id-only bodies: tail mask HERE. The body sees only its logical
+    // range: ZERO guards in user code, fusion invisible (the opacity
+    // contract — kernels are never written differently for fusion).
+    if constexpr (PlainBody<KB>)
+        if (flat >= r.flat_extent) return;
+    // nd_item bodies: receive the full padded slice; ragged-tail
+    // handling is the standard obligation of any group-using nd_range
+    // kernel. Their freedom is bounded by SYCL 2020 §4.17.3, verbatim:
+    // group functions "must be encountered in converged control flow by
+    // all work-items in the group ... under the same set of conditions"
+    // — skipping one via early exit, or calling it from divergent
+    // branches, is UB. Divergence is legal in code free of group
+    // functions. Guard the loads, never the participation. We spec to
+    // the spec, not to hardware tolerance.
+
+    const auto idx = detail::delinearize<kernel_rank_v<KB>>(flat, r.range);
+    auto in   = *reinterpret_cast<const typename KB::Inputs*>(inputs  + r.input_off);
+    auto out  = *reinterpret_cast<const typename KB::Outputs*>(outputs + r.output_off);
+    auto body = *reinterpret_cast<const KB*>(bodies + r.body_off);
+
+    if constexpr (HasScratch<KB>) {
+        auto s = *reinterpret_cast<const typename KB::Scratch*>(bodies + r.scratch_off);
+        detail::fixup_scratch(s, local_base);  // Local.ptr_ = base + offset_
+        body(it, in, out, s);
+    } else if constexpr (GroupBody<KB>) {
+        body(it, in, out);
+    } else {
+        body(idx, in, out);
+    }
+}
+
+## 5. The chained executor
+
+/// Placeholders — one per launch rank; declarations only, JIT replaces.
+/// Three families cost nothing at rest: SSCP lowers a codepath on first
+/// invocation only.
+void kb_entry_r1(sycl::nd_item<1>, FnOffsetInfo&, const std::byte*,
+                 std::byte*, const std::byte*, std::byte*);
+void kb_entry_r2(sycl::nd_item<2>, /* same trailing params */);
+void kb_entry_r3(sycl::nd_item<3>, /* same trailing params */);
+
+/// The outer kernel, one per rank — THE single call site:
+q.submit([&](sycl::handler& cgh){
+    sycl::local_accessor<std::byte, 1> local{launch_scratch_bytes, cgh};
+                                 // max over stages; zero when unused
+    cgh.parallel_for(sycl::nd_range<R>{padded_global, wg},
+        cfg.apply([=](sycl::nd_item<R> it){
+            FnOffsetInfo info{records_dev, 0};      // fresh per work-item
+            kb_entry_rR(it, info, inputs_dev, outputs_dev, bodies_dev,
+                        local.get_pointer().get());
+        }));
+});
+
+/// MECHANISM. cfg is built ONCE, at setup — there is NO runtime config
+/// cache: an individual component's config (define(entry_id, fn_id))
+/// never changes, and a FusedSystem's sequence config is built at ITS
+/// setup because fuse membership is static.
+///   individual:  cfg.define(kb_entry_rR_id, kb_fn_id);
+///   fused wave:  cfg.define_as_call_sequence(kb_entry_rR_id,
+///                    {fn_A_id, fn_B_id, barrier_id, fn_C_id, ...});
+/// At JIT time the ONE kb_entry_rR call expands, inline and in order:
+///     kb_fn_A(it, info, inputs, outputs, bodies, local);
+///     kb_fn_B(it, info, inputs, outputs, bodies, local);
+///     ...
+/// Every expanded call receives the SAME arguments — acpp's sequence
+/// semantics. `info` is a mutable reference to the work-item's private
+/// cursor: A's unconditional first-statement next() returns records[0]
+/// and leaves i==1; B's returns records[1]; and so on.
+///     CALL ORDER = SEQUENCE ORDER = RECORD ORDER = PACK ORDER
+/// — one identity, maintained by the System's packer writing records in
+/// execution order and by the first-statement law. No stage ids exist;
+/// the same KernelBody type twice in one wave reads two different
+/// records correctly by position alone.
+///
+/// Barrier stages: when any stage of a SEQUENTIAL-mode wave declares
+/// Scratch, the System interleaves the provided
+///     void kb_barrier(...same signature...) {
+///         sycl::group_barrier(it.get_group());   // does NOT call next()
+///     }
+/// between consecutive scratch-using stages: the call site is
+/// unconditional, so every work-item reaches it in converged control
+/// flow (legal), and stage N+1 cannot touch local bytes stage N still
+/// reads (necessary). kb_barrier consumes NO record — the one deliberate
+/// exception to one-call-one-record; the packer writes records only for
+/// real stages. Parallel-mode waves need no barriers: each group
+/// executes exactly one stage's body, so scratch never crosses stages.
 
 } // namespace naga::cospan
 ```
 
-## The pipeline
+## 6. Geometry and slices
 
-Three outer kernels — one per launch rank, each the single call site of
-its placeholder. The full launch mechanism, end to end:
+- All launches are typed by rank (the executor's switch); the default
+  geometry is flat: `{{padded_flat}, {default_wg}}` at rank 1, with
+  rank-appropriate defaults at ranks 2/3 (implementation-tunable, not
+  contract constants). The wg overloads of create_launch_config (01.D)
+  override per launch; FUSED rank and wg are set at SYSTEM level,
+  component wg intent ignored inside a fuse.
+- Rank agreement in a fuse: an nd_item stage whose rank differs from the
+  wave's rank is a hard error at fuse assembly; id-only stages are
+  rank-exempt (their device function is generated lazily for the wave's
+  rank; SSCP lowers only what is invoked).
+- Padding and extents are counted in WHOLE WORK-GROUPS: individual = the
+  stage's own group count; fused-sequential = max stage group count;
+  fused-parallel = Σ stage group counts with group_offset the prefix
+  sum. A group never straddles stages, under any geometry — this is
+  what makes the slice check group-uniform and collectives safe.
+- One dynamic_function_config per launch; the config object outlives
+  kernel completion; acpp JIT-caches per configuration, persistently
+  across runs (acpp laws).
 
-```cpp
-// Once at startup, per rank: the placeholder's type-erased handle.
-//   auto stage_rR_id = sycl::AdaptiveCpp_jit::dynamic_function<
-//       void, ParamCursor&, sycl::nd_item<R>>{&stage_rR}.id();
-// (Wrapper ids come from createKernelWrapper<KI>() at setup.)
+## 7. Dynamic shapes and the pipeline
 
-// Per launch: obtain the config — from the System's cache, keyed by
-// (rank, ordered wrapper-id sequence); construct + define only on miss.
-// acpp laws: one config per launch; construction has overhead (reuse);
-// the config object must outlive kernel completion.
-sycl::AdaptiveCpp_jit::dynamic_function_config& cfg =
-    config_cache.get_or_create(key, [&](auto& c){
-        // individual launch — one stage:
-        c.define(stage_rR_id, wrapper_KI_id);
-        // fused launch — the wave, in execution order:
-        // c.define_as_call_sequence(stage_rR_id, {w1_id, ..., wN_id});
-    });
-
-// The launch — identical shape for individual and fused; the JIT
-// expands the placeholder call site per cfg (a single wrapper call, or
-// the sequence inlined in order):
-q.parallel_for(sycl::nd_range<R>{padded_global, wg_shape},
-    cfg.apply([=](sycl::nd_item<R> it){
-        ParamCursor cur{params_base};
-        stage_rR(cur, it);
-    }));
-```
-
-- **Rank dispatch**: the System executor switches on the stored rank and
-  issues the correctly-typed launch. For id-only stages the choice of
-  launch rank is immaterial (the wrapper converts); for nd_item stages
-  the launch rank is the body's declared rank.
-- **Individual launches** (all Components outside a FusedSystem, whether
-  under plain Systems or ParallelSystems): the Component uploads its OWN
-  single param block at its own turn — Component-local, no shared arena —
-  and the launch uses `cfg.define(&stage_rR, wrapper_KI)` with the
-  component's registered geometry (default or overridden).
-- **FusedSystem launches** are the ONLY multi-block case. Rank and
-  work-group shape are specified AT SYSTEM LEVEL; component wg-shape
-  overrides are ignored inside a fuse. Rank agreement: an nd_item stage
-  whose rank differs from the fuse's rank is a hard error at fuse
-  assembly; id-only stages are rank-exempt. The wave's blocks are packed
-  into one arena in execution order, once per wave (legal because every
-  stage's extents are already resolved — see the dynamic-shape rules),
-  and the launch uses `cfg.define_as_call_sequence(&stage_rR, {w1..wN})`.
-  The single call site expands inline at JIT time; every expanded call
-  receives the same `(cur, it)`; cursor consumption assigns blocks
-  positionally. Per-element cost is N slice guards plus only the work
-  that survives them — part of FusedSystem's documented cost model
-  (spec 05).
-- **Slices and extents are counted in whole work-groups**: per-stage
-  padding rounds the logical extent up to groups of the launch geometry;
-  individual = the stage's own group count; fused-sequential = max stage
-  group count; fused-parallel = Σ stage group counts, with group_offset
-  the prefix sum. A group never straddles components, under any geometry.
-- **One dynamic_function_config per launch** (acpp law). The System
-  caches configs keyed by the ordered dynamic_function_id sequence; acpp
-  caches the JIT result per configuration, persistently across runs.
-
-## Dynamic shapes and the pipeline
-
-- **Resolution is just-in-time.** A Component resolves shapes in its
-  pre-forward codepath at its own turn in depth-first order — upstream
-  has completed by construction. Static models pay nothing anywhere in
-  this section.
+- **Resolution is just-in-time.** A Component resolves shapes in
+  run_pre_forward at its own turn in depth-first order — upstream has
+  completed by construction. Static models pay nothing anywhere in this
+  section.
 - **FromInput reads never flush the queue.** Each DimRecord carries a
-  tiny always-valid host destination (`dim_scratch`, 01.B). The PRODUCING
-  Component, right after enqueueing its kernel, enqueues the
-  device-to-host copy into the consumer's dim_scratch (the link is known
-  at finalize from the metadata chains). The consumer applies the value
-  to its extents at sizing time after the copy's event completes — by
-  which point it almost always already has. The wait, when it happens at
-  all, is an event wait, never a queue drain.
+  tiny always-valid host destination (`dim_scratch`, 01.B). The
+  PRODUCING Component's post_launch enqueues the device-to-host copy
+  into the consumer's dim_scratch (links fixed at finalize). The
+  consumer applies the value at its own shape update after the copy's
+  event completes — almost always already true. The wait, when it
+  happens, is an event wait, never a queue drain.
 - **FusedSystem: no intra-fuse shape dependencies — hard error.** A
   wave's geometry needs every stage's extent before the wave launches; a
   stage whose shape derives, through any determiner-or-connection chain,
@@ -233,9 +272,9 @@ q.parallel_for(sycl::nd_range<R>{padded_global, wg_shape},
   impossibility, not a trust question. Detected at fuse assembly from
   metadata; the error names the crossing chain. USERS SPLIT THEIR
   FUSEDSYSTEMS AT DYNAMIC-SHAPE BOUNDARIES.
-- **ParallelSystem: no cross-sibling shape dependencies — hard error.** A
-  child's shape reading a sibling's output (by value or shape) is a data
-  dependency, contradicting the independence the user asserted by
+- **ParallelSystem: no cross-sibling shape dependencies — hard error.**
+  A child's shape reading a sibling's output (by value or shape) is a
+  data dependency, contradicting the independence the user asserted by
   wrapping in ParallelSystem. Detected from the same metadata chains.
   General data-independence of parallel children remains the user's
   responsibility, unchanged.

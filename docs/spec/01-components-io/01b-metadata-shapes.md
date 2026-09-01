@@ -216,7 +216,9 @@ template <DType DT, int Rank> class OutputEntry final : public IOEntry { /* ... 
 // Enumerability — THE observation guarantee.
 // -----------------------------------------------------------------------------
 /// Every Component and System SHALL expose const iteration over its
-/// declared entries:   for (const detail::IOEntry& e : x.io_entries())
+/// declared entries, split by kind, OpenMDAO-style:
+///     for (const detail::IOEntry& e : x.get_inputs())  { ... }
+///     for (const detail::IOEntry& e : x.get_outputs()) { ... }
 /// uniformly through the hierarchy — System alias entries included.
 /// Recording, visualization, connection checking, and generated
 /// documentation build on this guarantee and on nothing else.
