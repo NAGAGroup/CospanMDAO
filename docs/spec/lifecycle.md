@@ -7,7 +7,7 @@ Cast: Model (02.B) · Subsystem verbs (01.D §1) · System and ExecCtx (01.E)
 
 **Assumption stated once:** the model is ACYCLIC. Cycles arrive with
 solvers; the connection ledger that records them is where any ordering
-exception below lives.
+exception below lives. Why: ledger §2.2 cycle.
 
 ---
 
@@ -39,7 +39,8 @@ child is.
 
 `System::run_setup` → `setup()`. Inside it: `add_subsystem` constructs the
 child, registers the name, sets its owner, **runs the child's `run_setup`
-before returning**; `connect` / `promote` / `tie_*` resolve paths in this
+before returning** (why: ledger P6 — no deferred resolution pass);
+`connect` / `promote` / `tie_*` resolve paths in this
 namespace and apply the set operation (02.C) — computed connections (03)
 create or extend the input's mapping System; marks record on roots. Then
 this System's post-setup pass: each mapping System — framework
@@ -77,6 +78,7 @@ own alias entries the same way (a tie alias root registers the System's
 device as primary; a promotion alias is a peer and registers the
 System's device on its root — so `get_output("alias")` from that System
 yields memory on that System's device). Returns `{device: bytes}`.
+Why: ledger §2.2 placement · P1 · P5.
 
 ### 2.3 Substrates
 

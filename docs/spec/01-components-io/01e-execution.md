@@ -15,6 +15,7 @@ namespace naga::cospan {
 /// and never handed to anyone: children receive a reference only to USE
 /// it — to allocate, to look up the device, to submit copies in
 /// post-compute. Nothing in the tree ever reads another System's ctx.
+/// Why: ledger P5 (ordering is derived from the queues, never passed) · P3.
 struct ExecCtx {
     sycl::device            device;      ///< this System's choice (own or inherited)
     sycl::queue*            primary;     ///< where THIS System submits: q_in by
@@ -149,10 +150,11 @@ return nullptr;                               // "I submitted"
   `AdaptiveCpp_retarget{ctx.device}` (the queues are `retargetable`); an
   in-order queue keeps its ordering across devices (acpp
   `ACPP_EXT_CG_PROPERTY_RETARGET`). Nobody creates queues but the Model.
+  Why: ledger §2.2 placement, §2.5 multi-device · P5.
 - **Waiting is the caller's choice**: `Model::wait()` waits both queues;
   a loop of forwards need not wait between them.
 
-## 4. Structural APIs — all inside `setup()`, else throw
+## 4. Structural APIs — all inside `setup()`, else throw (why: ledger P6 — declaration is one phase)
 
 ```cpp
 namespace naga::cospan {
@@ -177,7 +179,8 @@ public:
     T& add_subsystem(std::string name, const property_list& props, Args&&... ctor_args);
     /// A BASE System configured by properties: device and/or ONE flavor
     /// (parallel | fused — both on one call is an error; nest to combine). Returns the System to add
-    /// children to inline — no class derivation needed.
+    /// children to inline — no class derivation needed. Why: ledger
+    /// §2.2 inline composition · P2 (placement without editing).
     System& add_subsystem(std::string name, const property_list& props = {});
     // add_subsystem constructs the child, registers the name, and runs the
     // child's run_setup BEFORE returning, so later structural calls in this
@@ -212,13 +215,14 @@ namespace naga::cospan {
 /// (this captures everything q_in holds); for each child: pre-compute →
 /// compute → submit on q_ooo with lane i and the SAME pending snapshot →
 /// post-compute. Return null; the owner's refresh then picks up q_ooo's
-/// wait list. Data independence of children is the USER's assertion;
+/// wait list. Data independence of children is the USER's assertion
+/// (why: ledger P4);
 /// the framework checks only cross-sibling shape dependencies (hard
 /// error, checked each forward on the children's descriptions).
 class ParallelSystem : public System { /* runner overrides as described */ };
 
 /// COMPONENTS ONLY — enforced by the type system at the add, since a
-/// System cannot discern children at runtime:
+/// System cannot discern children at runtime (why: ledger §2.2 fuse · P5):
 ///   template <class T, class... A> requires std::derived_from<T, ComponentBase>
 ///   T& add_subsystem(std::string, A&&...);
 /// (no property-list overload). Rank and wg shape are the fuse's;
@@ -231,6 +235,7 @@ class ParallelSystem : public System { /* runner overrides as described */ };
 /// unless allowed → pack streams + records, stamp group slices, one
 /// staging, ONE submission with the sequence config → post-compute ALL.
 /// The order is forced: post-compute copies depend on the wave.
+/// Why: ledger §2.2 fuse, §2.2 opacity.
 class FusedSystem : public System {
 public:
     enum class Mode : uint8_t { sequential, parallel };

@@ -16,6 +16,7 @@ struct ModelConfig {
     /// `default_pool_bytes`. 0 = no pool = every dynamic allocation takes
     /// the OS route. Pre-allocation is a profiling-discovered
     /// optimization; memory_report() is how it is discovered.
+    /// Why: ledger §5 memory budgeting · P3.
     std::unordered_map<sycl::device, size_t> pool_bytes;
     size_t default_pool_bytes = 0;
     size_t pool_node_size     = 1024;
@@ -52,12 +53,14 @@ public:
     ///   6. root.init_tree()                      — children before owners
     /// After setup the model's STATE is not yet meaningful: it holds
     /// initialization. State is defined after the first forward.
+    /// Why: ledger §2.3 initialization.
     void setup();
 
     /// root.forward(): enqueue one forward. Returns immediately. Loop it
     /// freely — the model guarantees ordering internally.
     void forward();
     /// Wait both queues. The caller's choice, never implicit.
+    /// Why: ledger P3.
     void wait();
 
     // ---- host access (between runs) ---------------------------------------------
@@ -71,6 +74,8 @@ public:
     /// Writable output view: writes land in host staging; written back
     /// to the device on destruction AND on commit() (both; the
     /// destructor is the protection, commit() the mid-scope flush).
+    /// Why: ledger §2.3 host access · P3 (a read-only view costs no
+    /// submission).
     template <DType DT, int Rank> HostViewMut<DT, Rank> view_output_mut(std::string_view path);
     /// Setters: H2D into the root's primary storage on q_in, then copied
     /// to the root's other-device storage like any root write. Inputs:

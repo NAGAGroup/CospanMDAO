@@ -45,6 +45,13 @@ are their own components, composed in systems.
   forget it.
 - **Group-level parallelism:** work-group collectives and local memory
   are opt-in per kernel, with wrapper ergonomics, never required.
+- **User types on the device:** a type with invariants, a non-trivial
+  constructor or virtual functions must be constructible where it lives
+  and usable from kernels through a pointer, even though the type itself
+  is not device-copyable.
+- **Minimal device payload:** what a kernel captures is the data it
+  computes on and nothing the framework needs for bookkeeping; host-only
+  concerns never ride into a launch.
 
 ### 2.2 Structure (inter-component)
 
@@ -235,3 +242,32 @@ at declared scale.
 
 Everything not in this section is composite, served by helpers built on
 it.
+
+---
+
+## 7. Principles (the yardsticks solutions are judged by)
+
+Specifications cite these where a rule would otherwise look arbitrary.
+
+- **P1 Legibility** — refuse an operation whose meaning would depend on
+  knowledge not visible at the use site; what a name yields is what a
+  reader at that site would expect.
+- **P2 Adoption** — a subsystem written by someone else is placed,
+  initialized, promoted, connected, wrapped and re-run without editing
+  its source.
+- **P3 Pay-for-use** — a model that does not use a capability pays
+  nothing for it; no implicit synchronization, ever.
+- **P4 Trust model** — the framework checks what it can prove; explicit
+  overrides carry the rest, and the party holding the proof is the party
+  entitled to override.
+- **P5 Boundary** — nothing crosses the owner↔child boundary except the
+  framework verbs; owners know nothing of children, children nothing of
+  owners.
+- **P6 Uniformity over detection** — every entry carries every
+  mechanism's slot, used or not; no special-case logic anywhere.
+- **P7 Users never classify their work** — no tags on kernels or
+  components; the framework infers from signatures and declarations.
+- **P8 Safe by default, explicit opt-out** — every check is on unless a
+  user says otherwise, in code, at the site.
+- **P9 RAII, never ordered destruction** — shared ownership wherever
+  destruction order would otherwise matter.

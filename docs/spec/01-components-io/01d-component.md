@@ -18,6 +18,7 @@ namespace naga::cospan {
 /// flavors) override runners as they need; users override HOOKS. Runners
 /// are virtual so authors of new System types can override them — that
 /// is the extensibility contract — but a typical model never does.
+/// Why: ledger §2.2 possibility floor · P5.
 class Subsystem {
 public:
     virtual ~Subsystem();
@@ -49,7 +50,8 @@ public:
     /// Components: return a description of their work; they never
     /// submit it. Systems: submit their subtree's work themselves and
     /// return null — which tells the owner "queues were used; refresh
-    /// pending".
+    /// pending". Why: ledger §2.2 opacity · P5 (orchestration is a
+    /// System's; a Component only works).
     virtual std::unique_ptr<LaunchDescription> run_compute_forward() = 0;
     virtual void run_post_compute(ExecCtx& owner_ctx) = 0;
 };
@@ -90,6 +92,8 @@ public:
     /// write with an initializer inside your own kernel, fill, copy —
     /// anything. Initializing a connected input is harmless: the
     /// producer overwrites it at the first forward. Default no-op.
+    /// Why: ledger §2.3 initialization · P2 (an adopted subsystem's
+    /// inits must not need editing when its inputs get connected).
     virtual void init(sycl::queue& q) {}
     /// Per-forward manual shape control of a subset of entries; runs
     /// inside the automatic pre-compute after automatic derivation.
@@ -121,12 +125,14 @@ public:
     // ---- retrieval & enumeration ------------------------------------------
     template <DType DT, int Rank> Input<DT, Rank>&  get_input(std::string_view name);
     template <DType DT, int Rank> Output<DT, Rank>& get_output(std::string_view name);
-    auto get_inputs() const;    ///< range of const detail::IOEntry& (01.B guarantee)
+    auto get_inputs() const;    ///< range of const detail::IOEntry& (01.B guarantee;
+                                ///  why: ledger §2.4 observation)
     auto get_outputs() const;
 
     // ---- initializers (legal inside init() only; else throw) --------------
     /// Device initializer: the non-const-reference twin of Input/Output —
     /// usable directly inside a kernel the user writes on `q`.
+    /// Why: ledger §2.3 initialization (not limited beyond the queue).
     template <DType DT, int Rank> Initializer<DT, Rank> get_input_initializer(std::string_view name);
     template <DType DT, int Rank> Initializer<DT, Rank> get_output_initializer(std::string_view name);
     /// Host initializer: writable host view (multi-dim accessors, shape);
@@ -245,7 +251,8 @@ work and never sees a queue except through the owner's ctx.
    D2H event) that applies the resize on the host, reallocating through
    the OS route from inside the custom-op body if grown; **wait on that
    custom op's event** — the one forced sync, so this turn's launch
-   geometry is known. Then shape-derived dims, `pre_forward()` hook
+   geometry is known (why: ledger §2.1 shape source · P3 — only
+   value-driven entries pay it). Then shape-derived dims, `pre_forward()` hook
    (per-entry override, last write wins), dynamic connection validation,
    allocate-if-grown for the rest via the dynamic chain on `ctx.device`,
    wrapper sync.

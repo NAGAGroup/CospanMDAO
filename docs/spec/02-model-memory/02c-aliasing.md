@@ -13,7 +13,8 @@ number of PEERS: names for the same data (promotions, tie aliases) and
 consumers of it (connected inputs). Every entry points at its root; the
 root holds the peer list. Merging a set into another steals the peer list
 and repoints every member — no chains exist and nothing is ever walked
-at forward time: a peer reads `root()->data()`, one dereference.
+at forward time: a peer reads `root()->data()`, one dereference. Why:
+ledger §2.3 connection (aliasing correctness) · P3.
 
 There are no source/target links. Everything they would carry is a
 property of the set: the root is the producer; each input peer is a
@@ -30,7 +31,8 @@ it: the entry's flags say "what was I created to support"; the root's
 flags say "has aliasing since invalidated that". Flags are set at
 construction and NEVER mutated afterwards, with exactly ONE exception
 (§3, tie_*). Roots need no snapshot logic: a root's own flags are its
-set's flags.
+set's flags. Why: ledger P1 (a promoted input must never quietly become
+a source) · P6.
 
 ```cpp
 namespace naga::cospan::detail {
@@ -65,7 +67,8 @@ public:
     /// yields memory on that System's device. The root's producer copies
     /// primary -> each other device's storage in run_post_compute (and
     /// whoever writes a root from the host does the same). Registered in
-    /// get_exec_info, allocated in prepare_exec.
+    /// get_exec_info, allocated in prepare_exec. Why: ledger §2.2
+    /// placement · P1 (a name yields memory where the reader is).
     void*  storage_on(const sycl::device&) const;            ///< roots only
     std::span<const sycl::device> storage_devices() const;   ///< roots only; primary first
 
@@ -130,7 +133,7 @@ member's set into the alias. THE EXCEPTION: mark each member
 fails at the direct check. Data-wise it would be identical to connecting
 through the alias; the mark exists so a tie is visible at every use
 site — a discipline rule, not a correctness one, and the only
-post-construction flag mutation in the system.
+post-construction flag mutation in the system. Why: ledger P1.
 
 **tie_outputs({m...}, name, policy)** — the alias is a NEW ROOT with
 `can_be_source = true, can_be_target = false`; policy `require_atomic`
@@ -150,7 +153,8 @@ registered in that System or a Component's declared entry.
 Every entry that is a root once declaration completes owns storage —
 including unconnected inputs and unconnected `tie_inputs` aliases: that
 is how top-level design variables and shared inputs get memory with no
-IndepVarComp. Route by lifetime (02.B `MemorySubstrate`): durable ∧ static
+IndepVarComp (why: ledger §2.3 initialization, §2.4 marks). Route by
+lifetime (02.B `MemorySubstrate`): durable ∧ static
 roots from the arena; all other roots via the dynamic chain at first
 need and on growth. Peers own nothing, ever: a root holds one allocation
 per device its set spans (§2).

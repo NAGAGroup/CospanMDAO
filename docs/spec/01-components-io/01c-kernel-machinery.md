@@ -11,7 +11,7 @@ being implementable guarantees Components can express any function — and
 the roadmap for provided kernels (reductions, scatters, scans, sorts).
 Kernels are NEVER classified by their authors; no class field exists.
 The general case is guaranteed by construction: indexed access plus atomic
-dtypes (01.A), available in every kernel body.
+dtypes (01.A), available in every kernel body. Why: ledger §2.1 maps · P7.
 
 ## 1. The KernelBody contract
 
@@ -54,7 +54,7 @@ namespace naga::cospan {
 /// into the launch's device streams.
 /// REQUIREMENT (the AD keystone): KB SHALL be a template over its value
 /// mode, using wrapper `value_type` exclusively in the body. Opt-out:
-/// components supplying an analytical adjoint.
+/// components supplying an analytical adjoint. Why: ledger §2.4 derivatives.
 template <class KB> concept PlainBody   = /* operator()(id<R>, In, Out) */;
 template <class KB> concept GroupBody   = /* operator()(nd_item<R>, In, Out [, Scratch]) */;
 template <class KB> concept HasScratch  = /* trailing Scratch parameter */;
@@ -77,7 +77,8 @@ struct CustomOp {
     /// THE ONE PLACE a raw device pointer is obtainable (01.A: wrappers
     /// never expose one). A custom operation exists to hand memory to
     /// code outside the framework; this is that door, and it opens only
-    /// inside a custom-op body.
+    /// inside a custom-op body. Why: ledger §2.1 work outside device
+    /// kernels, §2.1 minimal device payload.
     template <class W> auto device_ptr(const W& io) -> typename W::value_type*;
     template <class W> auto to_host(const W& in) -> std::vector<typename W::value_type>;
     template <class W> void from_host(W& out, std::span<const typename W::value_type>);
@@ -134,7 +135,8 @@ namespace naga::cospan {
 ///     stream offsets, scratch_off/scratch_bytes;
 ///   System-stamped (launch pack): group_offset, group_count — the
 ///     GROUP-INDEX slice: slices are counted in whole work-groups, so a
-///     group never straddles stages under ANY geometry.
+///     group never straddles stages under ANY geometry. Why: ledger
+///     §2.2 fuse, §2.1 group-level parallelism.
 struct StageRecord {
     sycl::range<3> range;         // logical iteration space, 1-padded
     size_t   flat_extent;         // product of range
@@ -174,7 +176,8 @@ SYCL_EXTERNAL void kb_fn(sycl::nd_item<R> it, FnOffsetInfo& info,
     // LAW: THE CURSOR ADVANCE IS THE FIRST STATEMENT AND UNCONDITIONAL.
     // Every stage function consumes exactly one record before any
     // possible return; a masked-out stage still advances. Violating
-    // this desynchronizes every stage after it.
+    // this desynchronizes every stage after it. Why: ledger §2.2 fuse
+    // (the executor exists for fusion; opacity forbids stage ids).
     const StageRecord& r = info.next();
 
     // Group-index slice check — group-uniform by construction: whole
@@ -202,7 +205,8 @@ SYCL_EXTERNAL void kb_fn(sycl::nd_item<R> it, FnOffsetInfo& info,
     // — skipping one via early exit, or calling it from divergent
     // branches, is UB. Divergence is legal in code free of group
     // functions. Guard the loads, never the participation. We spec to
-    // the spec, not to hardware tolerance.
+    // the spec, not to hardware tolerance. Why: ledger §2.1 group-level
+    // parallelism, §2.2 opacity (kernels are never written for fusion).
 
     const auto idx = detail::delinearize<kernel_rank_v<KB>>(flat, r.range);
     auto in   = *reinterpret_cast<const typename KB::Inputs*>(inputs  + r.input_off);
@@ -281,6 +285,7 @@ q.submit([&](sycl::handler& cgh){
 /// exception to one-call-one-record; the packer writes records only for
 /// real stages. Parallel-mode waves need no barriers: each group
 /// executes exactly one stage's body, so scratch never crosses stages.
+/// Why: ledger §2.2 fuse, §2.1 group-level parallelism.
 
 } // namespace naga::cospan
 ```
@@ -327,10 +332,10 @@ q.submit([&](sycl::handler& cgh){
   impossibility, not a trust question. Detected from metadata each
   forward alongside the other wave checks (01.E §5); the error names the
   crossing chain. USERS SPLIT THEIR FUSEDSYSTEMS AT DYNAMIC-SHAPE
-  BOUNDARIES.
+  BOUNDARIES. Why: ledger §2.2 fuse, §2.1 shape source.
 - **ParallelSystem: no cross-sibling shape dependencies — hard error.**
   A child's shape reading a sibling's output (by value or shape) is a
   data dependency, contradicting the independence the user asserted by
   wrapping in ParallelSystem. Detected from the same metadata chains.
   General data-independence of parallel children remains the user's
-  responsibility, unchanged.
+  responsibility, unchanged. Why: ledger §2.2 parallel · P4.

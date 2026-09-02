@@ -14,6 +14,7 @@ Three kinds of "dst sees src's data", and they are NOT one mechanism:
   size equals dst's: dst is a peer whose `view()` is that region, in the
   ROOT's rank; the wrapper gets `root.data + offset` and the root's
   strides (01.A). Zero-copy. This is what the stride metadata exists for.
+  Why (for the whole spectrum): ledger §2.3 connection.
 - **computed** — everything else: a region of the source into a REGION
   of the input (several sources may feed one input, regions disjoint),
   or an index map (a gather is not affine; a view cannot express it).
@@ -63,7 +64,7 @@ pattern is exactly this convention; no dedicated type exists.
   components' outputs (each is full-dst-shaped) with
   `TieOutputsPolicy::allow_plain`, invoked BY THE FRAMEWORK: it holds
   the disjointness proof, so it is the party entitled to the override
-  (the trust model, used correctly); connect the tie alias to `dst`
+  (the trust model, used correctly — ledger P4); connect the tie alias to `dst`
   (identity); run the coverage check (§2.4).
 
 ### 2.2 Execution position
@@ -73,7 +74,7 @@ The mapping System must run after its sources and before whoever reads
 IMMEDIATELY BEFORE the child that contains the consumer (the first path
 segment of `dst`), not at the end. Sources produced by later siblings
 are a feedback loop the model already has; solvers own that,
-and the insertion rule does not change it.
+and the insertion rule does not change it. Why: ledger §2.2 sequence.
 
 ### 2.3 Mapping components
 
@@ -128,7 +129,8 @@ later optimization needing no spec change.
 
 Uncovered elements of `dst` hold whatever the tied storage holds — which
 may be exactly what the owning component initialized, deliberately. So
-coverage is checked BY DEFAULT and opted out per input at declaration:
+coverage is checked BY DEFAULT and opted out per input at declaration
+(why: ledger P8, §2.3 initialization):
 
 ```cpp
 enum class Coverage : uint8_t { required, optional };
@@ -152,7 +154,7 @@ initialized-remainder case, and a legitimate performance choice.
 Views compose by offset addition with containment: connecting from a
 name whose peer carries view `B`, with a `Slice{A}`, yields
 `{B.offset + A.offset, A.extents}` and requires `A ⊆ B` (error naming
-both). Promoting a peer that carries a view produces an alias that
+both; why: ledger §2.3 connection · P1). Promoting a peer that carries a view produces an alias that
 COPIES the view — the alias presents what the promoted entry sees. All
 views are in the root's rank; there is no rank reinterpretation through
 a view (rank is authoritative, 01.B).
@@ -180,7 +182,8 @@ public:
     /// MARKS RIDE ON THE ROOT: marking any name marks the data. Recorded
     /// on the root's IOEntry (01.B is_design_var/…), enumerated by
     /// Model. `region` restricts a mark to a subarray (root rank) via
-    /// the same view machinery; no index maps on marks.
+    /// the same view machinery; no index maps on marks. Why: ledger
+    /// §2.4 design variables, constraints, objectives.
 
     /// Root must be an INPUT root that is not connected — a free input;
     /// the optimizer is its producer. Dynamically shaped DVs are

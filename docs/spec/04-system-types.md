@@ -14,7 +14,8 @@ every owner above it stays ignorant. **No framework primitive exists for
 gating, counting, or change detection**: those are ordinary System
 subclasses — provided in the library where common, written by users
 where not — and their entire mechanism is an early return from
-`run_compute_forward`.
+`run_compute_forward`. Why: ledger §2.2 possibility floor, §3 (do once /
+run N / run when changed / run if) · P5.
 
 ```cpp
 namespace naga::cospan {
@@ -103,7 +104,8 @@ nesting.
 
 ## 3. Observation
 
-Observation is path resolution and enumeration, nothing more:
+Observation is path resolution and enumeration, nothing more (why:
+ledger §2.4 observation):
 `model.get_input("subs1.subs2.x")` resolves as
 `get_subsystem("subs1") → get_subsystem("subs2") → get_input("x")`, with
 `get_subsystem("subs1.subs2")` as the chaining convenience; every

@@ -14,6 +14,7 @@ namespace naga::cospan {
 /// references) and nothing else about its storage. An atomic variant
 /// exists exactly where sycl::atomic_ref is legal (4/8-byte element
 /// types); u8 has no atomic form.
+/// Why: ledger §2.1 write-safety.
 enum class DType : uint8_t {
     f32, f64, i32, u32, i64, u64, u8,
     atomic_f32, atomic_f64, atomic_i32, atomic_u32, atomic_i64, atomic_u64
@@ -24,6 +25,7 @@ enum class DType : uint8_t {
 ///     Connection/tie/promotion compatibility SHALL be judged on
 ///     value_dtype_of, never DT: the atomic modifier is an access
 ///     discipline over shared storage, not a storage type.
+///     Why: ledger §2.3 ties (the shared-I/O rules).
 ///   cpp_type_t<DT>          — C++ element type (through the modifier).
 ///   is_atomic_v<DT>         — true for atomic entries.
 ///   is_differentiable_v<DT> — true for f32/f64, plain or atomic.
@@ -41,13 +43,14 @@ enum class DType : uint8_t {
 //     {shape, stride, data}. Component APIs that take a member reference
 //     (e.g. reshape) resolve it to its IOEntry through the member-address
 //     map (spec 01.B); nothing host-only rides into kernel captures.
+//     Why: ledger §2.1 minimal device payload.
 //   * Raw pointers are private. The metadata layer (spec 01.B,
 //     detail::IOEntry) is the sole writer of wrapper fields, via
 //     friendship. User code never sees a pointer.
 //   * `value_type` is the ONLY element-type spelling kernel bodies may
 //     use — the scalar-genericity keystone: automatic differentiation
 //     re-instantiates the same bodies at derivative-carrying value
-//     types with no user-code change.
+//     types with no user-code change. Why: ledger §2.4 derivatives.
 //   * Rank is 1..3. Indexing accepts sycl::id<Rank> and flat size_t;
 //     flat indexing is row-major over shape().
 //   * stride() is the element step per dimension in the OWNING
@@ -60,7 +63,7 @@ enum class DType : uint8_t {
 /// Input<DT, Rank> — read-only view. THE INPUT CONTRACT: a kernel SHALL
 /// NOT be able to write through an Input — all access is const-reference.
 /// Load-bearing twice: ImplicitComponent's no-aliasing design and AD
-/// purity both assume it. Atomic dtypes are ill-formed on
+/// purity both assume it (why: ledger §2.6, §2.4 derivatives). Atomic dtypes are ill-formed on
 /// Input: atomicity governs write collision, and Inputs cannot write.
 template <DType DT, int Rank>
     requires(!is_atomic_v<DT>)

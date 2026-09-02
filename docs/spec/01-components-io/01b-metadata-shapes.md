@@ -10,7 +10,7 @@ semantic: rank-3 `{2,1,1}` and rank-1 `{2}` are different declarations with
 different API surfaces (`id<3>` vs `id<1>`). The 1-padded `sycl::range<3>`
 in metadata exists for exactly one purpose — uniform flat-size arithmetic
 with no per-rank conditionals — and SHALL NOT leak into any API surface,
-comparison, or user-visible semantics.
+comparison, or user-visible semantics. Why: ledger P6.
 
 ## Validity timing
 
@@ -34,6 +34,7 @@ enum class Lifetime : uint8_t { durable, transient };
 // A dimension is specified by anything integral (a fixed extent) or by a
 // derivation type. Derivation sources are INPUTS ONLY: an output's shape
 // is the result of computation, so it can never determine one.
+// Why: ledger §2.1 shape source.
 // -----------------------------------------------------------------------------
 
 /// This dimension = dim `dim` of the upstream connection's shape.
@@ -50,6 +51,7 @@ struct FromInputDim  { std::string_view input; uint8_t dim; };
 /// custom operation applying the resize, one wait on that operation's
 /// event. Only entries using FromInput ever pay it. Orchestration is
 /// Component-local, always; no producer knows its consumers.
+/// Why: ledger §2.1 shape source · P3 · P5.
 struct FromInput { std::string_view input; size_t index; };
 
 template <class T>
@@ -86,7 +88,8 @@ template <DType DT, int Rank, DimSpec... Specs>
     requires(sizeof...(Specs) == Rank)
 void declare_input(Input<DT, Rank>& member, std::string name,
                    Specs... specs, Lifetime life = Lifetime::durable,
-                   Coverage cov = Coverage::required);   // spec 03 §2.4
+                   Coverage cov = Coverage::required);   // spec 03 §2.4;
+                   // why: ledger §2.3 assembly, §2.3 initialization · P8
 
 /// FromSourceDim is ill-formed for outputs.
 template <DType DT, int Rank, DimSpec... Specs>
@@ -134,6 +137,7 @@ struct DimRecord {
                             ///  destination for from_input reads (01.C);
                             ///  unused for other specs — uniform by
                             ///  design, no detection logic anywhere
+                            ///  (why: ledger P6)
 };
 
 /// IOEntry — the metadata record behind one declared I/O. One instance
@@ -189,7 +193,7 @@ public:
     /// REALLOCATION POLICY: growing past the current allocation
     /// reallocates through the dynamic chain (pool if capable -> OS ->
     /// OOM); shrinking keeps the allocation — capacity is retained,
-    /// extents describe the logical shape.
+    /// extents describe the logical shape. Why: ledger §5 memory budgeting.
     virtual void reshape(sycl::range<3> new_extents) = 0;
 
     /// Connection validation — INPUT PEERS ONLY, against root():
