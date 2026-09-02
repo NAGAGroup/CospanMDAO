@@ -85,7 +85,8 @@ constexpr auto from_input_array(std::string_view input);
 template <DType DT, int Rank, DimSpec... Specs>
     requires(sizeof...(Specs) == Rank)
 void declare_input(Input<DT, Rank>& member, std::string name,
-                   Specs... specs, Lifetime life = Lifetime::durable);
+                   Specs... specs, Lifetime life = Lifetime::durable,
+                   Coverage cov = Coverage::required);   // spec 03 §2.4
 
 /// FromSourceDim is ill-formed for outputs.
 template <DType DT, int Rank, DimSpec... Specs>

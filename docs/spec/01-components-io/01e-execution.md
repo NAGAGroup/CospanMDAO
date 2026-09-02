@@ -207,15 +207,11 @@ public:
     ///     from the alias").
     void connect(std::string_view src_output, std::string_view dst_input);
 
-    /// Subarray forms: either endpoint may be a rectangular subarray of
-    /// its entry. Validation compares SUBARRAY flat sizes. The consumer
-    /// wrapper sees a strided view (01.A stride machinery) — no copy.
-    void connect(std::string_view src_output, SubarrayRef src_sub,
-                 std::string_view dst_input);
-    void connect(std::string_view src_output,
-                 std::string_view dst_input, SubarrayRef dst_sub);
-    void connect(std::string_view src_output, SubarrayRef src_sub,
-                 std::string_view dst_input, SubarrayRef dst_sub);
+    /// Non-identity forms take a ConnectionMap (spec 03): Slice (a view,
+    /// zero-copy), SliceInto / IndexMap / IndexMapInto (computed, via a
+    /// hidden mapping System).
+    void connect(std::string_view src_output, std::string_view dst_input,
+                 ConnectionMap map);
 
     // ---- promotion -------------------------------------------------------
 
@@ -297,8 +293,8 @@ class Top : public System {
         auto& obj  = add_subsystem<Objective>("obj");
 
         connect("mda.y1", "obj.y1");             // promoted names connect
-        connect("mda.y2", subarray<1>({0}, {1}), // like any output —
-                "obj.y2_head");                  //   subarrays included
+        connect("mda.y2", "obj.y2_head",      // like any output —
+                Slice{subarray<1>({0}, {1})});   //   slices included
     }
 };
 ```

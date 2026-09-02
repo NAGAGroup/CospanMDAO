@@ -27,7 +27,8 @@ public:
     template <DType DT, int Rank, DimSpec... Specs>
         requires(sizeof...(Specs) == Rank)
     void declare_input(Input<DT, Rank>& m, std::string name,
-                       Specs... specs, Lifetime life = Lifetime::durable);
+                       Specs... specs, Lifetime life = Lifetime::durable,
+                       Coverage cov = Coverage::required);   // spec 03 §2.4
     template <DType DT, int Rank, DimSpec... Specs>
         requires(sizeof...(Specs) == Rank)
     void declare_output(Output<DT, Rank>& m, std::string name,
