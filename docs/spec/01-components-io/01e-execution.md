@@ -1,274 +1,237 @@
-# Spec 01.E — System execution slice and structural APIs
+# Spec 01.E — System: execution context, orchestration, structural APIs
 
 Part of the phase-1 spec (`docs/spec/01-components-io/`). Binding contract;
-declarations only. Component: 01.D. Kernel machinery: 01.C. This document
-covers what a System DOES to its children each forward and the APIs a
-System's `setup()` uses to assemble them. Alias resolution order, index-map
-connections, optimization marks, and cross-level tie semantics are owned by
-later specs (forward-linked where they arise).
+declarations only. Subsystem verbs and Component: 01.D. Aliasing mechanics:
+02.C. Topology semantics: 03. Flavors beyond Parallel/Fused: 04. The
+end-to-end lifecycle: `lifecycle.md`.
 
-## 1. System — the execution contract
+## 1. ExecCtx — System-owned execution state
 
 ```cpp
 namespace naga::cospan {
 
-/// THE OPACITY CONTRACT, execution side: children are opaque. When a
-/// child's forward-participation returns, its effects are ORDERED on q
-/// ahead of every later sibling — the owner cannot tell (and never asks)
-/// whether a plain launch, a fused wave, a parallel fan-out, or a solver
-/// iteration happened inside. Completion is the queue's business;
-/// Model::run() owns the final wait.
-class System {
+/// Every System owns exactly one. Populated across the setup chain
+/// (device in get_exec_info; queues, lane and substrate in prepare_exec)
+/// and never handed to anyone: children receive a reference only to USE
+/// it — to allocate, to look up the device, to submit copies in
+/// post-compute. Nothing in the tree ever reads another System's ctx.
+struct ExecCtx {
+    sycl::device            device;      ///< this System's choice (own or inherited)
+    sycl::queue*            primary;     ///< where THIS System submits: q_in by
+                                         ///  default; q_ooo when a Parallel owner
+                                         ///  assigned this System a lane
+    sycl::queue*            q_in;        ///< both queues are always present
+    sycl::queue*            q_ooo;
+    std::optional<size_t>   lane;        ///< hint for q_ooo submissions
+    MemorySubstrate*        substrate;   ///< this device's arena (+ pool)
+    std::vector<sycl::event> pending;    ///< dependencies for the next submission
+
+    /// SubmitTarget view: what a LaunchDescription::submit consumes —
+    /// primary, pending (with retarget=device and lane applied), then
+    /// pending is cleared on an in-order primary and kept on an
+    /// out-of-order one.
+    SubmitTarget target();
+    /// Re-derive pending from both queues (ACPP_EXT_QUEUE_WAIT_LIST:
+    /// ≤1 event each for in-order; coarse-grained events elide backend
+    /// event creation). Called at the top of run_compute_forward and
+    /// after any child that submitted on its own.
+    void refresh_pending();
+};
+
+struct Queues { sycl::queue* q_in; sycl::queue* q_ooo; };
+struct MemorySubstrate { slabkit::DeviceArena arena; std::optional<slabkit::DevicePool> pool; };
+using  Substrates = std::unordered_map<sycl::device, MemorySubstrate>;
+
+} // namespace naga::cospan
+```
+
+## 2. System — concrete, orchestration only
+
+```cpp
+namespace naga::cospan {
+
+/// A System never does work: it orders, submits and gates the work its
+/// children describe. It has no I/O of its own beyond alias entries
+/// (02.C). `System` is a complete type: a System with no overrides is a
+/// plain sequential container (the property-list add_subsystem overload
+/// creates exactly that).
+class System : public Subsystem {
 public:
-    virtual ~System();
+    // ---- HOOKS ------------------------------------------------------------
+    virtual void setup() {}                     ///< structure & wiring (§4)
+    virtual void init(sycl::queue& q) {}        ///< runs AFTER children's; override by path
+    virtual void pre_forward() {}
 
-    /// USER: add children, wire I/O (§4 APIs). Once, at setup.
-    virtual void setup() = 0;
+    // ---- Model's entry --------------------------------------------------------
+    /// Model knows its root is a System. forward() == run_compute_forward()
+    /// (no pre/post-compute exists for the root).
+    void forward();
 
-    /// FRAMEWORK: the forward walk. Default implementation: children in
-    /// declared order, depth-first —
-    ///     for (child : children_) visit(child, q);
-    /// where visit() dispatches: Component -> execute() below;
-    /// System -> child.forward(q). Overridable by System subclasses —
-    /// the extensibility contract: new orchestration = a new System
-    /// subclass overriding forward(), composed of the same protected
-    /// helpers, with no base changes.
-    virtual void forward(sycl::queue& q);
+    // ---- initializers by path (legal inside init() only) ----------------------
+    template <DType DT, int Rank> Initializer<DT, Rank>     get_input_initializer (std::string_view path);
+    template <DType DT, int Rank> Initializer<DT, Rank>     get_output_initializer(std::string_view path);
+    template <DType DT, int Rank> HostInitializer<DT, Rank> get_input_host_initializer (std::string_view path, sycl::queue&);
+    template <DType DT, int Rank> HostInitializer<DT, Rank> get_output_host_initializer(std::string_view path, sycl::queue&);
+    template <class T> void fill_input (std::string_view path, T v);
+    template <class T> void fill_output(std::string_view path, T v);
 
+    // ---- retrieval & enumeration (hierarchy-aware; 01.B guarantee) ------------
+    template <DType DT, int Rank> Input<DT, Rank>&  get_input (std::string_view path);
+    template <DType DT, int Rank> Output<DT, Rank>& get_output(std::string_view path);
+    auto get_inputs()  const;   ///< this System's alias entries
+    auto get_outputs() const;
+    template <class Visitor> void visit(Visitor&& v) const;   ///< pre-order; spec 04
+
+    // ---- runners (Subsystem verbs) — the DEFAULT orchestration ----------------
 protected:
-    // ---- the friend-helper layer ----------------------------------------
-    /// ComponentBase befriends System ONLY (01.D); subclasses reach the
-    /// framework surface through these. Thin, static, complete:
-    static void run_pre_forward(ComponentBase& c, sycl::queue& q);
-    static KernelLaunchConfig compute_forward(ComponentBase& c);
-    static void post_launch(ComponentBase& c, sycl::queue& q);
-    static void compile_kernel(ComponentBase& c, int launch_rank);
-    static const CompiledKernelMeta& kernel_meta(const ComponentBase& c);
+    /// setup(); children's run_setup fire inside add_subsystem (§4).
+    void run_setup() override;
+    /// ctx.device = own property::device or parent_device. Process OWN
+    /// alias entries first (§ 01.D §4 logic — a tie alias root counts its
+    /// bytes here), then children in order; merge maps (sum on key).
+    std::unordered_map<sycl::device, size_t>
+        get_exec_info(const sycl::device& parent_device) override;
+    /// Complete ctx (primary = q_in, no lane, substrate = substrates[device]);
+    /// allocate own alias roots; then children with the SAME queue set.
+    void prepare_exec(const Queues&, Substrates&) override;
+    /// children.compile(ctx) in order; validate if this System has a
+    /// policy (Fused/Parallel); return nullopt.
+    std::optional<CompiledInfo> compile(const ExecCtx&) override;
+    /// children.run_init in order, then init(q retargeted to ctx.device).
+    void run_init(const ExecCtx&) override;
+    void run_pre_compute(ExecCtx&) override {}     ///< Systems do no work
+    void run_post_compute(ExecCtx&) override {}
+    /// THE DEFAULT LOOP (§3).
+    std::unique_ptr<LaunchDescription> run_compute_forward() override;
 
-    /// The individual-launch path — the canonical order's step 3 (01.D
-    /// §4), executed for one component:
-    ///   1. pad cfg.global to work-group multiples of the launch
-    ///      geometry (cfg.wg if has_wg, else the rank default);
-    ///   2. stamp the degenerate slice {0, all_groups} into cfg.record;
-    ///   3. stage device memory (ONE transient allocation: records[1] +
-    ///      inputs + outputs + bodies streams), one H2D copy;
-    ///   4. submit the rank-matched outer kernel (01.C §5) with the
-    ///      component's static individual_cfg and a local_accessor of
-    ///      cfg.scratch_bytes (zero when unused).
-    static sycl::event execute(ComponentBase& c, sycl::queue& q);
-    // { run_pre_forward(c, q);
-    //   auto cfg = compute_forward(c);
-    //   auto ev  = detail::launch_individual(cfg, q);
-    //   post_launch(c, q);
-    //   return ev; }
-
-    std::vector<child_ref> children_;   // Components and Systems, declared order
+    ExecCtx ctx_;
+    std::vector<std::unique_ptr<Subsystem>> children_;   ///< declared order = exec order
+    std::unordered_map<std::string, std::unique_ptr<detail::IOEntry>> aliases_;
 };
 
 } // namespace naga::cospan
 ```
 
-## 2. FusedSystem
+## 3. The default `run_compute_forward` — and how ordering works
 
-```cpp
-namespace naga::cospan {
-
-/// Children: COMPONENTS ONLY (structural rule). Mode fixed at
-/// construction. Rank and wg shape are SYSTEM-LEVEL parameters here —
-/// component wg intent is ignored inside a fuse (01.C §6).
-class FusedSystem final : public System {
-public:
-    enum class Mode : uint8_t { sequential, parallel };
-
-    FusedSystem(Mode mode, int rank /* = 1 */,
-                sycl::range<3> wg /* = rank default */);
-
-    /// setup(), beyond the base: the STATIC assembly, once —
-    ///   * compile every child at the fuse rank (compile_kernel; id-only
-    ///     bodies lazily instantiate here; an nd_item child whose native
-    ///     rank differs from the fuse rank is a HARD ERROR);
-    ///   * intra-fuse shape-dependency check: any determiner-or-
-    ///     connection chain from one child's shape to another child's
-    ///     output is a HARD ERROR naming the chain (01.C §7);
-    ///   * parallel mode ONLY: producer-consumer check from I/O
-    ///     metadata — a child consuming another child's output in the
-    ///     same wave is an ERROR by default, user-overridable
-    ///     (allow_producer_consumer(); the tie_outputs trust model);
-    ///   * sequential mode ONLY: interleave kb_barrier between
-    ///     consecutive scratch-declaring stages (01.C §5). Sequential
-    ///     fusion's semantics: same-index producer->consumer inside one
-    ///     work-item's call chain works; cross-index dependence does
-    ///     not — documented, not checked;
-    ///   * build THE sequence config, once:
-    ///     define_as_call_sequence(kb_entry_r{rank}, ordered fn ids).
-    void setup() override;
-
-    /// forward(): one wave, one launch —
-    ///   1. run_pre_forward for every child, declared order;
-    ///   2. compute_forward for every child; collect configs;
-    ///   3. PACK: concatenate inputs/outputs/bodies streams and
-    ///      StageRecords in EXECUTION ORDER (= sequence order = the
-    ///      cursor's order — the four-way identity, 01.C §5); stamp
-    ///      slices: sequential -> {0, own group count} per stage,
-    ///      launch extent = max; parallel -> prefix-sum group offsets,
-    ///      launch extent = Σ; scratch = max over stages;
-    ///   4. ONE transient device staging, ONE H2D, ONE submit via the
-    ///      setup-built sequence config;
-    ///   5. post_launch for every child.
-    void forward(sycl::queue& q) override;
-};
-
-} // namespace naga::cospan
+```
+ctx_.refresh_pending();                       // deps on everything both queues hold
+for (child : children_) {
+    child->run_pre_compute(ctx_);
+    auto d = child->run_compute_forward();
+    if (d) ctx_.pending = { d->submit(ctx_.target()) };   // WE submit; our event is next's dep
+    else   ctx_.refresh_pending();            // child submitted on its own; re-read queues
+    child->run_post_compute(ctx_);            // copies AFTER the work they depend on
+}
+return nullptr;                               // "I submitted"
 ```
 
-## 3. ParallelSystem
+- **Ordering is derived, never passed.** Which queue a System submits to
+  is static (`primary`, fixed in `prepare_exec` by what its owner handed
+  down). Cross-queue dependencies come from the queues themselves
+  (`get_wait_list`), refreshed at the top of the loop and after any child
+  that submitted for itself. In-order primaries consume `pending` with
+  their first submission; out-of-order primaries attach it to each.
+- **Devices are per submission.** Every submission carries
+  `AdaptiveCpp_retarget{ctx.device}` (the queues are `retargetable`); an
+  in-order queue keeps its ordering across devices (acpp
+  `ACPP_EXT_CG_PROPERTY_RETARGET`). Nobody creates queues but the Model.
+- **`run()` waits both queues**: trailing pending events after a parallel
+  section have no consumer otherwise.
+
+## 4. Structural APIs — all inside `setup()`, else throw
 
 ```cpp
 namespace naga::cospan {
 
-/// Children: any (Components or Systems), one LANE each — a private
-/// in-order queue per child, same device and context as the parent's.
-/// The user asserts lane independence by using this type (data
-/// independence is the user's responsibility; the ONE thing the
-/// framework checks is cross-sibling shape dependencies — hard error,
-/// 01.C §7, because a shape read is provably a data dependency).
-class ParallelSystem final : public System {
-public:
-    /// forward():
-    ///   1. FENCE-IN: each lane's first work must not begin before
-    ///      prior siblings' work on q — the parent enqueues an event
-    ///      join from q into every lane;
-    ///   2. dispatch: child i executes on lane_q[i] (Component ->
-    ///      execute(); System -> forward(lane_q[i]));
-    ///   3. FENCE-OUT: q's subsequent work must not begin before every
-    ///      lane completes — event join from every lane back into q.
-    ///      The join mechanism is implementation-defined (event
-    ///      dependencies preferred; a host wait is a conforming v1);
-    ///      the CONTRACT is only the ordering, stated in those two
-    ///      fences. The opacity contract holds: to the owner this was
-    ///      one child step on q.
-    void forward(sycl::queue& q) override;
-
-private:
-    std::vector<sycl::queue> lanes_;   // created at setup; in-order
-};
-
-} // namespace naga::cospan
-```
-
-**Queues:** created at the Model and flow DOWN through `forward(q)` —
-Systems receive and route them; ParallelSystem manufactures its lanes at
-setup; Components never orchestrate a queue (their framework surface
-receives `q` only for event-waits and the post_launch enqueues, both
-framework-driven).
-
-## 4. Structural APIs
-
-All structural calls are setup-time only; a structural call outside
-`setup()` throws.
-
-```cpp
-namespace naga::cospan {
+/// Options are SYCL-style properties: unordered, self-naming, type-checked.
+namespace property {
+    struct device        { sycl::device dev; };            // placement; inherited when absent
+    struct parallel      {};                               // flavor
+    struct fused         { Fused::Mode mode; int rank = 1; std::optional<sycl::range<3>> wg; };
+    struct conditional   { Predicate pred; };              // spec 04
+    struct change_tracked{};                               // spec 04
+}
+class property_list { /* SYCL idiom: constructed from any subset; has_property<T>(), get_property<T>() */ };
 
 class System {   // ...continued
 public:
-    // ---- children --------------------------------------------------------
-
-    /// Emplace a child (Component or System), owned by this System,
-    /// named in this System's namespace. Returns the typed reference:
-    ///     auto& hist = add_subsystem<WeightedHistogram>("hist", 0.f, 1.f);
-    template <class T, class... Args>
-        requires(std::derived_from<T, ComponentBase> ||
-                 std::derived_from<T, System>)
+    /// A REALIZED System or Component type, optionally with properties
+    /// (device; the wrapping flavors conditional/change_tracked).
+    template <class T, class... Args> requires std::derived_from<T, Subsystem>
     T& add_subsystem(std::string name, Args&&... ctor_args);
+    template <class T, class... Args> requires std::derived_from<T, Subsystem>
+    T& add_subsystem(std::string name, const property_list& props, Args&&... ctor_args);
+    /// A BASE System configured by properties: device and/or ONE flavor
+    /// (parallel | fused | conditional | change_tracked — two flavors on
+    /// one call is an error; nest to combine). Returns the System to add
+    /// children to inline — no class derivation needed.
+    System& add_subsystem(std::string name, const property_list& props = {});
+    // add_subsystem constructs the child, registers the name, and runs the
+    // child's run_setup BEFORE returning, so later structural calls in this
+    // same setup() see it fully declared.
 
-    /// Pre-built child transfer (ownership moves in).
-    template <class T>
-    T& add_subsystem(std::string name, std::unique_ptr<T> child);
-
-    // ---- connections -----------------------------------------------------
-
-    /// THE ONLY WAY TO ALIAS I/O BETWEEN SIBLINGS. Wires src (an OUTPUT
-    /// path) to dst (an INPUT path). Paths are dot-separated and resolve
-    /// in THIS System's namespace: child paths ("solver.mda.y1") and
-    /// this-System promoted/tied names both legal. RULES:
-    ///   * output -> input only, always;
-    ///   * an input has AT MOST ONE source — a second connection to the
-    ///     same input is an error at the call;
-    ///   * dtype compatibility on value_dtype_of (01.A): the atomic
-    ///     modifier never blocks a connection;
-    ///   * size compatibility is FLAT-SIZE equality, checked at the
-    ///     01.B validation point (setup-checked when both static;
-    ///     re-checked each forward when either side dynamic);
-    ///   * ALIASING (mechanics: 02.C): a connection merges the target's
-    ///     set into the source's; connecting through ANY name of a set
-    ///     is the same connection. Promotion is always allowed; ties
-    ///     must precede connections ("tie before connecting, or connect
-    ///     from the alias").
-    void connect(std::string_view src_output, std::string_view dst_input);
-
-    /// Non-identity forms take a ConnectionMap (spec 03): Slice (a view,
-    /// zero-copy), SliceInto / IndexMap / IndexMapInto (computed, via a
-    /// hidden mapping System).
-    void connect(std::string_view src_output, std::string_view dst_input,
-                 ConnectionMap map);
-
-    // ---- promotion -------------------------------------------------------
-
-    /// Lift ONE child I/O into this System's namespace under
-    /// promoted_name. Kind-agnostic and ALWAYS allowed — including on
-    /// already-connected or already-aliased entries (a higher level may
-    /// always want a name, e.g. probing an adopted System). Creates an
-    /// ALIAS ENTRY on this System — a real detail::IOEntry that joins
-    /// the promoted entry's set as a PEER with a snapshot of the root's
-    /// flags (02.C), enumerated under get_inputs()/get_outputs() by
-    /// those flags, retrievable by get_input()/get_output(), and
-    /// connectable AT THE PARENT LEVEL under the promoted name. No data
-    /// exists on the System: peers own nothing.
+    void connect(std::string_view src, std::string_view dst);                 // identity
+    void connect(std::string_view src, std::string_view dst, ConnectionMap);  // spec 03
     void promote(std::string_view child_path, std::string promoted_name);
-
-    // ---- ties ------------------------------------------------------------
-
-    /// Alias N child INPUTS to ONE promoted input in this namespace.
-    /// All members receive the SAME data: one upstream connection to
-    /// promoted_name feeds every member (e.g. every discipline consuming
-    /// the same design vector). Members must agree on value_dtype; flat
-    /// sizes validated per 01.B. NEVER inputs with outputs — there is
-    /// no mixed tie, by design. Members must be unconnected (02.C);
-    /// after the tie only the alias is a legal connection target.
-    void tie_inputs(std::initializer_list<std::string_view> child_input_paths,
-                    std::string promoted_name);
-
-    /// Alias N child OUTPUTS to ONE promoted output: the members WRITE
-    /// TO THE SAME STORAGE. Collision discipline is the whole question,
-    /// and the default answer is the type system's: every tied member
-    /// SHALL have an atomic dtype (01.A), checked at this call — the
-    /// B/C accumulation pattern with no forced copies and no adder
-    /// component. The override is the trust model verbatim: the user
-    /// asserting the writes cannot conflict (e.g. disjoint index sets)
-    /// takes responsibility with allow_plain. Members must have no
-    /// downstream connections yet (02.C); after the tie only the alias
-    /// is a legal connection source.
-    enum class TieOutputsPolicy : uint8_t { require_atomic, allow_plain };
-    void tie_outputs(std::initializer_list<std::string_view> child_output_paths,
-                     std::string promoted_name,
+    void tie_inputs (std::initializer_list<std::string_view> members, std::string name);
+    void tie_outputs(std::initializer_list<std::string_view> members, std::string name,
                      TieOutputsPolicy policy = TieOutputsPolicy::require_atomic);
+    void add_design_var(...);  void add_constraint(...);  void add_objective(...);   // spec 03
 };
-
-/// Rectangular subarray descriptor (rank-typed helper -> stored form):
-///     subarray<2>({row0, col0}, {rows, cols})
-struct SubarrayRef {
-    sycl::range<3> offset;   // 0-padded
-    sycl::range<3> extents;  // 1-padded
-    uint8_t        rank;
-};
-template <int R>
-SubarrayRef subarray(sycl::range<R> offset, sycl::range<R> extents);
 
 } // namespace naga::cospan
 ```
 
-## 5. Sample — Sellar-shaped wiring
+Rules (mechanics in 02.C; semantics in 03): output → input only; an input
+has at most one source, enforced at the ROOT's flag after the first
+connection; connecting through any name of a set is the same connection;
+`promote` is kind-agnostic and always allowed; ties must precede
+connections ("tie before connecting, or connect from the alias");
+`tie_outputs` requires atomic member dtypes unless `allow_plain`.
+
+## 5. ParallelSystem and FusedSystem — the two policy flavors
+
+```cpp
+namespace naga::cospan {
+
+/// Children are lanes on q_ooo. prepare_exec hands child i the queue set
+/// with primary = q_ooo, lane = i. run_compute_forward: refresh pending
+/// (this captures everything q_in holds); for each child: pre-compute →
+/// compute → submit on q_ooo with lane i and the SAME pending snapshot →
+/// post-compute. Return null; the owner's refresh then picks up q_ooo's
+/// wait list. Data independence of children is the USER's assertion;
+/// the framework checks only cross-sibling shape dependencies (hard
+/// error at compile).
+class ParallelSystem : public System { /* runner overrides as described */ };
+
+/// COMPONENTS ONLY — enforced by the type system at the add, since a
+/// System cannot discern children at runtime:
+///   template <class T, class... A> requires std::derived_from<T, ComponentBase>
+///   T& add_subsystem(std::string, A&&...);
+/// (no property-list overload). Rank and wg shape are the fuse's;
+/// children compile at the fuse rank (id-only bodies lazily). compile()
+/// validates the wave from the children's CompiledInfo: rank agreement
+/// for group bodies, no custom ops, no scratch-free/scratch mixing
+/// problems, no intra-fuse shape dependencies over the final sets,
+/// parallel mode: no producer-consumer pairs unless allowed; builds the
+/// sequence config once.
+/// run_compute_forward: pre-compute ALL children → compute ALL (collect
+/// descriptions; a null is an error) → pack streams + records, stamp
+/// group slices, one staging, ONE submission with the sequence config →
+/// post-compute ALL. The order is forced: post-compute copies depend on
+/// the wave.
+class FusedSystem : public System {
+public:
+    enum class Mode : uint8_t { sequential, parallel };
+    FusedSystem(Mode, int rank = 1, std::optional<sycl::range<3>> wg = {});
+    void allow_producer_consumer();   // parallel-mode override (trust model)
+};
+
+} // namespace naga::cospan
+```
+
+## 6. Sample — Sellar with inline Systems
 
 ```cpp
 class SellarMDA : public System {
@@ -276,35 +239,23 @@ public:
     void setup() override {
         auto& d1 = add_subsystem<Discipline1>("d1");
         auto& d2 = add_subsystem<Discipline2>("d2");
-
-        connect("d1.y1", "d2.y1_in");            // plain connection
-        connect("d2.y2", "d1.y2_in");            //   (the cycle: solvers spec)
-
-        tie_inputs({"d1.z", "d2.z"}, "z");       // shared design vector:
-                                                 //   one entry, one upstream
-        promote("d1.y1", "y1");                  // visible to the parent
-        promote("d2.y2", "y2");
+        connect("d1.y1", "d2.y1_in");
+        connect("d2.y2", "d1.y2_in");            // the cycle: solvers (spec 05)
+        tie_inputs({"d1.z", "d2.z"}, "z");
+        promote("d1.y1", "y1");  promote("d2.y2", "y2");
     }
+    void init(sycl::queue&) override { fill_input("z", 1.0); }   // last word over d1/d2 inits
 };
 
 class Top : public System {
     void setup() override {
-        auto& mda  = add_subsystem<SellarMDA>("mda");
-        auto& obj  = add_subsystem<Objective>("obj");
+        auto& mda = add_subsystem<SellarMDA>("mda", property_list{property::device{gpu0}});
+        auto& obj = add_subsystem<Objective>("obj");
+        connect("mda.y1", "obj.y1");
+        connect("mda.y2", "obj.y2_head", Slice{subarray<1>({0}, {1})});
 
-        connect("mda.y1", "obj.y1");             // promoted names connect
-        connect("mda.y2", "obj.y2_head",      // like any output —
-                Slice{subarray<1>({0}, {1})});   //   slices included
+        auto& par = add_subsystem("post", property_list{property::parallel{}});
+        par.add_subsystem<Report>("r1");  par.add_subsystem<Report>("r2");
     }
 };
 ```
-
-Load-bearing from earlier chunks: alias entries are ordinary `IOEntry`s,
-so the enumerability guarantee and `get_input<DT,R>("mda.y1")` hierarchy
-retrieval need no special cases (01.B's RTTI anchor); peers own nothing,
-so allocation is roots-only (02.C); `value_dtype_of` compatibility lets
-an atomic-tied output connect onward to a plain consumer input without
-ceremony (01.A).
-
-Deferred, explicitly: subarray-of-subarray composition,
-DV/constraint/objective marks on promoted entries (spec 03).

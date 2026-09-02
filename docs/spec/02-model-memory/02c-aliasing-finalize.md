@@ -54,6 +54,16 @@ public:
     /// The subarray of the root this peer sees; whole-root when unset.
     std::optional<SubarrayRef> view() const;
 
+    // ---- execution placement (set in get_exec_info; lifecycle.md) -------
+    const sycl::device& device() const;        ///< the owning subsystem's device
+    /// A peer whose device differs from its root's: it owns storage of
+    /// its own on its device, and the root's producer copies into it in
+    /// run_post_compute (the root's needs_memcpy list). Same-device peers
+    /// own nothing and read root()->data().
+    bool owns_nonroot_allocation() const;
+    std::span<IOEntry* const> needs_memcpy() const;   ///< roots only
+    uint64_t version() const;                          ///< spec 04
+
     // ---- capabilities (01.B, restated against the set) ------------------
     /// validate_connection: INPUT PEERS ONLY, against root() — flat-size
     /// (or view() subarray size) equality; after update_shape; every
@@ -137,25 +147,16 @@ IndepVarComp. Route by lifetime (02.B `MemoryTargets`): durable ∧ static
 roots from the arena; all other roots via the dynamic chain at first
 need and on growth. Peers own nothing, ever.
 
-## 5. The finalize pass — local, two walks
+## 5. From sets to storage
 
-`Model::setup` step 2 (02.B) is not a resolution pass: aliasing is
-complete the moment the structural calls return. Finalize is:
-
-1. **Fold** — depth-first, every System reports the durable ∧ static
-   bytes of ITS OWN root entries (its alias roots) and every Component
-   reports its own, via `get_inputs()/get_outputs()`. Model sums. No
-   registry, no table.
-2. Model constructs the arena at that size (and the pool iff the knob
-   is set).
-3. **Allocate** — the same walk again; every root allocates from the
-   targets handed down; peers do nothing.
-4. `FromInput` registration — each DimRecord with a `from_input` spec
-   registers itself with its input's root (the producing output), whose
-   Component's `post_launch` will enqueue the D2H copies.
-5. Static connection validation — each static input peer against its
-   root, once; dynamic pairs re-validate each forward (01.B).
-6. Compile (01.E) and sync — every wrapper reads its root.
+Aliasing is complete the moment each structural call returns. Storage
+follows in the setup chain (lifecycle.md): `get_exec_info` counts bytes
+per device (roots; and peers on a device other than their root's, which
+own their own copy), `prepare_exec` allocates from the substrates, and the
+sync step points every wrapper at its storage — own allocation if it has
+one, else `root()->data()`. Regrowth of a root needs no notification:
+peers re-read at their next sync. Cross-device peers are refreshed by the
+root's producer after every launch.
 
 ## 6. Sample
 

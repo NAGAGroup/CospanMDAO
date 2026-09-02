@@ -27,9 +27,22 @@ namespace naga::cospan {
 ///       void operator()(sycl::id<R> idx, Inputs, Outputs) const;
 ///          // or (sycl::nd_item<R>, Inputs, Outputs)
 ///          // or (sycl::nd_item<R>, Inputs, Outputs, Scratch)
+///          // or (CustomOp&, Inputs, Outputs)        — CUSTOM OPERATION
 ///   };
 ///
-/// THE SIGNATURE IS THE DECLARATION, three ways:
+/// CUSTOM-OPERATION BODIES are never compiled to a device function or
+/// launched: the owner submits them via AdaptiveCpp_enqueue_custom_
+/// operation on the SAME queue, with the same dependencies, retarget
+/// and lane — so ordering, parallel lanes and gating apply unchanged.
+/// Inputs/Outputs arrive as the bare wrappers with CURRENT device
+/// pointers. What the body does is open: host work, or handing the
+/// pointers to a native library on the native stream (CustomOp::h is
+/// the interop handle; CustomOp::to_host/from_host move data through
+/// the native backend for pure host work). Not fusable (no device
+/// function exists). Phase 7: opaque to the engine — analytical adjoint
+/// or FD/CS required when derivatives are requested.
+///
+/// THE SIGNATURE IS THE DECLARATION, four ways:
 ///   * first parameter id<R> vs nd_item<R>  => group semantics opt-in
 ///     (a body without the nd_item cannot touch group abstractions);
 ///   * R                                    => kernel rank, deduced
@@ -46,11 +59,12 @@ namespace naga::cospan {
 template <class KB> concept PlainBody   = /* operator()(id<R>, In, Out) */;
 template <class KB> concept GroupBody   = /* operator()(nd_item<R>, In, Out [, Scratch]) */;
 template <class KB> concept HasScratch  = /* trailing Scratch parameter */;
+template <class KB> concept CustomOpBody= /* operator()(CustomOp&, In, Out) */;
 template <class KB> concept KernelBodyC =
     std::is_trivially_copyable_v<KB> &&
     std::is_trivially_copyable_v<typename KB::Inputs> &&
     std::is_trivially_copyable_v<typename KB::Outputs> &&
-    (PlainBody<KB> != GroupBody<KB>);        // exactly one form
+    (int(PlainBody<KB>) + int(GroupBody<KB>) + int(CustomOpBody<KB>) == 1);
 template <class KB> inline constexpr int kernel_rank_v = /* from signature */;
 
 ## 2. Local<DT, Rank> — local memory with wrapper ergonomics

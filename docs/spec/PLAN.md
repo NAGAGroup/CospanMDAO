@@ -14,6 +14,8 @@ spec is assembled (phase 10).
   modular modeling, not just compute patterns).
 - Open items forward-link to the phase that owns them. A genuinely new
   pattern amends the ledger loudly, never silently.
+- `lifecycle.md` is the spine: every framework verb in firing order with
+  the state after each; numbered documents declare the surfaces it walks.
 - Spec documents stay ~500 lines or less; a phase that outgrows one file
   becomes a directory of chunk documents. Agents read short docs whole and
   filter long ones — the cap is what keeps the contract actually read.
@@ -29,8 +31,8 @@ spec is assembled (phase 10).
 |---|---|---|
 | 1 | **Components & I/O foundations** — dtypes+wrappers, metadata+shapes+declaration API, kernel machinery (KernelBody, chained executor, Local scratch), Component, System execution slice + structural APIs | `01-components-io/` (01a–01e) — DONE |
 | 2 | **Model, memory & finalize** — `Model` (setup driver, queue creation, run, final wait); the finalize pass as ONE walk: alias resolution order + allocation pass; slabkit's slimmed surface (pools, smart pointers); pool ownership flavor; multi-device-queue allocation | `02-model-memory/` |
-| 3 | **Topology semantics & optimization marks** — index-map connections and index-map-valued I/O, subarray composition, cross-level ties, the marks API (design vars / constraints / objectives with bounds and scaling slots) | `03-topology.md` |
-| 4 | **System types** — remaining base contract (host-locus property, observation hooks), conditional execution, change-tracked execution | `04-system-types.md` |
+| 3 | **Topology semantics & optimization marks** (DONE) — index-map connections and index-map-valued I/O, subarray composition, cross-level ties, the marks API (design vars / constraints / objectives with bounds and scaling slots) | `03-topology.md` |
+| 4 | **System types** — ConditionalSystem, ChangeTrackedSystem, versions, observation plumbing (Systems never do work; custom operations are Components) | `04-system-types.md` — DONE |
 | 5 | **Implicit & solvers** — ImplicitComponent, the Solver hierarchy, attachment API, convergence contract | `05-implicit-solvers.md` |
 | 6 | **Temporal** — temporal System type(s), recurrence wiring, history windows; composites proven by samples | `06-temporal.md` |
 | 7 | **AD** — engine document + AMENDMENTS to 01a (grad wrapper forms), 01d (adjoint verb), 01e (backward walk), 05 (solver adjoints); consistency audit inside the phase | `07-ad.md` + amendments |

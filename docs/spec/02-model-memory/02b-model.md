@@ -1,115 +1,115 @@
 # Spec 02.B — Model
 
 Phase-2 chunk B. Binding contract; declarations only. Memory objects:
-slabkit 02.A. Aliasing and the finalize walks: 02.C.
+slabkit 02.A. Aliasing: 02.C. Subsystem verbs: 01.D. System: 01.E. The
+full end-to-end walk: `lifecycle.md`.
 
 ```cpp
 namespace naga::cospan {
 
-// -----------------------------------------------------------------------------
-// 1. Model — the top of the tree, and the only owner of memory and queues
-// -----------------------------------------------------------------------------
-/// ONE queue, ONE device. Multi-device is the queue's business (acpp's
-/// multi-device queue, ruled in phase 0): a Model built on such a queue
-/// changes nothing here — slabkit's queue-target overloads allocate in
-/// that queue's context. Cospan never enumerates devices.
-struct ModelOptions {
-    size_t dynamic_pool_bytes = 0;    ///< THE knob. 0 = no pool: every
-                                      ///  dynamic allocation goes to the OS
-                                      ///  route. Pre-allocation is a
-                                      ///  profiling-discovered optimization
-                                      ///  (memory_report() is how).
+/// The Model owns exactly three kinds of thing: the two queues, the
+/// per-device memory substrates, and the root System. It drives the
+/// setup chain and the forward; it never touches a Subsystem except
+/// through the Subsystem verbs and System::forward().
+struct ModelConfig {
+    /// Per-device dynamic-pool sizes; a device not listed gets
+    /// `default_pool_bytes`. 0 = no pool = every dynamic allocation takes
+    /// the OS route. Pre-allocation is a profiling-discovered
+    /// optimization; memory_report() is how it is discovered.
+    std::unordered_map<sycl::device, size_t> pool_bytes;
+    size_t default_pool_bytes = 0;
     size_t pool_node_size     = 1024;
+    /// The default device (root System's device unless it overrides;
+    /// what every System inherits by default). Defaults to the runtime's
+    /// default selector.
+    std::optional<sycl::device> default_device;
 };
+
+/// THE factory. Constructs the root System with `args...`, the Model
+/// around it, and returns the Model by value (prvalue; Model is movable,
+/// so this is also merely ordinary).
+template <class Sys, class... Args> requires std::derived_from<Sys, System>
+Model create_model(ModelConfig cfg, Args&&... args);
 
 class Model {
 public:
-    /// The queue SHALL be in-order: the execution contract (01.E) is
-    /// stated in terms of in-order enqueue. An out-of-order queue is
-    /// rejected at construction.
-    explicit Model(sycl::queue q, ModelOptions opts = {});
-    Model(const Model&) = delete;  Model& operator=(const Model&) = delete;
+    Model(Model&&) noexcept;  Model& operator=(Model&&) noexcept;
+    Model(const Model&) = delete;
 
-    // ---- the tree -----------------------------------------------------------
-    /// The root System, emplaced. Exactly one; a second call throws.
-    template <class S, class... Args>
-        requires std::derived_from<S, System>
-    S& set_root(Args&&... ctor_args);
-    System& root();
-
-    // ---- lifecycle ------------------------------------------------------------
-    /// THE SETUP DRIVER. Runs once; a second call throws. In order:
-    ///   1. DECLARE — root.setup() recursively, depth-first in declared
-    ///      order. Every add_subsystem / declare_* / connect / promote /
-    ///      tie happens inside, and each structural call leaves the
-    ///      aliasing sets consistent as it returns (02.C). ZERO
-    ///      allocation.
-    ///   2. FINALIZE — the byte FOLD (02.C §5.1): depth-first, each
-    ///      System reports the durable∧static bytes of ITS OWN root
-    ///      entries, each Component its own; Model sums. No registry.
-    ///   3. MEMORY — construct the DeviceArena at exactly the folded
-    ///      size; construct the DevicePool iff dynamic_pool_bytes > 0.
-    ///   4. ALLOCATE — the same walk again: every durable∧static root
-    ///      allocates from the arena; other roots stay unallocated until
-    ///      first need (01.B). Peers own nothing.
-    ///   5. WIRE — FromInput DimRecords register with their input's root
-    ///      (02.C §5.4); static input peers validate against their roots
-    ///      once (dynamic pairs re-validate each forward).
-    ///   6. COMPILE — compile_kernel on every Component at its native
-    ///      rank; FusedSystem::setup assembly (01.E).
-    ///   7. SYNC — every wrapper reads its root's {data, shape, stride}.
+    // ---- lifecycle -------------------------------------------------------------
+    /// THE SETUP CHAIN. Runs once. Every step is a Subsystem verb driven
+    /// from the root; the Model adds only the two things nobody else
+    /// owns (queues, substrates):
+    ///   0. queues: q_in (in-order, AdaptiveCpp_retargetable,
+    ///      AdaptiveCpp_coarse_grained_events) and q_ooo (out-of-order,
+    ///      retargetable), both bound to default_device — created at
+    ///      construction, so they exist for everything below.
+    ///   1. root.run_setup()                       — declare (01.D/01.E)
+    ///   2. bytes = root.get_exec_info(default_device)   — device -> bytes
+    ///   3. substrates[d] = { DeviceArena(bytes[d]), pool iff configured }
+    ///   4. root.prepare_exec(queues, substrates) — allocate; ExecCtx complete
+    ///   5. root.compile(root_ctx)                — bodies; flavor validation
+    ///   6. root.run_init(root_ctx)               — children before owners
+    ///   7. wire: FromInput dim_scratches register with roots; static input
+    ///      peers validate against roots
+    ///   8. sync: every member wrapper is pointed at its storage (own
+    ///      allocation, else root()->data())
+    /// After setup the model's STATE is not yet meaningful: it holds
+    /// initialization. State is defined after the first run().
     void setup();
 
-    /// Enqueue one forward: root.forward(q). Returns immediately (the
-    /// queue is in-order; effects are ordered). For callers composing
-    /// loops (temporal, solvers — later phases) without host round-trips.
+    /// root.forward(): enqueue one forward. Returns immediately.
     void forward();
-
-    /// forward() + q.wait(). The final wait belongs here and nowhere
-    /// else (01.E: "Model::run() owns the final wait").
+    /// forward(); then wait BOTH queues (trailing parallel work has no
+    /// later consumer to order it). The final wait lives here only.
     void run();
 
-    sycl::queue& queue();
+    // ---- host access (between runs) ---------------------------------------------
+    /// Views: wrapper ergonomics on the host — shape(), operator[] with
+    /// id<Rank> and flat, size(). Constructing a view performs the D2H
+    /// copy of the root on q_in and waits for it (the honest cost, paid
+    /// only where asked). Read-only variants cost no writeback.
+    template <DType DT, int Rank> HostView<DT, Rank>    view_input (std::string_view path) const;
+    template <DType DT, int Rank> HostView<DT, Rank>    view_output(std::string_view path) const;   // read-only
+    /// Writable output view: writes land in host staging; written back
+    /// to the device on destruction AND on commit() (both; the
+    /// destructor is the protection, commit() the mid-scope flush).
+    template <DType DT, int Rank> HostViewMut<DT, Rank> view_output_mut(std::string_view path);
+    /// Setters: H2D on q_in; bump the root's version (spec 04); copy into
+    /// cross-device peers (needs_memcpy) like any root write. Inputs:
+    /// meaningful for free inputs (a connected one is overwritten at the
+    /// next forward — harmless, like init).
+    template <DType DT, int Rank> void set_input (std::string_view path, std::span<const cpp_type_t<DT>>);
+    template <DType DT, int Rank> void set_output(std::string_view path, std::span<const cpp_type_t<DT>>);
 
-    // ---- access ---------------------------------------------------------------
-    /// Path-resolved retrieval from the root ("mda.d1.y1"; promoted names
-    /// legal at every level) — the uniform chained lookup of 01.B.
-    template <DType DT, int Rank> Input<DT, Rank>&  get_input(std::string_view path);
+    // ---- retrieval & observation ------------------------------------------------
+    template <DType DT, int Rank> Input<DT, Rank>&  get_input (std::string_view path);
     template <DType DT, int Rank> Output<DT, Rank>& get_output(std::string_view path);
+    System& root();
+    template <class Visitor> void visit(Visitor&& v) const;   // root.visit
 
-    /// The profiling surface that makes the knob discoverable.
     struct MemoryReport {
-        size_t arena_bytes;          // durable∧static total (exact)
-        size_t pool_bytes;           // 0 when no pool
-        size_t pool_bytes_in_use;
-        size_t os_allocations;       // count of dynamic-chain OS-route hits
-        size_t os_bytes_in_use;      // what a pool of this size would absorb
-        size_t transient_peak_bytes; // launch streams / arenas, peak per forward
+        struct PerDevice { size_t arena_bytes, pool_bytes, pool_bytes_in_use,
+                                  os_allocations, os_bytes_in_use, transient_peak_bytes; };
+        std::unordered_map<sycl::device, PerDevice> devices;
     };
     MemoryReport memory_report() const;
 
-private:
-    // ---- the allocation target handed down the tree ---------------------------
-    /// IOEntry::allocate (01.B/02.C) takes exactly this. Route selection is
-    /// lifetime-driven, never a user choice:
-    ///   durable ∧ static  -> arena (step 4, once)
-    ///   anything else     -> the dynamic chain, at first need and on growth:
-    ///       pool ? slabkit::try_malloc_device<std::byte>(n, *pool) : nullopt
-    ///         -> slabkit::malloc_device<std::byte>(n, q)
-    ///         -> AllocationError{OutOfMemory} propagates: no fallback
-    ///            around a broken invariant; exit with the cause named.
-    struct MemoryTargets {
-        sycl::queue&             q;
-        slabkit::DeviceArena&    arena;
-        slabkit::DevicePool*     pool;    // null when no pool
-    };
-    MemoryTargets targets();
+    // ---- marks (spec 03) --------------------------------------------------------
+    std::span<const MarkRecord> design_vars() const;
+    std::span<const MarkRecord> constraints() const;
+    std::span<const MarkRecord> objectives()  const;
 
-    sycl::queue                              q_;
-    std::unique_ptr<System>                  root_;
-    std::optional<slabkit::DeviceArena>      arena_;   // exists after step 3
-    std::optional<slabkit::DevicePool>       pool_;    // iff knob > 0
-    friend class System;  friend class detail::IOEntry;
+    /// Teardown: wait both queues (kernels, copies and their configs in
+    /// flight) → destroy the root (entries release handles) → substrates
+    /// (allocations pin their slabs; the last handle frees) → queues.
+    ~Model();
+
+private:
+    sycl::queue q_in_, q_ooo_;
+    Substrates  substrates_;
+    std::unique_ptr<System> root_;
+    ModelConfig cfg_;
 };
 
 } // namespace naga::cospan
@@ -118,14 +118,13 @@ private:
 ## Sample — the whole user-side lifecycle
 
 ```cpp
-sycl::queue q{sycl::gpu_selector_v, sycl::property::queue::in_order()};
-Model model{q};                              // no pool: the safe default
-auto& top = model.set_root<Top>();           // Top::setup wires the tree (01.E sample)
-model.setup();                               // declare → fold → memory → allocate → wire → compile → sync
+auto model = create_model<Top>(ModelConfig{});          // default device, no pools
+model.setup();                                          // declare → exec-info → substrates
+                                                        //   → prepare → compile → init → wire → sync
+model.set_input<DType::f64, 1>("mda.z", {{1.0, 2.0}});  // drive a free input
+model.run();                                            // forward + wait both queues
 
-model.get_input<DType::f64, 1>("mda.z");     // host-side access by path
-model.run();                                 // forward + wait
-
-auto r = model.memory_report();              // r.os_bytes_in_use > 0 ?
-                                             //   -> rerun with {.dynamic_pool_bytes = r.os_bytes_in_use}
+auto y1 = model.view_output<DType::f64, 1>("mda.y1");   // D2H, read
+auto r  = model.memory_report();                        // r.devices[gpu0].os_bytes_in_use > 0 ?
+                                                        //   -> rerun with pool_bytes set to it
 ```
