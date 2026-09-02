@@ -94,7 +94,7 @@ struct RegionCopy {
 };
 
 /// IndexMap / IndexMapInto: dst[offset + i] = src[map[i]].
-/// Launch range = map's range. Its adjoint is a scatter-add (phase 7).
+/// Launch range = map's range.
 template <DType DT, DType IDX, int Rank>
 struct GatherInto {
     struct Inputs  { Input<DT, 1> src; Input<IDX, Rank> map; };
@@ -106,7 +106,7 @@ struct GatherInto {
 
 /// Scatter — the additive reverse map, out[map[i]] += in[i]; output
 /// atomic BY TYPE (the general-case floor). Not a connection kind — a
-/// provided kernel users compose (and the adjoint of a gather).
+/// provided kernel users compose.
 template <DType DT, DType IDX, int Rank>
 struct Scatter {
     struct Inputs  { Input<DT, Rank> in; Input<IDX, Rank> map; };
@@ -120,10 +120,9 @@ struct Scatter {
 
 Properties that fall out: the mapping System is a real, enumerable
 subsystem (observable, debuggable); every mapping component is an
-ordinary KernelBody, so phase 7 differentiates it for free; and because
-the components write disjoint regions, the mapping System is PROVABLY
-legal as a parallel-mode FusedSystem — a later optimization needing no
-spec change.
+ordinary KernelBody; and because the components write disjoint regions,
+the mapping System is PROVABLY legal as a parallel-mode FusedSystem — a
+later optimization needing no spec change.
 
 ### 2.4 Coverage
 
@@ -203,8 +202,7 @@ public:
 };
 
 /// Model-level enumeration — the contract an optimizer (spec 09) reads.
-/// Order = declaration order, depth-first. The gradient slot lands here
-/// in phase 7.
+/// Order = declaration order, depth-first.
 class Model {   // ...continued from 02.B
 public:
     struct MarkRecord {
@@ -243,8 +241,3 @@ add_objective ("obj.f");
 add_constraint("obj.g1", Bounds{.upper = {{0}}});
 add_constraint("obj.g2", Bounds{.upper = {{0}}});
 ```
-
-**AD-shadow note (phase 7):** RegionCopy is its own adjoint; GatherInto's
-adjoint is Scatter and vice versa; marks are the set phase 7
-differentiates with respect to (DVs) and of (objective, constraints) —
-`MarkRecord` is where the gradient slot lands.

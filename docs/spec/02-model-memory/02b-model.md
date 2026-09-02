@@ -72,8 +72,8 @@ public:
     /// to the device on destruction AND on commit() (both; the
     /// destructor is the protection, commit() the mid-scope flush).
     template <DType DT, int Rank> HostViewMut<DT, Rank> view_output_mut(std::string_view path);
-    /// Setters: H2D on q_in; copy into cross-device peers (needs_memcpy)
-    /// like any root write. Inputs:
+    /// Setters: H2D into the root's primary storage on q_in, then copied
+    /// to the root's other-device storage like any root write. Inputs:
     /// meaningful for free inputs (a connected one is overwritten at the
     /// next forward — harmless, like init).
     template <DType DT, int Rank> void set_input (std::string_view path, std::span<const cpp_type_t<DT>>);

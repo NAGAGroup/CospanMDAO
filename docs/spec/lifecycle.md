@@ -60,13 +60,23 @@ counts its static bytes here); then each child in order, merging returned
 maps (sum on key).
 
 `Component`: device = `parent_device`; per own entry `e`:
-- root → count static bytes on this device;
-- peer, `root(e).device == device` → nothing (reads the root);
-- peer, devices differ → count `e`'s bytes here, mark
-  `owns_nonroot_allocation`, append `e` to `root(e).needs_memcpy`.
+- root → register this device as `e`'s primary; count its static bytes
+  here;
+- input peer, `root(e)` already has storage registered on this device →
+  nothing;
+- input peer, it does not → register this device on `root(e)` and count
+  the root's static bytes here (the root will own a copy on this device;
+  02.C §2);
+- output peer (only a tied output is one) whose root's device ≠ this
+  device → ERROR naming the tie: producers cannot write one storage
+  from two devices.
 
 Every root is processed before any peer of it: alias roots before
-children, producers before consumers (acyclic). Returns `{device: bytes}`.
+children, producers before consumers (acyclic). A System processes its
+own alias entries the same way (a tie alias root registers the System's
+device as primary; a promotion alias is a peer and registers the
+System's device on its root — so `get_output("alias")` from that System
+yields memory on that System's device). Returns `{device: bytes}`.
 
 ### 2.3 Substrates
 
@@ -80,14 +90,15 @@ owner handed down (plain owners pass their set unchanged; a Parallel owner
 assigns `primary = q_ooo, lane = i`), `substrate = &substrates[device]`;
 allocate own alias roots and point their wrappers; recurse.
 
-`Component`: allocate every own entry that is (root ∨
-`owns_nonroot_allocation`) ∧ allocatable now — durable∧static from the
+`Component`: for every own ROOT entry allocatable now, one allocation per
+registered device from that device's substrate — durable∧static from the
 arena; durable∧dynamic with a known shape via the dynamic chain (pool →
 OS); dynamic-shaped and transient stay unallocated. Then point every
-member wrapper at its storage: own allocation if it has one, else
-`root()->data()` — guaranteed allocated by now (roots precede peers);
-shape and stride (+ view) set; static input peers validate against their
-roots here.
+member wrapper at `root()->storage_on(own device)` — guaranteed
+allocated by now (roots precede peers); shape and stride (+ view) set;
+static input peers validate against their roots here. An unconnected
+input carrying a `FromSourceDim` dimension has no source to derive from:
+ERROR here ("source-derived dimension on an unconnected input").
 
 ### 2.5 Compile — `root.compile()`
 
@@ -101,8 +112,8 @@ and it is where the information is).
 
 `System`: children in order, then `init(q)`. `Component`: `init(q)`. `q` is
 `q_in` retargeted to the subsystem's device. Post-order means an owner's
-`init` has the last word by path. Initializers write roots — and, for
-roots with `needs_memcpy` peers, copy into those peers. Unnecessary inits
+`init` has the last word by path. Initializers write a root's primary
+storage and copy it to the root's other-device storage. Unnecessary inits
 (connected inputs) are harmless. An initializer on unallocated storage
 throws.
 
@@ -156,8 +167,9 @@ with the sequence config → post-compute ALL. **Custom System types**
    Then `pre_forward()` → dynamic validation → wrapper sync.
 2. `run_compute_forward()` → `compute_forward()` → description (kernel or
    custom op). The owner submits it.
-3. `run_post_compute(ctx)`: memcpys root → each `needs_memcpy` peer,
-   through `ctx`, after the owner's submission.
+3. `run_post_compute(ctx)`: for each output root with storage on other
+   devices, memcpy primary → each of them, through `ctx`, after the
+   owner's submission.
 
 **State:** every output root holds this forward's values; dynamic roots
 sized to this forward.
@@ -167,8 +179,8 @@ sized to this forward.
 ## 4. Host access
 
 `view_*` (D2H on `q_in`, waits its copy; writable output view writes back
-on destruction and on `commit()`), `set_*` (H2D; copies to cross-device
-peers), `memory_report()`, `get_subsystem(path)` chaining and
+on destruction and on `commit()`), `set_*` (H2D into the primary, copied
+to the root's other-device storage), `memory_report()`, `get_subsystem(path)` chaining and
 `get_inputs()/get_outputs()` enumeration (spec 04 §3).
 
 ---

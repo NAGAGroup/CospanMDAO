@@ -56,23 +56,29 @@ public:
 
     // ---- execution placement (set in get_exec_info; lifecycle.md) -------
     const sycl::device& device() const;        ///< the owning subsystem's device
-    /// A peer whose device differs from its root's: it owns storage of
-    /// its own on its device, and the root's producer copies into it in
-    /// run_post_compute (the root's needs_memcpy list). Same-device peers
-    /// own nothing and read root()->data().
-    bool owns_nonroot_allocation() const;
-    std::span<IOEntry* const> needs_memcpy() const;   ///< roots only
+    /// THE ROOT HOLDS ALL STORAGE, PER DEVICE. A root owns one allocation
+    /// on its own device (the primary, where its producer writes) and one
+    /// on every other device any peer of its set lives on. Peers own
+    /// nothing: every peer reaches up to root()->storage_on(its device),
+    /// so peers on the same device — however they relate to each other —
+    /// share one pointer, and get_output("alias") from a System always
+    /// yields memory on that System's device. The root's producer copies
+    /// primary -> each other device's storage in run_post_compute (and
+    /// whoever writes a root from the host does the same). Registered in
+    /// get_exec_info, allocated in prepare_exec.
+    void*  storage_on(const sycl::device&) const;            ///< roots only
+    std::span<const sycl::device> storage_devices() const;   ///< roots only; primary first
 
     // ---- capabilities (01.B, restated against the set) ------------------
     /// validate_connection: INPUT PEERS ONLY, against root() — flat-size
     /// (or view() subarray size) equality; static pairs once in
     /// prepare_exec, dynamic pairs every forward after update_shape.
-    /// allocate(MemorySubstrate&): roots, and peers that own a cross-
-    /// device copy; no-op otherwise.
-    /// point_wrapper: own storage, else root()->data() (+ view()
-    /// offset/stride) into the member wrapper — which is why root
-    /// regrowth needs no notification: every peer re-points at its next
-    /// turn.
+    /// allocate(Substrates&): ROOTS ONLY — one allocation per device in
+    /// storage_devices(), each from that device's substrate; no-op on
+    /// peers.
+    /// point_wrapper: root()->storage_on(device()) (+ view() offset/
+    /// stride) into the member wrapper — which is why root regrowth needs
+    /// no notification: every peer re-points at its next turn.
 
 private:
     IOEntry*              root_  = this;
@@ -146,19 +152,25 @@ including unconnected inputs and unconnected `tie_inputs` aliases: that
 is how top-level design variables and shared inputs get memory with no
 IndepVarComp. Route by lifetime (02.B `MemorySubstrate`): durable ∧ static
 roots from the arena; all other roots via the dynamic chain at first
-need and on growth. Same-device peers own nothing, ever; a peer on a
-different device than its root owns a copy (§2, `owns_nonroot_allocation`).
+need and on growth. Peers own nothing, ever: a root holds one allocation
+per device its set spans (§2).
 
 ## 5. From sets to storage
 
 Aliasing is complete the moment each structural call returns. Storage
-follows in the setup chain (lifecycle.md): `get_exec_info` counts bytes
-per device (roots; and peers on a device other than their root's, which
-own their own copy), `prepare_exec` allocates from the substrates and
-points every wrapper at its storage — own allocation if it has one, else
-`root()->data()`. Regrowth of a root needs no notification: peers re-point
-at their next turn. Cross-device peers are refreshed by the root's
-producer after every launch.
+follows in the setup chain (lifecycle.md): `get_exec_info` registers on
+each root the devices its set spans and counts the root's bytes once per
+such device; `prepare_exec` allocates each root's per-device storage from
+the substrates and points every wrapper at
+`root()->storage_on(own device)`. Regrowth of a root needs no
+notification: peers re-point at their next turn. Non-primary device
+copies are refreshed by the root's producer after every launch.
+
+`tie_outputs` members MUST share the alias's device: producers cannot
+write one storage from two devices. Checked in the members' Components'
+`get_exec_info` (a non-root output whose root's device differs from the
+Component's own — the alias was processed first by its System, so the
+device is known), error naming the tie.
 
 ## 6. Sample
 

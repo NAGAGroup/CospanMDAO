@@ -10,10 +10,14 @@ in this directory. **Every phase is first-release scope.**
 ## Mechanics
 
 - Discussion per phase: dictation and convergence, 0a-style.
-- Every phase close checks three riders: **two-tier test** (abstraction
-  tier AND possibility floor covered), **AD-shadow note** (what this
-  phase's choices imply for phase 7), **modeling-lens sweep** (serves
-  modular modeling, not just compute patterns).
+- Every phase close checks two riders: **two-tier test** (abstraction
+  tier AND possibility floor covered) and **modeling-lens sweep** (serves
+  modular modeling, not just compute patterns). Gradients/AD are NOT
+  discussed before phase 7: an implemented base will inform that design
+  better than foresight. The only AD-related constraints held earlier
+  are the two structural ones in 01.A/01.C (wrapper `value_type` as the
+  sole element spelling; KernelBody as a value-mode template) — cheap
+  now, unrecoverable later.
 - Open items forward-link to the phase that owns them. A genuinely new
   pattern amends the ledger loudly, never silently.
 - `lifecycle.md` is the spine: every framework verb in firing order with
@@ -42,9 +46,9 @@ slabkit (02.A, with tests) → a spike on the load-bearing acpp facts
 both queues, custom operations under retarget) → cospan core in lifecycle
 order (wrappers/metadata → KernelBody + generated device functions →
 Component → System + ExecCtx → Model), with the 01.D sample components and
-an acyclic multi-System model as end-to-end tests. AD-shadow constraints
-(value-mode KernelBody templates, `is_differentiable_v` gating, marks on
-roots) are enforced during implementation even though AD is not built.
+an acyclic multi-System model as end-to-end tests. The two structural
+AD constraints above are enforced during implementation even though AD
+is not built.
 Resident architects (SlabKit, CospanMDAO) are briefed at this point, not
 before. Phases 5–11 resume on the implemented base.
 

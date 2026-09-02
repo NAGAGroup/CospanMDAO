@@ -209,21 +209,26 @@ private:
   structural calls as they happen.
 - **`get_exec_info(parent_device)`** — a Component has no device choice;
   it records `parent_device`, then for each own entry `e`:
-  - `e` is root: count its static bytes on this device.
-  - `e` is a peer: if `root(e)`'s device == this device → nothing (it will
-    read the root); else → count `e`'s bytes (its view size) here, mark
-    `e.owns_nonroot_allocation`, and append `e` to
-    `root(e).needs_memcpy`. (Every root is processed before any peer of
-    it in an acyclic model — Systems process their alias entries before
-    their children, and producers precede consumers. Cycles are a
-    solver-phase construct; their connection ledger owns the exception.)
+  - `e` is root: register this device as its primary; count its static
+    bytes here.
+  - `e` is an input peer: if `root(e)` already has storage registered on
+    this device → nothing; else register this device on `root(e)` and
+    count the root's static bytes here (the root owns one copy per
+    device its set spans — 02.C §2).
+  - `e` is an output peer (only a tied output is one): `root(e)`'s device
+    must equal this device, else ERROR naming the tie — producers cannot
+    write one storage from two devices.
+  (Every root is processed before any peer of it in an acyclic model —
+  Systems process their alias entries before their children, and
+  producers precede consumers. Cycles are a solver-phase construct; their
+  connection ledger owns the exception.)
   - Return `{device: bytes}`.
-- **`prepare_exec`**: allocate every own entry that is (root ∨
-  `owns_nonroot_allocation`) ∧ allocatable now (durable∧static → arena;
-  durable∧dynamic with known shape → dynamic chain) from
-  `substrates[device]`; then point every member wrapper at its storage —
-  own allocation if it has one, else `root()->data()` — and validate
-  static input peers against their roots.
+- **`prepare_exec`**: for every own ROOT allocatable now, one allocation
+  per registered device from that device's substrate (durable∧static →
+  arena; durable∧dynamic with known shape → dynamic chain); then point
+  every member wrapper at `root()->storage_on(this device)` and validate
+  static input peers against their roots. An unconnected input with a
+  `FromSourceDim` dimension errors here.
 - **`compile`**: the device function at the owner's fuse rank if any,
   else native; the individual config; custom-op bodies recorded.
 - **`run_init`**: `init(q)` with the owner's queue retargeted to this
@@ -247,9 +252,9 @@ work and never sees a queue except through the owner's ctx.
 2. **`run_compute_forward()`**: `compute_forward()` — returns the
    description. The owner submits it (01.E §3).
 3. **`run_post_compute(ctx)`**: through `ctx`, after the owner's
-   submission: memcpys from each output root into each `needs_memcpy`
-   peer's own storage. Safe to submit here because the ordering the work
-   depends on already exists.
+   submission: for each output root with storage on other devices,
+   memcpy primary → each. Safe to submit here because the ordering the
+   work depends on already exists.
 
 ## 6. Provided kernels — v1
 

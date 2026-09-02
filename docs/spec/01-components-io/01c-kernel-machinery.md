@@ -39,8 +39,7 @@ namespace naga::cospan {
 /// pointers to a native library on the native stream (CustomOp::h is
 /// the interop handle; CustomOp::to_host/from_host move data through
 /// the native backend for pure host work). Not fusable (no device
-/// function exists). Phase 7: opaque to the engine — analytical adjoint
-/// or FD/CS required when derivatives are requested.
+/// function exists).
 ///
 /// THE SIGNATURE IS THE DECLARATION, four ways:
 ///   * first parameter id<R> vs nd_item<R>  => group semantics opt-in

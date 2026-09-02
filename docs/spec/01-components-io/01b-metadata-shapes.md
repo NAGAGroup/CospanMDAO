@@ -174,8 +174,8 @@ public:
     bool     is_root() const;
     bool     can_be_source() const;  ///< construction-time (02.C §2)
     bool     can_be_target() const;
-    /// Storage ownership and cross-device placement — device(),
-    /// owns_nonroot_allocation(), needs_memcpy() — are declared in 02.C.
+    /// Device placement and per-device root storage — device(),
+    /// storage_on(), storage_devices() — are declared in 02.C.
 
     // ---- capabilities ---------------------------------------------------
 
@@ -199,17 +199,18 @@ public:
     /// after update_shape.
     virtual void validate_connection() const = 0;
 
-    /// Allocation, in prepare_exec, from the owning subsystem's device
-    /// substrate (02.B MemorySubstrate): roots, and peers that own a
-    /// cross-device copy (02.C). Durable ∧ fully-fixed → the arena (its
-    /// bytes are what get_exec_info counted); everything else → the
-    /// dynamic chain at first need.
-    virtual void allocate(MemorySubstrate&) = 0;
+    /// Allocation, in prepare_exec: ROOTS ONLY, one allocation per device
+    /// the set spans, each from that device's substrate (02.C §2).
+    /// Durable ∧ fully-fixed → the arena (its bytes are what
+    /// get_exec_info counted); everything else → the dynamic chain at
+    /// first need.
+    virtual void allocate(Substrates&) = 0;
 
-    /// Point the registered member wrapper at its storage — own
-    /// allocation, else root()->data() (+ view offset) — with shape and
-    /// stride. Called at the end of prepare_exec and after every resize;
-    /// the framework SHALL point before any launch reads wrappers.
+    /// Write {data pointer, shape, stride} into the registered member
+    /// Input/Output wrapper — the pointer being
+    /// root()->storage_on(device()) (+ view offset). This is what makes
+    /// the user's member variable usable; called at the end of
+    /// prepare_exec and after every resize.
     virtual void point_wrapper() = 0;
 };
 
