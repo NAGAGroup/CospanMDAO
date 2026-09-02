@@ -75,6 +75,11 @@ template <class KB> inline constexpr int kernel_rank_v = /* from signature */;
 /// kernel launch) is the body's own business.
 struct CustomOp {
     sycl::interop_handle& h;
+    /// THE ONE PLACE a raw device pointer is obtainable (01.A: wrappers
+    /// never expose one). A custom operation exists to hand memory to
+    /// code outside the framework; this is that door, and it opens only
+    /// inside a custom-op body.
+    template <class W> auto device_ptr(const W& io) -> typename W::value_type*;
     template <class W> auto to_host(const W& in) -> std::vector<typename W::value_type>;
     template <class W> void from_host(W& out, std::span<const typename W::value_type>);
 };

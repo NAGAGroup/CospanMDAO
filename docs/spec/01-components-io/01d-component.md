@@ -338,7 +338,9 @@ struct GemvBody {
     struct Inputs  { Input<DType::f32,2> A; Input<DType::f32,1> x; };
     struct Outputs { Output<DType::f32,1> y; };
     void operator()(CustomOp& op, Inputs in, Outputs out) const {
-        native_gemv(op.h /* interop handle: native stream */, in.A.data_ptr(), ...);
+        native_gemv(op.h /* interop handle: native stream */,
+                    op.device_ptr(in.A), op.device_ptr(in.x), op.device_ptr(out.y),
+                    in.A.shape()[0], in.A.shape()[1]);
     }
 };
 class Gemv : public Component<GemvBody> {

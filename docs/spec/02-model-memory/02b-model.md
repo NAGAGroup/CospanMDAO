@@ -63,8 +63,9 @@ public:
     // ---- host access (between runs) ---------------------------------------------
     /// Views: wrapper ergonomics on the host — shape(), operator[] with
     /// id<Rank> and flat, size(). Constructing a view performs the D2H
-    /// copy of the root on q_in and waits for it (the honest cost, paid
-    /// only where asked). Read-only variants cost no writeback.
+    /// copy of the root on q_in — ordered after both queues' wait lists,
+    /// like every framework submission — and waits for it (the honest
+    /// cost, paid only where asked). Read-only variants cost no writeback.
     template <DType DT, int Rank> HostView<DT, Rank>    view_input (std::string_view path) const;
     template <DType DT, int Rank> HostView<DT, Rank>    view_output(std::string_view path) const;   // read-only
     /// Writable output view: writes land in host staging; written back
