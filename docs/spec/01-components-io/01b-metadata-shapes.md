@@ -162,10 +162,15 @@ public:
     bool is_objective() const;
     /// CONSTRAINT: a design-var entry SHALL NOT be dynamically shaped.
 
-    // ---- aliasing slots (semantics: spec 02/03) -------------------------
-    IOEntry* source() const;         ///< non-null => aliased; data forwarded
-    IOEntry* target() const;
-    bool owns_data() const;          ///< source() == nullptr
+    // ---- the aliasing set (mechanics: spec 02.C) -------------------------
+    /// Every entry belongs to one set with one ROOT (data owner and, for
+    /// outputs, producer); peers are names for and consumers of the
+    /// root's data. There are no source/target links.
+    IOEntry* root();                 ///< self iff is_root()
+    bool     is_root() const;
+    bool     owns_data() const;      ///< == is_root()
+    bool     can_be_source() const;  ///< construction-time (02.C §2)
+    bool     can_be_target() const;
 
     // ---- capabilities ---------------------------------------------------
 
@@ -189,7 +194,7 @@ public:
     /// is_dynamic().
     virtual void validate_connection() const = 0;
 
-    /// Allocation. NO-OP when aliased (owns_data() == false). Durable,
+    /// Allocation. ROOTS ONLY — no-op on peers (02.C). Durable,
     /// fully-fixed entries are bump-allocated at setup — their sizes are
     /// what the model's accumulation pass counts; everything else
     /// allocates via the dynamic chain at first need.

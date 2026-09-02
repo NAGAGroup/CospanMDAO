@@ -200,9 +200,11 @@ public:
     ///   * size compatibility is FLAT-SIZE equality, checked at the
     ///     01.B validation point (setup-checked when both static;
     ///     re-checked each forward when either side dynamic);
-    ///   * EXCLUSIVITY: a connected input cannot be tied or promoted,
-    ///     and a tied or promoted I/O cannot be connected UNDERNEATH
-    ///     its alias — both directions error at the violating call.
+    ///   * ALIASING (mechanics: 02.C): a connection merges the target's
+    ///     set into the source's; connecting through ANY name of a set
+    ///     is the same connection. Promotion is always allowed; ties
+    ///     must precede connections ("tie before connecting, or connect
+    ///     from the alias").
     void connect(std::string_view src_output, std::string_view dst_input);
 
     /// Subarray forms: either endpoint may be a rectangular subarray of
@@ -218,17 +220,16 @@ public:
     // ---- promotion -------------------------------------------------------
 
     /// Lift ONE child I/O into this System's namespace under
-    /// promoted_name. Creates an ALIAS ENTRY on this System — a real
-    /// detail::IOEntry (kind preserved), enumerated by get_inputs()/
-    /// get_outputs(), retrievable by get_input()/get_output(), and
-    /// connectable AT THE PARENT LEVEL under the promoted name (this is
-    /// how wiring recurses up the tree). No data exists on the System:
-    /// the alias entry's source/target chain points at the child's
-    /// entry (owns_data() == false; allocation no-ops — 01.B).
-    void promote_input(std::string_view child_input_path,
-                       std::string promoted_name);
-    void promote_output(std::string_view child_output_path,
-                        std::string promoted_name);
+    /// promoted_name. Kind-agnostic and ALWAYS allowed — including on
+    /// already-connected or already-aliased entries (a higher level may
+    /// always want a name, e.g. probing an adopted System). Creates an
+    /// ALIAS ENTRY on this System — a real detail::IOEntry that joins
+    /// the promoted entry's set as a PEER with a snapshot of the root's
+    /// flags (02.C), enumerated under get_inputs()/get_outputs() by
+    /// those flags, retrievable by get_input()/get_output(), and
+    /// connectable AT THE PARENT LEVEL under the promoted name. No data
+    /// exists on the System: peers own nothing.
+    void promote(std::string_view child_path, std::string promoted_name);
 
     // ---- ties ------------------------------------------------------------
 
@@ -237,7 +238,8 @@ public:
     /// promoted_name feeds every member (e.g. every discipline consuming
     /// the same design vector). Members must agree on value_dtype; flat
     /// sizes validated per 01.B. NEVER inputs with outputs — there is
-    /// no mixed tie, by design.
+    /// no mixed tie, by design. Members must be unconnected (02.C);
+    /// after the tie only the alias is a legal connection target.
     void tie_inputs(std::initializer_list<std::string_view> child_input_paths,
                     std::string promoted_name);
 
@@ -248,7 +250,9 @@ public:
     /// B/C accumulation pattern with no forced copies and no adder
     /// component. The override is the trust model verbatim: the user
     /// asserting the writes cannot conflict (e.g. disjoint index sets)
-    /// takes responsibility with allow_plain.
+    /// takes responsibility with allow_plain. Members must have no
+    /// downstream connections yet (02.C); after the tie only the alias
+    /// is a legal connection source.
     enum class TieOutputsPolicy : uint8_t { require_atomic, allow_plain };
     void tie_outputs(std::initializer_list<std::string_view> child_output_paths,
                      std::string promoted_name,
@@ -282,8 +286,8 @@ public:
 
         tie_inputs({"d1.z", "d2.z"}, "z");       // shared design vector:
                                                  //   one entry, one upstream
-        promote_output("d1.y1", "y1");           // visible to the parent
-        promote_output("d2.y2", "y2");
+        promote("d1.y1", "y1");                  // visible to the parent
+        promote("d2.y2", "y2");
     }
 };
 
@@ -301,12 +305,10 @@ class Top : public System {
 
 Load-bearing from earlier chunks: alias entries are ordinary `IOEntry`s,
 so the enumerability guarantee and `get_input<DT,R>("mda.y1")` hierarchy
-retrieval need no special cases (01.B's RTTI anchor); `owns_data() ==
-false` makes allocation no-op on every alias (01.B); `value_dtype_of`
-compatibility lets an atomic-tied output connect onward to a plain
-consumer input without ceremony (01.A).
+retrieval need no special cases (01.B's RTTI anchor); peers own nothing,
+so allocation is roots-only (02.C); `value_dtype_of` compatibility lets
+an atomic-tied output connect onward to a plain consumer input without
+ceremony (01.A).
 
-Deferred, explicitly: finalize-time alias resolution order (who forwards
-data pointers to whom, when), subarray-of-subarray composition,
-DV/constraint/objective marks on promoted entries, cross-level tie
-interactions.
+Deferred, explicitly: subarray-of-subarray composition,
+DV/constraint/objective marks on promoted entries (spec 03).
