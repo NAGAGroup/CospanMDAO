@@ -1,8 +1,8 @@
 # Spec 03 — Topology semantics & optimization marks
 
-Phase 3. Binding contract; declarations only. Aliasing mechanics: 02.C.
-Structural APIs: 01.E. Amends 01.B/01.D (`declare_input` gains a coverage
-option, §2.4).
+Part of the CospanMDAO specification. Binding contract; declarations
+only. Aliasing mechanics: 02.C. Structural APIs: 01.E. `declare_input`'s
+coverage option: §2.4.
 
 ## 1. The connection spectrum
 
@@ -72,7 +72,7 @@ The mapping System must run after its sources and before whoever reads
 `dst`. The post-setup pass INSERTS it into the owner's child list
 IMMEDIATELY BEFORE the child that contains the consumer (the first path
 segment of `dst`), not at the end. Sources produced by later siblings
-are a feedback loop the model already has; solvers (spec 05) own that,
+are a feedback loop the model already has; solvers own that,
 and the insertion rule does not change it.
 
 ### 2.3 Mapping components
@@ -132,8 +132,8 @@ coverage is checked BY DEFAULT and opted out per input at declaration:
 
 ```cpp
 enum class Coverage : uint8_t { required, optional };
-/// 01.B/01.D amendment — every declare_input form gains a trailing
-/// option (default `required`):
+/// Every declare_input form (01.B/01.D) carries a trailing option
+/// (default `required`):
 template <DType DT, int Rank, DimSpec... Specs>
     requires(sizeof...(Specs) == Rank)
 void declare_input(Input<DT, Rank>& m, std::string name, Specs... specs,
@@ -173,7 +173,7 @@ namespace naga::cospan {
 /// Per-element or scalar bounds/scaling; host-side vectors sized to the
 /// marked region's flat size (scalar forms broadcast).
 struct Bounds  { std::optional<std::vector<double>> lower, upper; };
-struct Scaling { std::vector<double> ref{1.0}, ref0{0.0}; };   ///< semantics: spec 09/11
+struct Scaling { std::vector<double> ref{1.0}, ref0{0.0}; };   ///< semantics: with the optimizers
 
 class System {   // ...continued
 public:
@@ -201,7 +201,7 @@ public:
                        std::optional<SubarrayRef> region = {});
 };
 
-/// Model-level enumeration — the contract an optimizer (spec 09) reads.
+/// Model-level enumeration — the contract an optimizer reads.
 /// Order = declaration order, depth-first.
 class Model {   // ...continued from 02.B
 public:

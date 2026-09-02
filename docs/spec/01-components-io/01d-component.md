@@ -1,6 +1,6 @@
 # Spec 01.D — Subsystem and Component
 
-Part of the phase-1 spec (`docs/spec/01-components-io/`). Binding contract;
+Part of the CospanMDAO specification. Binding contract;
 declarations only. Wrappers: 01.A. Metadata/shapes: 01.B. Kernel
 machinery: 01.C. System: 01.E. The end-to-end lifecycle: `lifecycle.md`.
 
@@ -220,7 +220,7 @@ private:
     write one storage from two devices.
   (Every root is processed before any peer of it in an acyclic model —
   Systems process their alias entries before their children, and
-  producers precede consumers. Cycles are a solver-phase construct; their
+  producers precede consumers. Cycles arrive with solvers; their
   connection ledger owns the exception.)
   - Return `{device: bytes}`.
 - **`prepare_exec`**: for every own ROOT allocatable now, one allocation

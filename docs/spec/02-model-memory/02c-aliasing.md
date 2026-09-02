@@ -1,8 +1,8 @@
 # Spec 02.C — aliasing
 
-Phase-2 chunk C. Binding contract; declarations only. Amends 01.B's
-IOEntry (source/target slots are REPLACED by what follows) and gives 01.E's
-structural APIs their mechanics. Storage follows the setup chain in
+Part of the CospanMDAO specification. Binding contract; declarations
+only. Completes 01.B's IOEntry and gives 01.E's structural APIs their
+mechanics. Storage follows the setup chain in
 `lifecycle.md`.
 
 ## 1. The model: one relation, root + peers

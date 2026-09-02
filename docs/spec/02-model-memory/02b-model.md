@@ -1,6 +1,6 @@
 # Spec 02.B — Model
 
-Phase-2 chunk B. Binding contract; declarations only. Memory objects:
+Part of the CospanMDAO specification. Binding contract; declarations only. Memory objects:
 slabkit 02.A. Aliasing: 02.C. Subsystem verbs: 01.D. System: 01.E. The
 full end-to-end walk: `lifecycle.md`.
 

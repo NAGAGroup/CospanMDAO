@@ -1,6 +1,6 @@
 # Spec 01.C — kernel machinery
 
-Part of the phase-1 spec (`docs/spec/01-components-io/`). Binding contract;
+Part of the CospanMDAO specification. Binding contract;
 declarations only. Wrappers: 01.A. Metadata/shapes: 01.B. Component: 01.D.
 System-side execution: 01.E.
 
@@ -52,7 +52,7 @@ namespace naga::cospan {
 /// Inputs, Outputs, KB itself, and Scratch (if present) SHALL be
 /// trivially copyable — concept-enforced; they are copied byte-wise
 /// into the launch's device streams.
-/// REQUIREMENT (phase-7 keystone): KB SHALL be a template over its value
+/// REQUIREMENT (the AD keystone): KB SHALL be a template over its value
 /// mode, using wrapper `value_type` exclusively in the body. Opt-out:
 /// components supplying an analytical adjoint.
 template <class KB> concept PlainBody   = /* operator()(id<R>, In, Out) */;

@@ -1,6 +1,6 @@
 # Spec 04 — System types: the extension contract, by example
 
-Phase 4. Binding contract; declarations only. The base System, Parallel and
+Part of the CospanMDAO specification. Binding contract; declarations only. The base System, Parallel and
 Fused: 01.E. Systems never do work — a System type alters ORCHESTRATION
 (what runs, when, on which queue), never compute. Work is a Component's,
 including custom operations on the same queue (01.C §1).
@@ -109,4 +109,4 @@ Observation is path resolution and enumeration, nothing more:
 `get_subsystem("subs1.subs2")` as the chaining convenience; every
 Subsystem exposes `get_inputs()` / `get_outputs()` (01.B enumerability
 guarantee) and a System exposes its children. Recorders, listings and
-renderers are built over these calls in spec 10.
+renderers are built over these calls and nothing else.

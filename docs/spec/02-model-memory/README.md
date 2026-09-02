@@ -1,6 +1,6 @@
 # Spec 02 — Model & memory
 
-Phase-2 chunks:
+Documents:
 
 - **02.A slabkit surface** — lives in slabkit's repo, which owns it:
   `slabkit/docs/spec/02a-slabkit-surface.md` (arena/pool memory objects,

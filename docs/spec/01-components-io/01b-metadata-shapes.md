@@ -1,6 +1,6 @@
 # Spec 01.B — I/O metadata, shape derivation, declaration API
 
-Part of the phase-1 spec (`docs/spec/01-components-io/`). Binding contract;
+Part of the CospanMDAO specification. Binding contract;
 declarations only. Wrapper types: 01.A. Kernel machinery: 01.C.
 
 ## Rank is authoritative
@@ -218,7 +218,7 @@ public:
 /// OutputEntry holds Output<DT,Rank>* plus the owning data handle
 /// (slabkit::unique_device_ptr<std::byte[]> + capacity, 02.A/02.C).
 /// DIFFERENTIABLE dtypes additionally reserve a gradient allocation slot
-/// (same dtype and shape, populated under phase-7 policy); the slot's
+/// (same dtype and shape, populated under the AD policy); the slot's
 /// declarations do not exist for data-tier dtypes.
 template <DType DT, int Rank> class InputEntry  final : public IOEntry { /* ... */ };
 template <DType DT, int Rank> class OutputEntry final : public IOEntry { /* ... */ };
@@ -242,7 +242,7 @@ template <DType DT, int Rank> class OutputEntry final : public IOEntry { /* ... 
 ## Samples
 
 ```cpp
-// The 25x100 -> 100x5x5 reshape from the design discussion:
+// A 25x100 source consumed as 100x5x5:
 Input<DType::f32, 3> reshaped;
 declare_input(reshaped, "reshaped_input", FromSourceDim{1}, 5, 5);
 

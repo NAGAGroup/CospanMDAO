@@ -5,9 +5,9 @@ order it fires, with the state that exists after each. Binding contract.
 Cast: Model (02.B) · Subsystem verbs (01.D §1) · System and ExecCtx (01.E)
 · Component (01.D) · IOEntry sets (02.C) · slabkit memory (02.A).
 
-**Assumption stated once:** the model is ACYCLIC through phase 4. Cycles are
-a solver-phase construct (05); the connection ledger that records them is
-where any ordering exception below will live.
+**Assumption stated once:** the model is ACYCLIC. Cycles arrive with
+solvers; the connection ledger that records them is where any ordering
+exception below lives.
 
 ---
 

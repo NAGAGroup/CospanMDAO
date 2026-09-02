@@ -1,6 +1,6 @@
 # Spec 01.E — System: execution context, orchestration, structural APIs
 
-Part of the phase-1 spec (`docs/spec/01-components-io/`). Binding contract;
+Part of the CospanMDAO specification. Binding contract;
 declarations only. Subsystem verbs and Component: 01.D. Aliasing mechanics:
 02.C. Topology semantics: 03. Flavors beyond Parallel/Fused: 04. The
 end-to-end lifecycle: `lifecycle.md`.
@@ -250,7 +250,7 @@ public:
         auto& d1 = add_subsystem<Discipline1>("d1");
         auto& d2 = add_subsystem<Discipline2>("d2");
         connect("d1.y1", "d2.y1_in");
-        connect("d2.y2", "d1.y2_in");            // the cycle: solvers (spec 05)
+        connect("d2.y2", "d1.y2_in");            // the cycle: needs a solver
         tie_inputs({"d1.z", "d2.z"}, "z");
         promote("d1.y1", "y1");  promote("d2.y2", "y2");
     }
