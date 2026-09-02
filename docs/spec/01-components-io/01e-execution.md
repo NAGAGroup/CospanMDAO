@@ -42,6 +42,15 @@ struct Queues { sycl::queue* q_in; sycl::queue* q_ooo; };
 struct MemorySubstrate { slabkit::DeviceArena arena; std::optional<slabkit::DevicePool> pool; };
 using  Substrates = std::unordered_map<sycl::device, MemorySubstrate>;
 
+/// What a submission consumes (01.D LaunchDescription::submit): the
+/// queue, the dependency snapshot, and the CG properties to attach.
+struct SubmitTarget { sycl::queue& q; std::span<const sycl::event> pending;
+                      sycl::device retarget; std::optional<size_t> lane; };
+/// What a fused owner reads off a kernel description (01.D): the facts it
+/// validates and the parts it packs.
+struct KernelParts { int rank; bool group_body; bool has_scratch;
+                     const StageRecord& record; /* input/output/body streams */ };
+
 } // namespace naga::cospan
 ```
 
@@ -62,9 +71,12 @@ public:
     virtual void init(sycl::queue& q) {}        ///< runs AFTER children's; override by path
     virtual void pre_forward() {}
 
-    // ---- Model's entry --------------------------------------------------------
-    /// Model knows its root is a System. forward() == run_compute_forward()
-    /// (no pre/post-compute exists for the root).
+    // ---- Model's entries ------------------------------------------------------
+    /// Model knows its root is a System and has no ctx of its own, so the
+    /// root supplies its own: init_tree() == run_init(ctx_);
+    /// forward() == run_compute_forward() (no pre/post-compute exists for
+    /// the root).
+    void init_tree();
     void forward();
 
     // ---- initializers by path (legal inside init() only) ----------------------
@@ -149,7 +161,7 @@ namespace naga::cospan {
 namespace property {
     struct device        { sycl::device dev; };            // placement; inherited when absent
     struct parallel      {};                               // flavor
-    struct fused         { Fused::Mode mode; int rank = 1; std::optional<sycl::range<3>> wg; };
+    struct fused         { FusedSystem::Mode mode; int rank = 1; std::optional<sycl::range<3>> wg; };
 }
 // Gating, counting and change detection are custom System TYPES (spec
 // 04), added with the templated overload — not properties.

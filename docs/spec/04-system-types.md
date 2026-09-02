@@ -109,4 +109,4 @@ Observation is path resolution and enumeration, nothing more:
 `get_subsystem("subs1.subs2")` as the chaining convenience; every
 Subsystem exposes `get_inputs()` / `get_outputs()` (01.B enumerability
 guarantee) and a System exposes its children. Recorders, listings and
-renderers are built over these calls in spec 09.
+renderers are built over these calls in spec 10.

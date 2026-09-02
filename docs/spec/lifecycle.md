@@ -97,7 +97,7 @@ in order. Fused and Parallel legality is NOT checked here — it is checked
 each forward on the descriptions the children return (cheap, host-side,
 and it is where the information is).
 
-### 2.6 Init — `root.run_init()`
+### 2.6 Init — `root.init_tree()`
 
 `System`: children in order, then `init(q)`. `Component`: `init(q)`. `q` is
 `q_in` retargeted to the subsystem's device. Post-order means an owner's

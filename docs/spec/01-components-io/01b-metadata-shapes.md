@@ -45,11 +45,11 @@ struct FromInputDim  { std::string_view input; uint8_t dim; };
 
 /// This dimension's extent = the VALUE of element `index` (flat) of
 /// sibling input `input`. The source SHALL have an integer value dtype.
-/// The read happens in the declaring Component's own pre-forward
-/// codepath: a temporary host variable, one device-to-host copy
-/// (synchronizing on the producer's queue), used, discarded. Nothing
-/// persistent exists anywhere; only entries using FromInput ever pay the
-/// copy. Orchestration is Component-local, always.
+/// The read happens in the declaring Component's own run_pre_compute
+/// (01.D §5): a device-to-host copy into the DimRecord's dim_scratch, a
+/// custom operation applying the resize, one wait on that operation's
+/// event. Only entries using FromInput ever pay it. Orchestration is
+/// Component-local, always; no producer knows its consumers.
 struct FromInput { std::string_view input; size_t index; };
 
 template <class T>
@@ -97,15 +97,17 @@ void declare_output(Output<DT, Rank>& member, std::string name,
 /// Whole-shape overloads accepting the from_input_array marker alone.
 template <DType DT, int Rank>
 void declare_input(Input<DT, Rank>& member, std::string name,
-                   /* from_input_array marker */, Lifetime life = Lifetime::durable);
+                   /* from_input_array marker */, Lifetime life = Lifetime::durable,
+                   Coverage cov = Coverage::required);
 template <DType DT, int Rank>
 void declare_output(Output<DT, Rank>& member, std::string name,
                     /* from_input_array marker */, Lifetime life = Lifetime::durable);
 
 /// The escape hatch — and the ONLY resize spelling. Resolves the entry by
-/// the member's registered ADDRESS (the member-address map). Legal ONLY during the pre-forward step;
-/// it uses the same underlying setter as automatic derivation, and a
-/// manual call runs after the automatic pass, so it wins by ordering.
+/// the member's registered ADDRESS (the member-address map). Legal ONLY
+/// inside the pre_forward() hook; it uses the same underlying setter as
+/// automatic derivation, and the hook runs after the automatic pass, so
+/// it wins by ordering.
 /// (Users deriving shapes manually SHOULD declare fixed extents to avoid
 /// a redundant automatic update.)
 template <DType DT, int Rank>
@@ -138,7 +140,8 @@ struct DimRecord {
 /// per declaration, owned by the declaring Component/System in a
 /// name-keyed map. The virtual base is the RTTI anchor: typed retrieval
 /// (get_input<DT,Rank>) dynamic_casts the entry; hierarchy resolution
-/// (spec 04) is a chain of ordinary lookups ending here.
+/// (04 §3: get_subsystem chaining) is a chain of ordinary lookups ending
+/// here.
 class IOEntry {
 public:
     virtual ~IOEntry();
@@ -169,16 +172,17 @@ public:
     /// root's data. There are no source/target links.
     IOEntry* root();                 ///< self iff is_root()
     bool     is_root() const;
-    bool     owns_data() const;      ///< == is_root()
     bool     can_be_source() const;  ///< construction-time (02.C §2)
     bool     can_be_target() const;
+    /// Storage ownership and cross-device placement — device(),
+    /// owns_nonroot_allocation(), needs_memcpy() — are declared in 02.C.
 
     // ---- capabilities ---------------------------------------------------
 
     /// Automatic shape update: applies the DimRecords. Invoked by the
-    /// OWNING COMPONENT in its pre-forward codepath, BEFORE connection
-    /// validation. FromInput reads happen here via the ephemeral host
-    /// temp described above.
+    /// OWNING COMPONENT in run_pre_compute, BEFORE connection validation.
+    /// FromInput dims are resolved there first (D2H into dim_scratch,
+    /// custom-op resize, one wait — 01.D §5).
     virtual void update_shape() = 0;
 
     /// Resize (automatic derivation and user reshape share this path).
@@ -188,31 +192,33 @@ public:
     /// extents describe the logical shape.
     virtual void reshape(sycl::range<3> new_extents) = 0;
 
-    /// Connection validation — INPUTS ONLY, against the upstream entry:
+    /// Connection validation — INPUT PEERS ONLY, against root():
     /// FLAT-SIZE equality (rank and per-dim extents are free to differ
-    /// across a connection); subarray connections compare subarray sizes.
-    /// Runs AFTER update_shape; re-runs every forward when either side
-    /// is_dynamic().
+    /// across a connection); slice connections compare the view's size.
+    /// Static pairs once, in prepare_exec; dynamic pairs every forward
+    /// after update_shape.
     virtual void validate_connection() const = 0;
 
-    /// Allocation. ROOTS ONLY — no-op on peers (02.C). Durable,
-    /// fully-fixed entries are bump-allocated at setup — their sizes are
-    /// what the model's accumulation pass counts; everything else
-    /// allocates via the dynamic chain at first need.
-    virtual void allocate(/* pool handles — exact types: spec 02 */) = 0;
+    /// Allocation, in prepare_exec, from the owning subsystem's device
+    /// substrate (02.B MemorySubstrate): roots, and peers that own a
+    /// cross-device copy (02.C). Durable ∧ fully-fixed → the arena (its
+    /// bytes are what get_exec_info counted); everything else → the
+    /// dynamic chain at first need.
+    virtual void allocate(MemorySubstrate&) = 0;
 
-    /// Push current {data, shape, stride} into the registered member
-    /// wrapper. The wrapper is stale until sync'd; the framework SHALL
-    /// sync before any bind (spec 01.C) reads wrappers.
-    virtual void sync_wrapper() = 0;
+    /// Point the registered member wrapper at its storage — own
+    /// allocation, else root()->data() (+ view offset) — with shape and
+    /// stride. Called at the end of prepare_exec and after every resize;
+    /// the framework SHALL point before any launch reads wrappers.
+    virtual void point_wrapper() = 0;
 };
 
 /// Typed leaves. InputEntry holds Input<DT,Rank>* to the member variable;
-/// OutputEntry holds Output<DT,Rank>* plus the owning data handle (RAII
-/// smart pointer from slabkit — exact type: spec 02). DIFFERENTIABLE
-/// dtypes additionally reserve a gradient allocation slot (same dtype and
-/// shape, populated under phase-8 policy); the slot's declarations do not
-/// exist for data-tier dtypes.
+/// OutputEntry holds Output<DT,Rank>* plus the owning data handle
+/// (slabkit::unique_device_ptr<std::byte[]> + capacity, 02.A/02.C).
+/// DIFFERENTIABLE dtypes additionally reserve a gradient allocation slot
+/// (same dtype and shape, populated under phase-7 policy); the slot's
+/// declarations do not exist for data-tier dtypes.
 template <DType DT, int Rank> class InputEntry  final : public IOEntry { /* ... */ };
 template <DType DT, int Rank> class OutputEntry final : public IOEntry { /* ... */ };
 

@@ -53,7 +53,7 @@ namespace naga::cospan {
 /// Inputs, Outputs, KB itself, and Scratch (if present) SHALL be
 /// trivially copyable — concept-enforced; they are copied byte-wise
 /// into the launch's device streams.
-/// REQUIREMENT (phase-8 keystone): KB SHALL be a template over its value
+/// REQUIREMENT (phase-7 keystone): KB SHALL be a template over its value
 /// mode, using wrapper `value_type` exclusively in the body. Opt-out:
 /// components supplying an analytical adjoint.
 template <class KB> concept PlainBody   = /* operator()(id<R>, In, Out) */;
@@ -67,7 +67,25 @@ template <class KB> concept KernelBodyC =
     (int(PlainBody<KB>) + int(GroupBody<KB>) + int(CustomOpBody<KB>) == 1);
 template <class KB> inline constexpr int kernel_rank_v = /* from signature */;
 
+/// What a custom-operation body receives: the interop handle (native
+/// queue/stream/device of the device this submission was retargeted to)
+/// and two helpers for pure host work — device USM is not host-
+/// dereferenceable, so data moves through the native backend on h's
+/// stream. Anything else (a library call on the native stream, a native
+/// kernel launch) is the body's own business.
+struct CustomOp {
+    sycl::interop_handle& h;
+    template <class W> auto to_host(const W& in) -> std::vector<typename W::value_type>;
+    template <class W> void from_host(W& out, std::span<const typename W::value_type>);
+};
+
+} // namespace naga::cospan
+```
+
 ## 2. Local<DT, Rank> — local memory with wrapper ergonomics
+
+```cpp
+namespace naga::cospan {
 
 /// Same accessor discipline as Output (bare references; plain dtypes
 /// only in v1), but the storage is GROUP-LOCAL and the wrapper carries a
@@ -98,7 +116,13 @@ private:
     friend struct detail::ScratchLayout;
 };
 
+} // namespace naga::cospan
+```
+
 ## 3. StageRecord and FnOffsetInfo
+
+```cpp
+namespace naga::cospan {
 
 /// One StageRecord per stage per launch, fixed-size, packed into a
 /// device array in EXECUTION ORDER. Field ownership:
@@ -130,9 +154,15 @@ struct FnOffsetInfo {
     const StageRecord& next() { return records[i++]; }
 };
 
+} // namespace naga::cospan
+```
+
 ## 4. The generated device function — one per (KernelBody type, rank)
 
-/// compile_kernel() (01.D) emits, for KB at launch rank R:
+```cpp
+namespace naga::cospan {
+
+/// Component::compile() (01.D) emits, for KB at launch rank R:
 SYCL_EXTERNAL void kb_fn(sycl::nd_item<R> it, FnOffsetInfo& info,
                          const std::byte* inputs, std::byte* outputs,
                          const std::byte* bodies, std::byte* local_base)
@@ -186,7 +216,13 @@ SYCL_EXTERNAL void kb_fn(sycl::nd_item<R> it, FnOffsetInfo& info,
     }
 }
 
+} // namespace naga::cospan
+```
+
 ## 5. The chained executor
+
+```cpp
+namespace naga::cospan {
 
 /// Placeholders — one per launch rank; declarations only, JIT replaces.
 /// Three families cost nothing at rest: SSCP lowers a codepath on first
@@ -208,10 +244,10 @@ q.submit([&](sycl::handler& cgh){
         }));
 });
 
-/// MECHANISM. cfg is built ONCE, at setup — there is NO runtime config
-/// cache: an individual component's config (define(entry_id, fn_id))
-/// never changes, and a FusedSystem's sequence config is built at ITS
-/// setup because fuse membership is static.
+/// MECHANISM. cfg is built ONCE, in the compile step — there is NO
+/// runtime config cache: an individual component's config
+/// (define(entry_id, fn_id)) never changes, and a FusedSystem's sequence
+/// config is built in ITS compile because fuse membership is static.
 ///   individual:  cfg.define(kb_entry_rR_id, kb_fn_id);
 ///   fused wave:  cfg.define_as_call_sequence(kb_entry_rR_id,
 ///                    {fn_A_id, fn_B_id, barrier_id, fn_C_id, ...});
@@ -254,9 +290,9 @@ q.submit([&](sycl::handler& cgh){
   override per launch; FUSED rank and wg are set at SYSTEM level,
   component wg intent ignored inside a fuse.
 - Rank agreement in a fuse: an nd_item stage whose rank differs from the
-  wave's rank is a hard error at fuse assembly; id-only stages are
-  rank-exempt (their device function is generated lazily for the wave's
-  rank; SSCP lowers only what is invoked).
+  wave's rank is a hard error, checked on the descriptions each forward
+  (01.E §5); id-only stages are rank-exempt (their device function is
+  generated for the wave's rank; SSCP lowers only what is invoked).
 - Padding and extents are counted in WHOLE WORK-GROUPS: individual = the
   stage's own group count; fused-sequential = max stage group count;
   fused-parallel = Σ stage group counts with group_offset the prefix
@@ -269,7 +305,7 @@ q.submit([&](sycl::handler& cgh){
 ## 7. Dynamic shapes and the pipeline
 
 - **Resolution is just-in-time.** A Component resolves shapes in
-  run_pre_forward at its own turn in depth-first order — upstream has
+  run_pre_compute at its own turn in depth-first order — upstream has
   completed by construction. Static models pay nothing anywhere in this
   section.
 - **FromInput resizes are the consumer's own business.** In its
@@ -284,9 +320,10 @@ q.submit([&](sycl::handler& cgh){
   wave's geometry needs every stage's extent before the wave launches; a
   stage whose shape derives, through any determiner-or-connection chain,
   from data computed by another stage of the same fuse is an
-  impossibility, not a trust question. Detected at fuse assembly from
-  metadata; the error names the crossing chain. USERS SPLIT THEIR
-  FUSEDSYSTEMS AT DYNAMIC-SHAPE BOUNDARIES.
+  impossibility, not a trust question. Detected from metadata each
+  forward alongside the other wave checks (01.E §5); the error names the
+  crossing chain. USERS SPLIT THEIR FUSEDSYSTEMS AT DYNAMIC-SHAPE
+  BOUNDARIES.
 - **ParallelSystem: no cross-sibling shape dependencies — hard error.**
   A child's shape reading a sibling's output (by value or shape) is a
   data dependency, contradicting the independence the user asserted by

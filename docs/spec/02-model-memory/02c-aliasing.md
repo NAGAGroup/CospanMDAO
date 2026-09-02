@@ -1,8 +1,9 @@
-# Spec 02.C — aliasing and the finalize pass
+# Spec 02.C — aliasing
 
 Phase-2 chunk C. Binding contract; declarations only. Amends 01.B's
 IOEntry (source/target slots are REPLACED by what follows) and gives 01.E's
-structural APIs their mechanics.
+structural APIs their mechanics. Storage follows the setup chain in
+`lifecycle.md`.
 
 ## 1. The model: one relation, root + peers
 
@@ -18,9 +19,8 @@ There are no source/target links. Everything they would carry is a
 property of the set: the root is the producer; each input peer is a
 consumer; connection validation is each input peer against its root; a
 subarray connection is a fact on the input peer ("which part of the root
-I see"); `FromInput` (01.B) registers the consumer's DimRecord with its
-input's root; later cycle analysis is a graph over components through
-root ownership.
+I see"); later cycle analysis is a graph over components through root
+ownership.
 
 ## 2. Aliasing rules: two-level check, construction-time flags
 
@@ -65,12 +65,14 @@ public:
 
     // ---- capabilities (01.B, restated against the set) ------------------
     /// validate_connection: INPUT PEERS ONLY, against root() — flat-size
-    /// (or view() subarray size) equality; after update_shape; every
-    /// forward when either side is_dynamic().
-    /// allocate(Model::MemoryTargets&): ROOTS ONLY; no-op on peers.
-    /// sync_wrapper: reads root()->data() (+ view() offset/stride) into
-    /// the member wrapper — which is why root regrowth needs no
-    /// notification: every peer re-reads at its next sync.
+    /// (or view() subarray size) equality; static pairs once in
+    /// prepare_exec, dynamic pairs every forward after update_shape.
+    /// allocate(MemorySubstrate&): roots, and peers that own a cross-
+    /// device copy; no-op otherwise.
+    /// point_wrapper: own storage, else root()->data() (+ view()
+    /// offset/stride) into the member wrapper — which is why root
+    /// regrowth needs no notification: every peer re-points at its next
+    /// turn.
 
 private:
     IOEntry*              root_  = this;
@@ -139,23 +141,24 @@ registered in that System or a Component's declared entry.
 
 ## 4. What owns memory
 
-Every entry that is a root at finalize owns storage — including
-unconnected inputs and unconnected `tie_inputs` aliases: that is how
-top-level design variables and shared inputs get memory with no
-IndepVarComp. Route by lifetime (02.B `MemoryTargets`): durable ∧ static
+Every entry that is a root once declaration completes owns storage —
+including unconnected inputs and unconnected `tie_inputs` aliases: that
+is how top-level design variables and shared inputs get memory with no
+IndepVarComp. Route by lifetime (02.B `MemorySubstrate`): durable ∧ static
 roots from the arena; all other roots via the dynamic chain at first
-need and on growth. Peers own nothing, ever.
+need and on growth. Same-device peers own nothing, ever; a peer on a
+different device than its root owns a copy (§2, `owns_nonroot_allocation`).
 
 ## 5. From sets to storage
 
 Aliasing is complete the moment each structural call returns. Storage
 follows in the setup chain (lifecycle.md): `get_exec_info` counts bytes
 per device (roots; and peers on a device other than their root's, which
-own their own copy), `prepare_exec` allocates from the substrates, and the
-sync step points every wrapper at its storage — own allocation if it has
-one, else `root()->data()`. Regrowth of a root needs no notification:
-peers re-read at their next sync. Cross-device peers are refreshed by the
-root's producer after every launch.
+own their own copy), `prepare_exec` allocates from the substrates and
+points every wrapper at its storage — own allocation if it has one, else
+`root()->data()`. Regrowth of a root needs no notification: peers re-point
+at their next turn. Cross-device peers are refreshed by the root's
+producer after every launch.
 
 ## 6. Sample
 

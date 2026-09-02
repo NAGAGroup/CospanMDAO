@@ -45,22 +45,22 @@ enum class DType : uint8_t {
 //     detail::IOEntry) is the sole writer of wrapper fields, via
 //     friendship. User code never sees a pointer.
 //   * `value_type` is the ONLY element-type spelling kernel bodies may
-//     use — the scalar-genericity keystone: phase 8 re-instantiates the
-//     same bodies at derivative-carrying value types with no user-code
-//     change.
+//     use — the scalar-genericity keystone: phase 7 (AD) re-instantiates
+//     the same bodies at derivative-carrying value types with no
+//     user-code change.
 //   * Rank is 1..3. Indexing accepts sycl::id<Rank> and flat size_t;
 //     flat indexing is row-major over shape().
 //   * stride() is the element step per dimension in the OWNING
 //     allocation: subarray-aliased views (spec 03) are a metadata act,
 //     never a wrapper variant.
 //   * Wrappers carry primal data only. Gradient access arrives in
-//     phase 8 as separate wrapper forms instantiated at the same
+//     phase 7 as separate wrapper forms instantiated at the same
 //     declaration sites; the metadata layer reserves the slots.
 
 /// Input<DT, Rank> — read-only view. THE INPUT CONTRACT: a kernel SHALL
 /// NOT be able to write through an Input — all access is const-reference.
-/// Load-bearing twice: ImplicitComponent's no-aliasing design and
-/// phase-8 AD purity both assume it. Atomic dtypes are ill-formed on
+/// Load-bearing twice: ImplicitComponent's no-aliasing design (05) and
+/// phase-7 AD purity both assume it. Atomic dtypes are ill-formed on
 /// Input: atomicity governs write collision, and Inputs cannot write.
 template <DType DT, int Rank>
     requires(!is_atomic_v<DT>)
@@ -87,7 +87,8 @@ private:
 /// per instantiation, selected by the dtype:
 ///   * plain dtypes  -> bare mutable references ONLY. No atomic access
 ///     exists on the type; a plain Output in a colliding-write role is a
-///     model error the tie/fusion checks catch (spec 03/05).
+///     model error the tie check (02.C) and the fused-parallel
+///     producer-consumer check (01.E) catch.
 ///   * atomic dtypes -> sycl::atomic_ref (relaxed, device scope) ONLY.
 ///     No bare reference is obtainable — a kernel CANNOT forget
 ///     atomicity, by construction. Reads are atomic_ref::load().
@@ -135,7 +136,7 @@ static_assert(std::is_trivially_copyable_v<Output<DType::atomic_f32, 1>>);
   `value_dtype_of`; the atomic modifier never blocks aliasing — it changes
   which accessor discipline each side compiles against.
 - `tie_outputs` requires the atomic modifier on member outputs by default
-  (overridable) — spec 03 owns the rule; the dtype system here is what
+  (overridable) — 02.C owns the rule; the dtype system here is what
   makes it checkable.
-- DVs, constraints and objectives are metadata marks (spec 01.B / 03);
+- DVs, constraints and objectives are metadata marks (01.B / 03);
   nothing in the wrapper layer knows about them.

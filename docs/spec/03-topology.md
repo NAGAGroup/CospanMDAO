@@ -58,8 +58,8 @@ pattern is exactly this convention; no dedicated type exists.
 - **Each subsequent computed connection on `dst`**: check the new `dst`
   region against every recorded region — overlap is an error naming
   both connections — then add another mapping component.
-- **Post-setup pass** (end of the owning System's `setup`, before
-  finalize): for each mapping System — `tie_outputs` over all mapping
+- **Post-setup pass** (end of the owning System's `run_setup`, after its
+  `setup()` hook returns): for each mapping System — `tie_outputs` over all mapping
   components' outputs (each is full-dst-shaped) with
   `TieOutputsPolicy::allow_plain`, invoked BY THE FRAMEWORK: it holds
   the disjointness proof, so it is the party entitled to the override
@@ -174,7 +174,7 @@ namespace naga::cospan {
 /// Per-element or scalar bounds/scaling; host-side vectors sized to the
 /// marked region's flat size (scalar forms broadcast).
 struct Bounds  { std::optional<std::vector<double>> lower, upper; };
-struct Scaling { std::vector<double> ref{1.0}, ref0{0.0}; };   ///< semantics: spec 10
+struct Scaling { std::vector<double> ref{1.0}, ref0{0.0}; };   ///< semantics: spec 09/11
 
 class System {   // ...continued
 public:
@@ -202,9 +202,9 @@ public:
                        std::optional<SubarrayRef> region = {});
 };
 
-/// Model-level enumeration — the contract an optimizer reads. Order =
-/// declaration order, depth-first. The gradient slot lands here in
-/// phase 7.
+/// Model-level enumeration — the contract an optimizer (spec 09) reads.
+/// Order = declaration order, depth-first. The gradient slot lands here
+/// in phase 7.
 class Model {   // ...continued from 02.B
 public:
     struct MarkRecord {

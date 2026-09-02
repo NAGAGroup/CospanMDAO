@@ -1,4 +1,4 @@
-# Spec 02 — Model, memory & finalize
+# Spec 02 — Model & memory
 
 Phase-2 chunks:
 

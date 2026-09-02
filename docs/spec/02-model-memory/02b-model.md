@@ -49,7 +49,7 @@ public:
     ///   3. substrates[d] = { DeviceArena(bytes[d]), pool iff configured }
     ///   4. root.prepare_exec(queues, substrates) — allocate, point wrappers; ExecCtx complete
     ///   5. root.compile()                        — bodies
-    ///   6. root.run_init()                       — children before owners
+    ///   6. root.init_tree()                      — children before owners
     /// After setup the model's STATE is not yet meaningful: it holds
     /// initialization. State is defined after the first forward.
     void setup();
@@ -114,7 +114,7 @@ private:
 ```cpp
 auto model = create_model<Top>(ModelConfig{});          // default device, no pools
 model.setup();                                          // declare → exec-info → substrates
-                                                        //   → prepare → compile → init → wire → sync
+                                                        //   → prepare → compile → init
 model.set_input<DType::f64, 1>("mda.z", {{1.0, 2.0}});  // drive a free input
 model.forward();  model.wait();                         // enqueue; wait when results are wanted
 
