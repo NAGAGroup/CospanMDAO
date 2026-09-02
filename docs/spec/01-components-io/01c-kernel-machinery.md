@@ -272,13 +272,14 @@ q.submit([&](sycl::handler& cgh){
   run_pre_forward at its own turn in depth-first order — upstream has
   completed by construction. Static models pay nothing anywhere in this
   section.
-- **FromInput reads never flush the queue.** Each DimRecord carries a
-  tiny always-valid host destination (`dim_scratch`, 01.B). The
-  PRODUCING Component's post_launch enqueues the device-to-host copy
-  into the consumer's dim_scratch (links fixed at finalize). The
-  consumer applies the value at its own shape update after the copy's
-  event completes — almost always already true. The wait, when it
-  happens, is an event wait, never a queue drain.
+- **FromInput resizes are the consumer's own business.** In its
+  `run_pre_compute`, the consuming Component enqueues the D2H of the
+  driving input into the entry's `dim_scratch`, then a custom operation
+  (depending on that event) that applies the resize on the host —
+  reallocating through the OS route from inside the custom-op body if
+  grown — and waits on that custom op's event: the one forced sync, so
+  the launch geometry is known at enqueue. Nothing is registered
+  anywhere; no producer knows its consumers.
 - **FusedSystem: no intra-fuse shape dependencies — hard error.** A
   wave's geometry needs every stage's extent before the wave launches; a
   stage whose shape derives, through any determiner-or-connection chain,

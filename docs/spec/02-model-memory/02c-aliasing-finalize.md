@@ -62,7 +62,6 @@ public:
     /// own nothing and read root()->data().
     bool owns_nonroot_allocation() const;
     std::span<IOEntry* const> needs_memcpy() const;   ///< roots only
-    uint64_t version() const;                          ///< spec 04
 
     // ---- capabilities (01.B, restated against the set) ------------------
     /// validate_connection: INPUT PEERS ONLY, against root() — flat-size

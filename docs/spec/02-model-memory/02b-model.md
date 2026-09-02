@@ -47,22 +47,18 @@ public:
     ///   1. root.run_setup()                       — declare (01.D/01.E)
     ///   2. bytes = root.get_exec_info(default_device)   — device -> bytes
     ///   3. substrates[d] = { DeviceArena(bytes[d]), pool iff configured }
-    ///   4. root.prepare_exec(queues, substrates) — allocate; ExecCtx complete
-    ///   5. root.compile(root_ctx)                — bodies; flavor validation
-    ///   6. root.run_init(root_ctx)               — children before owners
-    ///   7. wire: FromInput dim_scratches register with roots; static input
-    ///      peers validate against roots
-    ///   8. sync: every member wrapper is pointed at its storage (own
-    ///      allocation, else root()->data())
+    ///   4. root.prepare_exec(queues, substrates) — allocate, point wrappers; ExecCtx complete
+    ///   5. root.compile()                        — bodies
+    ///   6. root.run_init()                       — children before owners
     /// After setup the model's STATE is not yet meaningful: it holds
-    /// initialization. State is defined after the first run().
+    /// initialization. State is defined after the first forward.
     void setup();
 
-    /// root.forward(): enqueue one forward. Returns immediately.
+    /// root.forward(): enqueue one forward. Returns immediately. Loop it
+    /// freely — the model guarantees ordering internally.
     void forward();
-    /// forward(); then wait BOTH queues (trailing parallel work has no
-    /// later consumer to order it). The final wait lives here only.
-    void run();
+    /// Wait both queues. The caller's choice, never implicit.
+    void wait();
 
     // ---- host access (between runs) ---------------------------------------------
     /// Views: wrapper ergonomics on the host — shape(), operator[] with
@@ -75,8 +71,8 @@ public:
     /// to the device on destruction AND on commit() (both; the
     /// destructor is the protection, commit() the mid-scope flush).
     template <DType DT, int Rank> HostViewMut<DT, Rank> view_output_mut(std::string_view path);
-    /// Setters: H2D on q_in; bump the root's version (spec 04); copy into
-    /// cross-device peers (needs_memcpy) like any root write. Inputs:
+    /// Setters: H2D on q_in; copy into cross-device peers (needs_memcpy)
+    /// like any root write. Inputs:
     /// meaningful for free inputs (a connected one is overwritten at the
     /// next forward — harmless, like init).
     template <DType DT, int Rank> void set_input (std::string_view path, std::span<const cpp_type_t<DT>>);
@@ -86,7 +82,7 @@ public:
     template <DType DT, int Rank> Input<DT, Rank>&  get_input (std::string_view path);
     template <DType DT, int Rank> Output<DT, Rank>& get_output(std::string_view path);
     System& root();
-    template <class Visitor> void visit(Visitor&& v) const;   // root.visit
+    Subsystem& get_subsystem(std::string_view path);           // root.get_subsystem
 
     struct MemoryReport {
         struct PerDevice { size_t arena_bytes, pool_bytes, pool_bytes_in_use,
@@ -100,9 +96,7 @@ public:
     std::span<const MarkRecord> constraints() const;
     std::span<const MarkRecord> objectives()  const;
 
-    /// Teardown: wait both queues (kernels, copies and their configs in
-    /// flight) → destroy the root (entries release handles) → substrates
-    /// (allocations pin their slabs; the last handle frees) → queues.
+    /// Waits both queues. Everything else is RAII.
     ~Model();
 
 private:
@@ -122,7 +116,7 @@ auto model = create_model<Top>(ModelConfig{});          // default device, no po
 model.setup();                                          // declare → exec-info → substrates
                                                         //   → prepare → compile → init → wire → sync
 model.set_input<DType::f64, 1>("mda.z", {{1.0, 2.0}});  // drive a free input
-model.run();                                            // forward + wait both queues
+model.forward();  model.wait();                         // enqueue; wait when results are wanted
 
 auto y1 = model.view_output<DType::f64, 1>("mda.y1");   // D2H, read
 auto r  = model.memory_report();                        // r.devices[gpu0].os_bytes_in_use > 0 ?

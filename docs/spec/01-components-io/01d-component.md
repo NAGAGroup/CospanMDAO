@@ -33,12 +33,13 @@ public:
     /// per-entry logic.
     virtual std::unordered_map<sycl::device, size_t>
         get_exec_info(const sycl::device& parent_device) = 0;
-    /// Allocate what can be allocated now; Systems complete their
-    /// ExecCtx. Storage pointers are wired in the SYNC step afterwards.
+    /// Allocate what can be allocated now and point every wrapper at its
+    /// storage (own allocation, else root()->data() — roots are allocated
+    /// before their peers); Systems complete their ExecCtx.
     virtual void prepare_exec(const Queues& queues, Substrates& substrates) = 0;
-    /// Compile bodies (Components) / validate flavors (Systems). Returns
-    /// compiled info for a fusing parent; Systems return nullopt.
-    virtual std::optional<CompiledInfo> compile(const ExecCtx& owner_ctx) = 0;
+    /// Compile bodies (Components); recurse (Systems). Flavor legality is
+    /// checked per forward on the descriptions, not here.
+    virtual void compile() = 0;
     /// Initialize: children before self (Systems), so an owner's init
     /// has the last word by path.
     virtual void run_init(const ExecCtx& owner_ctx) = 0;
@@ -53,19 +54,19 @@ public:
     virtual void run_post_compute(ExecCtx& owner_ctx) = 0;
 };
 
-/// What a Component's compute turn yields. Knows how to submit itself on
-/// a target; a kernel description additionally exposes its streams and
-/// record for packing into a fused wave (01.C).
+/// What a Component's compute turn yields. The owner ROUTES on
+/// is_custom_op(): kernels take the outer-kernel path (01.C §5), custom
+/// operations take AdaptiveCpp_enqueue_custom_operation through the same
+/// handler with the same dependencies/retarget/lane. A kernel
+/// description additionally exposes rank, group-body and scratch facts
+/// and its streams/record, for fused owners to validate and pack.
 class LaunchDescription {
 public:
     virtual ~LaunchDescription();
+    virtual bool is_custom_op() const = 0;
     virtual sycl::event submit(SubmitTarget& t) const = 0;
-    virtual const FusableParts* fusable() const { return nullptr; }
+    virtual const KernelParts* kernel() const { return nullptr; }  // null for custom ops
 };
-
-/// Returned by compile(); a fusing owner validates its wave from these.
-struct CompiledInfo { int native_rank; bool group_body; bool has_scratch;
-                      bool custom_op; };
 
 } // namespace naga::cospan
 ```
@@ -190,7 +191,7 @@ private:
     std::unordered_map<sycl::device, size_t>
         get_exec_info(const sycl::device& parent) override;   // §4
     void prepare_exec(const Queues&, Substrates&) override;   // §4
-    std::optional<CompiledInfo> compile(const ExecCtx&) override;
+    void compile() override;
     void run_init(const ExecCtx& c) override;        // -> init(c.queue_for_init())
     void run_pre_compute(ExecCtx&) override;         // §5
     std::unique_ptr<LaunchDescription> run_compute_forward() override; // -> compute_forward()
@@ -220,31 +221,35 @@ private:
 - **`prepare_exec`**: allocate every own entry that is (root ∨
   `owns_nonroot_allocation`) ∧ allocatable now (durable∧static → arena;
   durable∧dynamic with known shape → dynamic chain) from
-  `substrates[device]`. Nothing is pointed at yet.
+  `substrates[device]`; then point every member wrapper at its storage —
+  own allocation if it has one, else `root()->data()` — and validate
+  static input peers against their roots.
 - **`compile`**: the device function at the owner's fuse rank if any,
   else native; the individual config; custom-op bodies recorded.
-  Returns `CompiledInfo`.
 - **`run_init`**: `init(q)` with the owner's queue retargeted to this
   device.
-- **sync** (Model step): every member wrapper is pointed at its storage —
-  own allocation if it has one, else `root()->data()`.
 
 ## 5. A Component's forward turn
 
 Called by its owner in this order; a Component never submits its compute
 work and never sees a queue except through the owner's ctx.
 
-1. **`run_pre_compute(ctx)`**: automatic shape update (FromInput dims wait
-   their `dim_scratch` event, then read) → `pre_forward()` hook (per-entry
-   override, last write wins) → dynamic connection validation →
-   allocate-if-grown via the dynamic chain on `ctx.device` → wrapper sync.
+1. **`run_pre_compute(ctx)`**: value-driven shapes first — for each own
+   input carrying a `FromInput` spec, enqueue the D2H of that input into
+   the entry's `dim_scratch`, then a custom operation (depending on the
+   D2H event) that applies the resize on the host, reallocating through
+   the OS route from inside the custom-op body if grown; **wait on that
+   custom op's event** — the one forced sync, so this turn's launch
+   geometry is known. Then shape-derived dims, `pre_forward()` hook
+   (per-entry override, last write wins), dynamic connection validation,
+   allocate-if-grown for the rest via the dynamic chain on `ctx.device`,
+   wrapper sync.
 2. **`run_compute_forward()`**: `compute_forward()` — returns the
    description. The owner submits it (01.E §3).
 3. **`run_post_compute(ctx)`**: through `ctx`, after the owner's
-   submission: D2H copies into every registered consumer `dim_scratch`;
-   memcpys from each output root into each `needs_memcpy` peer's own
-   storage; bump each output root's `version()` (spec 04). Safe to
-   submit here because the ordering the work depends on already exists.
+   submission: memcpys from each output root into each `needs_memcpy`
+   peer's own storage. Safe to submit here because the ordering the work
+   depends on already exists.
 
 ## 6. Provided kernels — v1
 

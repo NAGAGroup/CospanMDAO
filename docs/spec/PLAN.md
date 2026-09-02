@@ -32,7 +32,7 @@ spec is assembled (phase 10).
 | 1 | **Components & I/O foundations** — dtypes+wrappers, metadata+shapes+declaration API, kernel machinery (KernelBody, chained executor, Local scratch), Component, System execution slice + structural APIs | `01-components-io/` (01a–01e) — DONE |
 | 2 | **Model, memory & finalize** — `Model` (setup driver, queue creation, run, final wait); the finalize pass as ONE walk: alias resolution order + allocation pass; slabkit's slimmed surface (pools, smart pointers); pool ownership flavor; multi-device-queue allocation | `02-model-memory/` |
 | 3 | **Topology semantics & optimization marks** (DONE) — index-map connections and index-map-valued I/O, subarray composition, cross-level ties, the marks API (design vars / constraints / objectives with bounds and scaling slots) | `03-topology.md` |
-| 4 | **System types** — ConditionalSystem, ChangeTrackedSystem, versions, observation plumbing (Systems never do work; custom operations are Components) | `04-system-types.md` — DONE |
+| 4 | **System types** — the extension contract by example (RunOnce/RunN/Conditional as custom System types via early return; Systems never do work; custom operations are Components); observation = path resolution + enumeration | `04-system-types.md` — DONE |
 | 5 | **Implicit & solvers** — ImplicitComponent, the Solver hierarchy, attachment API, convergence contract | `05-implicit-solvers.md` |
 | 6 | **Temporal** — temporal System type(s), recurrence wiring, history windows; composites proven by samples | `06-temporal.md` |
 | 7 | **AD** — engine document + AMENDMENTS to 01a (grad wrapper forms), 01d (adjoint verb), 01e (backward walk), 05 (solver adjoints); consistency audit inside the phase | `07-ad.md` + amendments |

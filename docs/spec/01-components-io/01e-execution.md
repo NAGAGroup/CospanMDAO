@@ -80,7 +80,7 @@ public:
     template <DType DT, int Rank> Output<DT, Rank>& get_output(std::string_view path);
     auto get_inputs()  const;   ///< this System's alias entries
     auto get_outputs() const;
-    template <class Visitor> void visit(Visitor&& v) const;   ///< pre-order; spec 04
+    Subsystem& get_subsystem(std::string_view path);          ///< chains through children
 
     // ---- runners (Subsystem verbs) — the DEFAULT orchestration ----------------
 protected:
@@ -92,11 +92,11 @@ protected:
     std::unordered_map<sycl::device, size_t>
         get_exec_info(const sycl::device& parent_device) override;
     /// Complete ctx (primary = q_in, no lane, substrate = substrates[device]);
-    /// allocate own alias roots; then children with the SAME queue set.
+    /// allocate own alias roots and point their wrappers; then children
+    /// with the SAME queue set.
     void prepare_exec(const Queues&, Substrates&) override;
-    /// children.compile(ctx) in order; validate if this System has a
-    /// policy (Fused/Parallel); return nullopt.
-    std::optional<CompiledInfo> compile(const ExecCtx&) override;
+    /// children.compile() in order.
+    void compile() override;
     /// children.run_init in order, then init(q retargeted to ctx.device).
     void run_init(const ExecCtx&) override;
     void run_pre_compute(ExecCtx&) override {}     ///< Systems do no work
@@ -119,7 +119,8 @@ ctx_.refresh_pending();                       // deps on everything both queues 
 for (child : children_) {
     child->run_pre_compute(ctx_);
     auto d = child->run_compute_forward();
-    if (d) ctx_.pending = { d->submit(ctx_.target()) };   // WE submit; our event is next's dep
+    if (d) ctx_.pending = { d->submit(ctx_.target()) };   // WE submit, routed on
+                                                         //   d->is_custom_op(); our event is next's dep
     else   ctx_.refresh_pending();            // child submitted on its own; re-read queues
     child->run_post_compute(ctx_);            // copies AFTER the work they depend on
 }
@@ -136,8 +137,8 @@ return nullptr;                               // "I submitted"
   `AdaptiveCpp_retarget{ctx.device}` (the queues are `retargetable`); an
   in-order queue keeps its ordering across devices (acpp
   `ACPP_EXT_CG_PROPERTY_RETARGET`). Nobody creates queues but the Model.
-- **`run()` waits both queues**: trailing pending events after a parallel
-  section have no consumer otherwise.
+- **Waiting is the caller's choice**: `Model::wait()` waits both queues;
+  a loop of forwards need not wait between them.
 
 ## 4. Structural APIs — all inside `setup()`, else throw
 
@@ -149,22 +150,21 @@ namespace property {
     struct device        { sycl::device dev; };            // placement; inherited when absent
     struct parallel      {};                               // flavor
     struct fused         { Fused::Mode mode; int rank = 1; std::optional<sycl::range<3>> wg; };
-    struct conditional   { Predicate pred; };              // spec 04
-    struct change_tracked{};                               // spec 04
 }
+// Gating, counting and change detection are custom System TYPES (spec
+// 04), added with the templated overload — not properties.
 class property_list { /* SYCL idiom: constructed from any subset; has_property<T>(), get_property<T>() */ };
 
 class System {   // ...continued
 public:
     /// A REALIZED System or Component type, optionally with properties
-    /// (device; the wrapping flavors conditional/change_tracked).
+    /// (device).
     template <class T, class... Args> requires std::derived_from<T, Subsystem>
     T& add_subsystem(std::string name, Args&&... ctor_args);
     template <class T, class... Args> requires std::derived_from<T, Subsystem>
     T& add_subsystem(std::string name, const property_list& props, Args&&... ctor_args);
     /// A BASE System configured by properties: device and/or ONE flavor
-    /// (parallel | fused | conditional | change_tracked — two flavors on
-    /// one call is an error; nest to combine). Returns the System to add
+    /// (parallel | fused — both on one call is an error; nest to combine). Returns the System to add
     /// children to inline — no class derivation needed.
     System& add_subsystem(std::string name, const property_list& props = {});
     // add_subsystem constructs the child, registers the name, and runs the
@@ -202,7 +202,7 @@ namespace naga::cospan {
 /// post-compute. Return null; the owner's refresh then picks up q_ooo's
 /// wait list. Data independence of children is the USER's assertion;
 /// the framework checks only cross-sibling shape dependencies (hard
-/// error at compile).
+/// error, checked each forward on the children's descriptions).
 class ParallelSystem : public System { /* runner overrides as described */ };
 
 /// COMPONENTS ONLY — enforced by the type system at the add, since a
@@ -210,17 +210,15 @@ class ParallelSystem : public System { /* runner overrides as described */ };
 ///   template <class T, class... A> requires std::derived_from<T, ComponentBase>
 ///   T& add_subsystem(std::string, A&&...);
 /// (no property-list overload). Rank and wg shape are the fuse's;
-/// children compile at the fuse rank (id-only bodies lazily). compile()
-/// validates the wave from the children's CompiledInfo: rank agreement
-/// for group bodies, no custom ops, no scratch-free/scratch mixing
-/// problems, no intra-fuse shape dependencies over the final sets,
-/// parallel mode: no producer-consumer pairs unless allowed; builds the
-/// sequence config once.
+/// children compile at the fuse rank (id-only bodies lazily); the
+/// sequence config is built once at compile.
 /// run_compute_forward: pre-compute ALL children → compute ALL (collect
-/// descriptions; a null is an error) → pack streams + records, stamp
-/// group slices, one staging, ONE submission with the sequence config →
-/// post-compute ALL. The order is forced: post-compute copies depend on
-/// the wave.
+/// descriptions) → VALIDATE on the descriptions, every forward, host-
+/// side and cheap: none null, none custom-op, rank agreement for group
+/// bodies, scratch handling, parallel mode: no producer-consumer pairs
+/// unless allowed → pack streams + records, stamp group slices, one
+/// staging, ONE submission with the sequence config → post-compute ALL.
+/// The order is forced: post-compute copies depend on the wave.
 class FusedSystem : public System {
 public:
     enum class Mode : uint8_t { sequential, parallel };
