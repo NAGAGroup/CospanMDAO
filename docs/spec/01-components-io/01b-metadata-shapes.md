@@ -191,8 +191,9 @@ public:
 
     /// Resize (automatic derivation and user reshape share this path).
     /// REALLOCATION POLICY: growing past the current allocation
-    /// reallocates through the dynamic chain (pool if capable -> OS ->
-    /// OOM); shrinking keeps the allocation — capacity is retained,
+    /// reallocates through the dynamic chain (pool if present ->
+    /// (device, context) -> throw); shrinking keeps the allocation —
+    /// capacity is retained,
     /// extents describe the logical shape. Why: ledger §5 memory budgeting.
     virtual void reshape(sycl::range<3> new_extents) = 0;
 

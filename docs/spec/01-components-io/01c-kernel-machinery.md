@@ -321,7 +321,8 @@ q.submit([&](sycl::handler& cgh){
   `run_pre_compute`, the consuming Component enqueues the D2H of the
   driving input into the entry's `dim_scratch`, then a custom operation
   (depending on that event) that applies the resize on the host —
-  reallocating through the OS route from inside the custom-op body if
+  reallocating through the substrate's (device, context) route from
+  inside the custom-op body if
   grown — and waits on that custom op's event: the one forced sync, so
   the launch geometry is known at enqueue. Nothing is registered
   anywhere; no producer knows its consumers.

@@ -17,10 +17,11 @@ exception below lives. Why: ledger §2.2 cycle.
 auto model = create_model<Top>(ModelConfig{...}, top_args...);
 ```
 
-1. Model validates its config and creates its two queues: `q_in` —
-   in-order, `AdaptiveCpp_retargetable`, `AdaptiveCpp_coarse_grained_events`;
-   `q_ooo` — out-of-order, `AdaptiveCpp_retargetable`. Both on
-   `default_device`, default context; every submission may retarget.
+1. Model validates its config, creates the default device's ONE context
+   (`sycl::context{default_device}`), then its two queues from that
+   context: `q_in` — in-order, `AdaptiveCpp_retargetable`,
+   `AdaptiveCpp_coarse_grained_events`; `q_ooo` — out-of-order,
+   `AdaptiveCpp_retargetable`. Every submission may retarget.
 2. Model constructs `Top(top_args...)`. A constructor is plain C++ state.
    Structural calls and declarations outside `setup()` throw.
 
@@ -82,8 +83,12 @@ Why: ledger §2.2 placement · P1 · P5.
 
 ### 2.3 Substrates
 
-Model: for each `(device, bytes)`: `substrates[device] = { DeviceArena(bytes),
-DevicePool iff configured for that device }`. Shared-backed handles (02.A).
+Model: for each `(device, bytes)`: `substrates[device] = { ctx, DeviceArena(device,
+ctx, bytes), DevicePool iff configured for that device }` where `ctx` is the
+default device's context from step 1 or `sycl::context{device}` otherwise —
+one context per device, held here for the model's life (02.A §3). Every
+allocation for a device goes through its substrate's `(device, ctx)`; the
+queue forms are never used below the Model.
 
 ### 2.4 Prepare — `root.prepare_exec(queues, substrates)`
 
@@ -95,7 +100,7 @@ allocate own alias roots and point their wrappers; recurse.
 `Component`: for every own ROOT entry allocatable now, one allocation per
 registered device from that device's substrate — durable∧static from the
 arena; durable∧dynamic with a known shape via the dynamic chain (pool →
-OS); dynamic-shaped and transient stay unallocated. Then point every
+(device, context) → throw); dynamic-shaped and transient stay unallocated. Then point every
 member wrapper at `root()->storage_on(own device)` — guaranteed
 allocated by now (roots precede peers); shape and stride (+ view) set;
 static input peers validate against their roots here. An unconnected
@@ -163,7 +168,8 @@ with the sequence config → post-compute ALL. **Custom System types**
 1. `run_pre_compute(ctx)`: for each own input driving a shape via
    `FromInput` — enqueue the D2H of that input into the entry's
    `dim_scratch`, then a custom operation (depending on that D2H event)
-   that applies the resize host-side, reallocating via the OS route from
+   that applies the resize host-side, reallocating via the substrate's
+   `(device, context)` route from
    inside the custom-op body if grown; then **wait on that custom op's
    event** — the one forced sync, so the launch geometry below is known.
    Then `pre_forward()` → dynamic validation → wrapper sync.

@@ -14,7 +14,7 @@ namespace naga::cospan {
 struct ModelConfig {
     /// Per-device dynamic-pool sizes; a device not listed gets
     /// `default_pool_bytes`. 0 = no pool = every dynamic allocation takes
-    /// the OS route. Pre-allocation is a profiling-discovered
+    /// the device+context route. Pre-allocation is a profiling-discovered
     /// optimization; memory_report() is how it is discovered.
     /// Why: ledger §5 memory budgeting · P3.
     std::unordered_map<sycl::device, size_t> pool_bytes;
@@ -41,13 +41,20 @@ public:
     /// THE SETUP CHAIN. Runs once. Every step is a Subsystem verb driven
     /// from the root; the Model adds only the two things nobody else
     /// owns (queues, substrates):
-    ///   0. queues: q_in (in-order, AdaptiveCpp_retargetable,
-    ///      AdaptiveCpp_coarse_grained_events) and q_ooo (out-of-order,
-    ///      retargetable), both bound to default_device — created at
-    ///      construction, so they exist for everything below.
+    ///   0. the default device's context — sycl::context{default_device},
+    ///      created FIRST — then the queues from it: q_in (in-order,
+    ///      AdaptiveCpp_retargetable, AdaptiveCpp_coarse_grained_events)
+    ///      and q_ooo (out-of-order, retargetable). Created at
+    ///      construction, so they exist for everything below. The context
+    ///      is stored as the default device's substrate context (02.A §3:
+    ///      the context passed for a queue's own device is the one the
+    ///      queue owns).
     ///   1. root.run_setup()                       — declare (01.D/01.E)
     ///   2. bytes = root.get_exec_info(default_device)   — device -> bytes
-    ///   3. substrates[d] = { DeviceArena(bytes[d]), pool iff configured }
+    ///   3. substrates[d] = { ctx (the default device's from step 0, else
+    ///      sycl::context{d}), DeviceArena(d, ctx, bytes[d]), pool iff
+    ///      configured } — every subsystem allocates through (d, ctx) and
+    ///      never learns which device the queues were built for
     ///   4. root.prepare_exec(queues, substrates) — allocate, point wrappers; ExecCtx complete
     ///   5. root.compile()                        — bodies
     ///   6. root.init_tree()                      — children before owners

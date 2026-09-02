@@ -249,7 +249,8 @@ work and never sees a queue except through the owner's ctx.
    input carrying a `FromInput` spec, enqueue the D2H of that input into
    the entry's `dim_scratch`, then a custom operation (depending on the
    D2H event) that applies the resize on the host, reallocating through
-   the OS route from inside the custom-op body if grown; **wait on that
+   the substrate's (device, context) route from inside the custom-op
+   body if grown; **wait on that
    custom op's event** — the one forced sync, so this turn's launch
    geometry is known (why: ledger §2.1 shape source · P3 — only
    value-driven entries pay it). Then shape-derived dims, `pre_forward()` hook

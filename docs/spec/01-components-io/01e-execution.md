@@ -24,7 +24,7 @@ struct ExecCtx {
     sycl::queue*            q_in;        ///< both queues are always present
     sycl::queue*            q_ooo;
     std::optional<size_t>   lane;        ///< hint for q_ooo submissions
-    MemorySubstrate*        substrate;   ///< this device's arena (+ pool)
+    MemorySubstrate*        substrate;   ///< this device's context, arena (+ pool)
     std::vector<sycl::event> pending;    ///< dependencies for the next submission
 
     /// SubmitTarget view: what a LaunchDescription::submit consumes —
@@ -40,7 +40,11 @@ struct ExecCtx {
 };
 
 struct Queues { sycl::queue* q_in; sycl::queue* q_ooo; };
-struct MemorySubstrate { slabkit::DeviceArena arena; std::optional<slabkit::DevicePool> pool; };
+/// One per device (02.A §7): the device's ONE context, held for the
+/// model's life, and the memory objects built from it. Every allocation
+/// a subsystem makes goes through (device, ctx) here.
+struct MemorySubstrate { sycl::context ctx; slabkit::DeviceArena arena;
+                         std::optional<slabkit::DevicePool> pool; };
 using  Substrates = std::unordered_map<sycl::device, MemorySubstrate>;
 
 /// What a submission consumes (01.D LaunchDescription::submit): the
