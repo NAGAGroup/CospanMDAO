@@ -1,156 +1,23 @@
 [workspace]
 authors = ["Jack Myers <jack@myersjack.dev>"]
-channels = ["https://prefix.dev/jackm97/naga-labs"]
+channels = ["https://prefix.dev/conda-forge"]
 name = "cospanmdao"
 platforms = ["linux-64"]
 version = "0.1.0"
-preview = ["pixi-build"]
 
-[activation]
-scripts = ["env.sh"]
+# TEMPORARY (2026-09-28). Every toolchain-bound section was removed so the
+# workspace solves while the naga AdaptiveCpp toolchain is republished:
+# the acpp pins, the slabkit/cereal path dependencies, the pixi-build
+# [package] tables, the build-variants, the env.sh activation, the
+# per-backend (cuda/l0/amd) features and the dev-* environments. Both this
+# manifest and slabkit's get redone against the new toolchain. The full
+# previous manifest is `git show dbebc3a:pixi.toml`.
 
-# Compiler selection (post-migration): variant stems, resolved by the backend
-# as <stem>_<target_platform> activation packages from the naga-labs channel.
-# This replaces the old `compilers = []` + manual acpp-toolchain dance.
-[workspace.build-variants]
-c_compiler = ["acpp-clang"]
-cxx_compiler = ["acpp-clangxx"]
-
-# ------------------------------------------------------------------------------
-# CONSUMER environment (default): consumes the developed package itself.
-# `pixi install` builds cospanmdao + its chain into the env; pixi-pack packs
-# this env directly (`pixi exec pixi-pack --create-executable`).
-# Toolchains/compilers NEVER appear here — they come from the package's own
-# dependency tables via the dev environment below.
-# ------------------------------------------------------------------------------
 [dependencies]
-cospanmdao = { path = "." }
-
-[feature.cuda.dependencies]
-cuda-nvvm = ">=12.9.86,<13"
-cuda-runtime = ">=12.9.2,<13"
-cuda-nvcc-tools = ">=12.9.86,<13"
-cuda-sanitizer-api = ">=12.9.79,<13"
-
-[feature.level-zero.dependencies]
-level-zero = ">=1.28.2,<2"
-
-[feature.amd.dependencies]
-hip-runtime-amd = ">=6,<7"
-rocm-device-libs = ">=6,<7"
-
-# Consumer envs per backend (the implicit default env = the bare package,
-# CPU/OMP-capable); `all` carries every runtime.
-[environments.cuda]
-features = ["cuda"]
-solve-group = "default"
-
-[environments.l0]
-features = ["level-zero"]
-solve-group = "default"
-
-[environments.amd]
-features = ["amd"]
-solve-group = "default"
-
-[environments.omp]
-features = []
-solve-group = "default"
-
-[environments.all]
-features = ["cuda", "level-zero", "amd"]
-solve-group = "default"
-
-# ------------------------------------------------------------------------------
-# The package: what consumers get when they declare
-#   cospanmdao = { path = "../cospan" }  (or a git/path spec of their own)
-# ------------------------------------------------------------------------------
-[package]
-name = "cospanmdao"
-version = "0.1.0"
-
-[package.build.backend]
-name = "pixi-build-cmake"
-version = "*"
-channels = [
-  "https://prefix.dev/pixi-build-backends",
-  "https://prefix.dev/conda-forge",
-]
-
-[package.build.config]
-extra-args = [
-  "-DNAGA_BUILD_TESTS=OFF",
-  "-DNAGA_BUILD_EXAMPLES=OFF",
-]
-
-[package.build-dependencies]
+nushell = ">=0.110.0,<0.111"
 cmake = ">=3.28,<4"
 ninja = ">=1.12"
-
-# SYCL headers + lib/cmake/AdaptiveCpp; runtime arrives via run-export.
-[package.host-dependencies]
-acpp = ">=25.10.0,<25.11.0a0"
-slabkit = { path = "../slabkit" }
-cereal = { path = "packages/cereal" }
-
-# Static lib with PUBLIC header/CMake-config deps: consumers need these at
-# their own compile time, so they propagate as run-dependencies
-# (manual run-exports).
-[package.run-dependencies]
-slabkit = { path = "../slabkit" }
-cereal = { path = "packages/cereal" }
-
-# ------------------------------------------------------------------------------
-# DEV environment: the package's dependency closure (toolchain included)
-# WITHOUT building the package, plus dev-only tools and tasks. Unstructured
-# work runs inside the build-time env: `pixi run -e dev <anything>`.
-# A dev env drives CMake directly (no backend), so it names the compiler
-# activation package explicitly — the one place that is correct.
-# ------------------------------------------------------------------------------
-[feature.dev.dev]
-cospanmdao = { path = "." }
-
-[feature.dev.dependencies]
-nushell = ">=0.110.0,<0.111"
 catch2 = ">=3.8"
-acpp = ">=25.10.0,<25.11.0a0"
-acpp-tools = ">=25.10.0,<25.11.0a0"
 
-[feature.dev.target.linux-64.dependencies]
-acpp-clangxx_linux-64 = ">=25.10.0,<25.11.0a0"
-acpp-clang_linux-64 = ">=25.10.0,<25.11.0a0"
-
-[feature.dev.tasks]
-configure = "nu scripts/configure.nu dev"
-build = { cmd = "nu scripts/build.nu dev", depends-on = ["configure"] }
-test = { cmd = "ACPP_VISIBILITY_MASK=omp ctest --test-dir build/dev --output-on-failure", depends-on = ["build"] }
-sellar = { cmd = "./build/dev/examples/sellar", depends-on = ["build"] }
-
-# Hardware-flavored dev envs: `-e dev` is the daily (CUDA) default;
-# dev-l0 / dev-amd / dev-cuda select the backend explicitly.
-[environments.dev]
-features = ["cuda", "dev"]
-solve-group = "default"
-no-default-feature = true
-
-[environments.dev-cuda]
-features = ["cuda", "dev"]
-solve-group = "default"
-no-default-feature = true
-
-[environments.dev-l0]
-features = ["level-zero", "dev"]
-solve-group = "default"
-no-default-feature = true
-
-[environments.dev-amd]
-features = ["amd", "dev"]
-solve-group = "default"
-no-default-feature = true
-
-# CPU-only: no GPU backend feature — AdaptiveCpp's built-in OpenMP host
-# backend needs nothing beyond the toolchain itself.
-[environments.dev-omp]
-features = ["dev"]
-solve-group = "default"
-no-default-feature = true
+[tasks]
+setup-git = "git config core.hooksPath .project/hooks"
