@@ -51,8 +51,8 @@ derivatives with fallback partials · implicit solves · temporal
 components · atomic element types (explicit).
 
 **I/O & execution topology:** connection / tie / promote semantics ·
-aliasing correctness · slice and assembly connections · marks · index-
-map-valued I/O · non-durable I/O · initialization · host access ·
+aliasing correctness · slice connections · marks · index-
+map-valued I/O · transient subtrees · initialization · host access ·
 enumerability of I/O (the one hard requirement of every tool built over the
 model).
 
@@ -133,10 +133,8 @@ are their own components, composed in systems.
 #### Need 2.3 — Data
 
 - **`connection`** — output→input aliasing; one primitive with a
-  spectrum: identity → slice (a region of the source, zero-copy) →
-  **assembly** (several producers' regions into one input, disjoint,
-  with coverage checked by default) → general index map (computed
-  gather). The only way I/O aliases across the input/output divide.
+  spectrum: identity → slice (a region of the source, zero-copy); gathers and
+  scatters are provided kernels users compose (§6.6). The only way I/O aliases across the input/output divide.
 - **`promote`** — an I/O given a name in an owning system's namespace;
   always allowed, including for I/O that is already connected or
   aliased, so a higher level can always name what it needs.
@@ -146,10 +144,10 @@ are their own components, composed in systems.
   name is refused so that the tie is visible at every use site.
 - **Index-map-valued I/O** — index maps are *data produced by components*
   (neighbour searches, sort permutations, sparse operator structure) and
-  consumed by gathers, scatters and connections. Connectivity is
+  consumed by gathers and scatters. Connectivity is
   computable by the model.
-- **Non-durable I/O** — a lifetime attribute on declarations: durable, or
-  scoped to a forward.
+- **Transient subtrees** — a property on a subsystem: the subtree's memory is
+  released after each of its runs and revived when it runs again (§4.4).
 - **Chunked execution over bounded scratch** — N independent instances
   whose per-instance intermediate scratch would cap problem size if
   materialized at once (per-node dense solves, operator fits): run in
@@ -436,8 +434,6 @@ EVERY shape resolution and throws on violation.
 namespace naga::cospan {
 
 enum class IOKind   : uint8_t { input, output };
-enum class Lifetime : uint8_t { durable, transient };
-    ///< transient: the declaring Component reads this input once per forward and does not need it afterwards. Inputs only.
 
 // -----------------------------------------------------------------------------
 // Dimension specification — DimSpec is a CONCEPT, not a type.
@@ -497,8 +493,8 @@ constexpr auto from_input_array(std::string_view input);
 template <DType DT, int Rank, DimSpec... Specs>
     requires(sizeof...(Specs) == Rank)
 void declare_input(Input<DT, Rank>& member, std::string name,
-                   Specs... specs, Lifetime life = Lifetime::durable);
-                   // why: §1 need 2.3 assembly, §1 need 2.3 initialization · P8
+                   Specs... specs);
+                   // why: §1 need 2.3 connection, §1 need 2.3 initialization · P8
 
 /// FromSourceDim is ill-formed for outputs.
 template <DType DT, int Rank, DimSpec... Specs>
@@ -509,7 +505,7 @@ void declare_output(Output<DT, Rank>& member, std::string name,
 /// Whole-shape overloads accepting the from_input_array marker alone.
 template <DType DT, int Rank>
 void declare_input(Input<DT, Rank>& member, std::string name,
-                   /* from_input_array marker */, Lifetime life = Lifetime::durable);
+                   /* from_input_array marker */);
 template <DType DT, int Rank>
 void declare_output(Output<DT, Rank>& member, std::string name,
                     /* from_input_array marker */);
@@ -558,7 +554,6 @@ public:
     IOKind   kind() const;
     DType    dtype() const;          ///< atomic-ness preserved
     int      rank() const;           ///< AUTHORITATIVE (see §3.1)
-    Lifetime lifetime() const;
 
     // ---- shape ----------------------------------------------------------
     sycl::range<3> extents() const;  ///< 1-padded; flat-size arithmetic ONLY
@@ -608,7 +603,7 @@ public:
 
     /// Allocation, in prepare_exec: ROOTS ONLY. Builds the root's
     /// slabkit::usm_vector for each device the set spans, each from that
-    /// device's substrate (§7.1): durable ∧ fully-fixed → the arena route
+    /// device's substrate (§7.1): fully-fixed and outside every transient subtree → the arena route
     /// (its bytes are what get_exec_info counted); everything else → the
     /// pool route, with the OS as fallback, at first need.
     virtual void allocate(sk::queue&, Substrates&) = 0;
@@ -698,7 +693,7 @@ namespace naga::cospan::detail {
 
 class IOEntry {
 public:
-    // ---- identity, shape, marks, lifetime: as in §3.3 ----------
+    // ---- identity, shape, marks: as in §3.3 ----------
 
     // ---- the set --------------------------------------------------------
     IOEntry*       root();                 ///< self iff is_root()
@@ -813,23 +808,26 @@ Every entry that is a root once declaration completes owns storage —
 including unconnected inputs and unconnected `tie_inputs` aliases: that
 is how top-level design variables and shared inputs get memory with no
 IndepVarComp (why: §1 need 2.3 initialization, §1 need 2.4 design
-variables). Route by lifetime (§7.1 `MemorySubstrate`): durable ∧ static
-roots from the arena; all other roots via the pool route (OS fallback) at
-first need and on growth. Peers own nothing, ever: a root holds one
+variables). Route (§7.1 `MemorySubstrate`): static roots outside every
+transient subtree from the arena; all other roots via the pool route (OS
+fallback) at first need and on growth. Peers own nothing, ever: a root holds one
 allocation per device its set spans (§4.2).
 
-A root is RELEASED PER FORWARD when it has at least one Component-declared
-input peer, every Component-declared input peer is transient, and the root
-is not retained (§7.4 `retain`). Alias peers (promotions, ties) do not
-count. Such a root takes no arena bytes: its declaring Component allocates
-it through the pool route in its own `run_pre_compute`, sized to that
-turn's shape, and the root drops the `usm_vector` when the last of those
-consuming Components finishes its `run_post_compute` — a countdown held on
-the root, decremented by each consuming Component for each of its
-transient inputs; SlabKit defers the free until every kernel that read it
-has completed. An unconnected transient input is its own root and is
-released by its own Component. Host access to a released root after the
-forward is an error naming the transient input and `retain`.
+TRANSIENT SUBTREES. A System added with `property::transient` (§7.4)
+releases, when its run of the subtree returns, every root declared anywhere
+in its subtree that has no peer declared outside the subtree. A root with
+an outside peer — a consumer connected from outside the subtree, or a
+promotion made by an owner above it — keeps its storage. Roots of a
+transient subtree take no arena bytes: they are allocated in `prepare_exec`
+like every other root, through the pool route. A forward that reaches a
+transient System whose roots are released first REVIVES the subtree: the
+released roots are re-allocated through the pool route at their current
+extents, and the subtree's init runs again (Component pass, then System
+pass; the stream orders that work before the loop's submissions); then the
+child loop runs; then the subtree is released again. Nested transient
+Systems release their own subtrees first. Host access to a released root is
+an error naming the transient System. Why: §1 need 2.1 transient subtrees ·
+P3.
 
 ### 4.5 From sets to storage
 
@@ -1298,11 +1296,11 @@ public:
     /// before their peers); Systems complete their ExecCtx.
     virtual void prepare_exec(sk::queue& queue, Substrates& substrates) = 0;
     /// Compile bodies (Components); recurse (Systems). Flavor legality is
-    /// checked per forward on the descriptions, not here.
+    /// checked per forward on the descriptions, not here, except rank
+    /// agreement in a fuse (§7.5).
     virtual void compile() = 0;
-    /// Initialize. Model runs two passes (§11): Components first, then
-    /// Systems children-before-owners, so an owner's init has the last
-    /// word by path.
+    /// Component pass of init_tree (§11): a Component runs its init(); a
+    /// System forwards to its children in order.
     virtual void run_init(const ExecCtx& owner_ctx) = 0;
 
     // ---- forward (per forward; §6.5) ------------------------------------
@@ -1365,14 +1363,12 @@ public:
     // ---- declaration API (semantics: §3; PUBLIC, OpenMDAO-style) ------
     template <DType DT, int Rank, DimSpec... Specs>
         requires(sizeof...(Specs) == Rank)
-    void declare_input(Input<DT, Rank>& m, std::string name, Specs... specs,
-                       Lifetime life = Lifetime::durable);
+    void declare_input(Input<DT, Rank>& m, std::string name, Specs... specs);
     template <DType DT, int Rank, DimSpec... Specs>
         requires(sizeof...(Specs) == Rank)
     void declare_output(Output<DT, Rank>& m, std::string name, Specs... specs);
     template <DType DT, int Rank>
-    void declare_input(Input<DT, Rank>& m, std::string name, from_input_array_t,
-                       Lifetime life = Lifetime::durable);
+    void declare_input(Input<DT, Rank>& m, std::string name, from_input_array_t);
     template <DType DT, int Rank>
     void declare_output(Output<DT, Rank>& m, std::string name, from_input_array_t);
 
@@ -1479,7 +1475,7 @@ private:
 - **`get_exec_info(parent_device)`** — a Component has no device choice;
   it records `parent_device`, then for each own entry `e`:
   - `e` is root: register this device as its primary; count its static
-    bytes here.
+    bytes here (zero for a root inside a transient subtree).
   - `e` is an input peer: if `root(e)` already has storage registered on
     this device → nothing; else register this device on `root(e)` and
     count the root's static bytes here (the root owns one copy per
@@ -1494,11 +1490,11 @@ private:
   - Return `{device: bytes}`.
 - **`prepare_exec`**: for every own ROOT allocatable now, build its
   `usm_vector` per registered device from that device's substrate
-  (durable∧static → arena route; durable∧dynamic with known shape → pool
-  route with OS fallback); then point every member wrapper at
+  (static and outside every transient subtree → arena route; otherwise, with
+  a known shape → pool route with OS fallback); then point every member wrapper at
   `root()->storage_on(this device)` and validate static input peers
   against their roots. An unconnected input with a `FromSourceDim`
-  dimension errors here. Roots released per forward (§4.4) are not allocated here.
+  dimension errors here.
 - **`compile`**: the device function at the body's own rank (`kernel_rank_v<KB>`);
   the individual config; custom-op bodies recorded. A Component knows nothing of fusing.
 - **`run_init`**: `init(queue, device)` with the Model's queue and this
@@ -1509,7 +1505,7 @@ private:
 Called by its owner in this order; a Component never submits its compute
 work and never sees a queue except through the owner's ctx.
 
-1. **`run_pre_compute(ctx)`**: allocate every own root that is released per forward (§4.4) through the pool route at this turn's shape; then value-driven shapes first — for each own
+1. **`run_pre_compute(ctx)`**: value-driven shapes first — for each own
    input carrying a `FromInput` spec, read the driving input's value
    through `host_view()` — a host read, whichever storage holds it (the
    one forced sync, so this turn's launch geometry is known), call
@@ -1525,7 +1521,7 @@ work and never sees a queue except through the owner's ctx.
    submission: for each output root with storage on other devices, for
    each other device `copy_d = root` — one assignment resizes to match
    and copies, routed by SlabKit. Ordered after the work it depends on by
-   the stream (§7.3). Then, for each own transient input, tell its root one consumer is done; a root whose countdown reaches zero drops its storage (§4.4).
+   the stream (§7.3).
 
 ### 6.6 Provided kernels — v1
 
@@ -1724,12 +1720,11 @@ public:
 
     // ---- Model's entries ------------------------------------------------------
     /// Model knows its root is a System and has no ctx of its own, so the
-    /// root supplies its own. init_tree() is two passes: every Component's
-    /// init, depth-first in declaration order; then every System's init,
-    /// children before owners, so the root System has the last word.
+    /// root supplies its own. init_tree() is run_init(ctx_) then run_system_init().
     /// forward() == run_compute_forward() (no pre/post-compute exists for
     /// the root).
     void init_tree();
+    void run_system_init();   ///< System pass of init_tree: child Systems first, then this System's init(*ctx_.queue, ctx_.device)
     void forward();
 
     // ---- initializers by path (legal inside init() only) ----------------------
@@ -1762,14 +1757,22 @@ protected:
     void prepare_exec(sk::queue&, Substrates&) override;
     /// children.compile() in order.
     void compile() override;
-    /// In the Component pass a System forwards run_init to its children in
-    /// order. In the System pass it calls its own init(*ctx.queue, ctx.device)
-    /// after its child Systems.
+    /// Forwards run_init to its children in order (the Component pass).
     void run_init(const ExecCtx&) override;
     void run_pre_compute(ExecCtx&) override {}     ///< Systems do no work
     void run_post_compute(ExecCtx&) override {}
     /// THE DEFAULT LOOP (§7.3).
     std::unique_ptr<LaunchDescription> run_compute_forward() override;
+
+    /// Transient subtrees (§4.4). Every run_compute_forward that runs the
+    /// subtree — the default loop, Parallel, Fused, and any custom type that
+    /// calls one of them — calls revive() on entry and release() on exit;
+    /// both are no-ops for a System that is not transient. A custom type
+    /// that returns early without running its subtree calls neither.
+    void revive();    ///< re-allocate released roots (pool route, current extents); re-run the subtree's init, both passes
+    void release();   ///< drop the usm_vector of every root in the subtree with no outside peer; SlabKit defers the free
+    bool transient_ = false;   ///< set by add_subsystem from property::transient
+    bool released_  = false;
 
     ExecCtx ctx_;
     std::vector<std::unique_ptr<Subsystem>> children_;   ///< declared order = exec order
@@ -1794,6 +1797,7 @@ The default loop is per child:
 run_post_compute`; a child that submitted itself needs no owner action.
 
 ```
+revive();
 for (child : children_) {
     child->run_pre_compute(ctx_);
     auto d = child->run_compute_forward();
@@ -1801,6 +1805,7 @@ for (child : children_) {
     child->run_post_compute(ctx_);            // copies AFTER the work they depend on —
                                               //   by the stream, not by an event
 }
+release();
 return nullptr;                               // "I submitted"
 ```
 
@@ -1826,6 +1831,7 @@ namespace naga::cospan {
 namespace property {
     struct device        { sycl::device dev; };            // placement; inherited when absent
     struct parallel      {};                               // flavor
+    struct transient     {};   // the subtree's memory is released after each of its runs (§4.4); Systems only
     struct fused         { FusedSystem::Mode mode; std::optional<sycl::range<3>> wg; };
 }
 // Gating, counting and change detection are custom System TYPES (§10),
@@ -1844,7 +1850,7 @@ public:
     template <class T, class... Args> requires std::derived_from<T, ComponentBase>
     auto child(std::string name, Args&&... ctor_args);
     /// The HELPER FORM: a System configured by properties (device and/or ONE
-    /// flavor — parallel | fused; both on one call is an error), populated
+    /// flavor — parallel | fused; both on one call is an error, and/or transient), populated
     /// with the given Components in order. No class is written for it. The
     /// children are Components by construction (child<T> requires
     /// ComponentBase), which is what Parallel and Fused require; a helper-
@@ -1865,8 +1871,6 @@ public:
     void tie_inputs (std::initializer_list<std::string_view> members, std::string name);
     void tie_outputs(std::initializer_list<std::string_view> members, std::string name,
                      TieOutputsPolicy policy = TieOutputsPolicy::require_atomic);
-    /// Keeps an output's storage for the whole forward and after it, whatever lifetime its consumers declare. Resolves from this namespace.
-    void retain(std::string_view path);
     void add_design_var(...);  void add_constraint(...);  void add_objective(...);   // §8
 };
 
@@ -1896,7 +1900,8 @@ namespace naga::cospan {
 /// run_compute_forward: pre_compute ALL children → queue.submit_group {
 /// each child's description submitted with its own device (the Parallel's
 /// unless placed) through a SubmitTarget carrying the group } →
-/// post_compute ALL after the group returns. The group is ONE item of the
+/// post_compute ALL after the group returns. revive() first, release() last
+/// (§4.4). The group is ONE item of the
 /// stream (§7.3): its children are unordered among themselves and ordered
 /// both ways against everything outside. ctx.group is set for the extent
 /// of that submit_group and null otherwise. Data independence of children
@@ -1919,6 +1924,7 @@ class ParallelSystem : public System { /* runner overrides as described */ };
 /// scratch handling, parallel mode: no producer-consumer pairs
 /// unless allowed → pack streams + records, stamp group slices, one
 /// staging, ONE submission with the sequence config → post-compute ALL.
+/// revive() first, release() last (§4.4).
 /// The order is forced: post-compute copies follow the wave in the stream.
 /// Why: §1 need 2.2 fuse, §1 need 2.2 opacity.
 class FusedSystem : public System {
@@ -2349,7 +2355,7 @@ nesting.
 
 - **Runners are virtual, hooks are for users.** A System type overrides
   `run_compute_forward` (and, when it must, `prepare_exec`, `compile`,
-  `run_init`); its users override `setup`/`init`/`pre_forward` as with any
+  `run_init`); its users override `setup`/`init` as with any
   System.
 - **Returning `nullptr` means "I submitted (or chose not to)".** The owner
   carries on; there is nothing for it to refresh (§7.3). Returning a
@@ -2420,7 +2426,7 @@ before returning** (why: P6 — no deferred resolution pass);
 namespace and apply the set operation (§4); marks record on roots.
 
 `Component::run_setup` → `setup()` → `declare_*` creates entries (roots of
-singleton sets; flags by kind; DimRecords; lifetime). Zero
+singleton sets; flags by kind; DimRecords). Zero
 allocation; no device anywhere in this step.
 
 **State:** final tree and exec order; final sets; marks. No storage.
@@ -2434,7 +2440,7 @@ maps (sum on key).
 
 `Component`: device = `parent_device`; per own entry `e`:
 - root → register this device as `e`'s primary; count its static bytes
-  here;
+  here (zero for a root inside a transient subtree);
 - input peer, `root(e)` already has storage registered on this device →
   nothing;
 - input peer, it does not → register this device on `root(e)` and count
@@ -2469,9 +2475,9 @@ wrappers; recurse.
 
 `Component`: for every own ROOT entry allocatable now, build its
 `usm_vector` per registered device from that device's substrate —
-durable∧static from the arena route; durable∧dynamic with a known shape via
-the pool route (OS fallback); dynamic-shaped roots and roots released
-per forward (§4.4) stay unallocated. Then point every member wrapper at
+static and outside every transient subtree from the arena route; otherwise,
+with a known shape, via the pool route (OS fallback); roots whose shape is
+not yet known stay unallocated. Then point every member wrapper at
 `root()->storage_on(own device)` — guaranteed
 allocated by now (roots precede peers); shape and stride (+ view) set;
 static input peers validate against their roots here. An unconnected
@@ -2489,13 +2495,13 @@ and it is where the information is).
 
 #### 11.2.6 Init — `root.init_tree()`
 
-`init_tree` is two passes. Component pass: every Component's
+`init_tree` is `run_init` (Component pass: every Component's
 `init(queue, device)`, depth-first in declaration order, with the Model's
-queue and the subsystem's device (signature: `init(sk::queue&, const
-sycl::device&)`); a System forwards `run_init` to its children. System
-pass: every System's `init(queue, device)`, children before owners, so an
-owner's `init` has the last word by path and the root System has the last
-word overall. Initializers write a root's
+queue and the subsystem's device — signature: `init(sk::queue&, const
+sycl::device&)`; Systems forward) then `run_system_init` (System pass: every
+System's `init(queue, device)`, child Systems before owners, so an owner's
+`init` has the last word by path and the root System has the last word
+overall). Initializers write a root's
 primary storage and copy it to the root's other-device storage. Unnecessary
 inits (connected inputs) are harmless. An initializer on unallocated
 storage throws.
@@ -2514,6 +2520,7 @@ need not wait between them — the stream orders (§7.3).
 #### 11.3.1 A System's turn — the ordering contract (§7.3)
 
 ```
+revive()
 for child in children:
     child.run_pre_compute(ctx)
     d = child.run_compute_forward()
@@ -2521,6 +2528,7 @@ for child in children:
                                               //   routed on d->is_custom_op()
     child.run_post_compute(ctx)               // a child that submitted itself
                                               //   needs no owner action
+release()
 return null
 ```
 
@@ -2542,8 +2550,7 @@ config → post-compute ALL. **Custom System types** (§10): early-return from
 
 #### 11.3.2 A Component's turn (§6.5)
 
-1. `run_pre_compute(ctx)`: allocate every own root released per forward
-   (§4.4) through the pool route at this turn's shape; then, for each own
+1. `run_pre_compute(ctx)`: for each own
    input driving a shape via `FromInput` — read the driving input's `host_view()` (the one
    forced sync, so the launch geometry below is known), `root.resize(shape)`,
    `point_wrapper`; nothing submitted for the resize, no reallocation
@@ -2553,9 +2560,7 @@ config → post-compute ALL. **Custom System types** (§10): early-return from
 3. `run_post_compute(ctx)`: for each output root with storage on other
    devices, for each other device `copy_d = root` — one assignment
    resizes to match and copies, routed by SlabKit — after the owner's
-   submission, ordered by the stream. Then, for each own transient input,
-   tell its root one consumer is done; a root whose countdown reaches zero
-   drops its storage (§4.4).
+   submission, ordered by the stream.
 
 **State:** every output root holds this forward's values; dynamic roots
 sized to this forward.
@@ -2568,8 +2573,8 @@ on the host and does `from_host` on destruction and on `commit()`),
 `set_*` (`root.from_host(span)`, then `copy_d = root` per other device),
 `memory_report()`, `get_subsystem(path)` chaining and
 `get_inputs()/get_outputs()` enumeration (§10.3). Host access is §9.2. Host
-access to a root released per forward (§4.4) after the forward is an error
-naming the transient input and `retain`.
+access to a released root of a transient subtree (§4.4) is an error naming
+the transient System.
 
 ### 11.5 End of life
 
