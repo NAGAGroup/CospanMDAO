@@ -1,7 +1,15 @@
 # CUDA: deadlock after a deferred OS-route free (no pool)
 
-Status: OPEN. The fix is pending Jack's decision (see "Where a fix belongs").
-Below CoSpan: the tests are correct and are tagged `[os-free]` so the CUDA runs can skip them.
+Status: WORKED AROUND in SlabKit (see "Status" below); root cause in the AdaptiveCpp fork, fix pending.
+Below CoSpan: the tests are correct and no longer need a tag; the CUDA runs are unfiltered.
+
+## Status
+
+The issue was worked around in SlabKit e5e2ac1 (full sha e5e2ac15f31a88bb4a565b2eb18933f5aba140e1), where frees run on their own lane, so no kernel depends on one.
+
+The root cause is the fork: `cuda_queue::needs_completed_requirements` (and hip_queue's) defers only when the requirement's device backend differs. The scheduler assigns an async_host node the target device (`dag_direct_scheduler.cpp`: `return std::make_pair(&rt->async_host(), dev)`), so it is not deferred. `inorder_executor::submit_inline` then classes it as external (`!is_backend_queue()`) and uses `submit_external_wait_for`, which calls cudaLaunchHostFunc with a blocking callback.
+
+The fix is pending a fork rebuild: apply the same `is_backend_queue` test in `needs_completed_requirements`.
 
 ## Symptom
 
@@ -129,14 +137,13 @@ so the affected tests keep exercising the OS route.
 
 ## Test tag
 
-Every test case that frees on the OS route carries `[os-free]`: the WeightedHistogram case in
-`test_component.cpp` and the `[transient]` case in `test_system.cpp`. To run the suite on CUDA
-without them: `pixi run -e cuda test "~[os-free]"`. On OpenMP they pass and are part of the
-normal full run. Do not run `[os-free]` on CUDA until the issue is fixed; it hangs.
+The `[os-free]` tag is gone. It marked the WeightedHistogram case in `test_component.cpp` and
+the `[transient]` case in `test_system.cpp`; with the SlabKit workaround they run in the full
+CUDA suite, so `pixi run -e cuda timeout 600 cospan-tests` runs everything.
 
 ## Where a fix belongs
 
-Pending Jack's decision. Not a CoSpan bug. The options are:
+Not a CoSpan bug. The fork fix is described in "Status"; the two alternatives considered were:
 
 - SlabKit's free path: do not call `cuMemFree` from an `async_host` task (for example, a
   stream-ordered free, or a synchronous free that takes no dependency on the stream), or

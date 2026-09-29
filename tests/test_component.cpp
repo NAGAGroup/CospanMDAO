@@ -486,7 +486,7 @@ TEST_CASE("plain body: y = 2x + 1 at ranks 1, 2 and 3", "[component][plain]") {
 // =============================================================================================
 // WeightedHistogram
 // =============================================================================================
-TEST_CASE("WeightedHistogram: atomic output, FromSourceDim, value-driven n_bins", "[component][histogram][os-free]") {
+TEST_CASE("WeightedHistogram: atomic output, FromSourceDim, value-driven n_bins", "[component][histogram]") {
     auto model = cs::create_model<tc::TopHist>(default_config());
     model.setup();
 
