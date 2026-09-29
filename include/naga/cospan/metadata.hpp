@@ -45,6 +45,7 @@ namespace sk = ::naga::slabkit;
 class System;
 class ComponentBase;
 class Model;
+class Subsystem;
 
 namespace detail {
 class IOEntry;
@@ -296,6 +297,12 @@ public:
     /// component's I/O (D3).
     sk::kind storage_kind() const noexcept { return storage_kind_; }
     bool     transient() const noexcept { return transient_; }
+    /// Roots: storage dropped by the transient owner's release; host access throws until revived.
+    bool released() const noexcept { return released_; }
+    /// Roots: path of the transient System that releases this root; empty otherwise.
+    std::string_view transient_owner() const noexcept { return transient_by_; }
+    /// The Subsystem that declared this entry (a Component for I/O, a System for aliases).
+    const Subsystem* declarer() const noexcept { return declarer_; }
 
     /// This entry's own placement: its subsystem's device and storage kind.
     Placement placement() const { return Placement{device(), storage_kind_}; }
@@ -351,6 +358,11 @@ public:
 
     /// Whether the ROOT of this entry's set has been allocated.
     virtual bool has_storage() const = 0;
+
+    /// ROOTS ONLY (no-op on peers): drop the storage of a transient root (§4.4).
+    virtual void release_storage() = 0;
+    /// ROOTS ONLY: re-allocate a released root through the pool route (§4.4).
+    virtual void revive_storage(sk::queue& q, Substrates& substrates) = 0;
 
 protected:
     IOEntry(std::string name, IOKind k, DType dt, int rank, std::vector<DimRecord> dims,
@@ -417,10 +429,12 @@ protected:
     std::vector<Placement>     placements_;        ///< roots; primary first
     std::optional<sycl::device> device_;
     sk::kind                   storage_kind_ = sk::kind::device;
+    bool                       released_ = false;     ///< roots: storage dropped by release_storage
+    std::string                transient_by_;         ///< roots: path of the releasing System
 
 private:
     /// The four structural operations and placement are System's (r01 §4.2);
-    /// EntryAccess is the internal/test-only stand-in until System exists.
+    /// EntryAccess remains the test-only stand-in for the entry-level smoke.
     friend class naga::cospan::System;
     friend class naga::cospan::ComponentBase;
     friend struct EntryAccess;
@@ -451,6 +465,7 @@ private:
     bool                  can_be_target_;
     std::optional<SubarrayRef> view_;
     bool                  transient_ = false;
+    const Subsystem*      declarer_  = nullptr;
 
     std::optional<MarkRecord> design_var_, constraint_, objective_;
 };
@@ -523,6 +538,18 @@ public:
         return r != nullptr && !r->slots_.empty();
     }
 
+    void release_storage() override {
+        if (!is_root() || slots_.empty()) return;
+        slots_.clear();  // usm_vector frees defer in SlabKit; launched work keeps its pointers
+        released_ = true;
+    }
+
+    void revive_storage(sk::queue& q, Substrates& subs) override {
+        if (!is_root() || !released_) return;
+        released_ = false;
+        allocate(q, subs);  // transient roots are not arena-eligible: pool route, current extents
+    }
+
     void sync_other_placements(sk::queue&) override {
         if (!is_root()) throw std::logic_error("naga::cospan: sync_other_placements is for roots");
         if (slots_.size() < 2) return;
@@ -559,10 +586,19 @@ protected:
 
     void* raw_storage_on(const Placement& p) const override {
         Slot* s = find_slot(p);
-        if (s == nullptr)
+        if (s == nullptr) {
+            if (released_) throw_released();
             throw std::logic_error("naga::cospan: '" + std::string{name()} +
                                    "' has no storage on that placement");
+        }
         return s->data.data();
+    }
+
+    /// Host access to a released root: the error names the transient System.
+    [[noreturn]] void throw_released() const {
+        throw std::logic_error("naga::cospan: '" + std::string{name()} + "' belongs to transient System '" +
+                               transient_by_ + "' and its storage is released; it exists only while that "
+                               "System runs");
     }
 
 private:
@@ -579,6 +615,7 @@ private:
     }
 
     Slot& primary_slot() const {
+        if (released_) throw_released();
         if (!is_root() || placements_.empty())
             throw std::logic_error("naga::cospan: '" + std::string{name()} + "' has no storage");
         Slot* s = find_slot(placements_.front());
@@ -705,16 +742,62 @@ public:
     void point_wrapper() override {}
 };
 
+namespace alias_factory {
+
+template <DType DT, int R>
+std::unique_ptr<IOEntry> make_typed(std::string name, IOKind k, const std::vector<DimRecord>& dims,
+                                    bool can_source, bool can_target) {
+    std::array<DimRecord, R> a{};
+    for (int d = 0; d < R; ++d) a[static_cast<std::size_t>(d)] = dims[static_cast<std::size_t>(d)];
+    return std::make_unique<AliasEntry<DT, R>>(std::move(name), k, a, can_source, can_target);
+}
+
+template <DType DT>
+std::unique_ptr<IOEntry> make_ranked(std::string name, IOKind k, const std::vector<DimRecord>& dims,
+                                     bool can_source, bool can_target) {
+    switch (dims.size()) {
+        case 1: return make_typed<DT, 1>(std::move(name), k, dims, can_source, can_target);
+        case 2: return make_typed<DT, 2>(std::move(name), k, dims, can_source, can_target);
+        default: return make_typed<DT, 3>(std::move(name), k, dims, can_source, can_target);
+    }
+}
+
+template <std::size_t... I>
+std::unique_ptr<IOEntry> make_impl(DType dt, std::string name, IOKind k,
+                                   const std::vector<DimRecord>& dims, bool can_source,
+                                   bool can_target, std::index_sequence<I...>) {
+    std::unique_ptr<IOEntry> out;
+    (void)((static_cast<std::size_t>(dt) == I
+                ? (out = make_ranked<static_cast<DType>(I)>(std::move(name), k, dims, can_source, can_target),
+                   true)
+                : false) ||
+           ...);
+    return out;
+}
+
+}  // namespace alias_factory
+
+/// A type-erased AliasEntry of the given dtype (atomic-ness preserved) and
+/// rank (dims.size()): System's promote / tie_* build aliases from resolved
+/// entries, whose dtype and rank are runtime values.
+inline std::unique_ptr<IOEntry> make_alias_entry(DType dt, std::string name, IOKind k,
+                                                 const std::vector<DimRecord>& dims, bool can_source,
+                                                 bool can_target) {
+    if (dims.empty() || dims.size() > 3)
+        throw std::invalid_argument("naga::cospan: '" + name + "': rank must be 1..3");
+    return alias_factory::make_impl(dt, std::move(name), k, dims, can_source, can_target,
+                                    std::make_index_sequence<13>{});
+}
+
 /// INTERNAL / TEST-ONLY. The structural and placement mutators are System's
-/// and the Component's (friendship); until they exist this is the one
-/// sanctioned way to drive them from outside (smoke tests). Deleted from the
-/// tests when System lands.
+/// and the Component's (friendship); this stays the sanctioned way for the
+/// ENTRY-LEVEL smoke (smoke.cpp) and the Component smoke to drive them without
+/// a System. System-level tests use System's own operations, never this.
 struct EntryAccess {
     static void merge(IOEntry& into, IOEntry& from) { IOEntry::merge(into, from); }
     static void register_placement(IOEntry& e, const Placement& p) { e.register_placement(p); }
     static void set_device(IOEntry& e, const sycl::device& d) { e.device_ = d; }
     static void set_storage_kind(IOEntry& e, sk::kind k) { e.storage_kind_ = k; }
-    static void set_transient(IOEntry& e, bool t) { e.transient_ = t; }
     static void set_view(IOEntry& e, std::optional<SubarrayRef> v) { e.view_ = std::move(v); }
     /// What the owning Component does for FromInputDim / FromInput dims.
     static void set_resolved_extent(IOEntry& e, int d, std::size_t extent) {

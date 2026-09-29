@@ -17,3 +17,7 @@ add_sycl_to_target(TARGET smoke SOURCES smoke.cpp)
 add_executable(smoke_component smoke_component.cpp)
 target_link_libraries(smoke_component PRIVATE naga::cospan)
 add_sycl_to_target(TARGET smoke_component SOURCES smoke_component.cpp)
+
+add_executable(smoke_system smoke_system.cpp)
+target_link_libraries(smoke_system PRIVATE naga::cospan)
+add_sycl_to_target(TARGET smoke_system SOURCES smoke_system.cpp)

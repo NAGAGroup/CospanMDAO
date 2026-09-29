@@ -303,6 +303,15 @@ protected:
     Substrates*                 subs_  = nullptr;
 
 private:
+    /// System resolves paths into a Component's namespace and walks its
+    /// entries (transient marking); nothing else reaches these.
+    friend class System;
+
+    detail::IOEntry* lookup_entry(std::string_view name) const {
+        const auto it = by_name_.find(std::string{name});
+        return it == by_name_.end() ? nullptr : it->second.get();
+    }
+
     // ---- declaration -------------------------------------------------------
     template <int Rank, class S>
     static std::array<detail::DimRecord, Rank> records_of(

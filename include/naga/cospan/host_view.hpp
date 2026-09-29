@@ -152,6 +152,7 @@ private:
     friend struct detail::HostViewAccess;
     friend class Model;
     friend class ComponentBase;
+    friend class System;
 };
 
 /// HostViewMut<DT, Rank> — the same host copy, writable. commit() writes it
@@ -209,6 +210,7 @@ private:
     friend struct detail::HostViewAccess;
     friend class Model;
     friend class ComponentBase;
+    friend class System;
 };
 
 template <DType DT, int Rank>
