@@ -388,3 +388,24 @@ The staging buffers are `std::optional<sk::usm_vector<T>>` members (`emplace` + 
 
 ## D96 — Test change in smoke_parallel
 Its case d uses `property::fused{Mode::parallel}`, since plain `property::fused` now builds a FusedSystem. Test-only.
+
+## D97 — Parallel mode: one slice of groups per stage
+`group_offset` is the running sum of the previous stages' `group_count`, and the launch has the SUM of the group counts (sequential mode: offset 0, launch = the max). Each stage still returns early, as a whole group, outside its own slice. Reason: the stages are independent, so they occupy disjoint groups of one launch. r01 §5.4, §5.7.
+
+## D98 — No barriers in parallel mode
+`compile()` inserts the `kb_barrier` ids only in sequential mode. Reason: stages own disjoint groups, so no two stages use the shared local buffer in the same group; a group body's own barrier is uniform because the slice check is per whole group. r01 §5.4.
+
+## D99 — Producer-consumer check in parallel mode
+Every forward, if any input's root is an output of ANOTHER stage of the wave (earlier or later), `validate` throws `invalid_argument` naming both stages and `allow_producer_consumer()`. The stages run unordered, so any such pair is a race. r01 §7.5.
+
+## D100 — allow_producer_consumer() is the trust override
+`FusedSystem::allow_producer_consumer()` sets a flag that skips D99's check; the values are then the user's assertion and are not checked by the framework. It is a no-op in sequential mode, whose dependency rule (D91) cannot be overridden. r01 §7.5.
+
+## D101 — The step 3b-3 throw is gone
+The FusedSystem constructor takes either mode; the helper form passes `{mode, wg}` through unchanged (no change in system.hpp's logic, only its comments). smoke_parallel case d now expects `property::fused{Mode::parallel}` to build without throwing. Reason: parallel mode is implemented.
+
+## D102 — Wave work-group in parallel mode
+Chosen as in sequential mode (D89), one shape for the whole wave: a group stage's requested wg is the wave's and plain stages adopt it. A plain stage's slice is ceil(flat_extent/wg_size) groups, a group stage's the product of its per-dimension ceilings. r01 §5.6.
+
+## D103 — Compile-time errors are the same in both modes
+A custom-op child, a host child, a child on another device and children of different kernel ranks all throw `invalid_argument` from `compile()` (during `start()`), naming the child; smoke_fused case g checks the first, second and last. Reason: none has a stage function, or the wave has one rank and one device. r01 §5.4.
