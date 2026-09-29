@@ -409,3 +409,27 @@ Chosen as in sequential mode (D89), one shape for the whole wave: a group stage'
 
 ## D103 — Compile-time errors are the same in both modes
 A custom-op child, a host child, a child on another device and children of different kernel ranks all throw `invalid_argument` from `compile()` (during `start()`), naming the child; smoke_fused case g checks the first, second and last. Reason: none has a stage function, or the wave has one rank and one device. r01 §5.4.
+
+## D104 — The Model's state lives on the heap
+`Model` is one `unique_ptr<Impl>`. After setup the Systems hold raw pointers to the queue and the substrates (ExecCtx, `subs_`), so those must not move when the Model does; moving the Model moves the pointer. Inside `Impl` the members are declared ctx, queue, substrates, root, the three mark vectors, cfg, so destruction is cfg, marks, root, substrates, queue, ctx (§9.4). A moved-from Model throws `logic_error` ("moved-from") from every verb. r01 §9.1, §9.4.
+
+## D105 — default_device resolution
+A set `default_device` is validated with `ctx.contains()` and a miss throws `invalid_argument` at construction. Unset: the runtime's default-selector device when the context holds it, else the context's first device (a device-list config need not contain the selector's pick). The queue is built on it: `queue{ctx, default_device, async_handler}`. r01 §9.1.
+
+## D106 — Setup chain, as the driver did it
+`setup()` places the root as `top`, then run_setup, get_exec_info(default device), substrates, prepare_exec, compile, run_init, run_system_init, marks. Per device in the exec-info map: an arena of `bytes + 4096*64` (the driver's alignment slack) iff bytes > 0, a pool of `pool_bytes[d]` or `default_pool_bytes` iff > 0 (node size `pool_node_size`); a device outside the context throws. The default device always gets a substrate entry. setup() runs once: a second call, or one after a failed first, throws `logic_error`; forward(), host access, retrieval, marks and memory_report before it has completed throw `logic_error`; wait() and root() do not. r01 §9.1, §11.
+
+## D107 — memory_report: what is filled and what is not
+`arena_bytes` is the arena's capacity (including the slack of D106), `arena_bytes_in_use` its `used()`; `pool_bytes` is slot_count x node_size, `pool_bytes_in_use` outstanding x node_size. `os_allocations` and `os_bytes_in_use` are always 0: Nothing in the runtime counts OS-route allocations yet, so the profile-then-size-a-pool loop of §9.3 cannot read OS use from this report; adding a counter is a later change. r01 §9.1.
+
+## D108 — Mark collection order
+The walk visits a System's own alias entries (inputs, then outputs), then its children in declaration order, recursing into child Systems and taking a Component's entries. Each root is read once (dedup by root pointer, first reached wins) and its design_var/constraint/objective is appended to the matching vector. The spans are cached at the end of setup(). r01 §8.4, §9.1.
+
+## D109 — Host access goes through the entry
+view_input/set_input require an input entry and view_output/view_output_mut/set_output an output entry (`invalid_argument` otherwise, naming the path). Views are the private-constructor HostView/HostViewMut (Model is their friend); view_output_mut's writes land in host staging and are written back on commit() and on destruction. `set_*` check dtype and rank (`detail::check_entry`) and call `detail::write_back`, which writes the root's primary storage (through the entry's region if it has one) and refreshes the other placements. r01 §9.1, §9.2.
+
+## D110 — ~Model and the moved Model
+`~Model` and move-assignment call `queue.wait_and_throw()` inside try/catch (a stream error is printed to stderr, never thrown), then release the Impl so members go in the D104 order. r01 §9.4.
+
+## D111 — smoke_model notes
+The Sellar Systems are copied from smoke_system (no shared header). Case d writes through `view_output_mut` on an OUTPUT root whose elements the producer does not overwrite (Hold writes y[0] of 4; the host owns y[1..3]): the dispatch said "a free input's root", but view_output_mut is the output view and a free input is written with set_input, so that literal case cannot exist. Case c's default_device-outside-context check needs two visible devices and is skipped with one. Observation: under `ACPP_VISIBILITY_MASK=cuda` the OpenMP host device was still enumerated, so case b also ran with that mask; with the mask removed the same result.
