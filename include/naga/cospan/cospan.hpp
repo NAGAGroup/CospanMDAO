@@ -10,3 +10,4 @@
 #include "naga/cospan/kernel.hpp"
 #include "naga/cospan/component.hpp"
 #include "naga/cospan/system.hpp"
+#include "naga/cospan/parallel_system.hpp"

@@ -36,43 +36,9 @@ static void check(bool ok, const char* what) {
     if (!ok) ++failures;
 }
 
-// ---- the test-only root driver --------------------------------------------------
-namespace naga::cospan::detail {
-
-struct RootDriver {
-    sycl::device dev;
-    sk::queue&   q;
-    cs::System&  root;
-    cs::Substrates subs;
-
-    RootDriver(const sycl::device& d, sk::queue& queue, cs::System& r) : dev{d}, q{queue}, root{r} {}
-
-    /// run_setup -> get_exec_info -> substrates (arena from bytes if > 0, pool)
-    /// -> prepare_exec -> compile -> run_init -> run_system_init.
-    void start() {
-        SubsystemAccess::place(root, "top", "top", nullptr);
-        root.run_setup();
-        std::size_t total = 0;
-        for (const auto& [d, bytes] : root.get_exec_info(dev)) total += bytes;
-        cs::MemorySubstrate m;
-        // Slack for the arena's per-allocation alignment.
-        if (total > 0) m.arena.emplace(q, dev, sk::kind::device, total + 4096 * 64);
-        m.pool.emplace(q, dev, sk::kind::device, 1 << 20);
-        subs.emplace(dev, std::move(m));
-        root.prepare_exec(q, subs);
-        root.compile();
-        cs::ExecCtx ctx{dev, &q, nullptr, &subs.at(dev)};
-        root.run_init(ctx);
-        root.run_system_init();
-    }
-
-    void forward() {
-        (void)root.run_compute_forward();
-        q.wait();
-    }
-};
-
-}  // namespace naga::cospan::detail
+// The test-only root driver (start / enqueue / wait / forward) is shared with
+// smoke_parallel.
+#include "driver.hpp"
 
 using cs::detail::RootDriver;
 

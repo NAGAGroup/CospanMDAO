@@ -49,7 +49,7 @@ namespace naga::cospan {
 
 namespace property {
 struct device { sycl::device dev; };  ///< placement; inherited when absent
-struct parallel {};                   ///< flavor (step 3b: throws when used)
+struct parallel {};                   ///< flavor: the helper form builds a ParallelSystem (§7.5)
 struct transient {};                  ///< the subtree's memory is released after each run (§4.4); Systems only
 struct fused {                        ///< flavor (step 3b: throws when used)
     enum class Mode : uint8_t { sequential, parallel };
@@ -104,6 +104,8 @@ private:
 
 enum class TieOutputsPolicy : uint8_t { require_atomic, allow_plain };
 
+class ParallelSystem;  // parallel_system.hpp (r01 §7.5)
+
 namespace detail {
 
 /// child<T>(name, args...): a Component to be added by the helper form.
@@ -124,6 +126,15 @@ template <class... Args>
 inline constexpr bool leads_with_props_v = false;
 template <class A, class... R>
 inline constexpr bool leads_with_props_v<A, R...> = std::is_same_v<std::remove_cvref_t<A>, property_list>;
+
+/// The type the helper form builds for property::parallel. It is a member of
+/// a class template only so that the name is DEPENDENT: parallel_system.hpp
+/// includes this header, so ParallelSystem is complete only at the point the
+/// helper form is instantiated (cospan.hpp includes both).
+template <class...>
+struct parallel_of {
+    using type = ParallelSystem;
+};
 
 }  // namespace detail
 
@@ -166,17 +177,21 @@ public:
             std::move(name), std::tuple<std::decay_t<Args>...>{std::forward<Args>(ctor_args)...}};
     }
 
-    /// The HELPER FORM: a plain System configured by properties (device,
-    /// transient), populated with the given Components in order. Flavors
-    /// (parallel, fused) are step 3b and throw.
+    /// The HELPER FORM: a System configured by properties (device, transient
+    /// and ONE flavor), populated with the given Components in order. With
+    /// property::parallel it is a ParallelSystem (§7.5); a plain System
+    /// otherwise. property::fused is step 3b and throws.
     template <class... Children>
         requires(sizeof...(Children) >= 1 &&
                  (detail::is_child_decl_v<std::remove_cvref_t<Children>> && ...))
     System& add_subsystem(std::string name, const property_list& props, Children&&... children) {
-        System& sys = add_child<System>(std::move(name), props);
-        detail::FlagScope scope{sys.declaring_};
-        (sys.add_decl(std::forward<Children>(children)), ...);
-        return sys;
+        if (props.has_property<property::parallel>() && props.has_property<property::fused>())
+            throw std::invalid_argument("naga::cospan: " + describe() + ": add_subsystem('" + name +
+                                        "'): parallel and fused are two flavors; give one");
+        if (props.has_property<property::parallel>())
+            return populate<typename detail::parallel_of<Children...>::type>(std::move(name), props,
+                                                                             std::forward<Children>(children)...);
+        return populate<System>(std::move(name), props, std::forward<Children>(children)...);
     }
 
     /// An empty System; add children with the templated overload inside its setup().
@@ -582,6 +597,11 @@ private:
         }
     }
 
+protected:
+    // The transient contract for System flavors (ParallelSystem, ...): every
+    // run_compute_forward that runs the subtree calls revive() on entry and
+    // release() on exit (§4.4, §7.2); both are no-ops when not transient.
+
     /// Re-allocate released roots (pool route, current extents) and re-run the
     /// subtree's init, both passes, when released. A no-op otherwise.
     void revive() {
@@ -602,6 +622,7 @@ private:
             }
     }
 
+private:
     /// This System's roots, and those of every released nested transient
     /// System (their storage is needed by the init this revive re-runs).
     void revive_storage() {
@@ -759,10 +780,13 @@ private:
         return it == aliases_.end() ? nullptr : it->second.get();
     }
 
+protected:
+    /// "the root System" or "System 'path'": the prefix of every System error.
     std::string describe() const {
         return path().empty() ? std::string{"the root System"} : "System '" + path() + "'";
     }
 
+private:
     EntryRefs aliases_of(IOKind k) const {
         EntryRefs out;
         for (const detail::IOEntry* a : alias_order_)
@@ -795,15 +819,33 @@ private:
     T& add_child(std::string name, const property_list& props, Args&&... ctor_args) {
         require_declaring("add_subsystem");
         check_new_name(name, "subsystem");
-        if (props.has_property<property::parallel>() || props.has_property<property::fused>())
+        if (props.has_property<property::fused>())
             throw std::logic_error(
-                "naga::cospan: property::parallel and property::fused are step 3b (ParallelSystem / "
-                "FusedSystem are not implemented yet)");
+                "naga::cospan: property::fused is step 3b (FusedSystem is not implemented yet)");
+        // property::parallel selects a flavor, which only the helper form can
+        // build; a typed child names its own type (derive from ParallelSystem).
+        if (props.has_property<property::parallel>() && !std::is_base_of_v<ParallelSystem, T>)
+            throw std::invalid_argument("naga::cospan: " + describe() + ": add_subsystem('" + name +
+                                        "'): property::parallel builds a ParallelSystem in the helper form "
+                                        "(add_subsystem(name, props, child<T>(...)...)); a typed child names "
+                                        "its own type, so derive it from ParallelSystem");
         auto owned = std::make_unique<T>(std::forward<Args>(ctor_args)...);
         T&   ref   = *owned;
         attach(std::move(owned), std::move(name), props);
         ref.run_setup();  // fully declared before the caller's next structural call
         return ref;
+    }
+
+    /// The helper form's body: build a child System of type S (System, or
+    /// ParallelSystem for property::parallel) and add the given Components to
+    /// it in order. add_child<S> has already run S::setup(), which left the
+    /// child's declaring flag off, so it is raised here for the adds.
+    template <class S, class... Children>
+    System& populate(std::string name, const property_list& props, Children&&... children) {
+        S& sys = add_child<S>(std::move(name), props);
+        detail::FlagScope scope{sys.declaring_};
+        (sys.add_decl(std::forward<Children>(children)), ...);
+        return sys;
     }
 
     template <class T, class... A>
@@ -1000,9 +1042,14 @@ private:
     bool transient_ = false;  ///< set by the owner from property::transient
     bool released_  = false;
 
+protected:
+    // What a flavor's runner needs (ParallelSystem): this System's ctx, one ctx
+    // per child (its placed device's substrate), and the children in order.
     ExecCtx                                                            ctx_;
     std::vector<ExecCtx>                                               child_ctx_;  ///< per child: its device's substrate
     std::vector<std::unique_ptr<Subsystem>>                            children_;   ///< declared order = exec order
+
+private:
     std::vector<Subsystem*>                                            child_ptrs_;
     std::unordered_map<std::string, std::size_t>                       child_index_;
     std::vector<std::optional<sycl::device>>                           placed_;     ///< property::device per child
