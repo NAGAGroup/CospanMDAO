@@ -1,9 +1,8 @@
 # CoSpan specification — r01, 2026-09-28: the design as agreed
 
-**What this is.** The CoSpan design as agreed on 2026-09-28. It is
-unverified by code. When the code disagrees, a new revision is cut and this
-file is never edited. Discussion decisions live in the project knowledge;
-this document holds only what was agreed. Notation: `sk::` is SlabKit's
+**What this is.** The CoSpan design as built. This file describes the design the code
+implements and is kept in step with the code. Discussion decisions live in
+the project knowledge; this document holds only what is specified. Notation: `sk::` is SlabKit's
 namespace (`sk::context`, `sk::queue`, `sk::queue::group`;
 `slabkit::usm_vector`, `DeviceArena`, `DevicePool`); SlabKit's own spec owns
 their contracts.
@@ -485,7 +484,7 @@ struct FromInputDim  { std::string_view input; uint8_t dim; };
 /// This dimension's extent = the VALUE of element `index` (flat) of
 /// sibling input `input`. The source SHALL have an integer value dtype.
 /// Reshaping is a host act, so the value is read on the host: the driving
-/// input's host_view() in the declaring Component's own run_pre_compute
+/// input's value, in the declaring Component's own run_pre_compute
 /// (§6.5) — one wait, nothing submitted for the resize. Only
 /// entries using FromInput ever pay it. Orchestration is Component-local,
 /// always; no producer knows its consumers.
@@ -616,7 +615,7 @@ public:
     /// Automatic shape update: applies the DimRecords. Invoked by the
     /// OWNING COMPONENT in run_pre_compute, BEFORE connection validation.
     /// FromInput dims are resolved there first (the driving input's
-    /// host_view(), resize, point_wrapper — §6.5).
+    /// value read on the host, resize, point_wrapper — §6.5).
     virtual void update_shape() = 0;
 
     /// Resize (automatic derivation and user reshape share this path).
@@ -1339,12 +1338,12 @@ q.submit([&](sycl::handler& cgh){
   run_pre_compute at its own turn in depth-first order — upstream has
   completed by construction. Static models pay nothing anywhere in this
   section.
-- **FromInput resizes are the consumer's own business.** In its
-  `run_pre_compute`, the consuming Component reads the driving input's
-  `host_view()` (the one forced sync, so the launch geometry is
-  known at enqueue), calls `root.resize(shape)`, then `point_wrapper` —
-  no staging copy, nothing submitted for the resize, no reallocation
-  inside a submitted task. Nothing is registered anywhere; no producer knows its consumers.
+- **FromInput applies to a Component's own inputs and outputs.** In its
+  `run_pre_compute`, the Component reads the driving input's value on the
+  host (the one forced sync, so the launch geometry is known at enqueue),
+  calls `root.resize(shape)`, then `point_wrapper` — no staging copy,
+  nothing submitted for the resize, no reallocation inside a submitted
+  task. Nothing is registered anywhere; no producer knows its consumers.
 - **FusedSystem: a value-driven size may not come from the same fuse.** A
   wave's geometry needs every stage's extent before the wave launches, and
   a `FromInput` size is read from the driving input's VALUE on the host
@@ -1650,7 +1649,7 @@ work and never sees a queue except through the owner's ctx.
    entry — inputs, then outputs, with cycle detection between the specs
    (`FromInputDim` reads the sibling input's extent) — for each entry
    carrying a `FromInput` spec, read the driving input's value
-   through `host_view()` — a host read, whichever storage holds it (the
+   on the host, whichever storage holds it (the
    one forced sync, so this turn's launch geometry is known; integer
    dtypes only, a negative value throws), allocate the entry's root first
    if it is still unallocated, call
@@ -2102,7 +2101,7 @@ public:
 /// slice (`StageRecord::local_off`, the running sum, each stage's bytes
 /// rounded up to 16) and the launch needs the sum; parallel mode shares
 /// one slice at offset 0 and needs the largest stage's. A wave over the
-/// device's limit throws `runtime_error` at forward, naming the scratch
+/// device's limit throws `invalid_argument` at forward, naming the scratch
 /// stages and their byte counts.
 /// The order is forced: post-compute copies follow the wave in the stream.
 /// Why: §1 need 2.2 fuse, §1 need 2.2 opacity.
@@ -2772,7 +2771,7 @@ framework inserts no barriers) → post-compute ALL. **Custom System types** (§
 #### 11.3.2 A Component's turn (§6.5)
 
 1. `run_pre_compute(ctx)`: for each own
-   entry (input or output) whose shape a `FromInput` spec drives — read the driving input's `host_view()` (the one
+   entry (input or output) whose shape a `FromInput` spec drives — read the driving input's value on the host (the one
    forced sync, so the launch geometry below is known), `root.resize(shape)`,
    `point_wrapper`; nothing submitted for the resize, no reallocation
    inside a submitted task. Then `pre_forward()` → dynamic validation → wrapper sync.
