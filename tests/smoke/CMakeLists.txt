@@ -13,3 +13,7 @@ add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../.. ${CMAKE_CURRENT_BINARY_DIR}/cos
 add_executable(smoke smoke.cpp)
 target_link_libraries(smoke PRIVATE naga::cospan)
 add_sycl_to_target(TARGET smoke SOURCES smoke.cpp)
+
+add_executable(smoke_component smoke_component.cpp)
+target_link_libraries(smoke_component PRIVATE naga::cospan)
+add_sycl_to_target(TARGET smoke_component SOURCES smoke_component.cpp)

@@ -35,6 +35,7 @@
 #include "naga/slabkit/slabkit.hpp"
 
 #include "naga/cospan/dtype.hpp"
+#include "naga/cospan/subsystem.hpp"
 #include "naga/cospan/wrappers.hpp"
 
 namespace naga::cospan {
@@ -138,17 +139,7 @@ struct MarkRecord {
     Scaling                            scaling;
 };
 
-// -----------------------------------------------------------------------------
-// Memory substrates (r01 §7.1)
-// -----------------------------------------------------------------------------
-
-/// One per device: the device's arena (present iff it has static bytes) and
-/// pool (present iff configured), held for the model's life.
-struct MemorySubstrate {
-    std::optional<sk::DeviceArena> arena;
-    std::optional<sk::DevicePool>  pool;
-};
-using Substrates = std::unordered_map<sycl::device, MemorySubstrate>;
+// MemorySubstrate / Substrates live in subsystem.hpp (D7).
 
 namespace detail {
 
@@ -342,6 +333,9 @@ public:
     /// The root's producer copies primary -> every other device's storage.
     virtual void sync_other_devices(sk::queue& q) = 0;
 
+    /// Whether the ROOT of this entry's set has been allocated.
+    virtual bool has_storage() const = 0;
+
 protected:
     IOEntry(std::string name, IOKind k, DType dt, int rank, std::vector<DimRecord> dims,
             bool can_source, bool can_target)
@@ -495,6 +489,11 @@ public:
         }
     }
 
+    bool has_storage() const override {
+        const auto* r = dynamic_cast<const StorageEntry<T>*>(root());
+        return r != nullptr && !r->slots_.empty();
+    }
+
     void sync_other_devices(sk::queue&) override {
         if (!is_root()) throw std::logic_error("naga::cospan: sync_other_devices is for roots");
         if (slots_.size() < 2) return;
@@ -635,6 +634,9 @@ public:
         if (member_ != nullptr) this->point(*member_);
     }
 
+    /// The registered member wrapper.
+    Input<DT, Rank>& member() const { return *member_; }
+
 private:
     Input<DT, Rank>* member_;
 };
@@ -651,6 +653,9 @@ public:
     void point_wrapper() override {
         if (member_ != nullptr) this->point(*member_);
     }
+
+    /// The registered member wrapper.
+    Output<DT, Rank>& member() const { return *member_; }
 
 private:
     Output<DT, Rank>* member_;

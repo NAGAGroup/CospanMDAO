@@ -20,10 +20,13 @@
 
 namespace naga::cospan {
 
+struct CustomOp;  // the one place a raw device pointer is obtainable (r01 §5.1)
+
 namespace detail {
 
 class IOEntry;
 struct ScratchLayout;
+struct ItemFixup;
 
 /// A range of rank R taken from the first R entries of a 1-padded triple.
 template <int R>
@@ -97,6 +100,7 @@ private:
     sycl::range<Rank> stride_ = detail::filled_range<Rank>(0);
     const value_type* data_   = nullptr;
     friend class detail::IOEntry;
+    friend struct CustomOp;
 };
 
 /// Output<DT, Rank> — read-write view with exactly ONE access discipline per
@@ -143,6 +147,7 @@ private:
     sycl::range<Rank> stride_ = detail::filled_range<Rank>(0);
     value_type*       data_   = nullptr;
     friend class detail::IOEntry;
+    friend struct CustomOp;
 };
 
 /// Initializer<DT, Rank> — the writable twin of an I/O for init(): the same
@@ -188,6 +193,7 @@ private:
     sycl::range<Rank> stride_ = detail::filled_range<Rank>(0);
     value_type*       data_   = nullptr;
     friend class detail::IOEntry;
+    friend struct CustomOp;
 };
 
 /// Local<DT, Rank> — group-local memory with wrapper ergonomics. Plain dtypes
