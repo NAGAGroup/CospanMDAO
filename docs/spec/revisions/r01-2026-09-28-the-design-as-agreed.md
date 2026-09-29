@@ -291,8 +291,8 @@ private:
 /// per instantiation, selected by the dtype:
 ///   * plain dtypes  -> bare mutable references ONLY. No atomic access
 ///     exists on the type; a plain Output in a colliding-write role is a
-///     model error the tie check (§4) and the fused-parallel
-///     producer-consumer check (§7.5) catch.
+///     model error the tie check (§4) and, in a parallel wave, the
+///     tied-outputs check (§7.5) catch.
 ///   * atomic dtypes -> sycl::atomic_ref (relaxed, device scope) ONLY.
 ///     No bare reference is obtainable — a kernel CANNOT forget
 ///     atomicity, by construction. Reads are atomic_ref::load().
@@ -821,13 +821,18 @@ second connection to any name in the set now fails at the ROOT check
 (the root is an output root, `can_be_target == false`) — fan-in is
 blocked structurally. Fan-out is the same op repeated. Subarray forms
 record `view()` on the input peer. Connecting through ANY name of a set
-is the same connection.
+is the same connection. Only an OUTPUT root can be a source: a free
+input, and a tie alias root of `tie_inputs`, cannot, because an input has
+no producer and "connect from it" could only mean "share its root", which
+is what a tie already is. A `Slice` therefore reads an output root.
 
 **tie_inputs({m...}, name)** — the alias is a NEW ROOT with
 `can_be_target = true, can_be_source = false`. Each member's root must be
 an input root with `can_be_target == true` — a member whose set is
-already connected fails here ("tie before connecting"). Merge every
-member's set into the alias. THE EXCEPTION: mark each member
+already connected fails here ("tie before connecting"). A member may
+itself be a tie alias: ties compose up the hierarchy, as promotions do.
+Merge every member's set into the alias (a tie alias member contributes
+its whole set). THE EXCEPTION: mark each member
 `can_be_target = false`, so a later connect *through a member name*
 fails at the direct check. Data-wise it would be identical to connecting
 through the alias; the mark exists so a tie is visible at every use
@@ -865,17 +870,29 @@ TRANSIENT SUBTREES. A System added with `property::transient` (§7.4)
 releases, when its run of the subtree returns, every root declared anywhere
 in its subtree that has no peer declared outside the subtree. A root with
 an outside peer — a consumer connected from outside the subtree, or a
-promotion made by an owner above it — keeps its storage. Roots of a
-transient subtree take no arena bytes: they are allocated in `prepare_exec`
-like every other root, through the pool route. A forward that reaches a
-transient System whose roots are released first REVIVES the subtree: the
-released roots are re-allocated through the pool route at their current
-extents, and the subtree's init runs again (Component pass, then System
-pass; the stream orders that work before the loop's submissions); then the
-child loop runs; then the subtree is released again. Nested transient
-Systems release their own subtrees first. Host access to a released root is
-an error naming the transient System. Why: §1 need 2.1 transient subtrees ·
-P3.
+promotion made by an owner above it — keeps its storage. Every entry
+records the Subsystem that declared it (`declarer()`); marking walks from
+the declarer up through the owners to find the System an entry lives in.
+Marking runs once, at the END of the ROOT System's setup (the System with
+no owner), not per System, because peers declared later by an outer System
+decide whether a root escapes. A root declared in a transient subtree with
+no peer outside it belongs to the INNERMOST qualifying transient System and
+takes no arena bytes: it is allocated in `prepare_exec` like every other
+root, through the pool route. A System releases the storage of the roots
+it owns and reports itself released only if it dropped storage, so an
+empty transient System is never released. A forward that reaches a
+transient System whose roots are released first REVIVES the subtree,
+before its children's loop: the released roots are re-allocated through
+the pool route at their current extents, nested released transient Systems
+revive the same way, and the subtree's init runs again (Component pass,
+then System pass, children before owners; the stream orders that work
+before the loop's submissions), so a revived root holds its initial values
+again; nothing outside the subtree re-initializes. Then the child loop
+runs; then the subtree is released again. Nested transient Systems release
+their own subtrees first. Host access to a released root — a view or a
+setter — throws, naming the root and the transient System and saying the
+storage exists only while that System runs; a silent empty view would read
+as valid data. Why: §1 need 2.1 transient subtrees · P3.
 
 ### 4.5 From sets to storage
 
@@ -972,8 +989,8 @@ namespace naga::cospan {
 /// (§4.2). The owner submits the body as an async host task ordered in
 /// the stream: `async_host_in_order` on the stream, or the group's
 /// `async_host` under a Parallel owner's group (§7.1, §7.3). A HOST BODY
-/// IS PLAIN HOST C++: no SYCL calls, no device code, no backend API
-/// calls. Not fusable.
+/// IS PLAIN HOST C++: no SYCL calls except `sycl::free`, no device code,
+/// no backend API calls (§11.6). Not fusable.
 ///
 /// THE SIGNATURE IS THE DECLARATION, four ways:
 ///   * first parameter id<R> vs GroupItem<R>  => group semantics opt-in
@@ -1243,7 +1260,8 @@ void kb_entry_r3(sycl::nd_item<3>, /* same trailing params */);
 /// The outer kernel, one per rank — THE single call site:
 q.submit([&](sycl::handler& cgh){
     sycl::local_accessor<std::byte, 1> local{launch_scratch_bytes, cgh};
-                                 // max over stages; zero when unused
+                                 // sequential wave: the sum of the stages' slices;
+                                 // parallel wave: the largest stage's; zero when unused
     cgh.parallel_for(sycl::nd_range<R>{padded_global, wg},
         cfg.apply([=](sycl::nd_item<R> it){
             FnOffsetInfo info{records_dev, 0};      // fresh per work-item
@@ -1258,7 +1276,7 @@ q.submit([&](sycl::handler& cgh){
 /// config is built in ITS compile because fuse membership is static.
 ///   individual:  cfg.define(kb_entry_rR_id, kb_fn_id);
 ///   fused wave:  cfg.define_as_call_sequence(kb_entry_rR_id,
-///                    {fn_A_id, fn_B_id, barrier_id, fn_C_id, ...});
+///                    {fn_A_id, fn_B_id, fn_C_id, ...});
 /// At JIT time the ONE kb_entry_rR call expands, inline and in order:
 ///     kb_fn_A(it, info, inputs, outputs, bodies, local);
 ///     kb_fn_B(it, info, inputs, outputs, bodies, local);
@@ -1273,18 +1291,21 @@ q.submit([&](sycl::handler& cgh){
 /// the same KernelBody type twice in one wave reads two different
 /// records correctly by position alone.
 ///
-/// Barrier stages: when any stage of a SEQUENTIAL-mode wave declares
-/// Scratch, the System interleaves the provided
-///     void kb_barrier(...same signature...) {
-///         sycl::group_barrier(it.get_group());   // does NOT call next()
-///     }
-/// between consecutive scratch-using stages: the call site is
-/// unconditional, so every work-item reaches it in converged control
-/// flow (legal), and stage N+1 cannot touch local bytes stage N still
-/// reads (necessary). kb_barrier consumes NO record — the one deliberate
-/// exception to one-call-one-record; the packer writes records only for
-/// real stages. Parallel-mode waves need no barriers: each group
-/// executes exactly one stage's body, so scratch never crosses stages.
+/// No barriers: the framework inserts none, in either mode, and the
+/// sequence holds only stage functions, one record each. Local memory is
+/// laid out so that none is needed for scratch:
+///   * sequential wave — every scratch stage has its OWN slice of the
+///     local buffer, at StageRecord::local_off (the running sum of the
+///     earlier stages' scratch bytes, each rounded up to 16 bytes); the
+///     launch's local size is the sum, so a stage never touches bytes
+///     another stage uses.
+///   * parallel wave — each group executes exactly one stage's body, so
+///     the stages share one slice at offset 0 and the launch's local
+///     size is the largest stage's.
+/// A local size above the device's local memory limit throws at forward,
+/// naming the scratch stages and their byte counts (§7.5). A read of
+/// another work-item's write, inside a stage or across stages of a
+/// sequential wave, needs the body's own group barrier (§5.3).
 /// Why: §1 need 2.2 fuse, §1 need 2.1 group-level parallelism.
 
 } // namespace naga::cospan
@@ -1296,11 +1317,13 @@ q.submit([&](sycl::handler& cgh){
   geometry is flat: `{{padded_flat}, {default_wg}}` at rank 1, with
   rank-appropriate defaults at ranks 2/3 (implementation-tunable, not
   contract constants). The wg overloads of create_launch_config (§6)
-  override per launch; the FUSED wg is set at SYSTEM level, component wg
-  intent ignored inside a fuse; the wave's rank is its children's.
+  override per launch; a wave has ONE work-group shape: the
+  FusedSystem's own, else the shape its stages request in common (a
+  stage asking for a different one throws at forward), else the default
+  for the wave's rank; the wave's rank is its children's.
 - Rank agreement in a fuse: a stage whose kernel rank differs from the
-  wave's rank is a hard error, checked at compile and on the descriptions
-  each forward (§7.5).
+  wave's rank is a hard error, checked at compile (the children's
+  kernel ranks) and on the descriptions each forward (§7.5).
 - Padding and extents are counted in WHOLE WORK-GROUPS: individual = the
   stage's own group count; fused-sequential = max stage group count;
   fused-parallel = Σ stage group counts with group_offset the prefix
@@ -1322,20 +1345,23 @@ q.submit([&](sycl::handler& cgh){
   known at enqueue), calls `root.resize(shape)`, then `point_wrapper` —
   no staging copy, nothing submitted for the resize, no reallocation
   inside a submitted task. Nothing is registered anywhere; no producer knows its consumers.
-- **FusedSystem: no intra-fuse shape dependencies — hard error.** A
-  wave's geometry needs every stage's extent before the wave launches; a
-  stage whose shape derives, through any determiner-or-connection chain,
-  from data computed by another stage of the same fuse is an
-  impossibility, not a trust question. Detected from metadata each
-  forward alongside the other wave checks (§7.5); the error names the
-  crossing chain. USERS SPLIT THEIR FUSEDSYSTEMS AT DYNAMIC-SHAPE
-  BOUNDARIES. Why: §1 need 2.2 fuse, §1 need 2.1 shape source.
-- **ParallelSystem: no cross-sibling shape dependencies — hard error.**
-  A child's shape reading a sibling's output (by value or shape) is a
-  data dependency, contradicting the independence the user asserted by
-  wrapping in ParallelSystem. Detected from the same metadata chains.
-  General data-independence of parallel children remains the user's
-  responsibility. Why: §1 need 2.2 parallel · P4.
+- **FusedSystem: a value-driven size may not come from the same fuse.** A
+  wave's geometry needs every stage's extent before the wave launches, and
+  a `FromInput` size is read from the driving input's VALUE on the host
+  before that launch. An entry of a stage with a `FromInput` dimension
+  whose driving input aliases an output of another stage of the same fuse
+  is therefore an impossibility, not a trust question: `compile()` throws,
+  naming the entry, the driving input and the stage that produces it, in
+  both modes. Shape-from-shape links (`FromInputDim`, `FromSourceDim`,
+  through connections) are always allowed: they read an extent, which is
+  known when the stage's turn comes, not a value a stage computes.
+  USERS SPLIT THEIR FUSEDSYSTEMS WHERE A VALUE MUST BE COMPUTED FIRST.
+  Why: §1 need 2.2 fuse, §1 need 2.1 shape source.
+- **ParallelSystem: no sibling-shape check.** The framework checks
+  nothing about children's shapes; its only wiring rules are those of
+  §7.5 (no connections between children; tied outputs need
+  `allow_tied_outputs()`). General data-independence of parallel children
+  remains the user's responsibility. Why: §1 need 2.2 parallel · P4.
 
 ---
 
@@ -1378,9 +1404,10 @@ public:
     /// storage (own allocation, else root()->data() — roots are allocated
     /// before their peers); Systems complete their ExecCtx.
     virtual void prepare_exec(sk::queue& queue, Substrates& substrates) = 0;
-    /// Compile bodies (Components); recurse (Systems). Flavor legality is
-    /// checked per forward on the descriptions, not here, except rank
-    /// agreement in a fuse (§7.5).
+    /// Compile bodies (Components); recurse (Systems). A FusedSystem also
+    /// checks its structure here (children, ranks, value-driven sizes);
+    /// the rest of a flavor's legality is checked per forward on the
+    /// descriptions (§7.5).
     virtual void compile() = 0;
     /// Component pass of init_tree (§11): a Component runs its init(); a
     /// System forwards to its children in order.
@@ -2027,33 +2054,67 @@ namespace naga::cospan {
 /// stream (§7.3): its children are unordered among themselves and ordered
 /// both ways against everything outside. ctx.group is set for the extent
 /// of that submit_group and null otherwise. Data independence of children
-/// is the USER's assertion (why: P4);
-/// the framework checks only cross-sibling shape dependencies (hard
-/// error, checked each forward on the children's descriptions).
-class ParallelSystem : public System { /* runner overrides as described */ };
+/// is the USER's assertion (why: P4); the framework checks two wirings,
+/// each forward, on the children's metadata, both `invalid_argument`
+/// naming the children involved: NO CONNECTIONS between children (an
+/// input whose aliasing set holds another child's output; no override,
+/// since the children run unordered there is nothing to read yet), and no
+/// tied outputs (two children whose outputs share one root, e.g. through
+/// `tie_outputs`) unless the owner calls `allow_tied_outputs()`, the user's
+/// assertion that the writers do not race. Children's shapes are not
+/// checked against each other.
+class ParallelSystem : public System {
+public:
+    void allow_tied_outputs();
+    /* runner overrides as described */
+};
 
 /// COMPONENTS ONLY — enforced by the type system at the add, since a
 /// System cannot discern children at runtime (why: §1 need 2.2 fuse · P5):
 ///   template <class T, class... A> requires std::derived_from<T, ComponentBase>
 ///   T& add_subsystem(std::string, A&&...);
-/// (no property-list overload). The wg shape is the fuse's. The wave's
-/// rank is its children's: every child's kernel rank (`kernel_rank_v`, from
-/// the body's signature) is checked equal at compile, and the sequence
-/// config is built once there at that rank.
+/// (no property-list overload). The wave has one work-group shape: the
+/// fuse's `wg`, else the stages' common request, else the rank's default.
+/// The wave's rank is its children's.
+///
+/// compile(): every child compiled, then the structure checked, each
+/// `invalid_argument` naming the child: at least one child; no custom-op or
+/// host child (neither has a stage function); every child on the fuse's
+/// device; every child's kernel rank (`kernel_rank_v`, from the body's
+/// signature) equal; and no value-driven size (`FromInput`) whose driving
+/// input aliases another stage's output in the same fuse, in either mode
+/// (shape-from-shape links, `FromInputDim` and `FromSourceDim`, are always
+/// allowed, §5.8). The sequence config is then built once, at the wave's
+/// rank, from the children's definition ids in child order.
 /// run_compute_forward: pre-compute ALL children → compute ALL (collect
 /// descriptions) → VALIDATE on the descriptions, every forward, host-
-/// side and cheap: none null, none custom-op, rank agreement,
-/// scratch handling, parallel mode: no producer-consumer pairs
-/// unless allowed → pack streams + records, stamp group slices, one
-/// staging, ONE submission with the sequence config → post-compute ALL.
-/// revive() first, release() last (§4.4).
+/// side and cheap: none null, rank agreement, one work-group shape;
+/// PARALLEL mode adds: no connections between stages (no override) and
+/// no tied outputs unless the fuse calls `allow_tied_outputs()`; SEQUENTIAL
+/// mode makes no inter-stage checks — stage ranges may differ, and the
+/// access pattern between stages is the user's responsibility (§5.3) →
+/// pack streams + records, stamp group slices and local slices, check the
+/// wave's local memory against the device's limit, one staging, ONE
+/// submission with the sequence config → post-compute ALL.
+/// revive() first, release() last (§4.4). The framework inserts no
+/// barriers, in either mode.
+/// Local memory (§5.6): sequential mode gives every scratch stage its own
+/// slice (`StageRecord::local_off`, the running sum, each stage's bytes
+/// rounded up to 16) and the launch needs the sum; parallel mode shares
+/// one slice at offset 0 and needs the largest stage's. A wave over the
+/// device's limit throws `runtime_error` at forward, naming the scratch
+/// stages and their byte counts.
 /// The order is forced: post-compute copies follow the wave in the stream.
 /// Why: §1 need 2.2 fuse, §1 need 2.2 opacity.
 class FusedSystem : public System {
 public:
     enum class Mode : uint8_t { sequential, parallel };
-    FusedSystem(Mode, std::optional<sycl::range<3>> wg = {});
-    void allow_producer_consumer();   // parallel-mode override (trust model)
+    explicit FusedSystem(Mode = Mode::sequential, std::optional<sycl::range<3>> wg = {});
+    /// Parallel mode: the user's assertion that stages whose outputs share
+    /// one root do not race (atomic writers, say); skips the tied-outputs
+    /// check. The no-connections rule has no override. No effect in
+    /// sequential mode.
+    void allow_tied_outputs();
 };
 
 } // namespace naga::cospan
@@ -2226,7 +2287,9 @@ namespace naga::cospan {
 
 /// The Model owns exactly four kinds of thing: one sk::context, one
 /// sk::queue, the per-device memory substrates ({arena, optional pool}),
-/// and the root System. It drives the setup chain and the forward; it
+/// and the root System. It drives the setup chain (declare, exec info,
+/// substrates, prepare, compile, init, and collecting the marks of §8.4) and
+/// the forward; it
 /// never touches a Subsystem except through the Subsystem verbs and
 /// System::forward().
 struct ModelConfig {
@@ -2241,7 +2304,7 @@ struct ModelConfig {
     /// Per-device dynamic-pool sizes; a device not listed gets
     /// `default_pool_bytes`. 0 = no pool = every dynamic allocation takes
     /// the OS route. Pre-allocation is a profiling-discovered
-    /// optimization; memory_report() is how it is discovered.
+    /// optimization; memory_report() reports the pool's use.
     /// Why: P3.
     std::unordered_map<sycl::device, size_t> pool_bytes;
     size_t default_pool_bytes = 0;
@@ -2277,9 +2340,11 @@ public:
     ///      one in-order stream (§7.3), existing for everything below
     ///   1. root.run_setup()                       — declare (§6/§7)
     ///   2. bytes = root.get_exec_info(default_device)   — device -> bytes
-    ///   3. substrates[d] = { DeviceArena{queue_, d, kind::device, bytes[d]} iff bytes[d] > 0,
+    ///   3. substrates[d] = { DeviceArena{queue_, d, kind::device, bytes[d] + slack} iff bytes[d] > 0,
     ///      DevicePool iff configured for d } — every subsystem allocates
-    ///      through its device's substrate
+    ///      through its device's substrate. The arena's capacity is the static
+///      bytes plus 4096*64 bytes of slack, the bytes measured exactly (the
+///      sum over the device's distinct roots), so capacity = sum + 262144
     ///   4. root.prepare_exec(queue_, substrates_) — allocate, point wrappers; ExecCtx complete
     ///   5. root.compile()                        — bodies
     ///   6. root.init_tree()                      — Components, then Systems children-before-owners
@@ -2308,14 +2373,14 @@ public:
     template <DType DT, int Rank> HostView<DT, Rank>    view_input (std::string_view path) const;
     template <DType DT, int Rank> HostView<DT, Rank>    view_output(std::string_view path) const;   // read-only
     /// Writable output view: writes land in host staging; written back
-    /// (root.from_host, then `copy_d = root` per other device) on
+    /// (root.from_host, then `copy_d = root` per other placement) on
     /// destruction AND on commit() (both; the destructor is the
     /// protection, commit() the mid-scope flush).
     /// Why: §1 need 2.3 host access · P3 (a read-only view costs no
     /// submission).
     template <DType DT, int Rank> HostViewMut<DT, Rank> view_output_mut(std::string_view path);
     /// Setters: root.from_host(span) into the root's primary storage,
-    /// then `copy_d = root` per other device, like any root write.
+    /// then `copy_d = root` per other placement, like any root write.
     /// Inputs: meaningful for free inputs (a connected one is overwritten
     /// at the next forward — harmless, like init).
     template <DType DT, int Rank> void set_input (std::string_view path, std::span<const cpp_type_t<DT>>);
@@ -2328,7 +2393,9 @@ public:
     Subsystem& get_subsystem(std::string_view path);           // root.get_subsystem
 
     struct MemoryReport {
-        /// A snapshot at the time of the call, between runs.
+        /// A snapshot at the time of the call, between runs. `arena_bytes` is the
+        /// arena's capacity, slack included. The OS route is not counted:
+        /// `os_allocations` and `os_bytes_in_use` are always 0.
         struct PerDevice { size_t arena_bytes, arena_bytes_in_use, pool_bytes, pool_bytes_in_use,
                                   os_allocations, os_bytes_in_use; };
         std::unordered_map<sycl::device, PerDevice> devices;
@@ -2360,7 +2427,7 @@ private:
 
 - `view_*` on a device-kind root = `root.host_view()`; on a shared- or
   host-kind root = `queue_.wait()` then `root.get_access()`.
-- `set_*` = `root.from_host(span)` then `copy_d = root` per other device.
+- `set_*` = `root.from_host(span)` then `copy_d = root` per other placement.
 - `view_output_mut` stages on the host and does `from_host` on commit and
   on destruction.
 - `forward()` enqueues; `wait()` = `queue_.wait_and_throw()`.
@@ -2375,8 +2442,8 @@ model.set_input<DType::f64, 1>("mda.z", {{1.0, 2.0}});  // drive a free input
 model.forward();  model.wait();                         // enqueue; wait when results are wanted
 
 auto y1 = model.view_output<DType::f64, 1>("mda.y1");   // host_view, read
-auto r  = model.memory_report();                        // r.devices[gpu0].os_bytes_in_use > 0 ?
-                                                        //   -> rerun with pool_bytes set to it
+auto r  = model.memory_report();                        // r.devices[gpu0].pool_bytes_in_use: how much pool did the run use?
+                                                        //   -> size pool_bytes from it
 
 // Two devices in one model:
 ModelConfig cfg{std::array{gpu0, gpu1}};                // builds the sk::context
@@ -2542,7 +2609,7 @@ auto model = create_model<Top>(ModelConfig{...}, top_args...);
 
 ### 11.2 `model.setup()` — the setup chain
 
-`run_setup → get_exec_info → substrates → prepare_exec → compile → init`.
+`run_setup → get_exec_info → substrates → prepare_exec → compile → init → marks`.
 Every step is a Subsystem verb driven from the root; Systems recurse in
 declared order (`children_` IS the exec order); nobody asks what kind a
 child is. The order is the one of §9.1: (0 construct) 1 run_setup ·
@@ -2625,10 +2692,14 @@ ERROR here ("source-derived dimension on an unconnected input").
 `Component`: device function(s) + id at the body's own rank
 (`kernel_rank_v`); individual config; a custom-op or host body compiles
 nothing. `System`:
-children in order; a FusedSystem also checks its children's kernel ranks
-equal and builds its sequence config. Other Fused and Parallel legality is
-NOT checked here — it is checked each forward on the descriptions the children return (cheap, host-side,
-and it is where the information is).
+children in order; a FusedSystem also checks its structure and builds its
+sequence config: it has children, none a custom-op or host body, all on its
+device and of one kernel rank, and no value-driven size (`FromInput`) whose
+driving input aliases another stage's output in the same fuse
+(`FromInputDim` and `FromSourceDim` are always allowed; §5.8, §7.5). The
+rest of the Fused and Parallel legality is checked each forward on the
+descriptions the children return (cheap, host-side, and it is where the
+information is).
 
 #### 11.2.6 Init — `root.init_tree()`
 
@@ -2689,10 +2760,13 @@ Parallel owner).
 **Parallel** (Components only): pre-compute ALL → `queue.submit_group {
 each child's description submitted with its own device }` → post-compute ALL
 after the group returns. **Fused**: pre-compute ALL → compute ALL (collect;
-a null or custom-op description is an error) → validate the wave on the
-descriptions (rank agreement, scratch, producer-consumer in parallel mode)
-→ pack, stamp group slices, one staging, ONE submission with the sequence
-config → post-compute ALL. **Custom System types** (§10): early-return from
+a null description is an error) → validate the wave on the descriptions
+(none null, rank agreement, one work-group shape; parallel mode: no
+connections between stages, and tied outputs only with
+`allow_tied_outputs()`; sequential mode: no inter-stage checks) → pack,
+stamp group and local slices, check the wave's local memory against the
+device's limit, one staging, ONE submission with the sequence config (the
+framework inserts no barriers) → post-compute ALL. **Custom System types** (§10): early-return from
 `run_compute_forward`.
 
 #### 11.3.2 A Component's turn (§6.5)
@@ -2717,7 +2791,7 @@ sized to this forward.
 `view_*` (device-kind root: `root.host_view()`; shared/host-kind root:
 `queue_.wait()` then `root.get_access()`; the writable output view stages
 on the host and does `from_host` on destruction and on `commit()`),
-`set_*` (`root.from_host(span)`, then `copy_d = root` per other device),
+`set_*` (`root.from_host(span)`, then `copy_d = root` per other placement),
 `memory_report()`, `get_subsystem(path)` chaining and
 `get_inputs()/get_outputs()` enumeration (§10.3). Host access is §9.2. Host
 access to a released root of a transient subtree (§4.4) is an error naming
@@ -2731,4 +2805,17 @@ user's obligation. `~Model` waits the stream as a convenience. Everything
 else is RAII, in reverse declaration order, identical to §9.4: `cfg_`,
 `root_` (roots' `usm_vector`s release), `substrates_` (arenas, pools),
 `queue_`, `ctx_` (P9).
+
+### 11.6 Platform and toolchain notes
+
+- Builds are Release without `-g`: the toolchain's clang 21.1.8 crashes in
+  the Debug Variable Analysis pass on these translation units, so Debug
+  and `-g` builds are not supported.
+- On CUDA and HIP, work that depends on `async_host` work is held back on
+  the host until that work completes: a kernel that follows a host body
+  waits in the host, not in the stream. A host body may therefore call
+  `sycl::free` (the case the hold-back exists for) and nothing else from
+  SYCL.
+- A host body is plain host C++: no SYCL calls except `sycl::free`, no
+  device code, no backend API calls (§5.1).
 
