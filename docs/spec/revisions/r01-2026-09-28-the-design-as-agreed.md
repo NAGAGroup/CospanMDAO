@@ -8,23 +8,6 @@ namespace (`sk::context`, `sk::queue`, `sk::queue::group`;
 `slabkit::usm_vector`, `DeviceArena`, `DevicePool`); SlabKit's own spec owns
 their contracts.
 
-**What changed.** First revision. It consolidates the twelve draft
-documents of Aug 31–Sep 2 into one, and applies the 2026-09-28 rulings:
-R1 everything is native SYCL, one kernel per component · R2 the Model owns
-one `sk::context`, one `sk::queue`, per-device {arena, optional pool} and
-the root System · R3 ordering is the stream's, `ExecCtx` carries no events ·
-R4 Parallel children are Components only · R5 every root is a
-`slabkit::usm_vector` over `allocator<T>` · R6 each layer orders what it
-submits · R7 cycles by registration order (OpenMDAO), implicit component =
-a self-connection inside a component (both on the roadmap, not specified
-here) · R8 the setup-step patterns (RunOnce/RunN) live inside the
-framework. It removes from the drafts: the composites table, interactions
-list and deliberate-decisions section of the ledger; the needs
-"optimization at declared scale", "determinism policy", "serialization" and
-"observation beyond path resolution"; the temporal composites (history
-windows, subcycling, events, hybrid commit); and memory budgeting as a
-separate policy (it is chunking, on the roadmap).
-
 ---
 
 ## 1. Principles and needs
@@ -251,9 +234,6 @@ enum class DType : uint8_t {
 ///   cpp_type_t<DT>          — C++ element type (through the modifier).
 ///   is_atomic_v<DT>         — true for atomic entries.
 ///   is_differentiable_v<DT> — true for f32/f64, plain or atomic.
-///     Data-tier dtypes (integers, u8): gradient-related declarations
-///     SHALL NOT EXIST at compile time (requires-gated) — misuse is a
-///     compile error, never a runtime one.
 
 // -----------------------------------------------------------------------------
 // Wrappers — the only device-side data handles in the framework.
@@ -270,17 +250,15 @@ enum class DType : uint8_t {
 //     detail::IOEntry) is the sole writer of wrapper fields, via
 //     friendship. User code never sees a pointer.
 //   * `value_type` is the ONLY element-type spelling kernel bodies may
-//     use — the scalar-genericity keystone: automatic differentiation
-//     re-instantiates the same bodies at derivative-carrying value
-//     types with no user-code change. Why: §1 need 2.4 derivatives.
+//     use. Automatic differentiation is a value type with the arithmetic
+//     operators and math functions defined on it; a body that spells its
+//     element type as `value_type` runs at that type as written.
+//     Why: §1 need 2.4 derivatives.
 //   * Rank is 1..3. Indexing accepts sycl::id<Rank> and flat size_t;
 //     flat indexing is row-major over shape().
 //   * stride() is the element step per dimension in the OWNING
 //     allocation: subarray-aliased views (§8) are a metadata act,
 //     never a wrapper variant.
-//   * Wrappers carry primal data only. Gradient access is a separate
-//     wrapper form instantiated at the same declaration sites; the
-//     metadata layer reserves the slots.
 
 /// Input<DT, Rank> — read-only view. THE INPUT CONTRACT: a kernel SHALL
 /// NOT be able to write through an Input — all access is const-reference.
@@ -344,8 +322,69 @@ private:
     friend class detail::IOEntry;
 };
 
+/// Initializer<DT, Rank> — the writable twin of an I/O for init(): the
+/// same accessor discipline as Output (bare references for plain dtypes,
+/// sycl::atomic_ref for atomic dtypes), over the entry's root storage on
+/// the Component's device. Obtained inside init() only (§6.2); captured
+/// by value into a kernel the user launches on the queue init() receives.
+template <DType DT, int Rank>
+struct Initializer {
+    using value_type = cpp_type_t<DT>;
+    static constexpr DType dtype = DT;
+    static constexpr int   rank  = Rank;
+
+    value_type& operator[](sycl::id<Rank> idx) const requires(!is_atomic_v<DT>);
+    value_type& operator[](size_t flat)        const requires(!is_atomic_v<DT>);
+
+    sycl::atomic_ref<value_type, sycl::memory_order::relaxed,
+                     sycl::memory_scope::device>
+        operator[](sycl::id<Rank> idx) const requires(is_atomic_v<DT>);
+    sycl::atomic_ref<value_type, sycl::memory_order::relaxed,
+                     sycl::memory_scope::device>
+        operator[](size_t flat) const requires(is_atomic_v<DT>);
+
+    sycl::range<Rank> shape() const;
+    sycl::range<Rank> stride() const;
+    size_t            size() const;
+
+private:
+    sycl::range<Rank> shape_;
+    sycl::range<Rank> stride_;
+    value_type*       data_;
+    friend class detail::IOEntry;
+};
+
+/// HostInitializer<DT, Rank> — a host buffer shaped like the entry.
+/// Element access reads and writes the buffer, never the device.
+/// commit() and destruction write the buffer into the entry's root
+/// storage (usm_vector::from_host, which owns its copy of the bytes
+/// before returning) and refresh the root's copies on other devices.
+/// Host-side only; not a kernel capture. Obtained inside init() only
+/// (§6.2).
+template <DType DT, int Rank>
+class HostInitializer {
+public:
+    using value_type = cpp_type_t<DT>;
+    static constexpr DType dtype = DT;
+    static constexpr int   rank  = Rank;
+
+    value_type& operator[](sycl::id<Rank> idx);
+    value_type& operator[](size_t flat);
+    sycl::range<Rank> shape() const;
+    size_t            size() const;
+    void commit();
+    ~HostInitializer();   ///< commit()
+
+private:
+    explicit HostInitializer(detail::IOEntry& entry);
+    detail::IOEntry*        entry_;
+    std::vector<value_type> host_;
+    friend class ComponentBase;
+};
+
 static_assert(std::is_trivially_copyable_v<Input<DType::f32, 2>>);
 static_assert(std::is_trivially_copyable_v<Output<DType::atomic_f32, 1>>);
+static_assert(std::is_trivially_copyable_v<Initializer<DType::f32, 1>>);
 
 // Spelling samples:
 //   Input<DType::f32, 1> x;
@@ -418,8 +457,9 @@ struct FromInputDim  { std::string_view input; uint8_t dim; };
 
 /// This dimension's extent = the VALUE of element `index` (flat) of
 /// sibling input `input`. The source SHALL have an integer value dtype.
-/// The read is the driving input root's host_view() in the declaring
-/// Component's own run_pre_compute (§6.5): one wait, nothing submitted for the resize. Only
+/// Reshaping is a host act, so the value is read on the host: the driving
+/// input's host_view() in the declaring Component's own run_pre_compute
+/// (§6.5) — one wait, nothing submitted for the resize. Only
 /// entries using FromInput ever pay it. Orchestration is Component-local,
 /// always; no producer knows its consumers.
 /// Why: §1 need 2.1 shape source · P3 · P5.
@@ -551,7 +591,7 @@ public:
 
     /// Automatic shape update: applies the DimRecords. Invoked by the
     /// OWNING COMPONENT in run_pre_compute, BEFORE connection validation.
-    /// FromInput dims are resolved there first (the driving root's
+    /// FromInput dims are resolved there first (the driving input's
     /// host_view(), resize, point_wrapper — §6.5).
     virtual void update_shape() = 0;
 
@@ -589,9 +629,6 @@ public:
 /// handle slabkit::usm_vector<cpp_type_t<DT>> (§4; an input ROOT — an
 /// unconnected input or tie alias — holds the same, since every root is a
 /// usm_vector over allocator<T>).
-/// DIFFERENTIABLE dtypes additionally reserve a gradient allocation slot
-/// (same dtype and shape, populated under the AD policy); the slot's
-/// declarations do not exist for data-tier dtypes.
 template <DType DT, int Rank> class InputEntry  final : public IOEntry { /* ... */ };
 template <DType DT, int Rank> class OutputEntry final : public IOEntry { /* ... */ };
 
@@ -869,9 +906,8 @@ namespace naga::cospan {
 /// Inputs, Outputs, KB itself, and Scratch (if present) SHALL be
 /// trivially copyable — concept-enforced; they are copied byte-wise
 /// into the launch's device streams.
-/// REQUIREMENT (the AD keystone): KB SHALL be a template over its value
-/// mode, using wrapper `value_type` exclusively in the body. Opt-out:
-/// components supplying an analytical adjoint. Why: §1 need 2.4 derivatives.
+/// Bodies spell element types as the wrappers' `value_type` (§2); nothing
+/// in a body is written for differentiation.
 template <class KB> concept PlainBody   = /* operator()(id<R>, In, Out) */;
 template <class KB> concept GroupBody   = /* operator()(nd_item<R>, In, Out [, Scratch]) */;
 template <class KB> concept HasScratch  = /* trailing Scratch parameter */;
@@ -1290,16 +1326,21 @@ public:
     auto get_outputs() const;
 
     // ---- initializers (legal inside init() only; else throw) --------------
-    /// Device initializer: the non-const-reference twin of Input/Output —
-    /// usable directly inside a kernel the user writes on `q`.
+    /// Device initializer: the writable twin of Input/Output with Output's
+    /// accessor discipline (§2) — usable directly inside a kernel the user
+    /// writes on `q`.
     /// Why: §1 need 2.3 initialization (not limited beyond the queue).
     template <DType DT, int Rank> Initializer<DT, Rank> get_input_initializer(std::string_view name);
     template <DType DT, int Rank> Initializer<DT, Rank> get_output_initializer(std::string_view name);
-    /// Host initializer: writable host view (multi-dim accessors, shape);
-    /// writes back to the device on destruction and on commit().
-    template <DType DT, int Rank> HostInitializer<DT, Rank> get_input_host_initializer(std::string_view name, sk::queue& q);
-    template <DType DT, int Rank> HostInitializer<DT, Rank> get_output_host_initializer(std::string_view name, sk::queue& q);
+    /// Host initializer: a host buffer shaped like the entry (§2); commit()
+    /// and destruction write it to the root and refresh the root's
+    /// other-device copies.
+    template <DType DT, int Rank> HostInitializer<DT, Rank> get_input_host_initializer(std::string_view name);
+    template <DType DT, int Rank> HostInitializer<DT, Rank> get_output_host_initializer(std::string_view name);
     /// Common-case helpers, by name.
+    /// Every helper writes the ROOT's storage on this Component's device,
+    /// then refreshes the root's other-device copies (`copy_d = root`,
+    /// §6.5 step 3).
     template <class T> void fill_input (std::string_view name, T value);
     template <class T> void fill_output(std::string_view name, T value);
     void zero_input (std::string_view name);
@@ -1407,9 +1448,10 @@ Called by its owner in this order; a Component never submits its compute
 work and never sees a queue except through the owner's ctx.
 
 1. **`run_pre_compute(ctx)`**: value-driven shapes first — for each own
-   input carrying a `FromInput` spec, read the driving input root's
-   `host_view()` (the one forced sync, so this turn's launch geometry is
-   known), call `root.resize(shape)`, then `point_wrapper`; no staging
+   input carrying a `FromInput` spec, read the driving input's value
+   through `host_view()` — a host read, whichever storage holds it (the
+   one forced sync, so this turn's launch geometry is known), call
+   `root.resize(shape)`, then `point_wrapper`; no staging
    copy, nothing submitted for the resize, no reallocation inside a
    submitted task (why: §1 need 2.1 shape source · P3 — only value-driven entries pay
    it). Then shape-derived dims, `pre_forward()` hook (per-entry
