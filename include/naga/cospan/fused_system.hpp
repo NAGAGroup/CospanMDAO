@@ -13,31 +13,41 @@
 //
 // compile(): children compile; custom-op and host children are rejected (they
 // have no stage function); all children must have the same kernel rank (the
-// wave's rank). The dynamic_function_config is built ONCE, as a call sequence
-// of the children's definition ids in child order, with kb_barrier inserted
-// after stage i when stage i has Scratch and a LATER stage has Scratch (all
-// stages share one local buffer, so its users are separated by a barrier).
+// wave's rank); every entry with a value-driven size (FromInput) must be driven
+// by a value that does not come from another stage of this fuse (wave_rules.hpp,
+// check_value_driven_sizes: the value is read on the host before the launch).
+// The dynamic_function_config is built ONCE, as a call sequence of the
+// children's definition ids in child order. THERE ARE NO FRAMEWORK BARRIERS: a
+// stage that reads, across work-items, what an earlier stage wrote calls its own
+// group barrier first.
 //
 // One forward: revive(); pre-compute ALL; compute ALL (the descriptions stay
 // alive to the end); validate; pack records and the three byte streams (16-byte
 // aligned) into member USM buffers; ONE outer launch through the stream;
 // post-compute ALL; release(). Groups are laid along dimension 0.
 //
-// THE CHAINED-DEPENDENCY RULE (checked every forward, from the metadata). A
-// stage may read the output of an EARLIER stage only if the two stages agree on
-// their range and either (a) both are plain bodies (the same work-item runs
-// index i of both, so the read is element-wise) or (b) both are group bodies
-// with Scratch (the barrier between them orders the group's writes before its
-// reads). An input carrying a subarray view is never element-wise. Reading the
-// output of a LATER stage is an error. Anything else throws, naming both stages.
+// SEQUENTIAL MODE HAS NO INTER-STAGE ACCESS CHECKS. Stage ranges may differ, and
+// a stage may read anything an earlier stage wrote: the framework runs the
+// stages in child order inside each work-group and checks nothing about who
+// reads what. The same work-item reads its own earlier writes; a read of another
+// work-item's write needs the reader's own group barrier; across groups nothing
+// is ordered.
+//
+// LOCAL MEMORY. Sequential: every scratch stage gets its OWN slice of the local
+// buffer (StageRecord::local_off = the running sum of the earlier stages'
+// scratch_bytes, each rounded up to 16) and the launch's local size is the sum.
+// Parallel: the stages own disjoint groups, so each uses offset 0 and the local
+// size is the max. Every forward, a local size above info::device::local_mem_size
+// throws, naming the scratch stages and their byte counts.
 //
 // PARALLEL MODE. The stages are independent: each gets its OWN slice of groups,
 // group_offset = the running sum of the previous stages' group counts, and the
-// launch has the SUM of the group counts. No barriers are inserted (stages own
-// disjoint groups, so they never use the shared local buffer at the same time).
-// Every forward, validate() refuses any stage that reads another stage's output
-// in the same wave (the stages run unordered) unless allow_producer_consumer()
-// was called: that is the user's assertion that the pair is safe (trust model).
+// launch has the SUM of the group counts. Every forward, validate() applies the
+// rules of a wave whose stages run unordered (wave_rules.hpp): NO CONNECTIONS
+// between stages (an input whose root is an output of another stage throws,
+// naming both; no override), and NO TIED OUTPUTS (two or more stages whose
+// outputs share one root, e.g. through tie_outputs, throw, naming them) unless
+// allow_tied_outputs() was called.
 //
 // Include order: this header includes system.hpp, whose helper form
 // (property::fused) needs FusedSystem complete when it is instantiated, so
@@ -57,6 +67,7 @@
 #include <vector>
 
 #include "naga/cospan/system.hpp"
+#include "naga/cospan/wave_rules.hpp"
 
 namespace naga::cospan {
 
@@ -70,10 +81,10 @@ public:
         : mode_{mode}, wg_{wg} {}
     ~FusedSystem() override = default;
 
-    /// Parallel mode: assert that a stage reading another stage's output is safe
-    /// (the user's responsibility; the framework then skips that check). It has
-    /// no effect in sequential mode, whose own dependency rule is not overridable.
-    void allow_producer_consumer() { allow_pc_ = true; }
+    /// Parallel mode: assert that stages whose outputs share one root (tie_outputs)
+    /// do not race (atomic writers, say); the framework then skips that check.
+    /// The no-connections rule has no override. No effect in sequential mode.
+    void allow_tied_outputs() { allow_tied_ = true; }
 
     // ---- adding children: Components only, at compile time (D74) ----------------------------
     template <class T, class... Args>
@@ -110,14 +121,12 @@ public:
                                             "; the stages of a wave share one rank");
         }
 
-        // The call sequence, built ONCE: definition ids in child order, plus a
-        // barrier after a scratch stage when a later stage also uses scratch (sequential mode only; parallel-mode stages own disjoint groups).
+        // (h) a value-driven size may not be driven by a stage of this fuse (both modes).
+        detail::check_value_driven_sizes(describe(), children());
+
+        // The call sequence, built ONCE: the definition ids in child order. No barriers.
         std::vector<detail::JitId> defs;
-        for (std::size_t i = 0; i < n; ++i) {
-            defs.push_back(stage(i).definition_id());
-            if (mode_ == Mode::sequential && stage(i).has_scratch() && later_has_scratch(i))
-                defs.push_back(detail::wave_barrier_id(rank_));
-        }
+        for (std::size_t i = 0; i < n; ++i) defs.push_back(stage(i).definition_id());
         cfg_ = std::make_unique<sycl::AdaptiveCpp_jit::dynamic_function_config>();
         cfg_->define_as_call_sequence(detail::wave_entry_id(rank_), defs);
     }
@@ -148,8 +157,6 @@ public:
     }
 
 private:
-    static constexpr std::size_t npos = static_cast<std::size_t>(-1);
-
     const ComponentBase& stage(std::size_t i) const {
         const auto* c = dynamic_cast<const ComponentBase*>(children_[i].get());
         if (c == nullptr)
@@ -158,20 +165,8 @@ private:
         return *c;
     }
 
-    bool later_has_scratch(std::size_t i) const {
-        for (std::size_t j = i + 1; j < children_.size(); ++j)
-            if (stage(j).has_scratch()) return true;
-        return false;
-    }
-
-    std::size_t index_of(const Subsystem* s) const {
-        for (std::size_t j = 0; j < children_.size(); ++j)
-            if (children_[j].get() == s) return j;
-        return npos;
-    }
-
-    /// Every description carries kernel parts of the wave's rank, and the
-    /// chained-dependency rule (file header) holds.
+    /// Every description carries kernel parts of the wave's rank; in parallel mode
+    /// the stages are not connected and share no output root (file header).
     std::vector<const KernelParts*> validate(const std::vector<std::unique_ptr<LaunchDescription>>& ds) const {
         const std::size_t               n = children_.size();
         std::vector<const KernelParts*> parts;
@@ -188,41 +183,12 @@ private:
             parts.push_back(p);
         }
 
-        for (std::size_t i = 0; i < n; ++i) {
-            for (const auto& ref : stage(i).get_inputs()) {
-                const detail::IOEntry& e = ref.get();
-                const detail::IOEntry* r = e.root();
-                if (r->kind() != IOKind::output) continue;
-                const std::size_t j = index_of(r->declarer());
-                if (j == npos || j == i) continue;  // not produced by a stage of this wave
-                const std::string who = "input '" + std::string{e.name()} + "' of '" + children_[i]->path() +
-                                        "' reads '" + std::string{r->name()} + "', an output of '" +
-                                        children_[j]->path() + "'";
-                if (mode_ == Mode::parallel) {
-                    // The stages run unordered: ANY producer-consumer pair inside the wave is a race,
-                    // unless the user asserted otherwise (allow_producer_consumer(), the trust model).
-                    if (allow_pc_) continue;
-                    throw std::invalid_argument(
-                        "naga::cospan: " + describe() + ": forward: " + who +
-                        "; the stages of a parallel-mode wave run unordered, so no stage may read another's output "
-                        "(call allow_producer_consumer() if the pair is known to be safe)");
-                }
-                if (j > i)
-                    throw std::invalid_argument("naga::cospan: " + describe() + ": forward: " + who +
-                                                ", a LATER stage of the wave");
-                const KernelParts& pj         = *parts[j];
-                const KernelParts& pi         = *parts[i];
-                const bool         same_range = pj.record.range == pi.record.range;
-                const bool         plain_pair = !pj.group_body && !pi.group_body && same_range;
-                const bool         scratch_pair = pj.has_scratch && pi.has_scratch && same_range;
-                if (e.view() || !(plain_pair || scratch_pair))
-                    throw std::invalid_argument(
-                        "naga::cospan: " + describe() + ": forward: " + who +
-                        "; inside a sequential wave that is allowed only element-wise (two plain stages of equal "
-                        "range) or between two group stages with Scratch of equal range (a barrier separates "
-                        "them), and never through a subarray view");
-            }
+        if (mode_ == Mode::parallel) {
+            // (c) no connections between stages (no override), (d) no tied outputs unless allowed.
+            detail::check_no_stage_connections(describe(), "parallel-mode wave", children());
+            if (!allow_tied_) detail::check_tied_outputs(describe(), "parallel-mode wave", children());
         }
+        // Sequential mode: no inter-stage access checks (rule (e)).
         return parts;
     }
 
@@ -297,8 +263,29 @@ private:
                 r.group_offset = 0;  // sequential: every stage starts at group 0
                 total_groups   = std::max(total_groups, r.group_count);
             }
-            local_bytes   = std::max<std::size_t>(local_bytes, r.scratch_bytes);
+            if (mode_ == Mode::sequential) {
+                // Every scratch stage has its own slice: the running sum, each rounded up to 16.
+                r.local_off = static_cast<std::uint32_t>(local_bytes);
+                local_bytes += (std::size_t{r.scratch_bytes} + 15) / 16 * 16;
+            } else {
+                // Parallel stages own disjoint groups: they share one slice at offset 0, the launch needs the max.
+                r.local_off = 0;
+                local_bytes = std::max<std::size_t>(local_bytes, r.scratch_bytes);
+            }
             recs.push_back(r);
+        }
+        const std::size_t local_limit = ctx_.device.get_info<sycl::info::device::local_mem_size>();
+        if (local_bytes > local_limit) {
+            std::string scratch_stages;
+            for (std::size_t i = 0; i < recs.size(); ++i)
+                if (recs[i].scratch_bytes != 0)
+                    scratch_stages += (scratch_stages.empty() ? "'" : ", '") + children_[i]->path() + "' (" +
+                                      std::to_string(recs[i].scratch_bytes) + " bytes)";
+            throw std::invalid_argument(
+                "naga::cospan: " + describe() + ": forward: the wave needs " + std::to_string(local_bytes) +
+                " bytes of local memory (" +
+                (mode_ == Mode::sequential ? "the sum of its stages' slices" : "the largest stage's slice, shared") +
+                ") but the device offers " + std::to_string(local_limit) + "; scratch stages: " + scratch_stages);
         }
         if (total_groups == 0) return;  // every stage is empty
 
@@ -326,7 +313,7 @@ private:
     }
 
     Mode                          mode_;
-    bool                          allow_pc_ = false;  // parallel mode: producer-consumer pairs are allowed
+    bool                          allow_tied_ = false;  // parallel mode: stages may share an output root
     std::optional<sycl::range<3>> wg_;
     int                           rank_ = 0;
     std::unique_ptr<sycl::AdaptiveCpp_jit::dynamic_function_config> cfg_;

@@ -126,6 +126,7 @@ struct StageRecord {
     uint32_t       body_off = 0;
     uint32_t       scratch_off = 0;
     uint32_t       scratch_bytes = 0;
+    uint32_t       local_off = 0;         ///< owner-stamped: this stage's byte offset into the launch's local buffer (individual launches: 0)
     uint8_t        rank = 0;
 };
 
@@ -454,7 +455,7 @@ SYCL_EXTERNAL void kb_fn(sycl::nd_item<kernel_rank_v<KB>> it, FnOffsetInfo& info
     if constexpr (HasScratch<KB>) {
         GroupItem<R> gi = detail::ItemFixup::make(it, r);
         auto s = *reinterpret_cast<const typename KB::Scratch*>(bodies + r.scratch_off);
-        detail::fixup_scratch(s, local_base);
+        detail::fixup_scratch(s, local_base + r.local_off);  // this stage's own slice of the local buffer
         body(gi, in, out, s);
     } else if constexpr (GroupBody<KB>) {
         GroupItem<R> gi = detail::ItemFixup::make(it, r);
@@ -463,13 +464,6 @@ SYCL_EXTERNAL void kb_fn(sycl::nd_item<kernel_rank_v<KB>> it, FnOffsetInfo& info
         const auto idx = detail::delinearize<R>(flat, r.range);
         body(idx, in, out);
     }
-}
-
-/// A sequential-mode barrier stage: consumes NO record.
-template <int R>
-SYCL_EXTERNAL void kb_barrier(sycl::nd_item<R> it, FnOffsetInfo&, const std::byte*, std::byte*,
-                              const std::byte*, std::byte*) {
-    sycl::group_barrier(it.get_group());
 }
 
 // -----------------------------------------------------------------------------
@@ -566,17 +560,6 @@ inline JitId wave_entry_id(int rank) {
         default: break;
     }
     throw std::logic_error("naga::cospan: no kernel entry of that rank");
-}
-
-/// The id of the barrier stage of rank `rank` (1..3).
-inline JitId wave_barrier_id(int rank) {
-    switch (rank) {
-        case 1: return stage_def_t<1>{&kb_barrier<1>}.id();
-        case 2: return stage_def_t<2>{&kb_barrier<2>}.id();
-        case 3: return stage_def_t<3>{&kb_barrier<3>}.id();
-        default: break;
-    }
-    throw std::logic_error("naga::cospan: no kernel barrier of that rank");
 }
 
 /// Submit the ONE outer kernel of a fused wave: like launch_individual, but the

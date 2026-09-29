@@ -9,13 +9,19 @@
 // Nested Parallel is not a concept.
 //
 // One forward turn: revive(); pre-compute ALL children; compute ALL (collect
-// the descriptions); check cross-sibling shape dependencies; ONE
-// queue.submit_group in which every child's description is submitted with its
-// own device; post-compute ALL after the group returns; release(). The group
-// is ONE item of the stream: its children are unordered among themselves and
-// ordered both ways against everything outside (§7.3). Data independence of
-// the children is the USER's assertion (P4); the framework checks only the
-// shape dependency it can see on the metadata.
+// the descriptions); check the siblings (below); ONE queue.submit_group in which
+// every child's description is submitted with its own device; post-compute ALL
+// after the group returns; release(). The group is ONE item of the stream: its
+// children are unordered among themselves and ordered both ways against
+// everything outside (§7.3).
+//
+// THE SIBLING RULES (every forward, from the metadata; wave_rules.hpp, shared
+// with the parallel mode of FusedSystem):
+//   - NO CONNECTIONS between siblings: an input whose root is an output of
+//     another sibling throws, naming both. There is no override.
+//   - NO TIED OUTPUTS: two or more siblings whose outputs share one root
+//     (tie_outputs) throw, naming them, unless allow_tied_outputs() was called.
+// Anything else about the siblings' data independence is the USER's assertion (P4).
 //
 // Include order: this header includes system.hpp, whose helper form
 // (property::parallel) needs ParallelSystem complete when it is instantiated,
@@ -31,12 +37,18 @@
 #include <vector>
 
 #include "naga/cospan/system.hpp"
+#include "naga/cospan/wave_rules.hpp"
 
 namespace naga::cospan {
 
 class ParallelSystem : public System {
 public:
     ~ParallelSystem() override = default;
+
+    /// Assert that siblings whose outputs share one root (tie_outputs) do not
+    /// race (atomic writers, say); the framework then skips that check. The
+    /// no-connections rule has no override.
+    void allow_tied_outputs() { allow_tied_ = true; }
 
     // ---- adding children: Components only, at compile time ---------------------------------
     // These declarations HIDE every add_subsystem of System, so a System child
@@ -82,7 +94,8 @@ public:
             ds.push_back(std::move(d));
         }
 
-        check_sibling_shape_dependencies();
+        detail::check_no_stage_connections(describe(), "ParallelSystem", children());
+        if (!allow_tied_) detail::check_tied_outputs(describe(), "ParallelSystem", children());
 
         ctx_.queue->submit_group([&](sk::queue::group& g) {
             GroupScope scope{*this, &g};
@@ -113,39 +126,7 @@ private:
         ParallelSystem& s_;
     };
 
-    /// The one thing the framework checks (§7.5): a child input whose ROOT is a
-    /// SIBLING's output and whose shape is derived from its source
-    /// (FromSourceDim). Siblings run unordered, so the source's extent is not
-    /// known when the consumer launches. A hard error, every forward.
-    void check_sibling_shape_dependencies() const {
-        for (const Subsystem* c : children()) {
-            // Children are Components by construction (the add_subsystem constraint).
-            const auto* comp = dynamic_cast<const ComponentBase*>(c);
-            if (comp == nullptr) continue;
-            for (const auto& ref : comp->get_inputs()) {
-                const detail::IOEntry& e = ref.get();
-                const detail::IOEntry* r = e.root();
-                if (r == &e || r->kind() != IOKind::output) continue;
-                const Subsystem* producer = r->declarer();
-                if (producer == c || !is_child(producer)) continue;
-                for (int d = 0; d < e.rank(); ++d)
-                    if (e.dim(d).how == detail::DimRecord::How::from_source_dim)
-                        throw std::invalid_argument(
-                            "naga::cospan: " + describe() + ": forward: input '" + std::string{e.name()} + "' of '" +
-                            c->path() + "' takes dimension " + std::to_string(d) + " of its shape from '" +
-                            std::string{r->name()} + "', an output of its sibling '" + producer->path() +
-                            "' (FromSourceDim); siblings of a ParallelSystem run unordered, so that extent is "
-                            "not known when the consumer launches (connect them through a sequential System, "
-                            "or give the input a fixed shape)");
-            }
-        }
-    }
-
-    bool is_child(const Subsystem* s) const {
-        for (const Subsystem* c : children())
-            if (c == s) return true;
-        return false;
-    }
+    bool allow_tied_ = false;  // siblings may share an output root
 };
 
 }  // namespace naga::cospan
