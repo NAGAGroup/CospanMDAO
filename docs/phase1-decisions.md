@@ -247,3 +247,75 @@ Case e records `device_ptr(in)` and `device_ptr(out)` into a `std::atomic<const 
 Attempted and reverted; nothing from the attempt is committed (pixi.toml, pixi.lock and the smoke files are back at 142a58c). What was tried: `cuda-cudart-dev = "*"` in `[workspace.dependencies]` and `[feature.cuda.dependencies]`; the solver picked cuda-cudart-dev 12.9.79 with no conflict against naga-acpp-runtime-cuda 2026.09.29, and `pixi install -e dev-cuda` succeeded. Smoke case f (a custom op taking `op.h.get_native_queue<sycl::backend::cuda>()` and calling `cudaMemcpyAsync` device-to-device, then a plain +1 component checked against a host reference) was gated in CMake by `find_package(CUDAToolkit QUIET)` and in the source by `COSPAN_SMOKE_NATIVE_CUDA` plus `defined(SYCL_EXT_HIPSYCL_BACKEND_CUDA)`.
 What failed: `find_package(CUDAToolkit)` did not succeed in dev-cuda, so case f was never compiled. Build 1: no hint, "CUDAToolkit not found". Fix round: `-DCUDAToolkit_ROOT=<.pixi/envs/dev-cuda>`, same result. Observed layout: `cuda_runtime.h` exists at `<env>/targets/x86_64-linux/include/cuda_runtime.h` and is absent from `<env>/include/`; there is no nvcc in the environment. Both builds compiled and passed smoke_component 10/10 on cuda (RTX 4090) with case f printing "skipped: CUDAToolkit not found at configure time", so no result exists for the native-stream call itself.
 Not reached, so still unknown: whether `SYCL_EXT_HIPSYCL_BACKEND_CUDA` is defined in the generic (SSCP) build, which decides whether `get_native_queue<sycl::backend::cuda>` is usable at all, and whether the cudart link works. Next attempt should start from the layout above (either give CMake the `targets/x86_64-linux` include dir and `libcudart` directly, bypassing `find_package(CUDAToolkit)`, or add a package that supplies nvcc) and check the macro first. D47 stands: custom-op native-stream work is untested.
+
+## D50 — System is a Subsystem with setup()/init() hooks; structure is legal in setup() only
+`System : Subsystem`. A user System overrides `setup()` (declares children, aliases, ties, marks) and optionally `init()` (path-addressed initializers). Every structural verb (`add_subsystem`, `connect`, `promote`, `tie_*`, `add_design_var`/`add_constraint`/`add_objective`) throws `std::logic_error` outside `setup()`; the initializer verbs throw outside `init()`. Reason: the exec-info, placement and transient passes assume the graph is frozen once `run_setup` returns. r01 §4.
+
+## D51 — Error-message policy
+Every System error is `naga::cospan: <System 'path' | the root System>: <verb>: <reason>`. Misuse of the API (wrong phase) is `std::logic_error`; bad wiring (unknown path, fan-in, kind or dtype mismatch, bad view) is `std::invalid_argument`. The reason names the offending path and, where useful, the fix ("tie before connecting, or connect from the alias"). The root's `describe()` reads "the root System" when its path is empty. Reason: a wiring error must be locatable from the message alone, without a debugger. r01 §4 (no wording given).
+
+## D52 — Path resolution
+Paths are dotted and descend through child Systems; the last segment names an alias of the owning System or an entry of a Component; a path may not descend past a Component; empty segments are refused. `find_child`/`find_alias`/`locate` are private; `entry_at(path)` is the public host-access hook and `get_subsystem(path)` returns the child. Reason: one resolver serves connect, ties, marks and initializers, so all error messages agree. r01 §10.3.
+
+## D53 — declarer_ tracking
+Every `IOEntry` records `declarer_` (a `const Subsystem*`), exposed as `declarer()`. `ComponentBase::register_entry` sets it for Component entries; System sets it on the alias entries it makes. Reason: transient marking walks `declarer() -> owner()` to find which System an entry lives in; without it no root was ever marked (found in the case c run of ddf2930). r01 §4.4.
+
+## D54 — Transient roots: how and when they are marked
+`mark_transient_roots()` runs at the END of the ROOT System's `run_setup` (`owner() == nullptr`), not per System, because peers declared later by an outer System decide whether a root escapes. A root declared inside a transient System's subtree, with no peer declared outside it, belongs to the INNERMOST qualifying transient System (`transient_by_`, `transient_owner()`). Such a root is not `arena_eligible()` and takes no arena bytes. The walk uses a `const_cast` on `owner()`, since marking is a setup-time mutation of a `const` accessor chain. r01 §4.4.
+
+## D55 — release/revive storage verbs
+`IOEntry` gains pure virtuals `release_storage()` and `revive_storage(sk::queue&, Substrates&)`, implemented in `StorageEntry` (release clears the slots and sets `released_`; revive clears the flag and calls `allocate`). `System::release()` drops the storage of the roots it owns and sets `released_` only if storage was actually dropped, so an empty transient System never reports released. `System::revive()` runs before the children's loop and `release()` after it. r01 §4.4.
+
+## D56 — Revive route and re-init
+`revive()` allocates through the pool route (transient roots are not arena-eligible, D41), recurses into released nested transient Systems, then re-runs BOTH init passes (Component, then System, children before owners) over the subtree, so a revived root has its initial values again. Nothing outside the subtree re-inits. Reason: a released root has lost its contents, so the init contract must hold on every forward. r01 §4.4.
+
+## D57 — Host access to a released root throws
+`HostView`/`HostViewMut` on a released root throw `throw_released()`: "'x' belongs to transient System 'path' and its storage is released; it exists only while that System runs". Reason: a silent empty view would read as valid data. r01 §4.4.
+
+## D58 — Alias factory
+`alias_factory::make_alias_entry(DType, name, IOKind, dims, can_source, can_target)` builds an alias entry from RUNTIME dtype and rank: a fold over the 13 `DType` values via `index_sequence`, then a rank 1-3 dispatch. Reason: `promote` and the ties know the dtype and rank only from a member entry at setup, not as template arguments. r01 §4.
+
+## D59 — promote: alias kind and flags
+`promote` makes a PEER alias with the kind of the member's ROOT and a snapshot of the root's `can_be_source_`/`can_be_target_` flags, copies the member's view, and sets its dims from the member. Reason: an alias must behave in connect exactly as the entry it stands for; the kind and flags the member itself carries can be stale after a tie. r01 §4, §8.1.
+
+## D60 — connect checks
+`connect(src, dst[, Slice])` checks four flag levels (src, src root, dst, dst root), dtype compatibility, and view composition per §8.2 (offsets add as `B.offset + A.offset`, `A` within `B`, view rank equals the root's rank). A view is applied to EVERY entry of dst's old set, and an identity connect from a viewed src passes that view on. A second connect into one input (fan-in) throws. r01 §8.1, §8.2.
+
+## D61 — Inputs cannot be connect sources
+A free input, and a tie alias root, cannot be a connect source; only an output root can. Consequence seen in smoke case a: a Slice has to read an output vector (`yy`), so `z` cannot be sliced for `obj`. Reason: an input has no producer, so "connect from it" would have to mean "share its root", which is what a tie already is. This restriction is not in r01 (gap; see the D50-D73 report).
+
+## D62 — Tie aliases are new roots
+`tie_inputs(members, alias)` requires each member to be a free input (target-not-source); `tie_outputs` requires source-not-target output roots. The alias is a NEW root whose set merges the members' sets (`IOEntry::merge(into, from)` needs two roots). Shape and dtype come from the first member (or that member's root) with a fixed shape; if none has one, the tie throws. Every member's `can_be_target_`/`can_be_source_` becomes false, so a later connect into a tied member is refused. r01 §4.3.
+
+## D63 — A tie alias can be tied
+A tie alias may itself be a member of another tie (case a: `tie_inputs({"mda.z", "obj.z"}, "z")` where `mda.z` is a tie alias of d1.z and d2.z); the member's whole root set is merged. Reason: it lets ties compose up the hierarchy, as promotions do. r01 §4.3.
+
+## D64 — tie_outputs restrictions
+Members must be output roots with no input-kind peers; dtypes must be atomic unless `allow_plain` is passed (`TieOutputsPolicy`). Reason: several producers writing one root is only defined for atomic accumulation; anything else is a race. r01 §4.3.
+
+## D65 — get_exec_info ordering and per-child context
+A System reports its own alias ROOTS first, then its children, then its own PEER aliases (the promotions). Each child gets its own `ExecCtx` (`child_ctx_`), and placed devices are held by the owner (`placed_`). Reason: reporting roots first avoids double-counting arena bytes for a promotion and lets a tie alias fix the device before its members register; peers last means their roots already exist. r01 §11.2.
+
+## D66 — Alias extents are inert
+An alias copies its dims at setup and does not follow a dynamic root's resolved extent; refresh is deferred to the Model step. Reason: nothing at System level resizes a root yet. r01 §7.2 (gap).
+
+## D67 — Typed access by path is Component-only
+`get_input`/`get_output<DT,Rank>(path)` resolve Component entries only; an alias has no typed wrapper (r01 says aliases "point their wrappers" without a member API). `entry_at(path)` and the HostView path work for aliases. r01 §7.2 (gap).
+
+## D68 — Marks are checked at setup
+`add_design_var` needs a free input root that `can_be_target()` and is not dynamic ("connected inputs are computed, not designed"). `add_constraint`/`add_objective` need an output root; an objective needs flat size 1. Regions and sizes are checked at declaration, so the marked root needs a fixed shape. Marks ride on the root and the last mark of a kind wins (a later `add_constraint` on the same path replaces the first). r01 §8.4.
+
+## D69 — property_list and the add_subsystem overloads
+Properties are a SYCL-style `property_list{property::device{d}, property::transient{}, ...}`. `add_subsystem<T>(name, args...)` and `add_subsystem<T>(name, props, args...)` are kept apart by `leads_with_props_v`; a `property_list` first argument is required to select the second (a bare property is a constructor argument). Reason: constructor arguments and properties are both variadic, so a marker is the only unambiguous split. r01 §4.
+
+## D70 — Helper-form plain System
+`add_subsystem(name, props, child<T>(...)...)` creates a PLAIN System (no user class) with the given properties and populates it with the `child<T>` declarations; the non-template `add_subsystem(name, props = {})` makes an empty one to fill through paths. Reason: it lets a transient or device-placed group be declared in one line. r01 §4.
+
+## D71 — Properties not yet supported
+`property::parallel` and `property::fused{Mode, wg}` (with its own nested `Mode`) are declared but throw "step 3b" in `add_child`. `property::transient` on a non-System throws. `property::device` equal to the parent's device is a no-op placement, not an error. Reason: parallel and fused are the next step; a silent ignore would run a different schedule than declared. r01 §4.
+
+## D72 — EntryAccess narrowed
+Only `EntryAccess::set_transient` is removed, since System now owns transient marking (D54). The other members stay because `smoke.cpp` and `smoke_component.cpp` build entries by hand. r01 §4.2.
+
+## D73 — Test-only RootDriver
+`detail::RootDriver` in smoke_system does what a Model will: place the root, `run_setup`, `get_exec_info`, substrates (arena if the total is nonzero, with 4096*64 slack; pool 1<<20), `prepare_exec`, `compile`, `run_init`, `run_system_init`; `forward()` is `run_compute_forward()` + `q.wait()`. It is not public API. r01 §11.2.
