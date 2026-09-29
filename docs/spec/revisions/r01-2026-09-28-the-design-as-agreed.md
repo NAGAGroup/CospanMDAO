@@ -92,8 +92,11 @@ are their own components, composed in systems.
   every I/O and by indexed access through the data wrappers.
 - **Work outside device kernels:** legacy code, file I/O, callbacks, and
   native libraries (BLAS, solvers) must be usable as ordinary components,
-  ordered with everything else. Floor: a component body that receives
-  the native handle and raw device pointers and does whatever it likes.
+  ordered with everything else. Floor: a host body (plain host C++ over
+  host-visible I/O, ordered in the stream) for legacy code, file I/O and
+  callbacks, and a custom-operation body that receives the native handle
+  and raw device pointers for native libraries and does whatever it likes
+  on the backend's stream.
 - **Shape source:** static, or **data-dependent extent** — an upstream
   output's *shape or value* may size downstream I/O.
 - **Write-safety:** atomicity lives in the element type; a kernel cannot
@@ -153,7 +156,7 @@ are their own components, composed in systems.
   materialized at once (per-node dense solves, operator fits): run in
   chunks over reused transient scratch, results landing in the
   full-shaped output. A first-class pattern with its own ergonomics;
-  touches shapes and transient lifetime. (Not specified in this revision;
+  touches shapes and transient subtrees (§4.4). (Not specified in this revision;
   see the roadmap.)
 - **Initialization** — free inputs and outputs receive initial values
   without a component existing to produce them; an owner can override
@@ -380,7 +383,7 @@ private:
 /// HostViewMut<DT, Rank> — the same host copy, writable: commit() and
 /// destruction write the buffer into the entry's root storage
 /// (usm_vector::from_host, which owns its copy of the bytes before
-/// returning) and refresh the root's copies on other devices. Obtained
+/// returning) and refresh the root's copies at other placements. Obtained
 /// from Model::view_output_mut (§9) and, as HostInitializer, from the
 /// initializer helpers inside init() (§6.2).
 template <DType DT, int Rank>
@@ -605,8 +608,8 @@ public:
     bool     is_root() const;
     bool     can_be_source() const;  ///< construction-time (§4.2)
     bool     can_be_target() const;
-    /// Device placement and per-device root storage — device(),
-    /// storage_on(), storage_devices() — are declared in §4.
+    /// Device placement and per-placement root storage — device(),
+    /// placement(), storage_on(), storage_placements() — are declared in §4.
 
     // ---- capabilities ---------------------------------------------------
 
@@ -631,22 +634,24 @@ public:
     virtual void validate_connection() const = 0;
 
     /// Allocation, in prepare_exec: ROOTS ONLY. Builds the root's
-    /// slabkit::usm_vector for each device the set spans, each from that
-    /// device's substrate (§7.1): fully-fixed and outside every transient subtree → the arena route
-    /// (its bytes are what get_exec_info counted); everything else → the
-    /// pool route, with the OS as fallback, at first need.
+    /// slabkit::usm_vector for each placement the set spans. A device
+    /// placement takes its device's substrate (§7.1): a device-kind root
+    /// that is fully fixed and outside every transient subtree → the arena
+    /// route (its bytes are what get_exec_info counted); everything else →
+    /// the pool route when the device has a pool, else the OS. A host-kind
+    /// placement takes the OS route on its device and counts no arena bytes.
     virtual void allocate(sk::queue&, Substrates&) = 0;
 
     /// Write {data pointer, shape, stride} into the registered member
     /// Input/Output wrapper — the pointer being
-    /// root()->storage_on(device()) (+ view offset). This is what makes
+    /// root()->storage_on(placement()) (+ view offset). This is what makes
     /// the user's member variable usable; called at the end of
     /// prepare_exec and after every resize.
     virtual void point_wrapper() = 0;
 };
 
 /// Typed leaves. InputEntry holds Input<DT,Rank>* to the member variable;
-/// OutputEntry holds Output<DT,Rank>* plus, per device, the owning data
+/// OutputEntry holds Output<DT,Rank>* plus, per placement, the owning data
 /// handle slabkit::usm_vector<cpp_type_t<DT>> (§4; an input ROOT — an
 /// unconnected input or tie alias — holds the same, since every root is a
 /// usm_vector over allocator<T>).
@@ -741,28 +746,39 @@ public:
 
     // ---- execution placement (set in get_exec_info; §11) ----------------
     const sycl::device& device() const;        ///< the owning subsystem's device
-    /// THE ROOT HOLDS ALL STORAGE, PER DEVICE. A root owns one allocation
-    /// on its own device (the primary, where its producer writes) and one
-    /// on every other device any peer of its set lives on. Peers own
-    /// nothing: every peer reaches up to root()->storage_on(its device),
-    /// so peers on the same device — however they relate to each other —
-    /// share one pointer, and get_output("alias") from a System always
-    /// yields memory on that System's device. The root's producer copies
-    /// primary -> each other device's storage in run_post_compute (and
-    /// whoever writes a root from the host does the same). Registered in
-    /// get_exec_info, allocated in prepare_exec. Why: §1 need 2.2
-    /// placement · P1 (a name yields memory where the reader is).
-    void*  storage_on(const sycl::device&) const;            ///< roots only
-    std::span<const sycl::device> storage_devices() const;   ///< roots only; primary first
+    Placement           placement() const;     ///< this entry's (device, storage kind)
+    /// THE ROOT HOLDS ALL STORAGE, PER PLACEMENT. A Placement is a
+    /// (device, kind) pair, declared beside IOKind. A root owns one
+    /// allocation at its own placement (the primary, where its producer
+    /// writes: the declarer's device and the declarer's default storage
+    /// kind — device kind, or host kind for a host component) and one at
+    /// every other placement any peer of its set lives at. Keying by
+    /// placement lets a root hold a device-kind and a host-kind copy on one
+    /// device, as a device producer feeding a host component requires.
+    /// Peers own nothing: every peer reaches up to
+    /// root()->storage_on(its placement), so peers at the same placement —
+    /// however they relate to each other — share one pointer, and
+    /// get_output("alias") from a System always yields memory on that
+    /// System's device. The root's producer copies primary -> each other
+    /// placement's storage in run_post_compute (sync_other_placements: a
+    /// copy-assignment of the primary usm_vector to every other slot, the
+    /// ordinary usm_vector copy rule); whoever writes a root from the host
+    /// does the same. Registered in get_exec_info (register_placement;
+    /// set_primary_placement puts the root's own placement first),
+    /// allocated in prepare_exec. Why: §1 need 2.2 placement · P1 (a name
+    /// yields memory where the reader is).
+    void*  storage_on(const Placement&) const;                 ///< roots only
+    std::span<const Placement> storage_placements() const;     ///< roots only; primary first
 
     // ---- capabilities (§3.3, restated against the set) ------------------
     /// validate_connection: INPUT PEERS ONLY, against root() — flat-size
     /// (or view() subarray size) equality; static pairs once in
     /// prepare_exec, dynamic pairs every forward after update_shape.
     /// allocate(sk::queue&, Substrates&): ROOTS ONLY — one usm_vector per
-    /// device in storage_devices(), each from that device's substrate;
-    /// no-op on peers.
-    /// point_wrapper: root()->storage_on(device()) (+ view() offset/
+    /// placement in storage_placements(); a device placement from that
+    /// device's substrate, a host placement through the OS route; no-op on
+    /// peers.
+    /// point_wrapper: root()->storage_on(placement()) (+ view() offset/
     /// stride) into the member wrapper — which is why root regrowth needs
     /// no notification: every peer re-points at its next turn.
 
@@ -837,10 +853,13 @@ Every entry that is a root once declaration completes owns storage —
 including unconnected inputs and unconnected `tie_inputs` aliases: that
 is how top-level design variables and shared inputs get memory with no
 IndepVarComp (why: §1 need 2.3 initialization, §1 need 2.4 design
-variables). Route (§7.1 `MemorySubstrate`): static roots outside every
-transient subtree from the arena; all other roots via the pool route (OS
-fallback) at first need and on growth. Peers own nothing, ever: a root holds one
-allocation per device its set spans (§4.2).
+variables). Route (§7.1 `MemorySubstrate`): a device placement of a device-kind root
+that is static and outside every transient subtree takes its device's
+arena; any other device placement takes that device's pool when it has one,
+else the OS; a host-kind placement takes the OS route on its device (a
+host-kind slot counts no arena bytes, and a host-primary root has no
+static bytes) — all at first need and on growth. Peers own nothing, ever:
+a root holds one allocation per placement its set spans (§4.2).
 
 TRANSIENT SUBTREES. A System added with `property::transient` (§7.4)
 releases, when its run of the subtree returns, every root declared anywhere
@@ -862,18 +881,20 @@ P3.
 
 Aliasing is complete the moment each structural call returns. Storage
 follows in the setup chain (§11): `get_exec_info` registers on
-each root the devices its set spans and counts the root's bytes once per
-such device; `prepare_exec` allocates each root's per-device storage from
-the substrates and points every wrapper at
-`root()->storage_on(own device)`. Regrowth of a root needs no
-notification: peers re-point at their next turn. Non-primary device
-copies are refreshed by the root's producer after every launch.
+each root the placements its set spans (the root's own placement first)
+and counts the root's bytes once per such device-kind placement, none for
+a host-kind one; `prepare_exec` allocates each root's per-placement
+storage from the substrates and points every wrapper at
+`root()->storage_on(own placement)`. Regrowth of a root needs no
+notification: peers re-point at their next turn. Copies at the
+non-primary placements are refreshed by the root's producer after every
+launch.
 
-`tie_outputs` members MUST share the alias's device: producers cannot
-write one storage from two devices. Checked in the members' Components'
-`get_exec_info` (a non-root output whose root's device differs from the
+`tie_outputs` members MUST share the alias's placement: producers cannot
+write one storage from two placements. Checked in the members' Components'
+`get_exec_info` (a non-root output whose root's placement differs from the
 Component's own — the alias was processed first by its System, so the
-device is known), error naming the tie.
+placement is known), error naming the tie.
 
 ### 4.6 Sample
 
@@ -893,6 +914,12 @@ tie_outputs({"d1.out","d2.out"}, "sum");   // FAILS: O1's set has an
 
 Binding contract; declarations only. Wrappers: §2. Metadata/shapes: §3.
 Component: §6. System-side execution: §7.
+
+**Library shape.** CoSpan is a header-only INTERFACE library. The
+placeholders (`kb_entry_rR`), the outer kernels and every stage function
+instantiate in the consumer's translation unit: the JIT finds a stage
+definition only when it is emitted in the same translation unit as the
+outer kernel that calls it. A model is built in one translation unit.
 
 ### The map taxonomy is doctrine, not metadata
 
@@ -918,6 +945,7 @@ namespace naga::cospan {
 ///          // or (GroupItem<R>, Inputs, Outputs)
 ///          // or (GroupItem<R>, Inputs, Outputs, Scratch)
 ///          // or (CustomOp&, Inputs, Outputs)        — CUSTOM OPERATION
+///          // or (Host, Inputs, Outputs)             — HOST BODY
 ///   };
 ///
 /// CUSTOM-OPERATION BODIES are never compiled to a device function or
@@ -926,15 +954,32 @@ namespace naga::cospan {
 /// stream orders them like any other submission (§7.3) and gating applies
 /// unchanged.
 /// Inputs/Outputs arrive as the bare wrappers with CURRENT device
-/// pointers. What the body does is open: host work, or handing the
-/// pointers to a native library on the native stream (CustomOp::h is
-/// the interop handle; CustomOp::to_host/from_host move data through
-/// the native backend for pure host work). Not fusable (no device
-/// function exists).
+/// pointers. A custom operation is for native backend work on the
+/// backend's own stream: the body runs when the work is SUBMITTED, not
+/// when it executes, so it may only enqueue asynchronous work on the
+/// native queue — a vendor library call, a native kernel launch
+/// (CustomOp::h is the interop handle). On a backend with no native queue
+/// (the OpenMP host device) the body still runs and receives correct
+/// device pointers. Not fusable (no device function exists).
+///
+/// HOST BODIES — `void operator()(Host, Inputs, Outputs) const`, `Host`
+/// being an empty tag — are the fourth kind: host work as an ordinary
+/// component (legacy code, file I/O, callbacks). They are never compiled
+/// to a device function. Every input and output of a host component is
+/// HOST-kind USM on the component's device (pinned host memory the body
+/// reads and writes directly), so data reaches it and leaves it by the
+/// ordinary rule for a producer and a consumer at different placements
+/// (§4.2). The owner submits the body as an async host task ordered in
+/// the stream: `async_host_in_order` on the stream, or the group's
+/// `async_host` under a Parallel owner's group (§7.1, §7.3). A HOST BODY
+/// IS PLAIN HOST C++: no SYCL calls, no device code, no backend API
+/// calls. Not fusable.
 ///
 /// THE SIGNATURE IS THE DECLARATION, four ways:
 ///   * first parameter id<R> vs GroupItem<R>  => group semantics opt-in
 ///     (a body without the GroupItem cannot touch group abstractions);
+///   * first parameter CustomOp& or Host    => custom-operation or host
+///     body (no device function; kernel_rank_v is 0);
 ///   * R                                    => kernel rank, deduced
 ///     (kernel_rank_v<KB>; no static member);
 ///   * trailing Scratch parameter           => local-memory opt-in
@@ -949,29 +994,33 @@ template <class KB> concept PlainBody   = /* operator()(id<R>, In, Out) */;
 template <class KB> concept GroupBody   = /* operator()(GroupItem<R>, In, Out [, Scratch]) */;
 template <class KB> concept HasScratch  = /* trailing Scratch parameter */;
 template <class KB> concept CustomOpBody= /* operator()(CustomOp&, In, Out) */;
+template <class KB> concept HostBody    = /* operator()(Host, In, Out) */;
 template <class KB> concept KernelBodyC =
     std::is_trivially_copyable_v<KB> &&
     std::is_trivially_copyable_v<typename KB::Inputs> &&
     std::is_trivially_copyable_v<typename KB::Outputs> &&
-    (int(PlainBody<KB>) + int(GroupBody<KB>) + int(CustomOpBody<KB>) == 1);
+    (int(PlainBody<KB>) + int(GroupBody<KB>) + int(CustomOpBody<KB>) +
+     int(HostBody<KB>) == 1);
+/// From the signature; 0 for custom-operation and host bodies.
 template <class KB> inline constexpr int kernel_rank_v = /* from signature */;
+/// kernel_rank_v, or 1 when that is 0: types the range parameters of
+/// create_launch_config.
+template <class KB> inline constexpr int launch_rank_v = /* see above */;
 
 /// What a custom-operation body receives: the interop handle (native
-/// queue/stream/device of the device this submission targets)
-/// and two helpers for pure host work — device USM is not host-
-/// dereferenceable, so data moves through the native backend on h's
-/// stream. Anything else (a library call on the native stream, a native
-/// kernel launch) is the body's own business.
+/// queue/stream/device of the device this submission targets) and the
+/// door to raw device pointers. Anything else (a library call on the
+/// native stream, a native kernel launch) is the body's own business, and
+/// it only enqueues asynchronous work.
 struct CustomOp {
     sycl::interop_handle& h;
     /// THE ONE PLACE a raw device pointer is obtainable (§2: wrappers
     /// never expose one). A custom operation exists to hand memory to
     /// code outside the framework; this is that door, and it opens only
-    /// inside a custom-op body. Why: §1 need 2.1 work outside device
-    /// kernels, §1 need 2.1 minimal device payload.
-    template <class W> auto device_ptr(const W& io) -> typename W::value_type*;
-    template <class W> auto to_host(const W& in) -> std::vector<typename W::value_type>;
-    template <class W> void from_host(W& out, std::span<const typename W::value_type>);
+    /// inside a custom-op body. It yields `const value_type*` for an Input
+    /// and `value_type*` for an Output or Initializer. Why: §1 need 2.1
+    /// work outside device kernels, §1 need 2.1 minimal device payload.
+    template <class W> auto device_ptr(const W& io) const;
 };
 
 } // namespace naga::cospan
@@ -1048,10 +1097,10 @@ struct GroupItem {
     sycl::sub_group get_sub_group() const;
 
 private:
-    sycl::nd_item<R> it_;
-    sycl::id<R>      group_offset_;   // this stage's first group, in the wave
+    sycl::nd_item<R> it_;             // the physical item
+    sycl::id<R>      group_id_;       // this stage's group id, stage-local
     sycl::range<R>   group_range_;    // this stage's group grid: ceil(range[d] / wg[d])
-    friend struct detail::ItemFixup;
+    friend struct detail::ItemFixup;  // the sole constructor
 };
 
 } // namespace naga::cospan
@@ -1060,8 +1109,10 @@ private:
 A wave lays its stages' work-groups out along dimension 0 only:
 `nd_range<R>{ {G·wg0, wg1, wg2}, {wg0, wg1, wg2} }`, so the physical group
 linear id is the group index along that axis. The device function (§5.5)
-builds the item from the stage record: stage-local linear group = physical
-linear group − `group_offset`, delinearized over `group_range`. A
+builds the item from the stage record: the stage-local linear group is the
+physical linear group − `group_offset`, delinearized over `group_range`
+into `group_id_`; the item stores that id and the grid (`group_range_`),
+so every group-level query answers stage-locally. A
 Component launched on its own is a one-stage wave with `group_offset = 0`;
 the same fixup serves both. Stages in a wave may have any ranges; the only
 geometry the wave imposes is the work-group shape. A user barrier inside a
@@ -1077,8 +1128,9 @@ namespace naga::cospan {
 /// device array in EXECUTION ORDER. Field ownership:
 ///   component-bound (create_launch_config): rank, range, flat_extent,
 ///     stream offsets, scratch_off/scratch_bytes;
-///   System-stamped (launch pack): group_offset, group_count, group_range — the
-///     GROUP-INDEX slice: slices are counted in whole work-groups, so a
+///   System-stamped (launch pack): group_offset, group_count, group_range —
+///     the GROUP-INDEX slice — and local_off, the stage's byte offset into
+///     the launch's local buffer. Slices are counted in whole work-groups, so a
 ///     group never straddles stages under ANY geometry. Why: §1 need
 ///     2.2 fuse, §1 need 2.1 group-level parallelism.
 struct StageRecord {
@@ -1092,6 +1144,8 @@ struct StageRecord {
     uint32_t body_off;            // into the bodies stream
     uint32_t scratch_off;         // into the bodies stream (Scratch bytes)
     uint32_t scratch_bytes;       // this stage's local-memory requirement
+    uint32_t local_off;           // System-stamped: byte offset of this stage's slice of the
+                                  //   launch's local buffer (0 for an individual launch)
     uint8_t  rank;
 };
 
@@ -1161,7 +1215,7 @@ SYCL_EXTERNAL void kb_fn(sycl::nd_item<R> it, FnOffsetInfo& info,
 
     if constexpr (HasScratch<KB>) {
         auto s = *reinterpret_cast<const typename KB::Scratch*>(bodies + r.scratch_off);
-        detail::fixup_scratch(s, local_base);  // Local.ptr_ = base + offset_
+        detail::fixup_scratch(s, local_base + r.local_off);  // Local.ptr_ = slice base + offset_
         body(gi, in, out, s);
     } else if constexpr (GroupBody<KB>) {
         body(gi, in, out);
@@ -1344,17 +1398,19 @@ public:
 };
 
 /// What a Component's compute turn yields. The owner ROUTES on
-/// is_custom_op(): kernels take the outer-kernel path (§5.6), custom
-/// operations take AdaptiveCpp_enqueue_custom_operation through the same
-/// SubmitTarget. A kernel description additionally exposes rank,
+/// is_custom_op() and is_host(): kernels take the outer-kernel path (§5.6),
+/// custom operations take AdaptiveCpp_enqueue_custom_operation through the
+/// same SubmitTarget, host bodies take an async host task (§5.1). A kernel
+/// description additionally exposes rank,
 /// group-body and scratch facts and its streams/record, for fused owners
 /// to validate and pack.
 class LaunchDescription {
 public:
     virtual ~LaunchDescription();
     virtual bool is_custom_op() const = 0;
+    virtual bool is_host() const = 0;
     virtual void submit(SubmitTarget& t) const = 0;   ///< ordering is the stream's (§7.3)
-    virtual const KernelParts* kernel() const { return nullptr; }  // null for custom ops
+    virtual const KernelParts* kernel() const { return nullptr; }  // null for custom ops and host bodies
 };
 
 } // namespace naga::cospan
@@ -1419,13 +1475,15 @@ public:
     /// Why: §1 need 2.3 initialization (not limited beyond the queue).
     template <DType DT, int Rank> Initializer<DT, Rank> get_input_initializer(std::string_view name);
     template <DType DT, int Rank> Initializer<DT, Rank> get_output_initializer(std::string_view name);
-    /// Host initializer: a HostViewMut (§2) over the entry — the current values on the host, written back to the root and its other-device copies on commit() and destruction.
+    /// Host initializer: a HostViewMut (§2) over the entry — the current values on the host, written back to the root and its other-placement copies on commit() and destruction.
     template <DType DT, int Rank> HostInitializer<DT, Rank> get_input_host_initializer(std::string_view name);
     template <DType DT, int Rank> HostInitializer<DT, Rank> get_output_host_initializer(std::string_view name);
     /// Common-case helpers, by name.
-    /// Every helper writes the ROOT's storage on this Component's device,
-    /// then refreshes the root's other-device copies (`copy_d = root`,
-    /// §6.5 step 3).
+    /// Every helper writes the ROOT's primary storage, then refreshes the
+    /// root's other-placement copies (`copy_d = root`, §6.5 step 3). On a
+    /// root that is unallocated and empty (a shape still to be resolved)
+    /// fill_* and zero_* are a no-op — a fresh allocation is zero-filled;
+    /// on an unallocated non-empty root they throw.
     template <class T> void fill_input (std::string_view name, T value);
     template <class T> void fill_output(std::string_view name, T value);
     void zero_input (std::string_view name);
@@ -1433,7 +1491,21 @@ public:
     template <class T> void set_input_from_host (std::string_view name, std::span<const T>);
     template <class T> void set_output_from_host(std::string_view name, std::span<const T>);
 
+    // ---- body facts, read off the body's signature -------------------------
+    /// Answered by Component<KB>; a fused owner holds type-erased children
+    /// and plans a wave from these without knowing the body types.
+    virtual int  kernel_rank() const;      ///< 0 for custom-op and host bodies
+    virtual bool is_group_body() const;
+    virtual bool has_scratch() const;
+    virtual bool is_custom_op() const;
+    virtual bool is_host() const;
+    /// The type-erased id of the body's stage function; throws for a
+    /// custom-op or host body (nothing is compiled).
+    virtual detail::JitId definition_id() const;
+
 protected:
+    /// The storage kind of this Component's I/O: device, or host for a host body.
+    virtual sk::kind default_storage_kind() const;
     std::unordered_map<std::string, std::unique_ptr<detail::IOEntry>> by_name_;
     std::unordered_map<const void*, detail::IOEntry*>                 by_member_;
     // Runner overrides (Subsystem verbs) are implemented by Component<KB>;
@@ -1458,24 +1530,31 @@ public:
     virtual std::unique_ptr<LaunchDescription> compute_forward() = 0;
 
 protected:
-    /// Base-provided staging. Kernel bodies: range[, wg], Inputs, Outputs
-    /// [, Scratch], body. Custom-op bodies (§5.1): Inputs, Outputs,
-    /// body — no range.
+    /// Base-provided staging (launch_rank_v<KB> is kernel_rank_v<KB>, or 1
+    /// for a body with no rank). Kernel bodies: range[, wg], Inputs,
+    /// Outputs [, Scratch], body. Custom-op and host bodies (§5.1): Inputs,
+    /// Outputs, body — no range.
     std::unique_ptr<LaunchDescription> create_launch_config(
-        sycl::range<kernel_rank_v<KB>> range,
+        sycl::range<launch_rank_v<KB>> range,
         typename KB::Inputs in, typename KB::Outputs out, KB body = {});
     std::unique_ptr<LaunchDescription> create_launch_config(
-        sycl::range<kernel_rank_v<KB>> range, sycl::range<kernel_rank_v<KB>> wg,
+        sycl::range<launch_rank_v<KB>> range, sycl::range<launch_rank_v<KB>> wg,
         typename KB::Inputs in, typename KB::Outputs out, KB body = {})
         requires GroupBody<KB>;
     std::unique_ptr<LaunchDescription> create_launch_config(
-        sycl::range<kernel_rank_v<KB>> range, sycl::range<kernel_rank_v<KB>> wg,
+        sycl::range<launch_rank_v<KB>> range, sycl::range<launch_rank_v<KB>> wg,
         typename KB::Inputs in, typename KB::Outputs out,
         typename KB::Scratch scratch, KB body = {})
         requires(GroupBody<KB> && HasScratch<KB>);
     std::unique_ptr<LaunchDescription> create_launch_config(
         typename KB::Inputs in, typename KB::Outputs out, KB body = {})
         requires CustomOpBody<KB>;
+    std::unique_ptr<LaunchDescription> create_launch_config(
+        typename KB::Inputs in, typename KB::Outputs out, KB body = {})
+        requires HostBody<KB>;
+    /// The storage kind of this Component's I/O: device kind, or host kind
+    /// for a host body.
+    sk::kind default_storage_kind() const override;
 
 private:
     // ---- runner overrides (the private bodies of the Subsystem verbs) ---
@@ -1500,30 +1579,38 @@ private:
 - **`run_setup`**: `setup()`. Entries exist; sets are formed by the owner's
   structural calls as they happen.
 - **`get_exec_info(parent_device)`** — a Component has no device choice;
-  it records `parent_device`, then for each own entry `e`:
-  - `e` is root: register this device as its primary; count its static
-    bytes here (zero for a root inside a transient subtree).
-  - `e` is an input peer: if `root(e)` already has storage registered on
-    this device → nothing; else register this device on `root(e)` and
-    count the root's static bytes here (the root owns one copy per
-    device its set spans — §4.2).
-  - `e` is an output peer (only a tied output is one): `root(e)`'s device
-    must equal this device, else ERROR naming the tie — producers cannot
-    write one storage from two devices.
+  it records `parent_device`, then for each own entry `e` sets `e`'s
+  placement to (`parent_device`, the Component's default storage kind —
+  device kind, or host kind for a host body):
+  - `e` is root: register this placement as its primary
+    (`set_primary_placement`: it goes first even when an input peer's
+    owner registered before it); count its static bytes here (zero for a
+    root inside a transient subtree, and zero for a host-kind primary).
+  - `e` is an input peer: if `root(e)` already has storage registered at
+    this placement → nothing; else register this placement on `root(e)`
+    and count the root's static bytes here — a device-kind placement adds
+    them once per device, a host-kind one adds none (the root owns one
+    copy per placement its set spans — §4.2).
+  - `e` is an output peer (only a tied output is one): `root(e)`'s
+    placement must equal this placement, else ERROR naming the tie —
+    producers cannot write one storage from two placements.
   (Every root is processed before any peer of it in an acyclic model —
   Systems process their alias entries before their children, and
   producers precede consumers. Cycles are on the roadmap; their design
   owns the exception.)
   - Return `{device: bytes}`.
 - **`prepare_exec`**: for every own ROOT allocatable now, build its
-  `usm_vector` per registered device from that device's substrate
-  (static and outside every transient subtree → arena route; otherwise, with
-  a known shape → pool route with OS fallback); then point every member wrapper at
-  `root()->storage_on(this device)` and validate static input peers
+  `usm_vector` per registered placement — a device placement from that
+  device's substrate (static, device-kind and outside every transient
+  subtree → arena route; otherwise, with a known shape → pool route with
+  OS fallback), a host placement through the OS route on its device;
+  then point every member wrapper at
+  `root()->storage_on(own placement)` and validate static input peers
   against their roots. An unconnected input with a `FromSourceDim`
   dimension errors here.
 - **`compile`**: the device function at the body's own rank (`kernel_rank_v<KB>`);
-  the individual config; custom-op bodies recorded. A Component knows nothing of fusing.
+  the individual config; a custom-op or host body compiles nothing. A
+  Component knows nothing of fusing.
 - **`run_init`**: `init(queue, device)` with the Model's queue and this
   Component's device.
 
@@ -1532,10 +1619,14 @@ private:
 Called by its owner in this order; a Component never submits its compute
 work and never sees a queue except through the owner's ctx.
 
-1. **`run_pre_compute(ctx)`**: value-driven shapes first — for each own
-   input carrying a `FromInput` spec, read the driving input's value
+1. **`run_pre_compute(ctx)`**: value-driven shapes first, over every own
+   entry — inputs, then outputs, with cycle detection between the specs
+   (`FromInputDim` reads the sibling input's extent) — for each entry
+   carrying a `FromInput` spec, read the driving input's value
    through `host_view()` — a host read, whichever storage holds it (the
-   one forced sync, so this turn's launch geometry is known), call
+   one forced sync, so this turn's launch geometry is known; integer
+   dtypes only, a negative value throws), allocate the entry's root first
+   if it is still unallocated, call
    `root.resize(shape)`, then `point_wrapper`; no staging
    copy, nothing submitted for the resize, no reallocation inside a
    submitted task (why: §1 need 2.1 shape source · P3 — only value-driven entries pay
@@ -1545,8 +1636,8 @@ work and never sees a queue except through the owner's ctx.
 2. **`run_compute_forward()`**: `compute_forward()` — returns the
    description. The owner submits it (§7.3).
 3. **`run_post_compute(ctx)`**: through `ctx`, after the owner's
-   submission: for each output root with storage on other devices, for
-   each other device `copy_d = root` — one assignment resizes to match
+   submission: for each output root with storage at other placements, for
+   each other placement `copy_d = root` — one assignment resizes to match
    and copies, routed by SlabKit. Ordered after the work it depends on by
    the stream (§7.3).
 
@@ -1814,7 +1905,10 @@ protected:
 
 The stream is an abstract in-order sequence of work items. A kernel is an
 item (a custom operation, submitted through the same `SubmitTarget`, is
-an item the same way). A group (`queue.submit_group`) is one item:
+an item the same way; a host body is submitted with `async_host_in_order`,
+which joins the stream's order as an item — under a Parallel owner's
+group, with the group's `async_host`). A group (`queue.submit_group`) is
+one item:
 unordered inside, ordered both ways outside. Async host and memory tasks
 are concurrent with each other but ordered after every kernel/group item
 before them and before every one after. Placement never costs the order.
@@ -1829,7 +1923,7 @@ revive();
 for (child : children_) {
     child->run_pre_compute(ctx_);
     auto d = child->run_compute_forward();
-    if (d) d->submit(ctx_.target());          // WE submit, routed on d->is_custom_op()
+    if (d) d->submit(ctx_.target());          // WE submit, routed on d->is_custom_op() / d->is_host()
     child->run_post_compute(ctx_);            // copies AFTER the work they depend on —
                                               //   by the stream, not by an event
 }
@@ -2307,7 +2401,7 @@ root's `usm_vector` releases), `substrates_` (arenas and pools), `queue_`,
 Binding contract; declarations only. The base System, Parallel and
 Fused: §7. Systems never do work — a System type alters ORCHESTRATION
 (what runs, when, on which device), never compute. Work is a Component's,
-including custom operations (§5.1).
+including custom operations and host bodies (§5.1).
 
 ### 10.1 The principle
 
@@ -2475,17 +2569,20 @@ allocation; no device anywhere in this step.
 counts its static bytes here); then each child in order, merging returned
 maps (sum on key).
 
-`Component`: device = `parent_device`; per own entry `e`:
-- root → register this device as `e`'s primary; count its static bytes
-  here (zero for a root inside a transient subtree);
-- input peer, `root(e)` already has storage registered on this device →
+`Component`: device = `parent_device`; every own entry's placement is
+(`parent_device`, the Component's default storage kind — host kind for a
+host body); per own entry `e`:
+- root → register this placement as `e`'s primary; count its static bytes
+  here (zero for a root inside a transient subtree, and for a host-kind
+  primary);
+- input peer, `root(e)` already has storage registered at this placement →
   nothing;
-- input peer, it does not → register this device on `root(e)` and count
-  the root's static bytes here (the root will own a copy on this device;
-  §4.2);
-- output peer (only a tied output is one) whose root's device ≠ this
-  device → ERROR naming the tie: producers cannot write one storage
-  from two devices.
+- input peer, it does not → register this placement on `root(e)` and count
+  the root's static bytes here when the placement is device kind (the
+  root will own a copy at this placement; §4.2);
+- output peer (only a tied output is one) whose root's placement ≠ this
+  placement → ERROR naming the tie: producers cannot write one storage
+  from two placements.
 
 Every root is processed before any peer of it: alias roots before
 children, producers before consumers (acyclic). A System processes its
@@ -2511,11 +2608,13 @@ Parallel owner sets one, for the extent of its `submit_group`),
 wrappers; recurse.
 
 `Component`: for every own ROOT entry allocatable now, build its
-`usm_vector` per registered device from that device's substrate —
-static and outside every transient subtree from the arena route; otherwise,
-with a known shape, via the pool route (OS fallback); roots whose shape is
-not yet known stay unallocated. Then point every member wrapper at
-`root()->storage_on(own device)` — guaranteed
+`usm_vector` per registered placement — a device placement from that
+device's substrate (static, device-kind and outside every transient
+subtree from the arena route; otherwise, with a known shape, via the pool
+route with OS fallback), a host placement through the OS route on its
+device; roots whose shape is not yet known stay unallocated. Then point
+every member wrapper at
+`root()->storage_on(own placement)` — guaranteed
 allocated by now (roots precede peers); shape and stride (+ view) set;
 static input peers validate against their roots here. An unconnected
 input carrying a `FromSourceDim` dimension has no source to derive from:
@@ -2524,7 +2623,8 @@ ERROR here ("source-derived dimension on an unconnected input").
 #### 11.2.5 Compile — `root.compile()`
 
 `Component`: device function(s) + id at the body's own rank
-(`kernel_rank_v`); individual config; custom-op bodies recorded. `System`:
+(`kernel_rank_v`); individual config; a custom-op or host body compiles
+nothing. `System`:
 children in order; a FusedSystem also checks its children's kernel ranks
 equal and builds its sequence config. Other Fused and Parallel legality is
 NOT checked here — it is checked each forward on the descriptions the children return (cheap, host-side,
@@ -2539,9 +2639,11 @@ sycl::device&)`; Systems forward) then `run_system_init` (System pass: every
 System's `init(queue, device)`, child Systems before owners, so an owner's
 `init` has the last word by path and the root System has the last word
 overall). Initializers write a root's
-primary storage and copy it to the root's other-device storage. Unnecessary
-inits (connected inputs) are harmless. An initializer on unallocated
-storage throws.
+primary storage and copy it to the root's other-placement storage.
+Unnecessary inits (connected inputs) are harmless. On a root that is
+unallocated and empty (a shape still to be resolved) an initializer is a
+no-op — a fresh allocation is zero-filled; on an unallocated non-empty
+root it throws.
 
 **State:** storage for every static root, initialized; wrappers current;
 kernels compiled. The model can run. Its state is not yet meaningful —
@@ -2568,7 +2670,7 @@ for child in children:
     child.run_pre_compute(ctx)
     d = child.run_compute_forward()
     if d:  d->submit(ctx.target())            // this System submits;
-                                              //   routed on d->is_custom_op()
+                                              //   routed on d->is_custom_op() / d->is_host()
     child.run_post_compute(ctx)               // a child that submitted itself
                                               //   needs no owner action
 release()
@@ -2581,7 +2683,9 @@ host and memory tasks are concurrent with each other and ordered after
 every kernel/group item before them and before every one after. Placement
 never costs the order; nothing in CoSpan threads dependencies. Kernel
 descriptions take the outer-kernel path, custom operations take
-`AdaptiveCpp_enqueue_custom_operation`, through the same `SubmitTarget`.
+`AdaptiveCpp_enqueue_custom_operation`, through the same `SubmitTarget`;
+host bodies take `async_host_in_order` (the group's `async_host` under a
+Parallel owner).
 **Parallel** (Components only): pre-compute ALL → `queue.submit_group {
 each child's description submitted with its own device }` → post-compute ALL
 after the group returns. **Fused**: pre-compute ALL → compute ALL (collect;
@@ -2594,14 +2698,14 @@ config → post-compute ALL. **Custom System types** (§10): early-return from
 #### 11.3.2 A Component's turn (§6.5)
 
 1. `run_pre_compute(ctx)`: for each own
-   input driving a shape via `FromInput` — read the driving input's `host_view()` (the one
+   entry (input or output) whose shape a `FromInput` spec drives — read the driving input's `host_view()` (the one
    forced sync, so the launch geometry below is known), `root.resize(shape)`,
    `point_wrapper`; nothing submitted for the resize, no reallocation
    inside a submitted task. Then `pre_forward()` → dynamic validation → wrapper sync.
-2. `run_compute_forward()` → `compute_forward()` → description (kernel or
-   custom op). The owner submits it.
-3. `run_post_compute(ctx)`: for each output root with storage on other
-   devices, for each other device `copy_d = root` — one assignment
+2. `run_compute_forward()` → `compute_forward()` → description (kernel,
+   custom op or host body). The owner submits it.
+3. `run_post_compute(ctx)`: for each output root with storage at other
+   placements, for each other placement `copy_d = root` — one assignment
    resizes to match and copies, routed by SlabKit — after the owner's
    submission, ordered by the stream.
 
