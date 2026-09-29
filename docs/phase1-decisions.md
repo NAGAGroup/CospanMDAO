@@ -355,3 +355,36 @@ If a child's pre/compute (or the sibling check) throws after `revive()`, `releas
 
 ## D85 — Arena over-reservation not investigated in this step
 The check of get_exec_info's byte total against the distinct arena-eligible roots (suspected from reading the code, not measured: a consumer declared before its producer may count a root's bytes twice, once from the input peer and once from the root's owner) is deferred to its own dispatch. Reason: user's scope for 3b-1. r01 §4.2, §11.2.
+
+## D86 — Kernel-shape virtuals on ComponentBase
+`kernel_rank()`, `is_group_body()`, `has_scratch()`, `is_custom_op()`, `is_host()` and `definition_id()` are virtual on ComponentBase; `Component<KB>` overrides them from the body's traits. `definition_id()` throws for custom-op and host bodies. Reason: a FusedSystem holds type-erased children and must plan a wave (rank, scratch, barrier) without knowing the body types. r01 §5.4.
+
+## D87 — A wave is one chained call sequence
+`compile()` builds `define_as_call_sequence(wave_entry_id(rank), defs)` where `defs` is the children's definition ids in order, plus `wave_barrier_id(rank)` after every scratch stage that has a later scratch stage. The stage function pointer must be a literal at its call site (reflection), so ids come from `stage_definition_id<KB>()`, `wave_entry_id` and `wave_barrier_id` in kernel.hpp. Reason: one launch runs the whole chain. r01 §5.5.
+
+## D88 — Wave geometry
+Groups run along dim 0 (`wave_nd_range<R>`); dims >= rank are 1. A plain stage's group_count is ceil(flat_extent/wg_size), a group stage's is the product of ceil(range[d]/wg[d]); the launch uses the max over stages and each stage returns early for groups beyond its own count. Sequential mode has group_offset 0. Reason: stages of different sizes share one launch. r01 §5.6.
+
+## D89 — Work-group choice
+The FusedSystem's `wg` if given, else the stages' common wg (a mismatch throws, naming the stages), else the rank's default. Reason: every stage of a wave runs in the same nd_range. r01 §5.6.
+
+## D90 — One local buffer, barrier between scratch stages
+The local buffer is the largest scratch any stage needs, shared by all stages; hence the barrier between consecutive scratch stages. Reason: less local memory; the barrier makes the reuse safe. r01 §5.6.
+
+## D91 — Chained-dependency rule inside a sequential wave
+Checked each forward from metadata. A stage may read an output of an earlier stage only if (equal range and both plain: element-wise) or (both group bodies with scratch: the barrier separates them). An input with a subarray view is never element-wise. Reading an output of a later stage throws. Every message names both stages. Reason: otherwise a wave would read data another work-group has not written yet. r01 §5.6.
+
+## D92 — Packing
+Records, inputs, outputs and body streams are packed into four 16-byte-aligned host buffers, uploaded to device USM each forward and passed to the launch. `scratch_off = body_off + record.scratch_off`. Reason: one launch has fixed arguments. r01 §5.7.
+
+## D93 — Staging through member usm_vectors
+The staging buffers are `std::optional<sk::usm_vector<T>>` members (`emplace` + `from_host`, which snapshots the source and is stream-ordered), allocated from the pool if the substrate has one, else the OS device allocator. Reason: usm_vector has no default constructor; back-to-back forwards stay valid because the snapshot is stream-ordered. Known risk: the vectors destruct after the RootDriver's pool if declared before it; not seen in the smoke. r01 §5.7.
+
+## D94 — Custom-op and host children are refused in a wave
+`compile()` throws naming the child. Reason: they have no device kernel to chain. r01 §5.4.
+
+## D95 — Helper form for fused; amends D79
+`add_subsystem(name, props, child<T>(...)...)` with `property::fused` builds a FusedSystem through `populate<S>` with a constructor tuple `{mode, wg}`; `parallel` and `fused` together still throw; a typed child given `property::fused` throws unless it derives from FusedSystem. Parallel mode throws "step 3b-3". `detail::fused_of` keeps the include order acyclic, as D80 does for parallel. FusedSystem's `add_subsystem` takes Components only, like ParallelSystem (D74). r01 §7.5.
+
+## D96 — Test change in smoke_parallel
+Its case d uses `property::fused{Mode::parallel}`, since plain `property::fused` now builds a FusedSystem. Test-only.
