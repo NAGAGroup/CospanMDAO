@@ -21,19 +21,22 @@ The spike (tests/spike) built and linked both variants in both environments; the
 
 Choice: B: cospanmdao is header-only (INTERFACE library); placeholders, outer kernels and stages all compile in the consumer's translation units — because the JIT could only find the stage definitions when they were emitted in the same translation unit as the outer kernel, and not when the outer kernel came from a shared library.
 
-## D3 — Host components: a fourth body kind, run through async_host_in_order
+## D3 — Host components: a fourth body kind, host work through async_host
 Host work in a model is a Component whose body's first parameter is the tag
 `cospan::Host`: `void operator()(Host, Inputs, Outputs) const`, with the same
-Input/Output wrappers as every other body. The framework places a host
-component on the OpenMP host device of the Model's context, whatever its
-parent's device; there, device memory is host memory, so the body reads and
-writes its wrappers directly. Data reaches it and leaves it through the
-ordinary multi-device root copies (the producer's post-compute copies into
-the host device's storage; the host component's post-compute copies its
-outputs to the devices that read them). The body is submitted with SlabKit's
-async_host_in_order, which joins the kernel order: plain async_host is not
-ordered against memory tasks, so it could run before its inputs finished
-copying in. Custom operations stay separate and are for native backend work
-only (D1). Consequence: the Model's context must contain the host device; the
-default ModelConfig includes it, and setup names the component and fails
-clearly when a model with a host component has no host device.
+Input/Output wrappers as every other body. It is submitted with the fork's
+async_host through SlabKit's async_host_in_order: a host callable run by the
+runtime, placed on no device, that joins the kernel order as an ordinary work
+item. Plain async_host is not ordered against memory tasks, so it could run
+before its inputs finished copying in.
+
+The only real constraint is memory: device memory is not host-readable, so a
+host component's entries live in HOST-kind USM (pinned host memory, addressable
+by the host and by devices; not managed memory, so CUDA-under-WSL2's
+shared-memory limit does not apply). Root storage is keyed by placement — a
+device, or the host — instead of by device alone. A host component's input
+whose root lives on a device gets a host-placement copy, refreshed by the
+producer's post-compute like any other-device copy; its outputs are host-kind
+roots that device consumers read directly or receive copies of by the same
+rule. Custom operations stay separate and are for native backend work only
+(D1).
