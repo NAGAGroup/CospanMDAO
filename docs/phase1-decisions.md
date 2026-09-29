@@ -355,6 +355,7 @@ If a child's pre/compute (or the sibling check) throws after `revive()`, `releas
 
 ## D85 — Arena over-reservation not investigated in this step
 The check of get_exec_info's byte total against the distinct arena-eligible roots (suspected from reading the code, not measured: a consumer declared before its producer may count a root's bytes twice, once from the input peer and once from the root's owner) is deferred to its own dispatch. Reason: user's scope for 3b-1. r01 §4.2, §11.2.
+Measured since (D133, tests/test_model.cpp, `[model][memory]`): expected 1008 B (distinct roots), arena capacity 263152 B = 1008 + 262144 slack, in use 1008 B after setup and after a forward. Capacity matches, so no double counting was seen in that shape and the test is not `[!mayfail]`. The exhaustive check over every declaration order is still open.
 
 ## D86 — Kernel-shape virtuals on ComponentBase
 `kernel_rank()`, `is_group_body()`, `has_scratch()`, `is_custom_op()`, `is_host()` and `definition_id()` are virtual on ComponentBase; `Component<KB>` overrides them from the body's traits. `definition_id()` throws for custom-op and host bodies. Reason: a FusedSystem holds type-erased children and must plan a wave (rank, scratch, barrier) without knowing the body types. r01 §5.4.
@@ -490,3 +491,17 @@ Four element-wise stages as a plain System and as a sequential FusedSystem (777 
 
 ## D130 — The wave rules live in one shared header, wave_rules.hpp
 `include/naga/cospan/wave_rules.hpp` (namespace `naga::cospan::detail`) holds `check_no_stage_connections`, `check_tied_outputs`, `check_value_driven_sizes` and their helpers; FusedSystem and ParallelSystem both call them. Reason: one wording and one aliasing walk for both parallel runners. r01 §7.5.
+
+
+## D131 — The Model tests live in test_model.cpp, namespace tmod
+`tests/test_model.cpp` (namespace `tmod`, tags `[model]` plus `[sellar]`, `[marks]`, `[lifecycle]`, `[host]`, `[memory]`, `[pool]`, `[devices]`) goes through a `cospan::Model` for everything; the only reach past the Model's verbs is its retrieval (`root().entry_at`, D113). The Sellar Systems are templated on the dtype and run in f32 (abs and rel 1e-5) and f64 (1e-12) over five design points against a host reference in double, computed from the values the device saw. The default_device-outside-context check is a SECTION of the lifecycle case and the two-device case is a whole-case SKIP, both when the runtime shows too few devices (omp mask: both skip; cuda mask: both run, since the OpenMP host device still enumerates, D111). r01 §9, §11.
+
+## D132 — set_input errors for dtype, rank and size name the entry, not the path
+`check_entry` and `write_back` (host_view.hpp) build their messages from `IOEntry::name()`, which is the leaf name: a wrong dtype, rank or size on `d1.y2` says `'y2'`, on the top-level alias `z` says `'z'`. The unknown-path and wrong-kind errors do carry the full path (`entry_at` and `Model::entry_of`). The test asserts the leaf name (and the path for a top-level alias); the library is unchanged. Open for Jack: whether these two messages should carry the dotted path.
+
+## D133 — Memory report measured: arena capacity is the distinct-root sum plus the setup slack, exactly
+A model with roots gen.y f32[100], cvt.d f64[64], a tie alias bc f32[8] and comb.o f32[16] (1008 B), two connected inputs (peers) and a connected f64 input, one tie and one promote, reports arena capacity 263152 B = 1008 + 262144 (`kArenaSlack`, D106) and 1008 B in use after setup and after a forward, on omp and on CUDA. So neither a connected input peer (D85) nor the old member roots of a tie are counted twice in this shape. The test asserts that equality and carries no `[!mayfail]`. The pool case shows `pool_bytes` 1 MiB and `pool_bytes_in_use` 1024 B for 8 floats and 12288 B for 3000 floats (node size 1024). r01 §9.
+
+## D134 — A CUDA run of the whole suite hung once in an existing flavors case
+One of four CUDA runs of the full suite at this commit hit the 600 s timeout in `test_flavors.cpp:943` (`fused: a value-driven size driven from outside the fuse runs and follows the value, in both modes`, parallel section) before reaching the model tests; the other three passed (44 cases, 543 assertions). Not diagnosed here. That case grows a root and frees it through the free route (D125); whether the hang is related to `docs/known-issues/cuda-deferred-free-deadlock.md` is not established. No library change was made in this step.
+A later CUDA run (run 1 of a repeat set) passed the whole suite (543 assertions in 44 test cases) and then the process dumped core (SIGSEGV, exit 245) after Catch2's summary, i.e. at teardown. Undiagnosed. Both symptoms (the hang and the exit crash) were seen on naga-acpp 2026.09.29 before the fork fix, and both may be the known fork bug (a value-driven root growing in a no-pool fused wave means an OS free plus SlabKit async_host copies). The next step is to move the lock to the fixed 2026.09.29 build and see what is left.
