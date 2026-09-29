@@ -341,6 +341,7 @@ private:
         if (by_member_.contains(member))
             throw std::invalid_argument("naga::cospan: " + describe() + ": member wrapper of '" + key +
                                         "' is already declared");
+        e->declarer_ = this;  // System's transient marking walks declarer -> owner (§4.4)
         order_.push_back(e.get());
         by_member_.emplace(member, e.get());
         by_name_.emplace(key, std::move(e));
