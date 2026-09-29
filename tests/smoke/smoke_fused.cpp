@@ -6,14 +6,14 @@
 //      One forward, then three back to back without waiting.
 //   b. A wave of two GROUP stages with Scratch (N = 200, work-group 64, ragged last group):
 //      A reverses within each work-group through Local; B reads the MIRRORED element of A's
-//      output at once, which crosses work-items, so it is only right if the barrier the
-//      FusedSystem inserts between the two scratch stages is really there.
+//      output, which crosses work-items: there is NO framework barrier between stages, so B
+//      calls its own group barrier first. Each scratch stage has its own local slice.
 //   c. A rank-2 wave (40 x 30) of two plain stages, the FusedSystem's work-group {8,8}.
 //   d. The helper form, property::fused{sequential}, builds a FusedSystem and runs A + B.
 //   e. PARALLEL mode: three independent stages of different sizes (plain 1000, plain 257,
 //      group + Scratch reverse 640), each in its own slice of groups; all three are checked.
-//   f. PARALLEL mode producer-consumer (B reads A's output): the forward throws naming both;
-//      with allow_producer_consumer() it runs (values are the user's assertion, not checked).
+//   f. PARALLEL mode connection (B reads A's output): the forward throws naming both, and
+//      allow_tied_outputs() does not lift it (that opt-in is for tied outputs only).
 //   g. Error cases at compile/setup: a custom-op child, a host child, children of different ranks.
 
 #include <cmath>
@@ -224,8 +224,9 @@ struct RevBody {
     }
 };
 
-// Mirror: the same mapping, but it reads the MIRRORED element of its input straight
-// away, which was written by ANOTHER work-item of the group in the previous stage.
+// Mirror: the same mapping, but it reads the MIRRORED element of its input, which was
+// written by ANOTHER work-item of the group in the previous stage: it calls its own group
+// barrier first (the framework inserts none).
 struct MirrorBody {
     struct Inputs {
         cs::Input<DType::f32, 1> x;
@@ -239,7 +240,8 @@ struct MirrorBody {
     void operator()(cs::GroupItem<1> it, Inputs in, Outputs out, Scratch s) const {
         const std::size_t n = it.get_local_range(0), l = it.get_local_linear_id(), g = it.get_global_id(0);
         const std::size_t total = in.x.shape()[0];
-        s.tile[l]               = 0.0f;  // touches the shared local buffer: this is a scratch stage
+        s.tile[l]               = 0.0f;  // touches the local buffer: this is a scratch stage
+        sycl::group_barrier(it.get_group());
         const std::size_t m = g - l + (n - 1 - l);
         if (g < total) out.y[g] = m < total ? in.x[m] : 0.0f;
     }
@@ -291,7 +293,7 @@ static std::vector<float> reverse_in_groups(const std::vector<float>& in, std::s
 }
 
 static void case_b(const sycl::device& dev, sk::queue& q) {
-    std::printf("-- b. sequential wave of two group stages with Scratch (barrier inserted between them)\n");
+    std::printf("-- b. sequential wave of two group stages with Scratch (B's own barrier, own local slices)\n");
     TopB       top;
     RootDriver d{dev, q, top};
     d.start();
@@ -304,7 +306,7 @@ static void case_b(const sycl::device& dev, sk::queue& q) {
     d.forward();
     check(values_of<1>(q, top.entry_at("f.a.y")) == want_y, "b: stage A: reversed within each work-group (ragged last group)");
     check(values_of<1>(q, top.entry_at("f.b.y")) == want_z,
-          "b: stage B: mirrored read of A's output is exact (the barrier between the scratch stages)");
+          "b: stage B: mirrored read of A's output is exact (B's own barrier)");
 }
 
 // ---- c. a rank-2 wave ----------------------------------------------------------------------
@@ -494,12 +496,12 @@ static void case_e(const sycl::device& dev, sk::queue& q) {
           "e: three forwards enqueued back to back: all three outputs intact");
 }
 
-// ---- f. parallel mode, producer-consumer ---------------------------------------------------
+// ---- f. parallel mode, a connection between stages ---------------------------------------------------
 template <bool Allow>
 class ChainWave : public cs::FusedSystem {
 public:
     ChainWave() : cs::FusedSystem(Mode::parallel) {
-        if constexpr (Allow) allow_producer_consumer();
+        if constexpr (Allow) allow_tied_outputs();  // does not lift a connection
     }
     void setup() override {
         add_subsystem<StepA>("a");
@@ -514,12 +516,12 @@ public:
         add_subsystem<Src>("src", kN);
         add_subsystem<ChainWave<Allow>>("f");
         connect("src.y", "f.a.x");
-        connect("f.a.y", "f.b.y");  // B reads A's output: a producer-consumer pair
+        connect("f.a.y", "f.b.y");  // B reads A's output: a connection between stages
     }
 };
 
 static void case_f(const sycl::device& dev, sk::queue& q) {
-    std::printf("-- f. parallel-mode producer-consumer: throws, unless allow_producer_consumer()\n");
+    std::printf("-- f. parallel-mode connection: throws, and allow_tied_outputs() does not lift it\n");
     {
         TopChain<false> top;
         RootDriver      d{dev, q, top};
@@ -548,7 +550,7 @@ static void case_f(const sycl::device& dev, sk::queue& q) {
             threw = true;
             std::printf("      %s\n", e.what());
         }
-        check(!threw, "f: with allow_producer_consumer() the forward runs (values are the user's assertion)");
+        check(threw, "f: allow_tied_outputs() does not lift the no-connections rule");
     }
 }
 

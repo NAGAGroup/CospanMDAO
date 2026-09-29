@@ -7,8 +7,8 @@
 //      references; then three forwards run back to back without waiting.
 //   b. Typed form: a class derived from ParallelSystem with two children, one
 //      of them placed with property::device{the same device}.
-//   c. A child input with a FromSourceDim connected from a SIBLING's output:
-//      the forward throws, naming both children.
+//   c. A child input connected from a SIBLING's output (any connection, here a
+//      FromSourceDim one): the forward throws, naming both children.
 //   d. Components only: a System child is rejected at compile time (a concept,
 //      because a requires-expression outside a template is ill-formed rather
 //      than false); the runtime-only rules (device-only properties, flavors)
@@ -311,7 +311,7 @@ static void case_b(const sycl::device& dev, sk::queue& q) {
     check(values_of(q, top.entry_at("par.b.y")) == want_b, "b: child b (device-placed): y == 3x + 0.5");
 }
 
-// ---- c. a shape dependency between siblings --------------------------------------------------
+// ---- c. a connection between siblings --------------------------------------------------
 class TopC : public cs::System {
 public:
     void setup() override {
@@ -322,7 +322,7 @@ public:
 };
 
 static void case_c(const sycl::device& dev, sk::queue& q) {
-    std::printf("-- c. FromSourceDim input fed by a sibling's output: the forward throws\n");
+    std::printf("-- c. input connected from a sibling's output: the forward throws\n");
     TopC       top;
     RootDriver d{dev, q, top};
     d.start();  // the wiring itself is legal; only the forward refuses

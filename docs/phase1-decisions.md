@@ -332,8 +332,8 @@ The property-list overload accepts a `property_list` and throws `invalid_argumen
 ## D77 — ctx.group is set only during submit_group
 An RAII `GroupScope` sets `group` on the Parallel's `ctx_` and on every `child_ctx_` entry for the extent of the `submit_group` lambda and resets it to null on any exit. Reason: a host body under a group must use `group.async_host` (D45) and nothing outside the group may see a dangling group. r01 §7.3.
 
-## D78 — The sibling-shape check
-Each forward, after compute and before the submit: a child input whose ROOT is an output declared by a SIBLING, with any dimension a FromSourceDim, throws `invalid_argument` naming the input, the consumer's path, the source and the sibling's path. Reason: siblings run unordered inside the group, so the source's extent is not known when the consumer launches; this is the only dependency visible on metadata. It reads only public entry accessors (`get_inputs`, `root`, `declarer`, `dim`); a root that is a System alias (a tie) has a System declarer and is not seen. r01 §7.5.
+## D78 — The sibling-shape check (subsumed by D99)
+Subsumed: the sibling-shape check is removed from ParallelSystem. Its FromSourceDim case is now one instance of the no-connections rule (D99), which covers every input rooted at another stage's output, not only shape-dependent ones, and is shared with the parallel FusedSystem through `wave_rules.hpp` (D130). Reason: one rule for every unordered set of stages. r01 §7.5.
 
 ## D79 — The helper form builds a ParallelSystem; amends D71
 `add_subsystem(name, props, child<T>(...)...)` with `property::parallel` builds a ParallelSystem; `fused` still throws "step 3b"; `parallel` and `fused` together throw `invalid_argument`. A TYPED child given `property::parallel` throws unless its type derives from ParallelSystem. Reason: the flavor selects a runner, which only the helper form can build without a user class. r01 §7.5.
@@ -359,8 +359,8 @@ The check of get_exec_info's byte total against the distinct arena-eligible root
 ## D86 — Kernel-shape virtuals on ComponentBase
 `kernel_rank()`, `is_group_body()`, `has_scratch()`, `is_custom_op()`, `is_host()` and `definition_id()` are virtual on ComponentBase; `Component<KB>` overrides them from the body's traits. `definition_id()` throws for custom-op and host bodies. Reason: a FusedSystem holds type-erased children and must plan a wave (rank, scratch, barrier) without knowing the body types. r01 §5.4.
 
-## D87 — A wave is one chained call sequence
-`compile()` builds `define_as_call_sequence(wave_entry_id(rank), defs)` where `defs` is the children's definition ids in order, plus `wave_barrier_id(rank)` after every scratch stage that has a later scratch stage. The stage function pointer must be a literal at its call site (reflection), so ids come from `stage_definition_id<KB>()`, `wave_entry_id` and `wave_barrier_id` in kernel.hpp. Reason: one launch runs the whole chain. r01 §5.5.
+## D87 — A wave is one chained call sequence, with no barrier ids
+`compile()` builds `define_as_call_sequence(wave_entry_id(rank), defs)` where `defs` is the children's definition ids in order and nothing else: the framework inserts no barriers, in either mode (`kb_barrier` and `wave_barrier_id` are deleted). The stage function pointer must be a literal at its call site (reflection), so ids come from `stage_definition_id<KB>()` and `wave_entry_id` in kernel.hpp. Reason: one launch runs the whole chain; ordering inside a work-group is the stage bodies' business (Jack, 2026-09-29). r01 §5.5.
 
 ## D88 — Wave geometry
 Groups run along dim 0 (`wave_nd_range<R>`); dims >= rank are 1. A plain stage's group_count is ceil(flat_extent/wg_size), a group stage's is the product of ceil(range[d]/wg[d]); the launch uses the max over stages and each stage returns early for groups beyond its own count. Sequential mode has group_offset 0. Reason: stages of different sizes share one launch. r01 §5.6.
@@ -368,11 +368,11 @@ Groups run along dim 0 (`wave_nd_range<R>`); dims >= rank are 1. A plain stage's
 ## D89 — Work-group choice
 The FusedSystem's `wg` if given, else the stages' common wg (a mismatch throws, naming the stages), else the rank's default. Reason: every stage of a wave runs in the same nd_range. r01 §5.6.
 
-## D90 — One local buffer, barrier between scratch stages
-The local buffer is the largest scratch any stage needs, shared by all stages; hence the barrier between consecutive scratch stages. Reason: less local memory; the barrier makes the reuse safe. r01 §5.6.
+## D90 — Local memory: per-stage slices in sequential mode, the max in parallel
+Sequential mode gives each scratch stage its own slice of the local buffer: `StageRecord::local_off` is a running sum of the stages' scratch sizes, each rounded up to 16 bytes, and the local size is the total. Parallel mode gives every stage `local_off` 0 and the local size is the maximum, because the stages occupy disjoint groups. A stage no longer reuses another's local memory, so no barrier between stages is needed (D87). Reason: slices make the barrier-free chain safe. Replaces the earlier single shared buffer with a barrier between scratch stages. r01 §5.6.
 
-## D91 — Chained-dependency rule inside a sequential wave
-Checked each forward from metadata. A stage may read an output of an earlier stage only if (equal range and both plain: element-wise) or (both group bodies with scratch: the barrier separates them). An input with a subarray view is never element-wise. Reading an output of a later stage throws. Every message names both stages. Reason: otherwise a wave would read data another work-group has not written yet. r01 §5.6.
+## D91 — REMOVED: no chained-dependency check in a sequential wave
+Removed (Jack, 2026-09-29). Sequential waves make no inter-stage access checks: a stage may read any earlier stage's output whatever the ranges or view shapes, and the stage ranges may differ. Reason: the check tried to prove metadata-level safety for accesses the stage bodies own; what remains framework-side is rank, wg and null-description agreement (D89) and the value-driven rule (D129). r01 §5.6.
 
 ## D92 — Packing
 Records, inputs, outputs and body streams are packed into four 16-byte-aligned host buffers, uploaded to device USM each forward and passed to the launch. `scratch_off = body_off + record.scratch_off`. Reason: one launch has fixed arguments. r01 §5.7.
@@ -392,14 +392,14 @@ Its case d uses `property::fused{Mode::parallel}`, since plain `property::fused`
 ## D97 — Parallel mode: one slice of groups per stage
 `group_offset` is the running sum of the previous stages' `group_count`, and the launch has the SUM of the group counts (sequential mode: offset 0, launch = the max). Each stage still returns early, as a whole group, outside its own slice. Reason: the stages are independent, so they occupy disjoint groups of one launch. r01 §5.4, §5.7.
 
-## D98 — No barriers in parallel mode
-`compile()` inserts the `kb_barrier` ids only in sequential mode. Reason: stages own disjoint groups, so no two stages use the shared local buffer in the same group; a group body's own barrier is uniform because the slice check is per whole group. r01 §5.4.
+## D98 — No barriers in either mode; amends the parallel-mode text
+The framework inserts no barrier ids in any mode (D87). In parallel mode the stages own disjoint groups (D97), so the local buffer needs no reuse discipline either: every stage has `local_off` 0 and the size is the max (D90). A group body's own barrier is uniform because the slice check is per whole group. r01 §5.4.
 
-## D99 — Producer-consumer check in parallel mode
-Every forward, if any input's root is an output of ANOTHER stage of the wave (earlier or later), `validate` throws `invalid_argument` naming both stages and `allow_producer_consumer()`. The stages run unordered, so any such pair is a race. r01 §7.5.
+## D99 — Replaced: no connections between the stages of a parallel wave
+Every forward, in a parallel FusedSystem and in a ParallelSystem, a stage input whose root's aliasing set holds another stage's output throws `invalid_argument` naming the input and its stage and the output and its stage. There is NO override: the stages run unordered, so the pair is always a race. Replaces the producer-consumer check that `allow_producer_consumer()` could lift. Sequential mode has no such check (D91). Implemented by `detail::check_no_stage_connections` (D130). r01 §7.5.
 
-## D100 — allow_producer_consumer() is the trust override
-`FusedSystem::allow_producer_consumer()` sets a flag that skips D99's check; the values are then the user's assertion and are not checked by the framework. It is a no-op in sequential mode, whose dependency rule (D91) cannot be overridden. r01 §7.5.
+## D100 — Replaced: allow_tied_outputs() is the opt-in for tied outputs
+In a parallel wave, two stage outputs that share one root (`tie_outputs`) throw at forward, naming the tied outputs and `allow_tied_outputs()`; calling `allow_tied_outputs()` on the FusedSystem or ParallelSystem lifts only this check (the values are then the user's assertion, e.g. atomic accumulation). It never lifts D99. Sequential mode does not check ties. `allow_producer_consumer()` is deleted. r01 §7.5.
 
 ## D101 — The step 3b-3 throw is gone
 The FusedSystem constructor takes either mode; the helper form passes `{mode, wg}` through unchanged (no change in system.hpp's logic, only its comments). smoke_parallel case d now expects `property::fused{Mode::parallel}` to build without throwing. Reason: parallel mode is implemented.
@@ -468,13 +468,25 @@ A no-pool Model on CUDA hangs in the first kernel submit after an OS-route free 
 `RelWithDebInfo` (`-O2 -g`) and `-gline-tables-only` builds of CoSpan translation units crash clang 21.1.8 (exit 139) in the "Debug Variable Analysis" pass (`LiveDebugVariables::computeIntervals` -> `LexicalScopes::initialize`) on `naga::cospan::kb_entry_r1`, in both test TUs. Until that is fixed or worked around, build Release without `-g`; libraries still resolve exported symbols in gdb, header-only CoSpan frames stay unsymbolized. Not a CoSpan source problem. r01 §11.
 
 ## D123 — Flavor refusals are observed at the phase that throws them
-The wiring rules of the two flavors are checked where the implementation checks them, and the tests follow: a `FromSourceDim` input fed by a Parallel sibling's output, the D91 chained-dependency rule and a producer-consumer pair in a parallel Fused all set up cleanly and throw at `forward()` (the test then calls `wait()`); a non-device property on a Parallel child, two flavors on one System, and a custom-op, host or mixed-rank Fused child throw at `setup()`. Every case names the offending child or children (`top.par.a`, `top.f.bad`) in the message, and the test checks the names. r01 §7.5.
+The wiring rules of the two flavors are checked where the implementation checks them, and the tests follow: a connection between the stages of a parallel wave (Fused or Parallel, through a `FromSourceDim` input or a fixed-shape one), and a tied-output pair in a parallel wave without `allow_tied_outputs()`, set up cleanly and throw at `forward()` (the test then calls `wait()`); a non-device property on a Parallel child, two flavors on one System, a custom-op, host or mixed-rank Fused child, and a value-driven size whose driver aliases another stage's output (D129) throw at `setup()`; the local-memory limit (D128) throws at `forward()` on a device that reports one. Every case names the offending child or children (`top.par.a`, `top.f.bad`) in the message, and the test checks the names. r01 §7.5.
 
 ## D124 — Fused against unfused is compared bitwise
 Four element-wise stages as a plain System and as a sequential FusedSystem (777 non-round floats) are compared with `memcmp`, not a tolerance: a fused wave runs the same body on the same operands in the same order, so nothing may differ, and the test passed bitwise on omp and on CUDA. A host recomputation with `cst::all_close` keeps the check from being vacuous (two equally wrong outputs would not pass). If a backend ever differs by float rounding alone, relax this one case to rel 1e-6. r01 §7.5.
 
-## D125 — The flavor tests never free through the OS route
-`test_flavors.cpp` (namespace `tfl`, tags `[flavors]` plus `[parallel]` or `[fused]`, `[errors]` on refusals) has no transient subtree and no growing root, so no case is tagged `[os-free]` (D121) and every case runs on CUDA. r01 §7.5, §11.
+## D125 — The flavor tests and the OS free route
+`test_flavors.cpp` (namespace `tfl`, tags `[flavors]` plus `[parallel]` or `[fused]`, `[errors]` on refusals) carries no `[os-free]` tag (D121) and every case except the local-memory-limit one runs on CUDA. Amended: the value-driven allowed cases (D129) now grow a root (`set_input` 8 then 13), which frees through the OS route when the substrate has no pool; that is acceptable since the free lane (D126) means no kernel depends on a free. The local-memory-limit case skips on a device with no usable limit (omp reports the size_t maximum). r01 §7.5, §11.
 
 ## D126 — SlabKit repinned to the frees-lane commit
 `pixi.toml` pins slabkit to `e5e2ac15f31a88bb4a565b2eb18933f5aba140e1` (was `5d6b7b5e6cb6563cfb285361ce05686518c18f04`): deferred frees run on their own lane, `begin_item` and `open_group` do not merge it, and `wait()` and the stream's wait list do, so no kernel depends on a free (D121). Lock refreshed with `pixi lock`. The `[os-free]` tag is removed from `test_component.cpp` and `test_system.cpp`, and the CUDA verification runs the whole suite with no filter, three times. The fork's root cause is unchanged and still pending a rebuild; see `docs/known-issues/cuda-deferred-free-deadlock.md`. r01 §4, §9.
+
+## D127 — StageRecord::local_off
+`StageRecord` gets `uint32_t local_off`, between `scratch_bytes` and `rank`; `kb_fn` fixes a stage's scratch up at `local_base + local_off`. `submit_wave` fills it: sequential running sum with each slice rounded up to 16, parallel 0 (D90). Reason: per-stage slices without a barrier. r01 §5.6.
+
+## D128 — The local-size limit is a forward-time error
+`submit_wave` compares the wave's local bytes with `info::device::local_mem_size` and throws `runtime_error` naming the scratch stages and their byte counts and the device's limit, instead of launching and failing in the backend. Sequential slices add up, so this is reachable where the old max-buffer was not. omp reports no usable limit and is not checked; CUDA offers about 48 KB, and the test runs there. r01 §5.6.
+
+## D129 — Value-driven sizes may not alias another stage's output (rule h)
+`compile()` throws, in both modes, when a stage's output size is value-driven (`DimRecord::How::from_input`, its extent read from an input's VALUE) and the driver's aliasing set (root plus peers) holds another stage's output; the message names the stage, the driver and the other output and says "VALUE". This did not exist before this commit. `FromInputDim` and `FromSourceDim` through connections stay allowed. Reason: the size is read at launch, before the producing stage could have written the value. r01 §7.5.
+
+## D130 — The wave rules live in one shared header, wave_rules.hpp
+`include/naga/cospan/wave_rules.hpp` (namespace `naga::cospan::detail`) holds `check_no_stage_connections`, `check_tied_outputs`, `check_value_driven_sizes` and their helpers; FusedSystem and ParallelSystem both call them. Reason: one wording and one aliasing walk for both parallel runners. r01 §7.5.

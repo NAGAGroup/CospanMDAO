@@ -975,7 +975,7 @@ TEST_CASE("fused: a wave's local memory over the device limit throws at forward,
         model.forward();
         model.wait();
         std::vector<float> x(256);
-        for (int i = 0; i < 256; ++i) x[i] = static_cast<float>(i);
+        for (int i = 0; i < 256; ++i) x[i] = static_cast<float>(i + 1);  // Src1's default offset is 1
         CHECK(tfl::out_of<1>(model, "f.a.y") == x);
         CHECK(tfl::out_of<1>(model, "f.b.y") == x);
     }
