@@ -433,3 +433,21 @@ view_input/set_input require an input entry and view_output/view_output_mut/set_
 
 ## D111 — smoke_model notes
 The Sellar Systems are copied from smoke_system (no shared header). Case d writes through `view_output_mut` on an OUTPUT root whose elements the producer does not overwrite (Hold writes y[0] of 4; the host owns y[1..3]): the dispatch said "a free input's root", but view_output_mut is the output view and a free input is written with set_input, so that literal case cannot exist. Case c's default_device-outside-context check needs two visible devices and is skipped with one. Observation: under `ACPP_VISIBILITY_MASK=cuda` the OpenMP host device was still enumerated, so case b also ran with that mask; with the mask removed the same result.
+
+## D112 — The test package is its own pixi-build package
+`cospanmdao-tests` is built from `tests/` by pixi-build-cmake (the root manifest's backend block) with host-dependencies `cospanmdao` and `catch2`, both `{ workspace = true }`; the pool form resolves in the sub-package, so no plain specs are needed. `tests/CMakeLists.txt` is standalone, like SlabKit's: cmake 3.24, `find_package(Threads/AdaptiveCpp/cospanmdao/Catch2 3)`, one executable `cospan-tests` (Catch2::Catch2WithMain + naga::cospan, `add_sycl_to_target`), installed to `bin`. The root CMakeLists does not `add_subdirectory(tests)`, and `tests/smoke` and `tests/spike` stay separate, standalone projects. `pixi run test` (task `cospan-tests`) runs it; the `cuda` environment holds both packages, so `pixi run -e cuda test` works with no layout change. r01 §11.
+
+## D113 — Every test goes through a Model
+The Catch2 tests build a small top System, make a Model (`create_model`, `setup`, `forward`, `wait`), and check with `view_*` and `set_*`. No RootDriver, no TestDriver, no EntryAccess. The only reach past the verbs is the Model's own retrieval (`root().entry_at(...)` for a storage kind or a storage pointer, `get_subsystem(...)` for a test component's public API). The smoke programs keep their drivers; they are not the suite. r01 §9, §11.
+
+## D114 — Shared test helpers
+`tests/support.hpp` (namespace `cst`) holds `default_config()` (a default `ModelConfig`), `close` / `all_close` (abs + rel tolerance, float and double), `to_vector` (a host view as a vector) and `wait_and_view` (forward, wait, read-only view of an output). Integer-valued results (histogram bins, prefix sums, 2x+1 of small integers) are compared exactly or with the tolerance; nothing depends on a device-specific rounding. r01 §11.
+
+## D115 — Values that change between forwards are free inputs
+A value the test changes between two forwards (the histogram's `n_bins`) is a free input written with `set_input`, not a test-only producer with a mutable member. The kernel-fed inputs (histogram values and weights, the iota producers) stay components, so producer-to-consumer wiring is still covered. A value-driven output (`FromInput{"n_bins", 0}`) is driven from a host-written free input and grows and accumulates as it did behind the driver. r01 §8.
+
+## D116 — Phase guards are checked through the component's public API
+After `setup()`, the test reaches a test component with `dynamic_cast<InitDemo&>(model.get_subsystem(...))` and calls the public initializer, `reshape` and `declare_*` API outside its phase; each throws `logic_error` naming `init() only`, `pre_forward() only` or `setup() only`. The declare and reshape calls come from two small test hooks on the component (a declare_* or reshape needs a member wrapper). The Model is unharmed by the refused calls. r01 §6.2.
+
+## D117 — Rank coverage by one templated body
+The rank 1, 2 and 3 plain-body cases are one `AffineBody<R>` / `Affine<R>` / `TopAffine<R>` template (sizes 1000, 40x30, 7x9x11; two forwards on different input). `cs::Model` is spelled out instead of `auto` in the template, so `model.set_input<...>` needs no `template` keyword. r01 §11.
