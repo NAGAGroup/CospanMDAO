@@ -200,21 +200,25 @@ public:
         for (detail::IOEntry* e : order_) {
             e->device_       = parent_device;
             e->storage_kind_ = default_storage_kind();
-            detail::IOEntry& root = *e->root();
+            const Placement own = e->placement();
+            detail::IOEntry&        root = *e->root();
             if (e->is_root()) {
-                e->register_device(parent_device);
+                e->set_primary_placement(own);
                 bytes += e->static_bytes();
             } else if (e->kind() == IOKind::input) {
-                if (!has_registered(root, parent_device)) {
-                    root.register_device(parent_device);
-                    bytes += root.static_bytes();
+                // Host-kind placements cost no arena bytes; a device-kind one
+                // costs the root's arena bytes once per device.
+                if (!has_registered(root, own)) {
+                    root.register_placement(own);
+                    if (own.kind == sk::kind::device) bytes += root.static_bytes();
                 }
-            } else if (root.device_ && *root.device_ != parent_device) {
+            } else if (root.device_ && root.placement() != own) {
                 throw std::logic_error("naga::cospan: " + describe() + ": output '" +
                                        std::string{e->name()} + "' is tied to '" +
                                        std::string{root.name()} +
-                                       "', which sits on another device; producers cannot write one "
-                                       "storage from two devices");
+                                       "', which sits on another placement (device, storage "
+                                       "kind); producers cannot write one storage from two "
+                                       "placements");
             }
         }
         return {{parent_device, bytes}};
@@ -266,13 +270,14 @@ public:
         }
     }
 
-    /// Refresh the other-device copies of every output root this Component
-    /// produces. Ordered after the launch by the stream.
+    /// Refresh the other-placement copies of every output root this Component
+    /// produces (routed copies: device<->host, cross-device). Ordered after
+    /// the launch by the stream.
     void run_post_compute(ExecCtx& owner_ctx) override {
         for (detail::IOEntry* e : order_)
-            if (e->kind() == IOKind::output && e->is_root() && e->storage_devices().size() > 1 &&
+            if (e->kind() == IOKind::output && e->is_root() && e->storage_placements().size() > 1 &&
                 e->has_storage())
-                e->sync_other_devices(*owner_ctx.queue);
+                e->sync_other_placements(*owner_ctx.queue);
     }
 
 protected:
@@ -382,9 +387,9 @@ private:
     }
 
     // ---- storage helpers ---------------------------------------------------
-    static bool has_registered(const detail::IOEntry& root, const sycl::device& d) {
-        for (const sycl::device& e : root.storage_devices())
-            if (e == d) return true;
+    static bool has_registered(const detail::IOEntry& root, const Placement& p) {
+        for (const Placement& e : root.storage_placements())
+            if (e == p) return true;
         return false;
     }
 
@@ -480,9 +485,9 @@ private:
             throw std::logic_error("naga::cospan: " + describe() + ": '" + std::string{e.name()} +
                                    "' has no storage to initialize");
         }
-        const sycl::device& d = root.storage_devices().front();
-        op(root, d, root.storage_on(d));
-        root.sync_other_devices(queue_ref());
+        const Placement pl = root.storage_placements().front();
+        op(root, pl.device, root.storage_on(pl));
+        root.sync_other_placements(queue_ref());
     }
 
     template <class T>
@@ -631,6 +636,72 @@ private:
     KernelParts    parts_;
 };
 
+/// A custom-operation launch (D1): the body runs at submission as an
+/// AdaptiveCpp custom operation with an interop_handle; it enqueues native
+/// backend work on the native stream. Inputs/Outputs/body are captured by
+/// value; nothing is compiled.
+template <class KB>
+class CustomOpLaunch final : public LaunchDescription {
+public:
+    CustomOpLaunch(typename KB::Inputs in, typename KB::Outputs out, KB body)
+        : in_{in}, out_{out}, body_{body} {}
+
+    bool is_custom_op() const override { return true; }
+    bool is_host() const override { return false; }
+
+    void submit(SubmitTarget& t) const override {
+        const typename KB::Inputs  in   = in_;
+        const typename KB::Outputs out  = out_;
+        const KB                   body = body_;
+        auto cgf = [=](sycl::handler& h) {
+            h.AdaptiveCpp_enqueue_custom_operation([=](sycl::interop_handle& ih) {
+                CustomOp op{ih};
+                body(op, in, out);
+            });
+        };
+        if (t.group != nullptr)
+            t.group->submit(t.device, cgf);
+        else
+            t.queue->submit(t.device, cgf);
+    }
+
+private:
+    typename KB::Inputs  in_;
+    typename KB::Outputs out_;
+    KB                   body_;
+};
+
+/// A host launch (D3): the body runs on the host as an ordered host task.
+/// Its Inputs/Outputs point at host-kind USM on the component's device.
+/// Without a group the task joins the stream's kernel order
+/// (async_host_in_order); under a group, group.async_host (a group has no
+/// in-order variant; ordering against kernel tasks is the group's).
+template <class KB>
+class HostLaunch final : public LaunchDescription {
+public:
+    HostLaunch(typename KB::Inputs in, typename KB::Outputs out, KB body)
+        : in_{in}, out_{out}, body_{body} {}
+
+    bool is_custom_op() const override { return false; }
+    bool is_host() const override { return true; }
+
+    void submit(SubmitTarget& t) const override {
+        const typename KB::Inputs  in   = in_;
+        const typename KB::Outputs out  = out_;
+        const KB                   body = body_;
+        auto f = [=]() { body(Host{}, in, out); };
+        if (t.group != nullptr)
+            t.group->async_host(t.device, f);
+        else
+            t.queue->async_host_in_order(t.device, f);
+    }
+
+private:
+    typename KB::Inputs  in_;
+    typename KB::Outputs out_;
+    KB                   body_;
+};
+
 }  // namespace detail
 
 // -----------------------------------------------------------------------------
@@ -646,10 +717,11 @@ public:
     /// parameters. Returns the description the owner will submit.
     virtual std::unique_ptr<LaunchDescription> compute_forward() = 0;
 
-    /// The individual dynamic_function_config: built once, here.
+    /// The individual dynamic_function_config: built once, here. A custom-op
+    /// or host body has nothing to compile.
     void compile() override {
         if constexpr (CustomOpBody<KB> || HostBody<KB>) {
-            throw std::logic_error("naga::cospan: custom-op and host bodies are implemented in step 2b");
+            // nothing: no kernel is JIT-specialised for these bodies
         } else {
             constexpr int R = kernel_rank_v<KB>;
             cfg_            = std::make_unique<Config>();
@@ -696,14 +768,20 @@ protected:
         return make_launch(range, wg, in, out, body, scratch);
     }
 
-    /// Custom-op and host bodies: no range (their launches are step 2b).
+    /// Custom-op bodies (D1): no range; the body enqueues native work.
     std::unique_ptr<LaunchDescription> create_launch_config(typename KB::Inputs in,
                                                             typename KB::Outputs out, KB body = {})
-        requires(CustomOpBody<KB> || HostBody<KB>)
+        requires CustomOpBody<KB>
     {
-        (void)in; (void)out; (void)body;
-        static_assert(sizeof(KB) == 0, "cospan: custom-op and host launches arrive in step 2b");
-        return nullptr;
+        return std::make_unique<detail::CustomOpLaunch<KB>>(in, out, body);
+    }
+
+    /// Host bodies (D3): no range; the body runs on the host over host-kind USM.
+    std::unique_ptr<LaunchDescription> create_launch_config(typename KB::Inputs in,
+                                                            typename KB::Outputs out, KB body = {})
+        requires HostBody<KB>
+    {
+        return std::make_unique<detail::HostLaunch<KB>>(in, out, body);
     }
 
     sk::kind default_storage_kind() const override {

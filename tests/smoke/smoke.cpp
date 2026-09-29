@@ -16,6 +16,7 @@
 namespace cs = naga::cospan;
 namespace sk = naga::slabkit;
 using cs::DType;
+using cs::Placement;
 using cs::detail::EntryAccess;
 using cs::detail::HostViewAccess;
 using cs::detail::InputEntry;
@@ -71,8 +72,8 @@ static void test_arena(sk::queue& q, const sycl::device& dev) {
                                    static_cast<cs::detail::IOEntry*>(&c)})
         EntryAccess::set_device(*e, dev);
     EntryAccess::merge(a, b);  // b_in becomes a peer of a
-    EntryAccess::register_device(a, dev);
-    EntryAccess::register_device(c, dev);
+    EntryAccess::register_placement(a, Placement{dev, sk::kind::device});
+    EntryAccess::register_placement(c, Placement{dev, sk::kind::device});
 
     check(a.is_root() && !b.is_root() && b.root() == &a && a.peers().size() == 1, "merge: b_in is a's peer");
     check(a.static_bytes() == 4000 && c.static_bytes() == 4000 && b.static_bytes() == 0,
@@ -92,12 +93,12 @@ static void test_arena(sk::queue& q, const sycl::device& dev) {
     check(subs.at(dev).pool->outstanding() == 0, "pool: untouched by fixed roots");
     bool peer_refused = false;
     try {
-        (void)b.storage_on(dev);
+        (void)b.storage_on(Placement{dev, sk::kind::device});
     } catch (const std::logic_error&) {
         peer_refused = true;
     }
     check(peer_refused, "storage_on refuses a peer");
-    check(a.storage_on(dev) != nullptr && b_in.size() == 1000 && b_in.stride()[0] == 1, "peer wrapper geometry");
+    check(a.storage_on(Placement{dev, sk::kind::device}) != nullptr && b_in.size() == 1000 && b_in.stride()[0] == 1, "peer wrapper geometry");
 
     q.parallel_for(sycl::range<1>{1000}, [out = a_out](sycl::id<1> i) { out[i] = 2.0f * static_cast<float>(i[0]); });
     q.parallel_for(sycl::range<1>{1000}, [in = b_in, co = c_out](sycl::id<1> i) { co[i] = in[i] + 1.0f; });
@@ -119,7 +120,7 @@ static void test_dynamic_pool(sk::queue& q, const sycl::device& dev) {
     // dim 0 is the VALUE of element 0 of a sibling input "n"; dim 1 is fixed.
     OutputEntry<DType::f32, 2> d{"dyn", dims(cs::FromInput{"n", 0}, 4), &w_out};
     EntryAccess::set_device(d, dev);
-    EntryAccess::register_device(d, dev);
+    EntryAccess::register_placement(d, Placement{dev, sk::kind::device});
 
     check(d.is_dynamic() && !d.arena_eligible() && d.static_bytes() == 0, "dynamic: not arena eligible");
     check(d.flat_size() == 0, "dynamic: unresolved extent starts at 0");
@@ -173,8 +174,8 @@ static void test_slice(sk::queue& q, const sycl::device& dev) {
     for (cs::detail::IOEntry* e : {static_cast<cs::detail::IOEntry*>(&grid), static_cast<cs::detail::IOEntry*>(&win),
                                    static_cast<cs::detail::IOEntry*>(&wo)})
         EntryAccess::set_device(*e, dev);
-    EntryAccess::register_device(grid, dev);
-    EntryAccess::register_device(wo, dev);
+    EntryAccess::register_placement(grid, Placement{dev, sk::kind::device});
+    EntryAccess::register_placement(wo, Placement{dev, sk::kind::device});
     EntryAccess::set_view(win, cs::subarray<2>({3, 2}, {2, 3}));
     EntryAccess::merge(grid, win);
 
@@ -252,9 +253,9 @@ static void test_host_and_atomic(sk::queue& q, const sycl::device& dev) {
     OutputEntry<DType::atomic_u32, 1> acc{"acc", dims(4), &acc_out};
     EntryAccess::set_device(h, dev);
     EntryAccess::set_device(acc, dev);
-    EntryAccess::register_device(h, dev);
-    EntryAccess::register_device(acc, dev);
     EntryAccess::set_storage_kind(h, sk::kind::host);
+    EntryAccess::register_placement(h, Placement{dev, sk::kind::host});
+    EntryAccess::register_placement(acc, Placement{dev, sk::kind::device});
 
     check(!h.arena_eligible() && h.static_bytes() == 0 && acc.arena_eligible(), "host-kind root takes no arena bytes");
 

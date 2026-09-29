@@ -53,6 +53,17 @@ struct EntryAccess;
 
 enum class IOKind : uint8_t { input, output };
 
+/// Where one copy of a root's storage lives: a device and a USM kind. A host
+/// component's I/O is (its device, host); its producer's is (the same device,
+/// device). Two placements on one device are two storages.
+struct Placement {
+    sycl::device device;
+    sk::kind     kind = sk::kind::device;
+    friend bool operator==(const Placement& a, const Placement& b) {
+        return a.device == b.device && a.kind == b.kind;
+    }
+};
+
 // -----------------------------------------------------------------------------
 // Dimension specification — DimSpec is a CONCEPT, not a type.
 // -----------------------------------------------------------------------------
@@ -286,16 +297,19 @@ public:
     sk::kind storage_kind() const noexcept { return storage_kind_; }
     bool     transient() const noexcept { return transient_; }
 
-    /// THE ROOT HOLDS ALL STORAGE, PER DEVICE. \throws for a peer, or for a
-    /// device the root has no allocation on. May be null for an empty extent.
-    void* storage_on(const sycl::device& d) const {
+    /// This entry's own placement: its subsystem's device and storage kind.
+    Placement placement() const { return Placement{device(), storage_kind_}; }
+
+    /// THE ROOT HOLDS ALL STORAGE, PER PLACEMENT. \throws for a peer, or for a
+    /// placement the root has no allocation on. May be null for an empty extent.
+    void* storage_on(const Placement& p) const {
         if (!is_root())
             throw std::logic_error("naga::cospan: storage_on is for roots; '" + name_ +
                                    "' is a peer of '" + root_->name_ + "'");
-        return raw_storage_on(d);
+        return raw_storage_on(p);
     }
-    /// Roots only; primary first.
-    std::span<const sycl::device> storage_devices() const noexcept { return storage_devices_; }
+    /// Roots only; primary (the declarer's own placement) first.
+    std::span<const Placement> storage_placements() const noexcept { return placements_; }
 
     /// Arena route: a root, fully fixed, outside every transient subtree, in
     /// device-kind storage (arenas are device-kind).
@@ -323,15 +337,17 @@ public:
     /// for a slice, which must also lie inside the root). Throws.
     virtual void validate_connection() const = 0;
 
-    /// ROOTS ONLY (no-op on peers): one usm_vector per device in
-    /// storage_devices(), each from that device's substrate.
+    /// ROOTS ONLY (no-op on peers): one usm_vector per placement in
+    /// storage_placements(), each from that placement's device substrate
+    /// (host-kind placements take the OS host route on the device).
     virtual void allocate(sk::queue& q, Substrates& substrates) = 0;
 
     /// Write {data pointer, shape, stride} into the registered member wrapper.
     virtual void point_wrapper() = 0;
 
-    /// The root's producer copies primary -> every other device's storage.
-    virtual void sync_other_devices(sk::queue& q) = 0;
+    /// The root's producer copies primary -> every other placement's storage
+    /// (a routed copy; the ordinary copy rule).
+    virtual void sync_other_placements(sk::queue& q) = 0;
 
     /// Whether the ROOT of this entry's set has been allocated.
     virtual bool has_storage() const = 0;
@@ -365,7 +381,7 @@ protected:
         }
     }
 
-    virtual void* raw_storage_on(const sycl::device& d) const = 0;
+    virtual void* raw_storage_on(const Placement& p) const = 0;
 
     /// The only writer of wrapper fields (friendship, r01 §2.1).
     template <class W, class P>
@@ -377,16 +393,28 @@ protected:
 
     /// Registered in get_exec_info (System/Component); appends if absent, so
     /// the first registration is the primary.
-    void register_device(const sycl::device& d) {
-        if (!is_root()) throw std::logic_error("naga::cospan: only roots register devices");
-        for (const sycl::device& e : storage_devices_)
-            if (e == d) return;
-        storage_devices_.push_back(d);
+    void register_placement(const Placement& p) {
+        if (!is_root()) throw std::logic_error("naga::cospan: only roots register placements");
+        for (const Placement& e : placements_)
+            if (e == p) return;
+        placements_.push_back(p);
+    }
+
+    /// The root's own placement is the primary whatever registered first
+    /// (an input peer's owner may run get_exec_info before the root's).
+    void set_primary_placement(const Placement& p) {
+        if (!is_root()) throw std::logic_error("naga::cospan: only roots register placements");
+        for (auto it = placements_.begin(); it != placements_.end(); ++it)
+            if (*it == p) {
+                placements_.erase(it);
+                break;
+            }
+        placements_.insert(placements_.begin(), p);
     }
 
     std::array<std::size_t, 3> extents_{1, 1, 1};  ///< 1-padded
     std::vector<DimRecord>     dims_;
-    std::vector<sycl::device>  storage_devices_;   ///< roots; primary first
+    std::vector<Placement>     placements_;        ///< roots; primary first
     std::optional<sycl::device> device_;
     sk::kind                   storage_kind_ = sk::kind::device;
 
@@ -482,10 +510,11 @@ public:
 
     void allocate(sk::queue& q, Substrates& subs) override {
         if (!is_root()) return;
-        if (storage_devices_.empty()) register_device(device_ ? *device_ : q.get_device());
-        for (const sycl::device& d : storage_devices_) {
-            if (find_slot(d) != nullptr) continue;
-            slots_.push_back(std::make_unique<Slot>(d, sk::usm_vector<T>(flat_size(), route(q, subs, d))));
+        if (placements_.empty())
+            register_placement(Placement{device_ ? *device_ : q.get_device(), storage_kind_});
+        for (const Placement& p : placements_) {
+            if (find_slot(p) != nullptr) continue;
+            slots_.push_back(std::make_unique<Slot>(p, sk::usm_vector<T>(flat_size(), route(q, subs, p))));
         }
     }
 
@@ -494,8 +523,8 @@ public:
         return r != nullptr && !r->slots_.empty();
     }
 
-    void sync_other_devices(sk::queue&) override {
-        if (!is_root()) throw std::logic_error("naga::cospan: sync_other_devices is for roots");
+    void sync_other_placements(sk::queue&) override {
+        if (!is_root()) throw std::logic_error("naga::cospan: sync_other_placements is for roots");
         if (slots_.size() < 2) return;
         Slot& primary = primary_slot();
         for (auto& s : slots_)
@@ -517,10 +546,10 @@ public:
     }
 
     /// Replace the primary storage's contents from the host, then refresh the
-    /// copies on the other devices.
+    /// copies on the other placements.
     void write_primary(sk::queue& q, std::span<const T> src) {
         primary_slot().data.from_host(src);
-        sync_other_devices(q);
+        sync_other_placements(q);
     }
 
 protected:
@@ -528,31 +557,31 @@ protected:
                  bool can_source, bool can_target)
         : IOEntry{std::move(name), k, dt, rank, std::move(dims), can_source, can_target} {}
 
-    void* raw_storage_on(const sycl::device& d) const override {
-        Slot* s = find_slot(d);
+    void* raw_storage_on(const Placement& p) const override {
+        Slot* s = find_slot(p);
         if (s == nullptr)
             throw std::logic_error("naga::cospan: '" + std::string{name()} +
-                                   "' has no storage on that device");
+                                   "' has no storage on that placement");
         return s->data.data();
     }
 
 private:
     struct Slot {
-        Slot(sycl::device d, sk::usm_vector<T> v) : dev{std::move(d)}, data{std::move(v)} {}
-        sycl::device      dev;
+        Slot(Placement p, sk::usm_vector<T> v) : pl{std::move(p)}, data{std::move(v)} {}
+        Placement         pl;
         sk::usm_vector<T> data;
     };
 
-    Slot* find_slot(const sycl::device& d) const {
+    Slot* find_slot(const Placement& p) const {
         for (const auto& s : slots_)
-            if (s->dev == d) return s.get();
+            if (s->pl == p) return s.get();
         return nullptr;
     }
 
     Slot& primary_slot() const {
-        if (!is_root() || storage_devices_.empty())
+        if (!is_root() || placements_.empty())
             throw std::logic_error("naga::cospan: '" + std::string{name()} + "' has no storage");
-        Slot* s = find_slot(storage_devices_.front());
+        Slot* s = find_slot(placements_.front());
         if (s == nullptr)
             throw std::logic_error("naga::cospan: '" + std::string{name()} + "' is not allocated");
         return *s;
@@ -571,12 +600,14 @@ private:
         return root()->extents()[d];
     }
 
-    /// r01 §4.4 as amended by D3: host-kind roots take the OS route on their
-    /// device; a fully fixed root outside a transient subtree takes the arena
-    /// (never falling back: an arena is a budget); everything else the pool if
-    /// the device has one, else the OS.
-    sk::allocator<T> route(sk::queue& q, Substrates& subs, const sycl::device& d) const {
-        if (storage_kind() != sk::kind::device) return sk::allocator<T>{q, storage_kind(), d};
+    /// r01 §4.4 as amended by D3: a host-kind placement takes the OS route
+    /// with its device choosing the context; a device-kind placement of a
+    /// fully fixed root outside a transient subtree takes the arena (never
+    /// falling back: an arena is a budget); everything else the pool if the
+    /// device has one, else the OS.
+    sk::allocator<T> route(sk::queue& q, Substrates& subs, const Placement& p) const {
+        if (p.kind != sk::kind::device) return sk::allocator<T>{q, p.kind, p.device};
+        const sycl::device& d = p.device;
         const auto it = subs.find(d);
         if (arena_eligible()) {
             if (it == subs.end() || !it->second.arena)
@@ -588,7 +619,7 @@ private:
         return sk::allocator<T>{q, sk::kind::device, d};
     }
 
-    std::vector<std::unique_ptr<Slot>> slots_;  // parallel to storage_devices_ once allocated
+    std::vector<std::unique_ptr<Slot>> slots_;  // parallel to placements_ once allocated
 };
 
 /// The rank/dtype-typed layer: the wrapper pointer helpers.
@@ -615,7 +646,7 @@ protected:
     template <class W>
     void point(W& w) const {
         const IOEntry::Geometry g = this->geometry();
-        auto* base = static_cast<value_type*>(this->root()->storage_on(this->device()));
+        auto* base = static_cast<value_type*>(this->root()->storage_on(this->placement()));
         IOEntry::write_wrapper(w, g, base != nullptr ? base + g.offset : nullptr);
     }
 };
@@ -680,7 +711,7 @@ public:
 /// tests when System lands.
 struct EntryAccess {
     static void merge(IOEntry& into, IOEntry& from) { IOEntry::merge(into, from); }
-    static void register_device(IOEntry& e, const sycl::device& d) { e.register_device(d); }
+    static void register_placement(IOEntry& e, const Placement& p) { e.register_placement(p); }
     static void set_device(IOEntry& e, const sycl::device& d) { e.device_ = d; }
     static void set_storage_kind(IOEntry& e, sk::kind k) { e.storage_kind_ = k; }
     static void set_transient(IOEntry& e, bool t) { e.transient_ = t; }
