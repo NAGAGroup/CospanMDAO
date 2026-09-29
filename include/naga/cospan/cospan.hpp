@@ -12,3 +12,4 @@
 #include "naga/cospan/system.hpp"
 #include "naga/cospan/parallel_system.hpp"
 #include "naga/cospan/fused_system.hpp"
+#include "naga/cospan/model.hpp"
