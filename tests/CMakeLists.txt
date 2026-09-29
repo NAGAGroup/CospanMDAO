@@ -20,6 +20,7 @@ find_package(Catch2 3 REQUIRED)
 
 set(COSPAN_TEST_SOURCES
     test_component.cpp
+    test_system.cpp
 )
 
 add_executable(cospan-tests ${COSPAN_TEST_SOURCES})
