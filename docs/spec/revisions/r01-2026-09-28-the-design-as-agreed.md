@@ -437,8 +437,7 @@ namespace naga::cospan {
 
 enum class IOKind   : uint8_t { input, output };
 enum class Lifetime : uint8_t { durable, transient };
-    ///< transient = valid within the owning System's forward invocation;
-    ///  storage comes from the dynamic chain, released at scope end.
+    ///< transient: the declaring Component reads this input once per forward and does not need it afterwards. Inputs only.
 
 // -----------------------------------------------------------------------------
 // Dimension specification — DimSpec is a CONCEPT, not a type.
@@ -498,24 +497,22 @@ constexpr auto from_input_array(std::string_view input);
 template <DType DT, int Rank, DimSpec... Specs>
     requires(sizeof...(Specs) == Rank)
 void declare_input(Input<DT, Rank>& member, std::string name,
-                   Specs... specs, Lifetime life = Lifetime::durable,
-                   Coverage cov = Coverage::required);   // §8.2.4;
+                   Specs... specs, Lifetime life = Lifetime::durable);
                    // why: §1 need 2.3 assembly, §1 need 2.3 initialization · P8
 
 /// FromSourceDim is ill-formed for outputs.
 template <DType DT, int Rank, DimSpec... Specs>
     requires(sizeof...(Specs) == Rank)
 void declare_output(Output<DT, Rank>& member, std::string name,
-                    Specs... specs, Lifetime life = Lifetime::durable);
+                    Specs... specs);
 
 /// Whole-shape overloads accepting the from_input_array marker alone.
 template <DType DT, int Rank>
 void declare_input(Input<DT, Rank>& member, std::string name,
-                   /* from_input_array marker */, Lifetime life = Lifetime::durable,
-                   Coverage cov = Coverage::required);
+                   /* from_input_array marker */, Lifetime life = Lifetime::durable);
 template <DType DT, int Rank>
 void declare_output(Output<DT, Rank>& member, std::string name,
-                    /* from_input_array marker */, Lifetime life = Lifetime::durable);
+                    /* from_input_array marker */);
 
 /// The escape hatch — and the ONLY resize spelling. Resolves the entry by
 /// the member's registered ADDRESS (the member-address map). Legal ONLY
@@ -571,9 +568,9 @@ public:
     bool is_dynamic() const;         ///< any dim not How::fixed
 
     // ---- marks (semantics: §8) ------------------------------------------
-    bool is_design_var() const;
-    bool is_constraint() const;
-    bool is_objective() const;
+    const std::optional<MarkRecord>& design_var() const;   ///< §8: bounds, scaling, region
+    const std::optional<MarkRecord>& constraint() const;
+    const std::optional<MarkRecord>& objective()  const;
     /// CONSTRAINT: a design-var entry SHALL NOT be dynamically shaped.
 
     // ---- the aliasing set (mechanics: §4) -------------------------------
@@ -701,7 +698,7 @@ namespace naga::cospan::detail {
 
 class IOEntry {
 public:
-    // ---- identity, shape, marks, lifetime: unchanged from §3.3 ----------
+    // ---- identity, shape, marks, lifetime: as in §3.3 ----------
 
     // ---- the set --------------------------------------------------------
     IOEntry*       root();                 ///< self iff is_root()
@@ -821,6 +818,19 @@ roots from the arena; all other roots via the pool route (OS fallback) at
 first need and on growth. Peers own nothing, ever: a root holds one
 allocation per device its set spans (§4.2).
 
+A root is RELEASED PER FORWARD when it has at least one Component-declared
+input peer, every Component-declared input peer is transient, and the root
+is not retained (§7.4 `retain`). Alias peers (promotions, ties) do not
+count. Such a root takes no arena bytes: its declaring Component allocates
+it through the pool route in its own `run_pre_compute`, sized to that
+turn's shape, and the root drops the `usm_vector` when the last of those
+consuming Components finishes its `run_post_compute` — a countdown held on
+the root, decremented by each consuming Component for each of its
+transient inputs; SlabKit defers the free until every kernel that read it
+has completed. An unconnected transient input is its own root and is
+released by its own Component. Host access to a released root after the
+forward is an error naming the transient input and `retain`.
+
 ### 4.5 From sets to storage
 
 Aliasing is complete the moment each structural call returns. Storage
@@ -878,8 +888,8 @@ namespace naga::cospan {
 ///       struct Outputs { Output<...> y; };
 ///       struct Scratch { Local<...>  tile; };     // OPTIONAL (local mem)
 ///       void operator()(sycl::id<R> idx, Inputs, Outputs) const;
-///          // or (sycl::nd_item<R>, Inputs, Outputs)
-///          // or (sycl::nd_item<R>, Inputs, Outputs, Scratch)
+///          // or (GroupItem<R>, Inputs, Outputs)
+///          // or (GroupItem<R>, Inputs, Outputs, Scratch)
 ///          // or (CustomOp&, Inputs, Outputs)        — CUSTOM OPERATION
 ///   };
 ///
@@ -896,12 +906,12 @@ namespace naga::cospan {
 /// function exists).
 ///
 /// THE SIGNATURE IS THE DECLARATION, four ways:
-///   * first parameter id<R> vs nd_item<R>  => group semantics opt-in
-///     (a body without the nd_item cannot touch group abstractions);
+///   * first parameter id<R> vs GroupItem<R>  => group semantics opt-in
+///     (a body without the GroupItem cannot touch group abstractions);
 ///   * R                                    => kernel rank, deduced
 ///     (kernel_rank_v<KB>; no static member);
 ///   * trailing Scratch parameter           => local-memory opt-in
-///     (nd_item bodies only — local memory without a group is
+///     (GroupItem bodies only — local memory without a group is
 ///     meaningless).
 /// Inputs, Outputs, KB itself, and Scratch (if present) SHALL be
 /// trivially copyable — concept-enforced; they are copied byte-wise
@@ -909,7 +919,7 @@ namespace naga::cospan {
 /// Bodies spell element types as the wrappers' `value_type` (§2); nothing
 /// in a body is written for differentiation.
 template <class KB> concept PlainBody   = /* operator()(id<R>, In, Out) */;
-template <class KB> concept GroupBody   = /* operator()(nd_item<R>, In, Out [, Scratch]) */;
+template <class KB> concept GroupBody   = /* operator()(GroupItem<R>, In, Out [, Scratch]) */;
 template <class KB> concept HasScratch  = /* trailing Scratch parameter */;
 template <class KB> concept CustomOpBody= /* operator()(CustomOp&, In, Out) */;
 template <class KB> concept KernelBodyC =
@@ -977,7 +987,61 @@ private:
 } // namespace naga::cospan
 ```
 
-### 5.3 StageRecord and FnOffsetInfo
+### 5.3 GroupItem<R> — the group body's item
+
+```cpp
+namespace naga::cospan {
+
+/// What a group body receives. The API of sycl::nd_item<R>, with every
+/// group-level index STAGE-LOCAL: the body sees the launch it was written
+/// for, whether it runs alone or as one stage of a fused wave. Local ids
+/// and ranges are the physical ones (a work-group is never split across
+/// stages); group and global ids are offset and delinearized over this
+/// stage's own group grid.
+template <int R>
+struct GroupItem {
+    sycl::id<R>    get_local_id() const;          size_t get_local_id(int d) const;
+    sycl::range<R> get_local_range() const;       size_t get_local_range(int d) const;
+    size_t         get_local_linear_id() const;
+
+    sycl::id<R>    get_group_id() const;          size_t get_group(int d) const;   // stage-local
+    sycl::range<R> get_group_range() const;       size_t get_group_range(int d) const;
+    size_t         get_group_linear_id() const;   // stage-local
+
+    sycl::id<R>    get_global_id() const;         size_t get_global_id(int d) const;
+    sycl::range<R> get_global_range() const;      // this stage's padded range
+    size_t         get_global_linear_id() const;
+
+    /// The PHYSICAL group, for group functions — sycl::group_barrier(
+    /// it.get_group()), reduce_over_group, ... Barriers are group-scoped and
+    /// the physical group is exactly the set of work-items executing this
+    /// stage together. Its own get_group_id() is physical; index with the
+    /// item's.
+    sycl::group<R>  get_group() const;
+    sycl::sub_group get_sub_group() const;
+
+private:
+    sycl::nd_item<R> it_;
+    sycl::id<R>      group_offset_;   // this stage's first group, in the wave
+    sycl::range<R>   group_range_;    // this stage's group grid: ceil(range[d] / wg[d])
+    friend struct detail::ItemFixup;
+};
+
+} // namespace naga::cospan
+```
+
+A wave lays its stages' work-groups out along dimension 0 only:
+`nd_range<R>{ {G·wg0, wg1, wg2}, {wg0, wg1, wg2} }`, so the physical group
+linear id is the group index along that axis. The device function (§5.5)
+builds the item from the stage record: stage-local linear group = physical
+linear group − `group_offset`, delinearized over `group_range`. A
+Component launched on its own is a one-stage wave with `group_offset = 0`;
+the same fixup serves both. Stages in a wave may have any ranges; the only
+geometry the wave imposes is the work-group shape. A user barrier inside a
+body is safe in either wave mode because the framework skips work in whole
+groups only: every work-item of a live group enters the body together.
+
+### 5.4 StageRecord and FnOffsetInfo
 
 ```cpp
 namespace naga::cospan {
@@ -986,7 +1050,7 @@ namespace naga::cospan {
 /// device array in EXECUTION ORDER. Field ownership:
 ///   component-bound (create_launch_config): rank, range, flat_extent,
 ///     stream offsets, scratch_off/scratch_bytes;
-///   System-stamped (launch pack): group_offset, group_count — the
+///   System-stamped (launch pack): group_offset, group_count, group_range — the
 ///     GROUP-INDEX slice: slices are counted in whole work-groups, so a
 ///     group never straddles stages under ANY geometry. Why: §1 need
 ///     2.2 fuse, §1 need 2.1 group-level parallelism.
@@ -995,6 +1059,7 @@ struct StageRecord {
     size_t   flat_extent;         // product of range
     size_t   group_offset;        // System-stamped
     size_t   group_count;         // System-stamped
+    sycl::range<3> group_range;   // System-stamped; group_count is its product
     uint32_t input_off;           // into the inputs stream
     uint32_t output_off;          // into the outputs stream
     uint32_t body_off;            // into the bodies stream
@@ -1016,7 +1081,7 @@ struct FnOffsetInfo {
 } // namespace naga::cospan
 ```
 
-### 5.4 The generated device function — one per (KernelBody type, rank)
+### 5.5 The generated device function — one per KernelBody type, at the body's rank
 
 ```cpp
 namespace naga::cospan {
@@ -1050,7 +1115,7 @@ SYCL_EXTERNAL void kb_fn(sycl::nd_item<R> it, FnOffsetInfo& info,
     // contract — kernels are never written differently for fusion).
     if constexpr (PlainBody<KB>)
         if (flat >= r.flat_extent) return;
-    // nd_item bodies: receive the full padded slice; ragged-tail
+    // GroupItem bodies: receive the full padded slice; ragged-tail
     // handling is the standard obligation of any group-using nd_range
     // kernel. Their freedom is bounded by SYCL 2020 §4.17.3, verbatim:
     // group functions "must be encountered in converged control flow by
@@ -1061,6 +1126,7 @@ SYCL_EXTERNAL void kb_fn(sycl::nd_item<R> it, FnOffsetInfo& info,
     // the spec, not to hardware tolerance. Why: §1 need 2.1 group-level
     // parallelism, §1 need 2.2 opacity (kernels are never written for fusion).
 
+    GroupItem<kernel_rank_v<KB>> gi = detail::ItemFixup::make(it, r);   // stage-local view (§5.3)
     const auto idx = detail::delinearize<kernel_rank_v<KB>>(flat, r.range);
     auto in   = *reinterpret_cast<const typename KB::Inputs*>(inputs  + r.input_off);
     auto out  = *reinterpret_cast<const typename KB::Outputs*>(outputs + r.output_off);
@@ -1069,9 +1135,9 @@ SYCL_EXTERNAL void kb_fn(sycl::nd_item<R> it, FnOffsetInfo& info,
     if constexpr (HasScratch<KB>) {
         auto s = *reinterpret_cast<const typename KB::Scratch*>(bodies + r.scratch_off);
         detail::fixup_scratch(s, local_base);  // Local.ptr_ = base + offset_
-        body(it, in, out, s);
+        body(gi, in, out, s);
     } else if constexpr (GroupBody<KB>) {
-        body(it, in, out);
+        body(gi, in, out);
     } else {
         body(idx, in, out);
     }
@@ -1080,7 +1146,7 @@ SYCL_EXTERNAL void kb_fn(sycl::nd_item<R> it, FnOffsetInfo& info,
 } // namespace naga::cospan
 ```
 
-### 5.5 The chained executor
+### 5.6 The chained executor
 
 ```cpp
 namespace naga::cospan {
@@ -1143,18 +1209,17 @@ q.submit([&](sycl::handler& cgh){
 } // namespace naga::cospan
 ```
 
-### 5.6 Geometry and slices
+### 5.7 Geometry and slices
 
 - All launches are typed by rank (the executor's switch); the default
   geometry is flat: `{{padded_flat}, {default_wg}}` at rank 1, with
   rank-appropriate defaults at ranks 2/3 (implementation-tunable, not
   contract constants). The wg overloads of create_launch_config (§6)
-  override per launch; FUSED rank and wg are set at SYSTEM level,
-  component wg intent ignored inside a fuse.
-- Rank agreement in a fuse: an nd_item stage whose rank differs from the
-  wave's rank is a hard error, checked on the descriptions each forward
-  (§7.5); id-only stages are rank-exempt (their device function is
-  generated for the wave's rank; SSCP lowers only what is invoked).
+  override per launch; the FUSED wg is set at SYSTEM level, component wg
+  intent ignored inside a fuse; the wave's rank is its children's.
+- Rank agreement in a fuse: a stage whose kernel rank differs from the
+  wave's rank is a hard error, checked at compile and on the descriptions
+  each forward (§7.5).
 - Padding and extents are counted in WHOLE WORK-GROUPS: individual = the
   stage's own group count; fused-sequential = max stage group count;
   fused-parallel = Σ stage group counts with group_offset the prefix
@@ -1164,15 +1229,15 @@ q.submit([&](sycl::handler& cgh){
   kernel completion; acpp JIT-caches per configuration, persistently
   across runs (acpp laws).
 
-### 5.7 Dynamic shapes and the pipeline
+### 5.8 Dynamic shapes and the pipeline
 
 - **Resolution is just-in-time.** A Component resolves shapes in
   run_pre_compute at its own turn in depth-first order — upstream has
   completed by construction. Static models pay nothing anywhere in this
   section.
 - **FromInput resizes are the consumer's own business.** In its
-  `run_pre_compute`, the consuming Component reads the driving input
-  root's `host_view()` (the one forced sync, so the launch geometry is
+  `run_pre_compute`, the consuming Component reads the driving input's
+  `host_view()` (the one forced sync, so the launch geometry is
   known at enqueue), calls `root.resize(shape)`, then `point_wrapper` —
   no staging copy, nothing submitted for the resize, no reallocation
   inside a submitted task. Nothing is registered anywhere; no producer knows its consumers.
@@ -1189,7 +1254,7 @@ q.submit([&](sycl::handler& cgh){
   data dependency, contradicting the independence the user asserted by
   wrapping in ParallelSystem. Detected from the same metadata chains.
   General data-independence of parallel children remains the user's
-  responsibility, unchanged. Why: §1 need 2.2 parallel · P4.
+  responsibility. Why: §1 need 2.2 parallel · P4.
 
 ---
 
@@ -1235,8 +1300,9 @@ public:
     /// Compile bodies (Components); recurse (Systems). Flavor legality is
     /// checked per forward on the descriptions, not here.
     virtual void compile() = 0;
-    /// Initialize: children before self (Systems), so an owner's init
-    /// has the last word by path.
+    /// Initialize. Model runs two passes (§11): Components first, then
+    /// Systems children-before-owners, so an owner's init has the last
+    /// word by path.
     virtual void run_init(const ExecCtx& owner_ctx) = 0;
 
     // ---- forward (per forward; §6.5) ------------------------------------
@@ -1251,7 +1317,7 @@ public:
 };
 
 /// What a Component's compute turn yields. The owner ROUTES on
-/// is_custom_op(): kernels take the outer-kernel path (§5.5), custom
+/// is_custom_op(): kernels take the outer-kernel path (§5.6), custom
 /// operations take AdaptiveCpp_enqueue_custom_operation through the same
 /// SubmitTarget. A kernel description additionally exposes rank,
 /// group-body and scratch facts and its streams/record, for fused owners
@@ -1282,7 +1348,7 @@ public:
     /// no device, no queue.
     virtual void setup() = 0;
     /// Initialize own I/O. Runs once, after allocation and compilation,
-    /// children before owners. Not limited beyond what `q` permits:
+    /// in the Component pass of init_tree (§11). Not limited beyond what `q` permits:
     /// write with an initializer inside your own kernel, fill, copy —
     /// anything (anything launched over a root outside the framework is
     /// ordered by its launcher, §9.4). Initializing a connected input is
@@ -1300,19 +1366,15 @@ public:
     template <DType DT, int Rank, DimSpec... Specs>
         requires(sizeof...(Specs) == Rank)
     void declare_input(Input<DT, Rank>& m, std::string name, Specs... specs,
-                       Lifetime life = Lifetime::durable,
-                       Coverage cov = Coverage::required);
+                       Lifetime life = Lifetime::durable);
     template <DType DT, int Rank, DimSpec... Specs>
         requires(sizeof...(Specs) == Rank)
-    void declare_output(Output<DT, Rank>& m, std::string name, Specs... specs,
-                        Lifetime life = Lifetime::durable);
+    void declare_output(Output<DT, Rank>& m, std::string name, Specs... specs);
     template <DType DT, int Rank>
     void declare_input(Input<DT, Rank>& m, std::string name, from_input_array_t,
-                       Lifetime life = Lifetime::durable,
-                       Coverage cov = Coverage::required);
+                       Lifetime life = Lifetime::durable);
     template <DType DT, int Rank>
-    void declare_output(Output<DT, Rank>& m, std::string name, from_input_array_t,
-                        Lifetime life = Lifetime::durable);
+    void declare_output(Output<DT, Rank>& m, std::string name, from_input_array_t);
 
     /// pre_forward-slot-only resize; same setter as automatic derivation.
     template <DType DT, int Rank> void reshape(Input<DT, Rank>& m, sycl::range<Rank>);
@@ -1436,9 +1498,9 @@ private:
   route with OS fallback); then point every member wrapper at
   `root()->storage_on(this device)` and validate static input peers
   against their roots. An unconnected input with a `FromSourceDim`
-  dimension errors here.
-- **`compile`**: the device function at the owner's fuse rank if any,
-  else native; the individual config; custom-op bodies recorded.
+  dimension errors here. Roots released per forward (§4.4) are not allocated here.
+- **`compile`**: the device function at the body's own rank (`kernel_rank_v<KB>`);
+  the individual config; custom-op bodies recorded. A Component knows nothing of fusing.
 - **`run_init`**: `init(queue, device)` with the Model's queue and this
   Component's device.
 
@@ -1447,7 +1509,7 @@ private:
 Called by its owner in this order; a Component never submits its compute
 work and never sees a queue except through the owner's ctx.
 
-1. **`run_pre_compute(ctx)`**: value-driven shapes first — for each own
+1. **`run_pre_compute(ctx)`**: allocate every own root that is released per forward (§4.4) through the pool route at this turn's shape; then value-driven shapes first — for each own
    input carrying a `FromInput` spec, read the driving input's value
    through `host_view()` — a host read, whichever storage holds it (the
    one forced sync, so this turn's launch geometry is known), call
@@ -1463,7 +1525,7 @@ work and never sees a queue except through the owner's ctx.
    submission: for each output root with storage on other devices, for
    each other device `copy_d = root` — one assignment resizes to match
    and copies, routed by SlabKit. Ordered after the work it depends on by
-   the stream (§7.3).
+   the stream (§7.3). Then, for each own transient input, tell its root one consumer is done; a root whose countdown reaches zero drops its storage (§4.4).
 
 ### 6.6 Provided kernels — v1
 
@@ -1473,7 +1535,7 @@ template <DType DT, class Op = sycl::plus<cpp_type_t<DT>>>
 struct GroupReduce {      // fast; reduce_over_group + leader atomic; accumulates ONTO out
     struct Inputs  { Input<DT, 1> in; };
     struct Outputs { Output<to_atomic_v<DT>, 1> out; };
-    void operator()(sycl::nd_item<1>, Inputs, Outputs) const;
+    void operator()(GroupItem<1>, Inputs, Outputs) const;
 };
 template <DType DT, class Op = sycl::plus<cpp_type_t<DT>>>
 struct OrderedReduce {    // deterministic; one agent, ascending order; fuses anywhere
@@ -1481,7 +1543,25 @@ struct OrderedReduce {    // deterministic; one agent, ascending order; fuses an
     struct Outputs { Output<DT, 1> out; };
     void operator()(sycl::id<1>, Inputs, Outputs) const;
 };
-// RegionCopy, GatherInto, Scatter: §8.
+/// dst[offset + i] = src[map[i]]. Launch range = map's range. `map` is any integer-dtype I/O.
+template <DType DT, DType IDX, int Rank>
+struct GatherInto {
+    struct Inputs  { Input<DT, 1> src; Input<IDX, Rank> map; };
+    struct Outputs { Output<DT, Rank> out; };
+    sycl::id<Rank> dst_offset;
+    void operator()(sycl::id<Rank> i, Inputs a, Outputs o) const
+        { o.out[i + dst_offset] = a.src[a.map[i]]; }
+};
+
+/// Scatter — the additive reverse map, out[map[i]] += in[i]; output
+/// atomic BY TYPE (the general-case floor). A provided kernel users compose.
+template <DType DT, DType IDX, int Rank>
+struct Scatter {
+    struct Inputs  { Input<DT, Rank> in; Input<IDX, Rank> map; };
+    struct Outputs { Output<to_atomic_v<DT>, 1> out; };
+    void operator()(sycl::id<Rank> i, Inputs a, Outputs o) const
+        { o.out[a.map[i]] += a.in[i]; }
+};
 }
 ```
 
@@ -1518,12 +1598,12 @@ public:
     }
 };
 
-// (b) Group + wg override + Local scratch; nd_item body.
+// (b) Group + wg override + Local scratch; GroupItem body.
 struct TransposeBody {
     struct Inputs  { Input<DType::f32,2> in; };
     struct Outputs { Output<DType::f32,2> out; };
     struct Scratch { Local<DType::f32,2> tile; };
-    void operator()(sycl::nd_item<2> it, Inputs in, Outputs out, Scratch s) const {
+    void operator()(GroupItem<2> it, Inputs in, Outputs out, Scratch s) const {
         const auto l = it.get_local_id(), g = it.get_global_id();
         const bool live = g[0] < in.in.shape()[0] && g[1] < in.in.shape()[1];
         if (live) s.tile[{l[0], l[1]}] = in.in[{g[0], g[1]}];   // guard loads
@@ -1618,8 +1698,10 @@ struct SubmitTarget { sk::queue* queue; sk::queue::group* group;
                       sycl::device device; };
 /// What a fused owner reads off a kernel description (§6.1): the facts it
 /// validates and the parts it packs.
-struct KernelParts { int rank; bool group_body; bool has_scratch;
-                     const StageRecord& record; /* input/output/body streams */ };
+struct KernelParts { int rank; bool group_body; bool has_scratch; StageRecord record;
+                     std::span<const std::byte> inputs, outputs, body, scratch;
+                     std::optional<sycl::range<3>> wg; };
+// the trivially-copyable structs as bytes; group_* fields stamped by the fused owner
 
 } // namespace naga::cospan
 ```
@@ -1638,12 +1720,13 @@ class System : public Subsystem {
 public:
     // ---- HOOKS ------------------------------------------------------------
     virtual void setup() {}                     ///< structure & wiring (§7.4)
-    virtual void init(sk::queue& q, const sycl::device& dev) {}   ///< runs AFTER children's; override by path
-    virtual void pre_forward() {}
+    virtual void init(sk::queue& q, const sycl::device& dev) {}   ///< runs in the System pass of init_tree (§11), children before owners
 
     // ---- Model's entries ------------------------------------------------------
     /// Model knows its root is a System and has no ctx of its own, so the
-    /// root supplies its own: init_tree() == run_init(ctx_);
+    /// root supplies its own. init_tree() is two passes: every Component's
+    /// init, depth-first in declaration order; then every System's init,
+    /// children before owners, so the root System has the last word.
     /// forward() == run_compute_forward() (no pre/post-compute exists for
     /// the root).
     void init_tree();
@@ -1652,8 +1735,8 @@ public:
     // ---- initializers by path (legal inside init() only) ----------------------
     template <DType DT, int Rank> Initializer<DT, Rank>     get_input_initializer (std::string_view path);
     template <DType DT, int Rank> Initializer<DT, Rank>     get_output_initializer(std::string_view path);
-    template <DType DT, int Rank> HostInitializer<DT, Rank> get_input_host_initializer (std::string_view path, sk::queue&);
-    template <DType DT, int Rank> HostInitializer<DT, Rank> get_output_host_initializer(std::string_view path, sk::queue&);
+    template <DType DT, int Rank> HostInitializer<DT, Rank> get_input_host_initializer (std::string_view path);
+    template <DType DT, int Rank> HostInitializer<DT, Rank> get_output_host_initializer(std::string_view path);
     template <class T> void fill_input (std::string_view path, T v);
     template <class T> void fill_output(std::string_view path, T v);
 
@@ -1679,7 +1762,9 @@ protected:
     void prepare_exec(sk::queue&, Substrates&) override;
     /// children.compile() in order.
     void compile() override;
-    /// children.run_init in order, then init(*ctx.queue, ctx.device).
+    /// In the Component pass a System forwards run_init to its children in
+    /// order. In the System pass it calls its own init(*ctx.queue, ctx.device)
+    /// after its child Systems.
     void run_init(const ExecCtx&) override;
     void run_pre_compute(ExecCtx&) override {}     ///< Systems do no work
     void run_post_compute(ExecCtx&) override {}
@@ -1741,7 +1826,7 @@ namespace naga::cospan {
 namespace property {
     struct device        { sycl::device dev; };            // placement; inherited when absent
     struct parallel      {};                               // flavor
-    struct fused         { FusedSystem::Mode mode; int rank = 1; std::optional<sycl::range<3>> wg; };
+    struct fused         { FusedSystem::Mode mode; std::optional<sycl::range<3>> wg; };
 }
 // Gating, counting and change detection are custom System TYPES (§10),
 // added with the templated overload — not properties.
@@ -1755,22 +1840,33 @@ public:
     T& add_subsystem(std::string name, Args&&... ctor_args);
     template <class T, class... Args> requires std::derived_from<T, Subsystem>
     T& add_subsystem(std::string name, const property_list& props, Args&&... ctor_args);
-    /// A BASE System configured by properties: device and/or ONE flavor
-    /// (parallel | fused — both on one call is an error). Returns
-    /// the System to add
-    /// children to inline — no class derivation needed. Why: §1 need
-    /// 2.2 inline composition · P2 (placement without editing).
-    System& add_subsystem(std::string name, const property_list& props = {});
+    /// A child Component to add through the helper form: type, name, ctor args.
+    template <class T, class... Args> requires std::derived_from<T, ComponentBase>
+    auto child(std::string name, Args&&... ctor_args);
+    /// The HELPER FORM: a System configured by properties (device and/or ONE
+    /// flavor — parallel | fused; both on one call is an error), populated
+    /// with the given Components in order. No class is written for it. The
+    /// children are Components by construction (child<T> requires
+    /// ComponentBase), which is what Parallel and Fused require; a helper-
+    /// built plain System takes Components too — nest Systems through the
+    /// templated overload or a class. Returns the System (typed Parallel/
+    /// Fused underneath) for connect/promote by name. Why: §1 need 2.2
+    /// inline composition · P2 (placement without editing).
+    template <class... Children>
+    System& add_subsystem(std::string name, const property_list& props, Children&&... children);
+    System& add_subsystem(std::string name, const property_list& props = {});   ///< empty; add children by the templated overload inside setup()
     // add_subsystem constructs the child, registers the name, and runs the
     // child's run_setup BEFORE returning, so later structural calls in this
     // same setup() see it fully declared.
 
     void connect(std::string_view src, std::string_view dst);                 // identity
-    void connect(std::string_view src, std::string_view dst, ConnectionMap);  // §8
+    void connect(std::string_view src, std::string_view dst, Slice view);   // §8.1: dst sees a rectangular region of src's root
     void promote(std::string_view child_path, std::string promoted_name);
     void tie_inputs (std::initializer_list<std::string_view> members, std::string name);
     void tie_outputs(std::initializer_list<std::string_view> members, std::string name,
                      TieOutputsPolicy policy = TieOutputsPolicy::require_atomic);
+    /// Keeps an output's storage for the whole forward and after it, whatever lifetime its consumers declare. Resolves from this namespace.
+    void retain(std::string_view path);
     void add_design_var(...);  void add_constraint(...);  void add_objective(...);   // §8
 };
 
@@ -1794,10 +1890,12 @@ namespace naga::cospan {
 /// children at runtime; why: §1 need 2.2 parallel · P5):
 ///   template <class T, class... A> requires std::derived_from<T, ComponentBase>
 ///   T& add_subsystem(std::string, A&&...);
-/// (no property-list overload). Nested Parallel is not a concept.
+/// (property-list overload with `property::device` only: each child may sit
+/// on its own device; the group is one item of the stream whichever devices
+/// its members target). Nested Parallel is not a concept.
 /// run_compute_forward: pre_compute ALL children → queue.submit_group {
-/// each child's description submitted with its device (Components inherit
-/// the Parallel's) through a SubmitTarget carrying the group } →
+/// each child's description submitted with its own device (the Parallel's
+/// unless placed) through a SubmitTarget carrying the group } →
 /// post_compute ALL after the group returns. The group is ONE item of the
 /// stream (§7.3): its children are unordered among themselves and ordered
 /// both ways against everything outside. ctx.group is set for the extent
@@ -1811,13 +1909,14 @@ class ParallelSystem : public System { /* runner overrides as described */ };
 /// System cannot discern children at runtime (why: §1 need 2.2 fuse · P5):
 ///   template <class T, class... A> requires std::derived_from<T, ComponentBase>
 ///   T& add_subsystem(std::string, A&&...);
-/// (no property-list overload). Rank and wg shape are the fuse's;
-/// children compile at the fuse rank (id-only bodies lazily); the
-/// sequence config is built once at compile.
+/// (no property-list overload). The wg shape is the fuse's. The wave's
+/// rank is its children's: every child's kernel rank (`kernel_rank_v`, from
+/// the body's signature) is checked equal at compile, and the sequence
+/// config is built once there at that rank.
 /// run_compute_forward: pre-compute ALL children → compute ALL (collect
 /// descriptions) → VALIDATE on the descriptions, every forward, host-
-/// side and cheap: none null, none custom-op, rank agreement for group
-/// bodies, scratch handling, parallel mode: no producer-consumer pairs
+/// side and cheap: none null, none custom-op, rank agreement,
+/// scratch handling, parallel mode: no producer-consumer pairs
 /// unless allowed → pack streams + records, stamp group slices, one
 /// staging, ONE submission with the sequence config → post-compute ALL.
 /// The order is forced: post-compute copies follow the wave in the stream.
@@ -1825,7 +1924,7 @@ class ParallelSystem : public System { /* runner overrides as described */ };
 class FusedSystem : public System {
 public:
     enum class Mode : uint8_t { sequential, parallel };
-    FusedSystem(Mode, int rank = 1, std::optional<sycl::range<3>> wg = {});
+    FusedSystem(Mode, std::optional<sycl::range<3>> wg = {});
     void allow_producer_consumer();   // parallel-mode override (trust model)
 };
 
@@ -1845,7 +1944,7 @@ public:
         tie_inputs({"d1.z", "d2.z"}, "z");
         promote("d1.y1", "y1");  promote("d2.y2", "y2");
     }
-    void init(sk::queue&, const sycl::device&) override { fill_input("z", 1.0); }   // last word over d1/d2 inits
+    void init(sk::queue&, const sycl::device&) override { fill_input("z", 1.0); }   // System pass: last word over d1/d2 inits
 };
 
 class Top : public System {
@@ -1855,8 +1954,7 @@ class Top : public System {
         connect("mda.y1", "obj.y1");
         connect("mda.y2", "obj.y2_head", Slice{subarray<1>({0}, {1})});
 
-        auto& par = add_subsystem("post", property_list{property::parallel{}});
-        par.add_subsystem<Report>("r1");  par.add_subsystem<Report>("r2");
+        add_subsystem("post", property_list{property::parallel{}}, child<Report>("r1"), child<Report>("r2"));
     }
 };
 ```
@@ -1866,154 +1964,36 @@ class Top : public System {
 ## 8. Topology semantics and optimization marks
 
 Binding contract; declarations only. Aliasing mechanics: §4. Structural
-APIs: §7. `declare_input`'s coverage option: §8.2.4.
+APIs: §7.
 
 ### 8.1 The connection spectrum
 
-Three kinds of "dst sees src's data", and they are NOT one mechanism:
+Two kinds of "dst sees src's data", and they are NOT one mechanism:
 
 - **identity** — `connect(src, dst)`: dst joins the root's set as a peer
   reading the whole root. Zero-copy.
-- **whole-input slice** — a rectangular region of the root whose flat
+- **slice** — a rectangular region of the root whose flat
   size equals dst's: dst is a peer whose `view()` is that region, in the
   ROOT's rank; the wrapper gets `root.data + offset` and the root's
   strides (§2). Zero-copy. This is what the stride metadata exists for.
   Why (for the whole spectrum): §1 need 2.3 connection.
-- **computed** — everything else: a region of the source into a REGION
-  of the input (several sources may feed one input, regions disjoint),
-  or an index map (a gather is not affine; a view cannot express it).
-  These produce a MAPPING SYSTEM (§8.2): a copy by necessity, made of
-  ordinary components so it is enumerable, fusable and differentiable
-  like anything else.
 
 ```cpp
 namespace naga::cospan {
 
-/// What `connect` accepts beyond identity. Two are VIEWS, the rest are
-/// COMPUTED.
-struct Slice        { SubarrayRef src; };                     // view
-struct SliceInto    { SubarrayRef src; SubarrayRef dst; };     // computed
-struct IndexMap     { std::string_view map; };                 // computed, whole dst
-struct IndexMapInto { std::string_view map; SubarrayRef dst; };// computed, region
-using ConnectionMap = std::variant<Slice, SliceInto, IndexMap, IndexMapInto>;
+/// What `connect` accepts beyond identity.
+struct Slice { SubarrayRef src; };   // a view
 
 class System {   // ...continued from §7.4
 public:
     void connect(std::string_view src, std::string_view dst);                // identity
-    void connect(std::string_view src, std::string_view dst, ConnectionMap); // §8.1/§8.2
+    void connect(std::string_view src, std::string_view dst, Slice view);
 };
 
 } // namespace naga::cospan
 ```
 
-`map` names an index-map-valued I/O: any integer-dtype entry (an output
-produced upstream — neighbour lists, CSR columns — or an unconnected
-input root set from the host). §1's "index-map-valued I/O" need is
-exactly this convention; no dedicated type exists.
-
-### 8.2 The mapping System
-
-#### 8.2.1 Lifecycle
-
-- **First computed connection on an input `dst`**: the owning System
-  creates a hidden mapping System named `<dst>__map`, records it in its
-  `input -> mapping system` table, and `add_subsystem`s it (its `setup()`
-  is empty — components arrive afterwards; `add_subsystem` on a System
-  whose setup has run is legal). Then adds the first mapping component.
-- **Each subsequent computed connection on `dst`**: check the new `dst`
-  region against every recorded region — overlap is an error naming
-  both connections — then add another mapping component.
-- **Post-setup pass** (end of the owning System's `run_setup`, after its
-  `setup()` hook returns): for each mapping System — `tie_outputs` over all mapping
-  components' outputs (each is full-dst-shaped) with
-  `TieOutputsPolicy::allow_plain`, invoked BY THE FRAMEWORK: it holds
-  the disjointness proof, so it is the party entitled to the override
-  (the trust model, used correctly — P4); connect the tie alias to `dst`
-  (identity); run the coverage check (§8.2.4).
-
-#### 8.2.2 Execution position
-
-The mapping System must run after its sources and before whoever reads
-`dst`. The post-setup pass INSERTS it into the owner's child list
-IMMEDIATELY BEFORE the child that contains the consumer (the first path
-segment of `dst`), not at the end. Sources produced by later siblings
-are a feedback loop the model already has; solvers own that,
-and the insertion rule does not change it. Why: §1 need 2.2 sequence.
-
-#### 8.2.3 Mapping components
-
-```cpp
-namespace naga::cospan::kernels {
-
-/// SliceInto: the component's input is a PEER WITH A VIEW of the source
-/// root (an ordinary slice connection — the read side reuses the view
-/// machinery); the output is full-dst-shaped and only the region is
-/// written. Launch range = region extents.
-template <DType DT, int Rank>
-struct RegionCopy {
-    struct Inputs  { Input<DT, Rank>  src; };       // already the sliced view
-    struct Outputs { Output<DT, Rank> out; };
-    sycl::id<Rank> dst_offset;                       // POD config
-    void operator()(sycl::id<Rank> i, Inputs a, Outputs o) const
-        { o.out[i + dst_offset] = a.src[i]; }
-};
-
-/// IndexMap / IndexMapInto: dst[offset + i] = src[map[i]].
-/// Launch range = map's range.
-template <DType DT, DType IDX, int Rank>
-struct GatherInto {
-    struct Inputs  { Input<DT, 1> src; Input<IDX, Rank> map; };
-    struct Outputs { Output<DT, Rank> out; };
-    sycl::id<Rank> dst_offset;
-    void operator()(sycl::id<Rank> i, Inputs a, Outputs o) const
-        { o.out[i + dst_offset] = a.src[a.map[i]]; }
-};
-
-/// Scatter — the additive reverse map, out[map[i]] += in[i]; output
-/// atomic BY TYPE (the general-case floor). Not a connection kind — a
-/// provided kernel users compose.
-template <DType DT, DType IDX, int Rank>
-struct Scatter {
-    struct Inputs  { Input<DT, Rank> in; Input<IDX, Rank> map; };
-    struct Outputs { Output<to_atomic_v<DT>, 1> out; };
-    void operator()(sycl::id<Rank> i, Inputs a, Outputs o) const
-        { o.out[a.map[i]] += a.in[i]; }
-};
-
-} // namespace naga::cospan::kernels
-```
-
-Properties that fall out: the mapping System is a real, enumerable
-subsystem (observable, debuggable); every mapping component is an
-ordinary KernelBody; and because the components write disjoint regions,
-the mapping System is PROVABLY legal as a parallel-mode FusedSystem — a
-later optimization needing no spec change.
-
-#### 8.2.4 Coverage
-
-Uncovered elements of `dst` hold whatever the tied storage holds — which
-may be exactly what the owning component initialized, deliberately. So
-coverage is checked BY DEFAULT and opted out per input at declaration
-(why: P8, §1 need 2.3 initialization):
-
-```cpp
-enum class Coverage : uint8_t { required, optional };
-/// Every declare_input form (§3.3/§6.2) carries a trailing option
-/// (default `required`):
-template <DType DT, int Rank, DimSpec... Specs>
-    requires(sizeof...(Specs) == Rank)
-void declare_input(Input<DT, Rank>& m, std::string name, Specs... specs,
-                   Lifetime life = Lifetime::durable,
-                   Coverage cov = Coverage::required);
-```
-
-The post-setup pass reads `dst`'s coverage option (the tie alias
-inherits it) and, when `required`, errors if the recorded regions do not
-cover `dst` entirely ("input `x` is 40% covered by computed
-connections"). `optional` skips the check — the escape hatch for the
-initialized-remainder case, and a legitimate performance choice.
-
-### 8.3 View composition
+### 8.2 View composition
 
 Views compose by offset addition with containment: connecting from a
 name whose peer carries view `B`, with a `Slice{A}`, yields
@@ -2023,7 +2003,7 @@ COPIES the view — the alias presents what the promoted entry sees. All
 views are in the root's rank; there is no rank reinterpretation through
 a view (rank is authoritative, §3.1).
 
-### 8.4 Cross-level ties
+### 8.3 Cross-level ties
 
 Nothing new: members resolve from the caller's namespace at any depth,
 and a member whose root is already a tie alias (a child-level tie) is a
@@ -2031,7 +2011,7 @@ legal member when that alias is unconnected — the merge makes the child
 alias a peer of the new root, and the `tie_*` exception marks it like
 any named member. Ties layer upward without special rules.
 
-### 8.5 Optimization marks
+### 8.4 Optimization marks
 
 ```cpp
 namespace naga::cospan {
@@ -2043,10 +2023,14 @@ struct Scaling { std::vector<double> ref{1.0}, ref0{0.0}; };   ///< semantics: w
 
 class System {   // ...continued
 public:
-    /// MARKS RIDE ON THE ROOT: marking any name marks the data. Recorded
-    /// on the root's IOEntry (§3.3 is_design_var/…), enumerated by
+    /// MARKS RIDE ON THE ROOT: marking any name marks the data. A later
+    /// mark of the same kind on the same root replaces the earlier one.
+    /// Connecting an output into a marked input moves the input into the
+    /// output's set, and the mark is gone with the old root: a consumed
+    /// System's marks never bind the System that consumes it. Recorded
+    /// on the root's IOEntry (§3.3 design_var()/…), enumerated by
     /// Model. `region` restricts a mark to a subarray (root rank) via
-    /// the same view machinery; no index maps on marks. Why: §1 need
+    /// the same view machinery. Why: §1 need
     /// 2.4 design variables, constraints, objectives.
 
     /// Root must be an INPUT root that is not connected — a free input;
@@ -2087,20 +2071,9 @@ public:
 } // namespace naga::cospan
 ```
 
-### 8.6 Samples
+### 8.5 Samples
 
 ```cpp
-// Two producers assembling one field: rows 0..N/2 from a, the rest from b.
-connect("a.field", "solver.field", SliceInto{subarray<2>({0,0},{N/2,M}),
-                                             subarray<2>({0,0},{N/2,M})});
-connect("b.field", "solver.field", SliceInto{subarray<2>({0,0},{N/2,M}),
-                                             subarray<2>({N/2,0},{N/2,M})});
-// -> hidden System "solver.field__map" with two RegionCopy components,
-//    inserted before "solver"; full coverage verified.
-
-// Neighbour gather: LBVH produces the map, the operator consumes gathered values.
-connect("lbvh.neighbors", "op.gathered", IndexMap{"lbvh.neighbor_ids"});
-
 // Sellar's marks.
 add_design_var("mda.z", Bounds{.lower = {{-10, 0}}, .upper = {{10, 10}}});
 add_design_var("mda.x", Bounds{.lower = {{0}},      .upper = {{10}}});
@@ -2177,7 +2150,7 @@ public:
     ///      through its device's substrate
     ///   4. root.prepare_exec(queue_, substrates_) — allocate, point wrappers; ExecCtx complete
     ///   5. root.compile()                        — bodies
-    ///   6. root.init_tree()                      — children before owners
+    ///   6. root.init_tree()                      — Components, then Systems children-before-owners
     /// After setup the model's STATE is not yet meaningful: it holds
     /// initialization. State is defined after the first forward.
     /// Why: §1 need 2.3 initialization.
@@ -2444,14 +2417,10 @@ child is. The order is the one of §9.1: (0 construct) 1 run_setup ·
 child, registers the name, sets its owner, **runs the child's `run_setup`
 before returning** (why: P6 — no deferred resolution pass);
 `connect` / `promote` / `tie_*` resolve paths in this
-namespace and apply the set operation (§4) — computed connections (§8)
-create or extend the input's mapping System; marks record on roots. Then
-this System's post-setup pass: each mapping System — framework
-`tie_outputs(allow_plain)`, alias → input, coverage check, insert before
-the consumer's child.
+namespace and apply the set operation (§4); marks record on roots.
 
 `Component::run_setup` → `setup()` → `declare_*` creates entries (roots of
-singleton sets; flags by kind; DimRecords; lifetime; coverage). Zero
+singleton sets; flags by kind; DimRecords; lifetime). Zero
 allocation; no device anywhere in this step.
 
 **State:** final tree and exec order; final sets; marks. No storage.
@@ -2501,8 +2470,8 @@ wrappers; recurse.
 `Component`: for every own ROOT entry allocatable now, build its
 `usm_vector` per registered device from that device's substrate —
 durable∧static from the arena route; durable∧dynamic with a known shape via
-the pool route (OS fallback); dynamic-shaped and transient stay
-unallocated. Then point every member wrapper at
+the pool route (OS fallback); dynamic-shaped roots and roots released
+per forward (§4.4) stay unallocated. Then point every member wrapper at
 `root()->storage_on(own device)` — guaranteed
 allocated by now (roots precede peers); shape and stride (+ view) set;
 static input peers validate against their roots here. An unconnected
@@ -2511,18 +2480,22 @@ ERROR here ("source-derived dimension on an unconnected input").
 
 #### 11.2.5 Compile — `root.compile()`
 
-`Component`: device function(s) + id at the owner's fuse rank if any, else
-native; individual config; custom-op bodies recorded. `System`: children
-in order. Fused and Parallel legality is NOT checked here — it is checked
-each forward on the descriptions the children return (cheap, host-side,
+`Component`: device function(s) + id at the body's own rank
+(`kernel_rank_v`); individual config; custom-op bodies recorded. `System`:
+children in order; a FusedSystem also checks its children's kernel ranks
+equal and builds its sequence config. Other Fused and Parallel legality is
+NOT checked here — it is checked each forward on the descriptions the children return (cheap, host-side,
 and it is where the information is).
 
 #### 11.2.6 Init — `root.init_tree()`
 
-`System`: children in order, then `init(queue, device)`. `Component`:
-`init(queue, device)`, with the Model's queue and the subsystem's device
-(signature: `init(sk::queue&, const sycl::device&)`). Post-order means an
-owner's `init` has the last word by path. Initializers write a root's
+`init_tree` is two passes. Component pass: every Component's
+`init(queue, device)`, depth-first in declaration order, with the Model's
+queue and the subsystem's device (signature: `init(sk::queue&, const
+sycl::device&)`); a System forwards `run_init` to its children. System
+pass: every System's `init(queue, device)`, children before owners, so an
+owner's `init` has the last word by path and the root System has the last
+word overall. Initializers write a root's
 primary storage and copy it to the root's other-device storage. Unnecessary
 inits (connected inputs) are harmless. An initializer on unallocated
 storage throws.
@@ -2559,7 +2532,7 @@ never costs the order; nothing in CoSpan threads dependencies. Kernel
 descriptions take the outer-kernel path, custom operations take
 `AdaptiveCpp_enqueue_custom_operation`, through the same `SubmitTarget`.
 **Parallel** (Components only): pre-compute ALL → `queue.submit_group {
-each child's description submitted with its device }` → post-compute ALL
+each child's description submitted with its own device }` → post-compute ALL
 after the group returns. **Fused**: pre-compute ALL → compute ALL (collect;
 a null or custom-op description is an error) → validate the wave on the
 descriptions (rank agreement, scratch, producer-consumer in parallel mode)
@@ -2569,8 +2542,9 @@ config → post-compute ALL. **Custom System types** (§10): early-return from
 
 #### 11.3.2 A Component's turn (§6.5)
 
-1. `run_pre_compute(ctx)`: for each own input driving a shape via
-   `FromInput` — read the driving input root's `host_view()` (the one
+1. `run_pre_compute(ctx)`: allocate every own root released per forward
+   (§4.4) through the pool route at this turn's shape; then, for each own
+   input driving a shape via `FromInput` — read the driving input's `host_view()` (the one
    forced sync, so the launch geometry below is known), `root.resize(shape)`,
    `point_wrapper`; nothing submitted for the resize, no reallocation
    inside a submitted task. Then `pre_forward()` → dynamic validation → wrapper sync.
@@ -2579,7 +2553,9 @@ config → post-compute ALL. **Custom System types** (§10): early-return from
 3. `run_post_compute(ctx)`: for each output root with storage on other
    devices, for each other device `copy_d = root` — one assignment
    resizes to match and copies, routed by SlabKit — after the owner's
-   submission, ordered by the stream.
+   submission, ordered by the stream. Then, for each own transient input,
+   tell its root one consumer is done; a root whose countdown reaches zero
+   drops its storage (§4.4).
 
 **State:** every output root holds this forward's values; dynamic roots
 sized to this forward.
@@ -2591,7 +2567,9 @@ sized to this forward.
 on the host and does `from_host` on destruction and on `commit()`),
 `set_*` (`root.from_host(span)`, then `copy_d = root` per other device),
 `memory_report()`, `get_subsystem(path)` chaining and
-`get_inputs()/get_outputs()` enumeration (§10.3). Host access is §9.2.
+`get_inputs()/get_outputs()` enumeration (§10.3). Host access is §9.2. Host
+access to a root released per forward (§4.4) after the forward is an error
+naming the transient input and `retain`.
 
 ### 11.5 End of life
 
