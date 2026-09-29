@@ -7,7 +7,12 @@
 //      second with a larger n_bins (accumulate-onto a grown, zero-padded root).
 //   b. TiledTranspose: GroupItem<2> body, Local scratch, work-group override.
 //   c. A rank-2 plain body, y = 2x + 1.
+//   d. A host component (sequential prefix sum) between two GPU components on
+//      one device: its I/O are host-kind USM, moved by the ordinary copy rule.
+//   e. Custom-op plumbing: the body records the pointers it is handed and
+//      enqueues nothing; a plain component after it still runs in order.
 
+#include <atomic>
 #include <cstdio>
 #include <exception>
 #include <stdexcept>
@@ -298,6 +303,188 @@ static void check_affine(sk::queue& q, cs::detail::IOEntry& y) {
     check(good, "rank-2 plain body: y == 2x + 1 on 40x30");
 }
 
+// ---- shared pieces of d and e: a 1-D iota producer and a "+1" consumer ------------------
+struct Iota1DBody {
+    struct Inputs {};
+    struct Outputs {
+        cs::Output<DType::f32, 1> y;
+    };
+    void operator()(sycl::id<1> i, Inputs, Outputs o) const { o.y[i] = static_cast<float>(i[0]); }
+};
+
+class Iota1D : public cs::Component<Iota1DBody> {
+    cs::Output<DType::f32, 1> y_;
+    int                       n_;
+
+public:
+    explicit Iota1D(int n) : n_{n} {}
+    void setup() override { declare_output(y_, "y", n_); }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+        return create_launch_config(y_.shape(), {}, {y_}, {});
+    }
+};
+
+struct Plus1Body {
+    struct Inputs {
+        cs::Input<DType::f32, 1> z;
+    };
+    struct Outputs {
+        cs::Output<DType::f32, 1> w;
+    };
+    void operator()(sycl::id<1> i, Inputs in, Outputs out) const { out.w[i] = in.z[i] + 1.0f; }
+};
+
+class Plus1 : public cs::Component<Plus1Body> {
+    cs::Input<DType::f32, 1>  z_;
+    cs::Output<DType::f32, 1> w_;
+
+public:
+    void setup() override {
+        declare_input(z_, "z", cs::from_source_shape<1>());
+        declare_output(w_, "w", cs::from_input_shape<1>("z"));
+    }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+        return create_launch_config(z_.shape(), {z_}, {w_}, {});
+    }
+};
+
+// ---- d. a host component between two GPU components ---------------------------------------
+// The host body is a sequential prefix sum: z[i] = z[i-1] + y[i].
+struct PrefixBody {
+    struct Inputs {
+        cs::Input<DType::f32, 1> y;
+    };
+    struct Outputs {
+        cs::Output<DType::f32, 1> z;
+    };
+    void operator()(cs::Host, Inputs in, Outputs out) const {
+        float acc = 0.0f;
+        for (std::size_t i = 0; i < in.y.size(); ++i) {
+            acc += in.y[i];
+            out.z[i] = acc;
+        }
+    }
+};
+
+class PrefixSum : public cs::Component<PrefixBody> {
+    cs::Input<DType::f32, 1>  y_;
+    cs::Output<DType::f32, 1> z_;
+
+public:
+    void setup() override {
+        declare_input(y_, "y", cs::from_source_shape<1>());
+        declare_output(z_, "z", cs::from_input_shape<1>("y"));
+    }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+        return create_launch_config({y_}, {z_}, {});
+    }
+};
+
+static void case_d(const sycl::device& dev, sk::queue& q) {
+    std::printf("-- d. host component chain: GPU iota -> host prefix sum -> GPU +1\n");
+    Iota1D    iota{static_cast<int>(kN)};
+    PrefixSum prefix;
+    Plus1     plus1;
+    TestDriver d{dev, q};
+    d.add(iota, "iota");
+    d.add(prefix, "prefix");
+    d.add(plus1, "plus1");
+    d.run_setup();
+    TestDriver::connect(iota, "y", prefix, "y");
+    TestDriver::connect(prefix, "z", plus1, "z");
+    d.start();
+
+    // The host component's input lives in host-kind USM on the producer's device.
+    auto& y_root = *TestDriver::entry(prefix, "y").root();
+    auto& z_root = *TestDriver::entry(prefix, "z").root();
+    const cs::Placement dev_pl{dev, sk::kind::device}, host_pl{dev, sk::kind::host};
+    check(TestDriver::entry(prefix, "y").storage_kind() == sk::kind::host &&
+              TestDriver::entry(prefix, "y").placement() == host_pl,
+          "d: the host component's input entry is placed (device, host)");
+    check(y_root.storage_placements().size() == 2 && y_root.storage_placements()[0] == dev_pl &&
+              y_root.storage_placements()[1] == host_pl,
+          "d: the producer's root holds [(dev, device) primary, (dev, host)]");
+    check(y_root.storage_on(host_pl) != nullptr && y_root.storage_on(host_pl) != y_root.storage_on(dev_pl),
+          "d: the host-kind slot is its own allocation");
+    check(z_root.storage_placements().size() == 2 && z_root.storage_placements()[0] == host_pl &&
+              z_root.storage_placements()[1] == dev_pl,
+          "d: the host component's output root holds [(dev, host) primary, (dev, device)]");
+
+    d.forward();
+    auto& w = TestDriver::entry(plus1, "w");
+    auto  h = HostViewAccess::view<DType::f32, 1>(w, q);
+    bool  good = h.size() == kN;
+    float acc  = 0.0f;
+    for (std::size_t i = 0; i < kN && good; ++i) {
+        acc += static_cast<float>(i);
+        good = h[i] == acc + 1.0f;
+    }
+    check(good, "d: w[i] == prefix_sum(i)[i] + 1 against the host reference (N=1000)");
+}
+
+// ---- e. custom-op plumbing (no native work) -------------------------------------------------
+// The body records the pointers it is handed and enqueues nothing.
+struct RecordBody {
+    struct Inputs {
+        cs::Input<DType::f32, 1> x;
+    };
+    struct Outputs {
+        cs::Output<DType::f32, 1> y;
+    };
+    std::atomic<const void*>* in_ptr;
+    std::atomic<const void*>* out_ptr;
+    void operator()(cs::CustomOp& op, Inputs in, Outputs out) const {
+        in_ptr->store(op.device_ptr(in.x));
+        out_ptr->store(op.device_ptr(out.y));
+    }
+};
+
+class Recorder : public cs::Component<RecordBody> {
+    cs::Input<DType::f32, 1>  x_;
+    cs::Output<DType::f32, 1> y_;
+
+public:
+    std::atomic<const void*> in_rec{nullptr}, out_rec{nullptr};
+    void setup() override {
+        declare_input(x_, "x", cs::from_source_shape<1>());
+        declare_output(y_, "y", cs::from_input_shape<1>("x"));
+    }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+        return create_launch_config({x_}, {y_}, {&in_rec, &out_rec});
+    }
+};
+
+static void case_e(const sycl::device& dev, sk::queue& q) {
+    std::printf("-- e. custom-op plumbing: pointers recorded at submission, nothing enqueued\n");
+    Iota1D   iota{static_cast<int>(kN)};
+    Recorder rec;
+    Plus1    plus1;
+    TestDriver d{dev, q};
+    d.add(iota, "iota");
+    d.add(rec, "rec");
+    d.add(plus1, "plus1");
+    d.run_setup();
+    TestDriver::connect(iota, "y", rec, "x");
+    TestDriver::connect(rec, "y", plus1, "z");
+    d.start();
+    d.forward();
+
+    const cs::Placement dev_pl{dev, sk::kind::device};
+    const void* want_in  = TestDriver::entry(iota, "y").storage_on(dev_pl);
+    const void* want_out = TestDriver::entry(rec, "y").storage_on(dev_pl);
+    check(rec.in_rec.load() != nullptr && rec.in_rec.load() == want_in,
+          "e: device_ptr(in) is the producer root's (device, device) storage");
+    check(rec.out_rec.load() != nullptr && rec.out_rec.load() == want_out,
+          "e: device_ptr(out) is the recorder's own root storage");
+
+    // The recorder wrote nothing, so its zero-filled output feeds the plain
+    // consumer: w == 0 + 1 everywhere, after the custom op in stream order.
+    auto h = HostViewAccess::view<DType::f32, 1>(TestDriver::entry(plus1, "w"), q);
+    bool good = h.size() == kN;
+    for (std::size_t i = 0; i < kN && good; ++i) good = h[i] == 1.0f;
+    check(good, "e: the plain component after the custom op produces w == 1 (ordering intact)");
+}
+
 int main() {
     try {
         sycl::device dev{sycl::default_selector_v};
@@ -345,6 +532,9 @@ int main() {
         check(bins_equal(q, bins, want), "forward 2: n_bins=13, grown root == zero-padded first bins + new histogram");
         check_transpose(q, tout);
         check_affine(q, ayout);
+
+        case_d(dev, q);
+        case_e(dev, q);
     } catch (const std::exception& e) {
         std::printf("EXCEPTION: %s\n", e.what());
         return 2;

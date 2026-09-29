@@ -212,3 +212,33 @@ Shape resolution (`run_pre_compute`) covers every own entry, inputs first, then 
 
 ## D38 — TestDriver is test-only
 `detail::TestDriver` (in tests/smoke/smoke_component.cpp) stands in for System: `run_setup`, `get_exec_info`, arena sized from the returned bytes plus 4096 per component and a 1 MiB pool, `prepare_exec`, `compile`, `run_init`; per forward `run_pre_compute`, `run_compute_forward`, `submit`, `run_post_compute`. Components are connected with `EntryAccess::merge(producer_out, consumer_in)`; producers are added before consumers.
+
+## D39 — Root storage is keyed by Placement (amends D3: "root storage stays keyed by device")
+`Placement {sycl::device device; sk::kind kind;}` (with `==`) is declared in metadata.hpp beside `IOKind`, in `naga::cospan`. A root's storage slots are keyed by Placement, not device: `register_device` -> `register_placement`, `storage_on(device)` -> `storage_on(placement)`, `storage_devices()` -> `storage_placements()` (primary first), `sync_other_devices` -> `sync_other_placements`, `raw_storage_on` and `Slot` likewise. Keying by device alone cannot hold both a device-kind and a host-kind copy of one root, which the host-kind rule (D3) requires when a GPU component feeds a host component on the same device. The primary slot is the root's own placement (the declarer's device plus the declarer's `default_storage_kind()`). `IOEntry::placement()` is added: this entry's (device, storage kind). A peer's wrapper points at `root->storage_on(peer.placement())`. Device-kind components behave as before.
+
+## D40 — Registration in get_exec_info
+Each entry gets `device_ = parent_device` and `storage_kind_ = default_storage_kind()`. A root sets its own placement as primary (`set_primary_placement`: moved to the front even if an input peer's owner registered first). An input peer registers its (device, default kind) on its root if absent. An output peer tied to a root must have a placement equal to the root's, else `logic_error` (a producer cannot write one storage from two placements).
+
+## D41 — Host-kind slots cost no arena bytes
+`arena_eligible()` still requires a device-kind root, so a host-primary root has `static_bytes() == 0`. A host-kind SECONDARY slot on a device-kind root adds nothing to the exec-info byte total; a device-kind secondary adds the root's `static_bytes()` once per device, as before. Routing (`StorageEntry::route(q, subs, placement)`): a non-device placement takes the OS route `allocator<T>{q, kind, placement.device}` (the device chooses the context; SlabKit already had `(queue, kind, device)`, so there is no SlabKit gap); a device placement takes its device's arena if the root is arena-eligible, else the pool if the device has one, else the OS. A device-kind secondary of a host-primary root is therefore pooled.
+
+## D42 — sync_other_placements
+`sync_other_placements` copy-assigns the primary `usm_vector` to every other slot: usm_vector's routed copy keeps the target's own allocator, needs the same queue, and depends on both slots' last events. Device<->host and cross-device movement is thus one mechanism, the ordinary copy rule. `run_post_compute` calls it for every own output root with more than one placement; `write_root` (initializers) calls it after writing the primary.
+
+## D43 — Ordering of a host component in a chain
+producer kernel -> device->host copy (memory task) -> `async_host_in_order` -> host->device copy (memory task) -> consumer kernel is ordered by the stream alone: memory tasks are ordered against kernel-order tasks in both directions, and `async_host_in_order` joins the kernel order. No events pass between Components. Smoke case d runs this chain on one device; it passed on omp and 5/5 runs on cuda.
+
+## D44 — Custom-operation launch (D1)
+`detail::CustomOpLaunch<KB>` captures Inputs, Outputs and the body by value. `submit(SubmitTarget&)` runs `h.AdaptiveCpp_enqueue_custom_operation([=](sycl::interop_handle& ih) { CustomOp op{ih}; body(op, in, out); })` inside a command group, submitted with `t.group->submit(t.device, cgf)` under a group and `t.queue->submit(t.device, cgf)` otherwise. `is_custom_op()` is true. Custom-op I/O is device-kind USM.
+
+## D45 — Host launch (D3)
+`detail::HostLaunch<KB>` captures by value and runs `body(Host{}, in, out)`. `submit`: with no group `t.queue->async_host_in_order(t.device, f)`; under a group `t.group->async_host(t.device, f)`, because `sk::queue::group` has no in-order variant (ordering against kernel tasks is the group's). `is_host()` is true. `default_storage_kind()` is `kind::host` for a `HostBody` component, so its inputs and outputs are host-kind USM on its device.
+
+## D46 — compile() and create_launch_config for the non-kernel bodies (amends D32, D36)
+`compile()` builds nothing for a custom-op or host body (no `dynamic_function_config`, no `cfg_`). D36's step-2b `static_assert` and the throw are gone: `create_launch_config(in, out, body = {})` exists twice, constrained by `CustomOpBody<KB>` and by `HostBody<KB>`, returning `CustomOpLaunch<KB>` and `HostLaunch<KB>`.
+
+## D47 — Custom-op smoke covers plumbing only
+Case e records `device_ptr(in)` and `device_ptr(out)` into a `std::atomic<const void*>` pair captured by pointer in the body config, enqueues nothing, and checks the pointers equal the roots' (device, device) storage and that a following plain component reads the zero-filled output (w == 1). Native-stream work is not tested here: it needs a vendor library (the CUDA runtime headers and library), not present in the dev-cuda environment at this commit. The order check is weak by design: the recorder writes nothing, so it shows that the stream still runs the consumer after the custom-op node, not that a native write is visible to it.
+
+## D48 — Smoke driver constraints
+`TestDriver` runs each component's post-compute right after its submission, which is what moves the host copy between the GPU producer and the host component. `Placement` is used unqualified in tests through `using cs::Placement;`.
