@@ -105,6 +105,7 @@ private:
 enum class TieOutputsPolicy : uint8_t { require_atomic, allow_plain };
 
 class ParallelSystem;  // parallel_system.hpp (r01 §7.5)
+class FusedSystem;     // fused_system.hpp (r01 §7.5)
 
 namespace detail {
 
@@ -134,6 +135,12 @@ inline constexpr bool leads_with_props_v<A, R...> = std::is_same_v<std::remove_c
 template <class...>
 struct parallel_of {
     using type = ParallelSystem;
+};
+
+/// The same dependent-name device for property::fused (fused_system.hpp).
+template <class...>
+struct fused_of {
+    using type = FusedSystem;
 };
 
 }  // namespace detail
@@ -180,7 +187,8 @@ public:
     /// The HELPER FORM: a System configured by properties (device, transient
     /// and ONE flavor), populated with the given Components in order. With
     /// property::parallel it is a ParallelSystem (§7.5); a plain System
-    /// otherwise. property::fused is step 3b and throws.
+    /// otherwise. With property::fused it is a FusedSystem (§7.5) carrying the
+    /// property's mode and work-group; parallel mode is step 3b-3 and throws.
     template <class... Children>
         requires(sizeof...(Children) >= 1 &&
                  (detail::is_child_decl_v<std::remove_cvref_t<Children>> && ...))
@@ -189,9 +197,16 @@ public:
             throw std::invalid_argument("naga::cospan: " + describe() + ": add_subsystem('" + name +
                                         "'): parallel and fused are two flavors; give one");
         if (props.has_property<property::parallel>())
-            return populate<typename detail::parallel_of<Children...>::type>(std::move(name), props,
-                                                                             std::forward<Children>(children)...);
-        return populate<System>(std::move(name), props, std::forward<Children>(children)...);
+            return populate<typename detail::parallel_of<Children...>::type>(
+                std::move(name), props, std::tuple<>{}, std::forward<Children>(children)...);
+        if (props.has_property<property::fused>()) {
+            const property::fused& f = props.get_property<property::fused>();
+            return populate<typename detail::fused_of<Children...>::type>(
+                std::move(name), props,
+                std::tuple<property::fused::Mode, std::optional<sycl::range<3>>>{f.mode, f.wg},
+                std::forward<Children>(children)...);
+        }
+        return populate<System>(std::move(name), props, std::tuple<>{}, std::forward<Children>(children)...);
     }
 
     /// An empty System; add children with the templated overload inside its setup().
@@ -819,9 +834,13 @@ private:
     T& add_child(std::string name, const property_list& props, Args&&... ctor_args) {
         require_declaring("add_subsystem");
         check_new_name(name, "subsystem");
-        if (props.has_property<property::fused>())
-            throw std::logic_error(
-                "naga::cospan: property::fused is step 3b (FusedSystem is not implemented yet)");
+        // property::fused is a flavor like parallel: the helper form builds a
+        // FusedSystem; a typed child names its own type (derive from FusedSystem).
+        if (props.has_property<property::fused>() && !std::is_base_of_v<FusedSystem, T>)
+            throw std::invalid_argument("naga::cospan: " + describe() + ": add_subsystem('" + name +
+                                        "'): property::fused builds a FusedSystem in the helper form "
+                                        "(add_subsystem(name, props, child<T>(...)...)); a typed child names "
+                                        "its own type, so derive it from FusedSystem");
         // property::parallel selects a flavor, which only the helper form can
         // build; a typed child names its own type (derive from ParallelSystem).
         if (props.has_property<property::parallel>() && !std::is_base_of_v<ParallelSystem, T>)
@@ -840,9 +859,14 @@ private:
     /// ParallelSystem for property::parallel) and add the given Components to
     /// it in order. add_child<S> has already run S::setup(), which left the
     /// child's declaring flag off, so it is raised here for the adds.
-    template <class S, class... Children>
-    System& populate(std::string name, const property_list& props, Children&&... children) {
-        S& sys = add_child<S>(std::move(name), props);
+    template <class S, class Ctor, class... Children>
+    System& populate(std::string name, const property_list& props, Ctor ctor, Children&&... children) {
+        // `ctor` is a tuple of S's constructor arguments (empty for System and ParallelSystem).
+        S& sys = std::apply(
+            [&](auto&&... a) -> S& {
+                return this->add_child<S>(std::move(name), props, std::forward<decltype(a)>(a)...);
+            },
+            std::move(ctor));
         detail::FlagScope scope{sys.declaring_};
         (sys.add_decl(std::forward<Children>(children)), ...);
         return sys;

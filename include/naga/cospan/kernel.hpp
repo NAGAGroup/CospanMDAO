@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <type_traits>
 #include <utility>
 
@@ -523,6 +524,80 @@ void launch_individual(const SubmitTarget& t, sycl::AdaptiveCpp_jit::dynamic_fun
                 kb_entry_r2(it, info, in_b, out_b, body_b, lb);
             else
                 kb_entry_r3(it, info, in_b, out_b, body_b, lb);
+        }));
+    };
+    if (t.group != nullptr)
+        t.group->submit(t.device, cgf);
+    else
+        t.queue->submit(t.device, cgf);
+}
+
+// -----------------------------------------------------------------------------
+// The chained wave (fused owners, r01 §5.6, §7.5)
+// -----------------------------------------------------------------------------
+
+using JitId = sycl::AdaptiveCpp_jit::dynamic_function_id;
+
+/// The REAL six-argument signature of the entry placeholder and of every stage
+/// function, as the type-erased id types need it (the spike's four-argument
+/// version was illustrative only).
+template <int R>
+using entry_fn_t =
+    sycl::AdaptiveCpp_jit::dynamic_function<void, sycl::nd_item<R>, FnOffsetInfo&, const std::byte*,
+                                            std::byte*, const std::byte*, std::byte*>;
+template <int R>
+using stage_def_t =
+    sycl::AdaptiveCpp_jit::dynamic_function_definition<void, sycl::nd_item<R>, FnOffsetInfo&,
+                                                       const std::byte*, std::byte*, const std::byte*,
+                                                       std::byte*>;
+
+/// The type-erased id of kb_fn<KB>: what a fused owner puts in a call sequence.
+template <class KB>
+JitId stage_definition_id() {
+    return stage_def_t<kernel_rank_v<KB>>{&kb_fn<KB>}.id();
+}
+
+/// The id of the entry placeholder of rank `rank` (1..3).
+inline JitId wave_entry_id(int rank) {
+    switch (rank) {
+        case 1: return entry_fn_t<1>{&kb_entry_r1}.id();
+        case 2: return entry_fn_t<2>{&kb_entry_r2}.id();
+        case 3: return entry_fn_t<3>{&kb_entry_r3}.id();
+        default: break;
+    }
+    throw std::logic_error("naga::cospan: no kernel entry of that rank");
+}
+
+/// The id of the barrier stage of rank `rank` (1..3).
+inline JitId wave_barrier_id(int rank) {
+    switch (rank) {
+        case 1: return stage_def_t<1>{&kb_barrier<1>}.id();
+        case 2: return stage_def_t<2>{&kb_barrier<2>}.id();
+        case 3: return stage_def_t<3>{&kb_barrier<3>}.id();
+        default: break;
+    }
+    throw std::logic_error("naga::cospan: no kernel barrier of that rank");
+}
+
+/// Submit the ONE outer kernel of a fused wave: like launch_individual, but the
+/// records and the three byte streams are USM the owner staged, captured as
+/// raw pointers. Every work-item starts with a fresh cursor at record 0; the
+/// call sequence in `cfg` walks the records in position order.
+template <int R>
+void launch_wave(const SubmitTarget& t, sycl::AdaptiveCpp_jit::dynamic_function_config& cfg,
+                 const sycl::nd_range<R>& nd, const StageRecord* records, const std::byte* in_bytes,
+                 std::byte* out_bytes, const std::byte* body_bytes, std::size_t local_bytes) {
+    auto cgf = [&](sycl::handler& h) {
+        sycl::local_accessor<std::byte, 1> local{sycl::range<1>{local_bytes ? local_bytes : 1}, h};
+        h.parallel_for(nd, cfg.apply([=](sycl::nd_item<R> it) {
+            FnOffsetInfo info{records, 0};  // fresh per work-item
+            std::byte*   lb = local.template get_multi_ptr<sycl::access::decorated::no>().get();
+            if constexpr (R == 1)
+                kb_entry_r1(it, info, in_bytes, out_bytes, body_bytes, lb);
+            else if constexpr (R == 2)
+                kb_entry_r2(it, info, in_bytes, out_bytes, body_bytes, lb);
+            else
+                kb_entry_r3(it, info, in_bytes, out_bytes, body_bytes, lb);
         }));
     };
     if (t.group != nullptr)

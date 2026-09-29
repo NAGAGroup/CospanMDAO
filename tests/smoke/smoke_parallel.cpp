@@ -381,7 +381,11 @@ public:
 };
 class TopFused : public cs::System {
 public:
-    void setup() override { add_subsystem("p", cs::property_list{cs::property::fused{}}, child<Src>("s")); }
+    // Sequential fused works since step 3b-2; the parallel mode is step 3b-3 and throws.
+    void setup() override {
+        add_subsystem("p", cs::property_list{cs::property::fused{cs::property::fused::Mode::parallel}},
+                      child<Src>("s"));
+    }
 };
 
 template <class Top>
@@ -404,7 +408,7 @@ static void case_d(const sycl::device& dev, sk::queue& q) {
     check(start_throws<TopTypedParallelOnSystem>(dev, q),
           "d: property::parallel on a typed non-Parallel child throws");
     check(start_throws<TopParallelAndFused>(dev, q), "d: parallel and fused together throw");
-    check(start_throws<TopFused>(dev, q), "d: fused alone still throws (step 3b)");
+    check(start_throws<TopFused>(dev, q), "d: fused in parallel mode still throws (step 3b-3)");
 }
 
 int main() {

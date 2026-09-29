@@ -280,6 +280,20 @@ public:
                 e->sync_other_placements(*owner_ctx.queue);
     }
 
+    // ---- what a fused owner needs to know, without knowing the KernelBody type --
+    // Answered by Component<KB> from its body's signature. An owner reads
+    // these; nothing here knows what fusing is.
+    virtual int  kernel_rank() const { return 0; }       ///< 0 for custom-op and host bodies
+    virtual bool is_group_body() const { return false; }
+    virtual bool has_scratch() const { return false; }
+    virtual bool is_custom_op() const { return false; }
+    virtual bool is_host() const { return false; }
+    /// The type-erased id of this body's stage function (kb_fn<KB>), for a
+    /// call sequence. Throws for a custom-op or host body (nothing is compiled).
+    virtual detail::JitId definition_id() const {
+        throw std::logic_error("naga::cospan: " + describe() + " has no stage function");
+    }
+
 protected:
     ComponentBase() = default;
 
@@ -745,6 +759,20 @@ public:
     }
 
     std::unique_ptr<LaunchDescription> run_compute_forward() override { return compute_forward(); }
+
+    // ---- read off the body's signature, for a fused owner --------------------
+    int  kernel_rank() const override { return kernel_rank_v<KB>; }
+    bool is_group_body() const override { return GroupBody<KB>; }
+    bool has_scratch() const override { return HasScratch<KB>; }
+    bool is_custom_op() const override { return CustomOpBody<KB>; }
+    bool is_host() const override { return HostBody<KB>; }
+    detail::JitId definition_id() const override {
+        if constexpr (CustomOpBody<KB> || HostBody<KB>)
+            throw std::logic_error("naga::cospan: " + describe() +
+                                   " is a custom-op or host body: it has no stage function");
+        else
+            return detail::stage_definition_id<KB>();
+    }
 
 protected:
     static constexpr int LR = launch_rank_v<KB>;
