@@ -352,15 +352,39 @@ private:
     friend class detail::IOEntry;
 };
 
-/// HostInitializer<DT, Rank> — a host buffer shaped like the entry.
-/// Element access reads and writes the buffer, never the device.
-/// commit() and destruction write the buffer into the entry's root
-/// storage (usm_vector::from_host, which owns its copy of the bytes
-/// before returning) and refresh the root's copies on other devices.
-/// Host-side only; not a kernel capture. Obtained inside init() only
-/// (§6.2).
+/// HostView<DT, Rank> — a read-only host copy of one entry, shaped like it,
+/// taken at construction: a device-kind root → root.host_view() (SlabKit
+/// orders the read after the stream's prior work); a shared- or host-kind
+/// root → queue.wait() then get_access(). A peer with a view (§8.1)
+/// presents its region only. Host-side only; not a kernel capture.
 template <DType DT, int Rank>
-class HostInitializer {
+class HostView {
+public:
+    using value_type = cpp_type_t<DT>;
+    static constexpr DType dtype = DT;
+    static constexpr int   rank  = Rank;
+
+    const value_type& operator[](sycl::id<Rank> idx) const;
+    const value_type& operator[](size_t flat) const;
+    sycl::range<Rank> shape() const;
+    size_t            size() const;
+    std::span<const value_type> span() const;
+
+private:
+    explicit HostView(const detail::IOEntry& entry, sk::queue& q);
+    std::vector<value_type> host_;
+    sycl::range<Rank>       shape_;
+    friend class Model;
+};
+
+/// HostViewMut<DT, Rank> — the same host copy, writable: commit() and
+/// destruction write the buffer into the entry's root storage
+/// (usm_vector::from_host, which owns its copy of the bytes before
+/// returning) and refresh the root's copies on other devices. Obtained
+/// from Model::view_output_mut (§9) and, as HostInitializer, from the
+/// initializer helpers inside init() (§6.2).
+template <DType DT, int Rank>
+class HostViewMut {
 public:
     using value_type = cpp_type_t<DT>;
     static constexpr DType dtype = DT;
@@ -370,15 +394,20 @@ public:
     value_type& operator[](size_t flat);
     sycl::range<Rank> shape() const;
     size_t            size() const;
+    std::span<value_type> span();
     void commit();
-    ~HostInitializer();   ///< commit()
+    ~HostViewMut();   ///< commit()
 
 private:
-    explicit HostInitializer(detail::IOEntry& entry);
+    explicit HostViewMut(detail::IOEntry& entry, sk::queue& q);
     detail::IOEntry*        entry_;
+    sk::queue*              q_;
     std::vector<value_type> host_;
+    friend class Model;
     friend class ComponentBase;
 };
+
+template <DType DT, int Rank> using HostInitializer = HostViewMut<DT, Rank>;
 
 static_assert(std::is_trivially_copyable_v<Input<DType::f32, 2>>);
 static_assert(std::is_trivially_copyable_v<Output<DType::atomic_f32, 1>>);
@@ -1390,9 +1419,7 @@ public:
     /// Why: §1 need 2.3 initialization (not limited beyond the queue).
     template <DType DT, int Rank> Initializer<DT, Rank> get_input_initializer(std::string_view name);
     template <DType DT, int Rank> Initializer<DT, Rank> get_output_initializer(std::string_view name);
-    /// Host initializer: a host buffer shaped like the entry (§2); commit()
-    /// and destruction write it to the root and refresh the root's
-    /// other-device copies.
+    /// Host initializer: a HostViewMut (§2) over the entry — the current values on the host, written back to the root and its other-device copies on commit() and destruction.
     template <DType DT, int Rank> HostInitializer<DT, Rank> get_input_host_initializer(std::string_view name);
     template <DType DT, int Rank> HostInitializer<DT, Rank> get_output_host_initializer(std::string_view name);
     /// Common-case helpers, by name.
@@ -1680,11 +1707,11 @@ struct ExecCtx {
     SubmitTarget target();
 };
 
-/// One per device (SlabKit spec): the device's arena and optional pool,
+/// One per device (SlabKit spec): the device's arena (present iff it has static bytes) and pool (present iff configured),
 /// built from (queue, device) and held for the model's life. Every
 /// allocation a subsystem makes goes through its device's substrate.
-struct MemorySubstrate { slabkit::DeviceArena arena;
-                         std::optional<slabkit::DevicePool> pool; };
+struct MemorySubstrate { std::optional<slabkit::DeviceArena> arena;   // present iff the device has static bytes
+                         std::optional<slabkit::DevicePool>  pool; };  // present iff configured (§9)
 using  Substrates = std::unordered_map<sycl::device, MemorySubstrate>;
 
 /// What a submission consumes (§6.1 LaunchDescription::submit): the
@@ -1741,6 +1768,7 @@ public:
     auto get_inputs()  const;   ///< this System's alias entries
     auto get_outputs() const;
     Subsystem& get_subsystem(std::string_view path);          ///< chains through children
+    std::span<Subsystem* const> children() const;             ///< declaration order = exec order; Model's walks use this and nothing else
 
     // ---- runners (Subsystem verbs) — the DEFAULT orchestration ----------------
 protected:
@@ -2060,6 +2088,7 @@ public:
 
 /// Model-level enumeration — the contract an optimizer reads.
 /// Order = declaration order, depth-first.
+/// Collected once, at the end of Model::setup(), from every root entry (§9).
 class Model {   // ...continued from §9
 public:
     struct MarkRecord {
@@ -2128,6 +2157,10 @@ struct ModelConfig {
     /// default selector. Validated at Model construction:
     /// ctx.contains(*default_device), else throw.
     std::optional<sycl::device> default_device;
+    /// Handed to the queue at construction. Asynchronous errors reach it
+    /// when wait() runs queue.wait_and_throw(); absent → the runtime's
+    /// default behaviour. SYCL's own mechanism; the Model adds nothing.
+    std::optional<sycl::async_handler> async_handler;
 };
 
 /// THE factory. Constructs the root System with `args...`, the Model
@@ -2146,17 +2179,18 @@ public:
     /// from the root; the Model adds only the two things nobody else
     /// owns (the queue, the substrates):
     ///   0. at Model construction: the context is cfg.ctx; the queue is
-    ///      queue_ = sk::queue{ctx_, default_device, handler} — ONE queue,
-    ///      one in-order stream (§7.3), existing for everything below;
-    ///      `handler` is the async-error handler that wait() surfaces
+    ///      queue_ = sk::queue{ctx_, default_device, cfg.async_handler} — ONE queue,
+    ///      one in-order stream (§7.3), existing for everything below
     ///   1. root.run_setup()                       — declare (§6/§7)
     ///   2. bytes = root.get_exec_info(default_device)   — device -> bytes
-    ///   3. substrates[d] = { DeviceArena{queue_, d, kind::device, bytes[d]},
-    ///      DevicePool iff configured } — every subsystem allocates
+    ///   3. substrates[d] = { DeviceArena{queue_, d, kind::device, bytes[d]} iff bytes[d] > 0,
+    ///      DevicePool iff configured for d } — every subsystem allocates
     ///      through its device's substrate
     ///   4. root.prepare_exec(queue_, substrates_) — allocate, point wrappers; ExecCtx complete
     ///   5. root.compile()                        — bodies
     ///   6. root.init_tree()                      — Components, then Systems children-before-owners
+    ///   7. marks: walk children() depth-first in declaration order and read design_var()/constraint()/objective() off every root entry; cached (§8.4)
+    /// Runs once: a second setup(), or forward() / host access before setup(), throws.
     /// After setup the model's STATE is not yet meaningful: it holds
     /// initialization. State is defined after the first forward.
     /// Why: §1 need 2.3 initialization.
@@ -2170,8 +2204,8 @@ public:
     void wait();
 
     // ---- host access (between runs) ---------------------------------------------
-    /// Views: wrapper ergonomics on the host — shape(), operator[] with
-    /// id<Rank> and flat, size(). On a device-kind root a view is
+    /// Views (HostView / HostViewMut, §2): shape(), operator[] with
+    /// id<Rank> and flat, size(), span(). On a device-kind root a view is
     /// root.host_view(); on a shared- or host-kind root it is
     /// queue_.wait() then root.get_access(). Either way the cost is
     /// honest and paid only where asked; the read is ordered after the
@@ -2200,13 +2234,14 @@ public:
     Subsystem& get_subsystem(std::string_view path);           // root.get_subsystem
 
     struct MemoryReport {
-        struct PerDevice { size_t arena_bytes, pool_bytes, pool_bytes_in_use,
-                                  os_allocations, os_bytes_in_use, transient_peak_bytes; };
+        /// A snapshot at the time of the call, between runs.
+        struct PerDevice { size_t arena_bytes, arena_bytes_in_use, pool_bytes, pool_bytes_in_use,
+                                  os_allocations, os_bytes_in_use; };
         std::unordered_map<sycl::device, PerDevice> devices;
     };
     MemoryReport memory_report() const;
 
-    // ---- marks (§8) -------------------------------------------------------------
+    // ---- marks (§8.4) — collected at the end of setup() ----
     std::span<const MarkRecord> design_vars() const;
     std::span<const MarkRecord> constraints() const;
     std::span<const MarkRecord> objectives()  const;
@@ -2220,6 +2255,8 @@ private:
     Substrates  substrates_;
     std::unique_ptr<System> root_;
     ModelConfig cfg_;
+    sycl::device            default_device_;
+    std::vector<MarkRecord> design_vars_, constraints_, objectives_;
 };
 
 } // namespace naga::cospan
@@ -2378,7 +2415,7 @@ Observation is path resolution and enumeration, nothing more (why:
 `get_subsystem("subs1") → get_subsystem("subs2") → get_input("x")`, with
 `get_subsystem("subs1.subs2")` as the chaining convenience; every
 Subsystem exposes `get_inputs()` / `get_outputs()` (§3.3 enumerability
-guarantee) and a System exposes its children. Recorders, listings and
+guarantee) and a System exposes its children (`children()`). Recorders, listings and
 renderers are built over these calls and nothing else.
 
 ---
@@ -2402,7 +2439,7 @@ auto model = create_model<Top>(ModelConfig{...}, top_args...);
 
 1. Model validates its config (`default_device` against `ctx.contains()`),
    holds the context (`cfg.ctx`), then constructs its one queue from it:
-   `queue_ = sk::queue{ctx_, default_device, handler}` — one in-order
+   `queue_ = sk::queue{ctx_, default_device, cfg.async_handler}` — one in-order
    stream. Every submission names the device it targets.
 2. Model constructs `Top(top_args...)`. A constructor is plain C++ state.
    Structural calls and declarations outside `setup()` throw.
@@ -2415,7 +2452,7 @@ auto model = create_model<Top>(ModelConfig{...}, top_args...);
 Every step is a Subsystem verb driven from the root; Systems recurse in
 declared order (`children_` IS the exec order); nobody asks what kind a
 child is. The order is the one of §9.1: (0 construct) 1 run_setup ·
-2 get_exec_info · 3 substrates · 4 prepare_exec · 5 compile · 6 init_tree.
+2 get_exec_info · 3 substrates · 4 prepare_exec · 5 compile · 6 init_tree · 7 marks.
 
 #### 11.2.1 Declare — `root.run_setup()`
 
@@ -2461,7 +2498,7 @@ Why: §1 need 2.2 placement · P1 · P5.
 #### 11.2.3 Substrates
 
 Model: for each `(device, bytes)`: `substrates[device] =
-{ DeviceArena{queue_, device, kind::device, bytes}, DevicePool iff
+{ DeviceArena{queue_, device, kind::device, bytes} iff bytes > 0, DevicePool iff
 configured for that device }` — built from `(queue, device)`, with no
 context of its own; the one context is the Model's. Every
 allocation for a device goes through its substrate.
@@ -2509,6 +2546,12 @@ storage throws.
 **State:** storage for every static root, initialized; wrappers current;
 kernels compiled. The model can run. Its state is not yet meaningful —
 it holds initialization; state is defined after the first forward.
+
+#### 11.2.7 Marks
+
+Model walks `children()` depth-first in declaration order and reads
+`design_var()`/`constraint()`/`objective()` off every root entry into its
+three cached lists (§8.4). **State:** the marks an optimizer reads.
 
 ### 11.3 `model.forward()`
 
