@@ -1,0 +1,9 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+find_dependency(Threads)
+find_dependency(AdaptiveCpp)
+find_dependency(slabkit)
+include("${CMAKE_CURRENT_LIST_DIR}/cospanmdaoTargets.cmake")
+
+check_required_components(cospanmdao)
