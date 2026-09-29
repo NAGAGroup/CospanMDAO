@@ -498,8 +498,12 @@ public:
                 throw std::invalid_argument("naga::cospan: '" + std::string{name()} +
                                             "': extents past the rank must be 1");
         extents_ = {r[0], r[1], r[2]};
-        if (is_root())
+        if (is_root()) {
+            // Growing reallocates and frees the old storage synchronously (D135): wait the stream's kernels first.
+            if (!slots_.empty() && flat_size() > slots_.front()->data.capacity())
+                slots_.front()->data.get_queue().wait();
             for (auto& s : slots_) s->data.resize(flat_size());
+        }
     }
 
     void validate_connection() const override {
@@ -540,7 +544,10 @@ public:
 
     void release_storage() override {
         if (!is_root() || slots_.empty()) return;
-        slots_.clear();  // usm_vector frees defer in SlabKit; launched work keeps its pointers
+        // Synchronous frees (D135): the stream's kernels may still read these roots and a usm_vector waits
+        // only for its own tasks, so wait the stream, then the vectors free here.
+        slots_.front()->data.get_queue().wait();
+        slots_.clear();
         released_ = true;
     }
 

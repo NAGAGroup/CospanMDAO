@@ -75,12 +75,9 @@ void expect_throws(F&& f, const std::string& needle) {
 /// A Model of `Sys` whose setup() must throw with `needle` in the message.
 template <class Sys>
 void expect_setup_throws(const std::string& needle) {
-    expect_throws(
-        [] {
-            cs::Model model = cs::create_model<Sys>(default_config());
-            model.setup();
-        },
-        needle);
+    cs::Model model = cs::create_model<Sys>(default_config());
+    expect_throws([&] { model.setup(); }, needle);
+    model.wait();  // setup() may have submitted initializer work before it threw (D135)
 }
 
 constexpr std::size_t kLen = 8;
@@ -929,12 +926,9 @@ TEST_CASE("ties: tie_outputs", "[system][tie]") {
 
     SECTION("plain outputs without allow_plain throw") {
         tsys::expect_setup_throws<tsys::TieOutPlain>("not atomic");
-        tsys::expect_throws(
-            [] {
-                cs::Model model = cs::create_model<tsys::TieOutPlain>(default_config(), false);
-                model.setup();
-            },
-            "require_atomic");
+        cs::Model model = cs::create_model<tsys::TieOutPlain>(default_config(), false);
+        tsys::expect_throws([&] { model.setup(); }, "require_atomic");
+        model.wait();  // setup() may have submitted initializer work before it threw (D135)
     }
 
     SECTION("plain outputs with allow_plain are accepted") {
@@ -993,6 +987,7 @@ TEST_CASE("marks: recorded on the Model with paths and bounds; the last of a kin
         REQUIRE(f->scaling.ref.size() == 1);
         CHECK(f->scaling.ref[0] == 2.0);  // the second mark's scaling
     }
+    model.wait();  // setup() submitted initializer work; wait before the Model goes out of scope (D135)
 }
 
 TEST_CASE("marks: ill-formed marks throw at setup", "[system][marks]") {
@@ -1141,6 +1136,7 @@ TEST_CASE("structural errors", "[system][errors]") {
         tsys::expect_throws([&] { sys.promote("a.y", "y"); }, "setup() only");
         tsys::expect_throws([&] { sys.tie_inputs({"a.x", "b.x"}, "t"); }, "setup() only");
         tsys::expect_throws([&] { sys.add_design_var("a.x"); }, "setup() only");
+        model.wait();  // setup() submitted initializer work (D135)
     }
     SECTION("an unknown path in view_output names the path") {
         cs::Model model = cs::create_model<tsys::ThreeAxpb>(default_config());
@@ -1150,6 +1146,7 @@ TEST_CASE("structural errors", "[system][errors]") {
         // The kind is checked too.
         tsys::expect_throws([&] { (void)model.view_output<DType::f32, 1>("a.x"); }, "is an input");
         tsys::expect_throws([&] { (void)model.view_input<DType::f32, 1>("a.y"); }, "is an output");
+        model.wait();  // setup() submitted initializer work (D135)
     }
 }
 

@@ -626,8 +626,8 @@ protected:
         run_system_init();
     }
 
-    /// Drop the storage of every root this System owns. SlabKit defers the
-    /// free, so work already submitted keeps its pointers.
+    /// Drop the storage of every root this System owns. Each root waits the
+    /// stream before it drops its storage, and SlabKit frees synchronously (D135).
     void release() {
         if (!transient_) return;
         for (detail::IOEntry* r : owned_roots_)

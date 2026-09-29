@@ -17,13 +17,11 @@
 // the order that makes their destruction the one §9.4 names: cfg, the mark
 // records, root, substrates, queue, ctx.
 //
-// LAYERING (§9.4). Each layer orders what it submits; ~Model waits the stream
-// as a convenience, before any member goes, and never throws.
+// LAYERING (§9.4). Each layer orders what it submits; ~Model does not wait
+// (D135): call wait() before a Model is destroyed or reassigned.
 
 #include <concepts>
 #include <cstddef>
-#include <cstdio>
-#include <exception>
 #include <memory>
 #include <optional>
 #include <span>
@@ -100,7 +98,7 @@ public:
     Model(const Model&)            = delete;
     Model& operator=(const Model&) = delete;
 
-    /// Waits the stream as a convenience (§9.4); never throws.
+    /// Does not wait (D135); never throws.
     ~Model() { finish(); }
 
     // ---- lifecycle -------------------------------------------------------------
@@ -292,17 +290,10 @@ private:
         return e;
     }
 
-    /// The last thing the Model does with its stream; never throws.
+    /// Releases the Impl in the §9.4 order. Does not wait: the user waits before destroying or reassigning a Model (D135).
     void finish() noexcept {
         if (!s_) return;
-        try {
-            s_->queue.wait_and_throw();
-        } catch (const std::exception& e) {
-            std::fprintf(stderr, "naga::cospan: ~Model: the stream reported an error: %s\n", e.what());
-        } catch (...) {
-            std::fprintf(stderr, "naga::cospan: ~Model: the stream reported an unknown error\n");
-        }
-        s_.reset();  // members go in the §9.4 order
+        s_.reset();
     }
 
     /// Depth-first in declaration order: a System's own alias entries, then its

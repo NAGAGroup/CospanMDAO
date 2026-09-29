@@ -640,4 +640,5 @@ TEST_CASE("phase guards: initializers, reshape and declare outside their phase t
         auto y = wait_and_view<DType::f32, 1>(model, "ini.y");
         CHECK(to_vector(y) == std::vector<float>({121.0f, 222.0f, 323.0f, 424.0f}));
     }
+    model.wait();  // setup() submitted initializer work; wait before the Model goes out of scope (D135)
 }

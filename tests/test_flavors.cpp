@@ -629,6 +629,7 @@ TEST_CASE("parallel: rejections at setup", "[flavors][parallel][errors]") {
             }});
         });
         tfl::expect_throws([&] { model.setup(); }, {"takes property::device only"});
+        model.wait();  // setup() may have submitted initializer work before it threw (D135)
     }
     SECTION("parallel and fused together") {
         cs::Model model = tfl::make([](cs::System& s) {
@@ -636,6 +637,7 @@ TEST_CASE("parallel: rejections at setup", "[flavors][parallel][errors]") {
                             s.child<tfl::Src1>("s", std::array<int, 1>{4}));
         });
         tfl::expect_throws([&] { model.setup(); }, {"two flavors"});
+        model.wait();  // setup() may have submitted initializer work before it threw (D135)
     }
     // Compile-time rejection of System children is the static_asserts at the top of the file.
 }
@@ -911,6 +913,7 @@ TEST_CASE("fused: a value-driven size driven by a stage of the same fuse throws 
             s.connect("f.a.n", "f.b.n");  // b's output size is the VALUE of a's output
         });
         tfl::expect_throws([&] { model.setup(); }, {"top.f.b", "top.f.a", "VALUE"});
+        model.wait();  // setup() may have submitted initializer work before it threw (D135)
     };
     SECTION("sequential") { refused(cs::FusedSystem::Mode::sequential); }
     SECTION("parallel") { refused(cs::FusedSystem::Mode::parallel); }
@@ -1009,14 +1012,17 @@ TEST_CASE("fused: a custom-op child, a host child and mixed ranks throw at setup
     SECTION("custom-op child") {
         cs::Model model = bad_wave(std::type_identity<tfl::NopCustom>{}, true);
         tfl::expect_throws([&] { model.setup(); }, {"top.f.bad", "custom-op", "cannot be fused"});
+        model.wait();  // setup() may have submitted initializer work before it threw (D135)
     }
     SECTION("host child") {
         cs::Model model = bad_wave(std::type_identity<tfl::NopHost>{}, true);
         tfl::expect_throws([&] { model.setup(); }, {"top.f.bad", "host", "cannot be fused"});
+        model.wait();  // setup() may have submitted initializer work before it threw (D135)
     }
     SECTION("children of different ranks") {
         cs::Model model = bad_wave(std::type_identity<tfl::Src2>{}, false);
         tfl::expect_throws([&] { model.setup(); }, {"top.f.bad", "share one rank"});
+        model.wait();  // setup() may have submitted initializer work before it threw (D135)
     }
 }
 

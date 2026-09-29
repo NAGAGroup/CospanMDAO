@@ -642,6 +642,7 @@ TEST_CASE("Marks: design variables, objective, constraints, one record per root"
     }
     CHECK(on_g1 == 1);
     CHECK(on_g2 == 1);
+    model.wait();  // setup() submitted initializer work; wait before the Model goes out of scope (D135)
 }
 
 // =============================================================================================
@@ -662,6 +663,7 @@ TEST_CASE("Lifecycle: errors before setup, setup twice, moved-from, default_devi
         auto m = cs::create_model<Top>(default_config());
         m.setup();
         tmod::expect_throws([&] { m.setup(); }, {"runs once"});
+        m.wait();  // the first setup() submitted initializer work (D135)
     }
     SECTION("forward on a moved-from Model throws; the moved-to Model runs") {
         auto m = cs::create_model<Top>(default_config());
@@ -707,6 +709,7 @@ TEST_CASE("Host access: errors name the path; view_output_mut survives a forward
         tmod::expect_throws([&] { model.set_input<DType::f32, 1>("z", std::span<const float>{two.data(), 1}); }, {"'z'", "shape"});
         // The right call still works after all that.
         CHECK_NOTHROW(model.set_input<DType::f32, 1>("z", std::span<const float>{two}));
+        model.wait();  // setup() and the last set_input submitted work (D135)
     }
 
     SECTION("view_output_mut on an output the forward does not overwrite") {
