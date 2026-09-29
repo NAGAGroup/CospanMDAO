@@ -319,3 +319,39 @@ Only `EntryAccess::set_transient` is removed, since System now owns transient ma
 
 ## D73 — Test-only RootDriver
 `detail::RootDriver` in smoke_system does what a Model will: place the root, `run_setup`, `get_exec_info`, substrates (arena if the total is nonzero, with 4096*64 slack; pool 1<<20), `prepare_exec`, `compile`, `run_init`, `run_system_init`; `forward()` is `run_compute_forward()` + `q.wait()`. It is not public API. r01 §11.2.
+
+## D74 — ParallelSystem children are Components, checked at compile time
+`ParallelSystem::add_subsystem<T>` is constrained to `T` derived from `ComponentBase`. Its declarations hide every `add_subsystem` of System, so a System child, a nested Parallel and the untyped `add_subsystem(name, props)` (explicitly `= delete`d) have no viable overload. Reason: a System cannot discern its children at runtime (r01 §1 need 2.2 parallel, P5); the type system is the only place to refuse. r01 §7.5.
+
+## D75 — Only property::device on a ParallelSystem child, checked at runtime
+The property-list overload accepts a `property_list` and throws `invalid_argument` if it holds `parallel`, `transient` or `fused`. Reason: a `property_list` is a runtime value, so its content cannot be a compile-time constraint; the child's device is the one property that means something inside a group. r01 §7.5.
+
+## D76 — The runner's order
+`run_compute_forward`: `revive()`; pre-compute ALL children; compute ALL (collect the descriptions; a null description is a `logic_error`); the sibling-shape check; ONE `queue->submit_group` in which each description is submitted to its child's own `ExecCtx::target()`; post-compute ALL after the group returns; `release()`; return null. Reason: the group is one stream item, so pre/post work and the check (which reads only metadata) sit outside it. r01 §7.5, §11.3.1.
+
+## D77 — ctx.group is set only during submit_group
+An RAII `GroupScope` sets `group` on the Parallel's `ctx_` and on every `child_ctx_` entry for the extent of the `submit_group` lambda and resets it to null on any exit. Reason: a host body under a group must use `group.async_host` (D45) and nothing outside the group may see a dangling group. r01 §7.3.
+
+## D78 — The sibling-shape check
+Each forward, after compute and before the submit: a child input whose ROOT is an output declared by a SIBLING, with any dimension a FromSourceDim, throws `invalid_argument` naming the input, the consumer's path, the source and the sibling's path. Reason: siblings run unordered inside the group, so the source's extent is not known when the consumer launches; this is the only dependency visible on metadata. It reads only public entry accessors (`get_inputs`, `root`, `declarer`, `dim`); a root that is a System alias (a tie) has a System declarer and is not seen. r01 §7.5.
+
+## D79 — The helper form builds a ParallelSystem; amends D71
+`add_subsystem(name, props, child<T>(...)...)` with `property::parallel` builds a ParallelSystem; `fused` still throws "step 3b"; `parallel` and `fused` together throw `invalid_argument`. A TYPED child given `property::parallel` throws unless its type derives from ParallelSystem. Reason: the flavor selects a runner, which only the helper form can build without a user class. r01 §7.5.
+
+## D80 — `detail::parallel_of` keeps the include order acyclic
+system.hpp forward-declares ParallelSystem and names it through `detail::parallel_of<Children...>::type`, a dependent name, so the type only has to be complete when the helper form is instantiated. parallel_system.hpp includes system.hpp; use `naga/cospan/cospan.hpp` (or parallel_system.hpp) wherever the helper form is used. Reason: avoids a circular include without a separate translation unit. r01 §7.5.
+
+## D81 — System access changes for flavors
+`revive()`, `release()`, `describe()`, `ctx_`, `child_ctx_` and `children_` are `protected`; the rest of System's state stays private. `populate<S>` (private) builds the helper form's child through `add_child<S>` and raises the new System's declaring flag for the adds. Reason: a flavor's runner needs the transient contract and the per-child contexts; nothing else. r01 §7.2.
+
+## D82 — Case d's compile-time check is a concept
+`static_assert`s use `concept CanAdd<P, T> = requires(P& p) { p.template add_subsystem<T>(name); }`. Reason: a requires-expression with an invalid expression outside a template is ill-formed rather than false; a concept over dependent parameters yields false. The device-only-property, typed-parallel and flavor rules are runtime and are checked by the throws they raise. r01 §7.5.
+
+## D83 — RootDriver moved to tests/smoke/driver.hpp
+The driver is shared by smoke_system and smoke_parallel, and now exposes `info` (what the root's `get_exec_info` returned), `enqueue()` (a forward without a wait), `wait()` and `forward()`. Reason: the Parallel smoke enqueues three forwards back to back (§11.3: a loop of forwards need not wait). Test-only. r01 §11.2.
+
+## D84 — An exception during a forward leaves the subtree unreleased
+If a child's pre/compute (or the sibling check) throws after `revive()`, `release()` is not run. Reason: a forward that throws is an error state, not a supported flow; the RAII for that would hide the failure. Known consequence, not fixed here. r01 §4.4.
+
+## D85 — Arena over-reservation not investigated in this step
+The check of get_exec_info's byte total against the distinct arena-eligible roots (suspected from reading the code, not measured: a consumer declared before its producer may count a root's bytes twice, once from the input peer and once from the root's owner) is deferred to its own dispatch. Reason: user's scope for 3b-1. r01 §4.2, §11.2.
