@@ -51,7 +51,7 @@ namespace property {
 struct device { sycl::device dev; };  ///< placement; inherited when absent
 struct parallel {};                   ///< flavor: the helper form builds a ParallelSystem (§7.5)
 struct transient {};                  ///< the subtree's memory is released after each run (§4.4); Systems only
-struct fused {                        ///< flavor (step 3b: throws when used)
+struct fused {                        ///< flavor: the helper form builds a FusedSystem (§7.5)
     enum class Mode : uint8_t { sequential, parallel };
     Mode                          mode = Mode::sequential;
     std::optional<sycl::range<3>> wg;
@@ -188,7 +188,7 @@ public:
     /// and ONE flavor), populated with the given Components in order. With
     /// property::parallel it is a ParallelSystem (§7.5); a plain System
     /// otherwise. With property::fused it is a FusedSystem (§7.5) carrying the
-    /// property's mode and work-group; parallel mode is step 3b-3 and throws.
+    /// property's mode (sequential or parallel) and work-group.
     template <class... Children>
         requires(sizeof...(Children) >= 1 &&
                  (detail::is_child_decl_v<std::remove_cvref_t<Children>> && ...))

@@ -10,6 +10,11 @@
 //      FusedSystem inserts between the two scratch stages is really there.
 //   c. A rank-2 wave (40 x 30) of two plain stages, the FusedSystem's work-group {8,8}.
 //   d. The helper form, property::fused{sequential}, builds a FusedSystem and runs A + B.
+//   e. PARALLEL mode: three independent stages of different sizes (plain 1000, plain 257,
+//      group + Scratch reverse 640), each in its own slice of groups; all three are checked.
+//   f. PARALLEL mode producer-consumer (B reads A's output): the forward throws naming both;
+//      with allow_producer_consumer() it runs (values are the user's assertion, not checked).
+//   g. Error cases at compile/setup: a custom-op child, a host child, children of different ranks.
 
 #include <cmath>
 #include <cstdio>
@@ -437,6 +442,213 @@ static void case_d(const sycl::device& dev, sk::queue& q) {
     check(values_of<1>(q, top.entry_at("f.b.z")) == want_z, "d: B: z == y*y");
 }
 
+// ---- e. parallel mode, three independent stages --------------------------------------------
+constexpr std::size_t kE1 = 1000, kE2 = 257, kE3 = 640;  // 16 + 5 + 10 groups of 64
+
+class WaveE : public cs::FusedSystem {
+public:
+    WaveE() : cs::FusedSystem(Mode::parallel) {}
+    void setup() override {
+        add_subsystem<StepA>("a");                 // plain, 1000
+        add_subsystem<StepC>("c");                 // plain, 257
+        add_subsystem<GroupStage<RevBody>>("r");   // group + Scratch, 640, work-group 64
+    }
+};
+
+class TopE : public cs::System {
+public:
+    void setup() override {
+        add_subsystem<Src>("src1", kE1);
+        add_subsystem<Src>("src2", kE2);
+        add_subsystem<Src>("src3", kE3);
+        add_subsystem<WaveE>("f");
+        connect("src1.y", "f.a.x");
+        connect("src2.y", "f.c.x");
+        connect("src3.y", "f.r.x");
+    }
+};
+
+static void case_e(const sycl::device& dev, sk::queue& q) {
+    std::printf("-- e. parallel-mode wave of three independent stages (plain 1000, plain 257, group+scratch 640)\n");
+    TopE       top;
+    RootDriver d{dev, q, top};
+    d.start();
+
+    std::vector<float> want_a(kE1), want_c(kE2), x3(kE3);
+    for (std::size_t i = 0; i < kE1; ++i) want_a[i] = 2.0f * static_cast<float>(i + 1) + 1.0f;
+    for (std::size_t i = 0; i < kE2; ++i) want_c[i] = static_cast<float>(i + 1) + 3.0f;
+    for (std::size_t i = 0; i < kE3; ++i) x3[i] = static_cast<float>(i + 1);
+    const std::vector<float> want_r = reverse_in_groups(x3, kWg);
+
+    d.forward();
+    check(values_of<1>(q, top.entry_at("f.a.y")) == want_a, "e: plain stage (1000): y == 2x + 1");
+    check(values_of<1>(q, top.entry_at("f.c.w")) == want_c, "e: plain stage (257, ragged): w == x + 3");
+    check(values_of<1>(q, top.entry_at("f.r.y")) == want_r, "e: group+scratch stage (640): reversed within each work-group");
+
+    d.enqueue();
+    d.enqueue();
+    d.enqueue();
+    d.wait();
+    check(values_of<1>(q, top.entry_at("f.a.y")) == want_a && values_of<1>(q, top.entry_at("f.c.w")) == want_c &&
+              values_of<1>(q, top.entry_at("f.r.y")) == want_r,
+          "e: three forwards enqueued back to back: all three outputs intact");
+}
+
+// ---- f. parallel mode, producer-consumer ---------------------------------------------------
+template <bool Allow>
+class ChainWave : public cs::FusedSystem {
+public:
+    ChainWave() : cs::FusedSystem(Mode::parallel) {
+        if constexpr (Allow) allow_producer_consumer();
+    }
+    void setup() override {
+        add_subsystem<StepA>("a");
+        add_subsystem<StepB>("b");
+    }
+};
+
+template <bool Allow>
+class TopChain : public cs::System {
+public:
+    void setup() override {
+        add_subsystem<Src>("src", kN);
+        add_subsystem<ChainWave<Allow>>("f");
+        connect("src.y", "f.a.x");
+        connect("f.a.y", "f.b.y");  // B reads A's output: a producer-consumer pair
+    }
+};
+
+static void case_f(const sycl::device& dev, sk::queue& q) {
+    std::printf("-- f. parallel-mode producer-consumer: throws, unless allow_producer_consumer()\n");
+    {
+        TopChain<false> top;
+        RootDriver      d{dev, q, top};
+        d.start();  // compiles fine: the pair is only seen on the forward
+        bool        threw = false;
+        std::string what;
+        try {
+            d.forward();
+        } catch (const std::exception& e) {
+            threw = true;
+            what  = e.what();
+            std::printf("      %s\n", what.c_str());
+        }
+        check(threw, "f: B reading A's output in a parallel-mode wave throws");
+        check(what.find("top.f.a") != std::string::npos && what.find("top.f.b") != std::string::npos,
+              "f: the message names both stages");
+    }
+    {
+        TopChain<true> top;
+        RootDriver     d{dev, q, top};
+        d.start();
+        bool threw = false;
+        try {
+            d.forward();
+        } catch (const std::exception& e) {
+            threw = true;
+            std::printf("      %s\n", e.what());
+        }
+        check(!threw, "f: with allow_producer_consumer() the forward runs (values are the user's assertion)");
+    }
+}
+
+// ---- g. compile/setup errors ---------------------------------------------------------------
+struct NopCustomBody {
+    struct Inputs {
+        cs::Input<DType::f32, 1> x;
+    };
+    struct Outputs {
+        cs::Output<DType::f32, 1> y;
+    };
+    void operator()(cs::CustomOp&, Inputs, Outputs) const {}
+};
+
+class NopCustom : public cs::Component<NopCustomBody> {
+    cs::Input<DType::f32, 1>  x_;
+    cs::Output<DType::f32, 1> y_;
+
+public:
+    void setup() override {
+        declare_input(x_, "x", cs::from_source_shape<1>());
+        declare_output(y_, "y", cs::from_input_shape<1>("x"));
+    }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+        return create_launch_config({x_}, {y_}, {});
+    }
+};
+
+struct NopHostBody {
+    struct Inputs {
+        cs::Input<DType::f32, 1> x;
+    };
+    struct Outputs {
+        cs::Output<DType::f32, 1> y;
+    };
+    void operator()(cs::Host, Inputs, Outputs) const {}
+};
+
+class NopHost : public cs::Component<NopHostBody> {
+    cs::Input<DType::f32, 1>  x_;
+    cs::Output<DType::f32, 1> y_;
+
+public:
+    void setup() override {
+        declare_input(x_, "x", cs::from_source_shape<1>());
+        declare_output(y_, "y", cs::from_input_shape<1>("x"));
+    }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+        return create_launch_config({x_}, {y_}, {});
+    }
+};
+
+// A valid plain stage first, then the offender.
+template <class Bad>
+class WaveBad : public cs::FusedSystem {
+public:
+    WaveBad() : cs::FusedSystem(Mode::parallel) {}
+    void setup() override {
+        add_subsystem<StepA>("a");
+        add_subsystem<Bad>("bad");
+    }
+};
+
+// BadHasInput: the offender has an input that needs a source; Init2 has none.
+template <class Bad, bool BadHasInput>
+class TopBad : public cs::System {
+public:
+    void setup() override {
+        add_subsystem<Src>("src", kN);
+        add_subsystem<WaveBad<Bad>>("f");
+        connect("src.y", "f.a.x");
+        if constexpr (BadHasInput) {
+            add_subsystem<Src>("src2", kN);
+            connect("src2.y", "f.bad.x");
+        }
+    }
+};
+
+// True when start() (setup + compile) throws with `needle` in the message.
+template <class Top>
+static bool start_throws_with(const sycl::device& dev, sk::queue& q, const char* needle) {
+    try {
+        Top        top;
+        RootDriver d{dev, q, top};
+        d.start();
+    } catch (const std::exception& e) {
+        std::printf("      %s\n", e.what());
+        return std::string{e.what()}.find(needle) != std::string::npos;
+    }
+    return false;
+}
+
+static void case_g(const sycl::device& dev, sk::queue& q) {
+    std::printf("-- g. errors at compile/setup: custom-op child, host child, mixed ranks\n");
+    check(start_throws_with<TopBad<NopCustom, true>>(dev, q, "cannot be fused"), "g: a custom-op child throws");
+    check(start_throws_with<TopBad<NopHost, true>>(dev, q, "cannot be fused"), "g: a host child throws");
+    check(start_throws_with<TopBad<Init2, false>>(dev, q, "share one rank"),
+          "g: children of different kernel ranks throw (rank 1 + rank 2)");
+}
+
 int main() {
     try {
         sycl::device dev{sycl::default_selector_v};
@@ -447,6 +659,9 @@ int main() {
         case_b(dev, q);
         case_c(dev, q);
         case_d(dev, q);
+        case_e(dev, q);
+        case_f(dev, q);
+        case_g(dev, q);
     } catch (const std::exception& e) {
         std::printf("EXCEPTION: %s\n", e.what());
         return 2;

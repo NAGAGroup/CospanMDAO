@@ -1,7 +1,7 @@
 #pragma once
 
 // =============================================================================
-// naga/cospan/fused_system.hpp — FusedSystem, sequential mode (r01 §5.4-§5.7, §7.5)
+// naga/cospan/fused_system.hpp — FusedSystem, sequential and parallel mode (r01 §5.4-§5.7, §7.5)
 // =============================================================================
 //
 // CHILDREN ARE COMPONENTS ONLY (the D74 pattern, as ParallelSystem). Their
@@ -31,6 +31,14 @@
 // reads). An input carrying a subarray view is never element-wise. Reading the
 // output of a LATER stage is an error. Anything else throws, naming both stages.
 //
+// PARALLEL MODE. The stages are independent: each gets its OWN slice of groups,
+// group_offset = the running sum of the previous stages' group counts, and the
+// launch has the SUM of the group counts. No barriers are inserted (stages own
+// disjoint groups, so they never use the shared local buffer at the same time).
+// Every forward, validate() refuses any stage that reads another stage's output
+// in the same wave (the stages run unordered) unless allow_producer_consumer()
+// was called: that is the user's assertion that the pair is safe (trust model).
+//
 // Include order: this header includes system.hpp, whose helper form
 // (property::fused) needs FusedSystem complete when it is instantiated, so
 // include naga/cospan/cospan.hpp (or this header).
@@ -59,11 +67,13 @@ public:
     /// `wg`: the wave's work-group shape; absent, it is the stages' common
     /// requested shape, else the default for the wave's rank.
     explicit FusedSystem(Mode mode = Mode::sequential, std::optional<sycl::range<3>> wg = {})
-        : mode_{mode}, wg_{wg} {
-        if (mode_ == Mode::parallel)
-            throw std::logic_error("naga::cospan: FusedSystem parallel mode is step 3b-3 (not implemented yet)");
-    }
+        : mode_{mode}, wg_{wg} {}
     ~FusedSystem() override = default;
+
+    /// Parallel mode: assert that a stage reading another stage's output is safe
+    /// (the user's responsibility; the framework then skips that check). It has
+    /// no effect in sequential mode, whose own dependency rule is not overridable.
+    void allow_producer_consumer() { allow_pc_ = true; }
 
     // ---- adding children: Components only, at compile time (D74) ----------------------------
     template <class T, class... Args>
@@ -101,11 +111,12 @@ public:
         }
 
         // The call sequence, built ONCE: definition ids in child order, plus a
-        // barrier after a scratch stage when a later stage also uses scratch.
+        // barrier after a scratch stage when a later stage also uses scratch (sequential mode only; parallel-mode stages own disjoint groups).
         std::vector<detail::JitId> defs;
         for (std::size_t i = 0; i < n; ++i) {
             defs.push_back(stage(i).definition_id());
-            if (stage(i).has_scratch() && later_has_scratch(i)) defs.push_back(detail::wave_barrier_id(rank_));
+            if (mode_ == Mode::sequential && stage(i).has_scratch() && later_has_scratch(i))
+                defs.push_back(detail::wave_barrier_id(rank_));
         }
         cfg_ = std::make_unique<sycl::AdaptiveCpp_jit::dynamic_function_config>();
         cfg_->define_as_call_sequence(detail::wave_entry_id(rank_), defs);
@@ -187,6 +198,15 @@ private:
                 const std::string who = "input '" + std::string{e.name()} + "' of '" + children_[i]->path() +
                                         "' reads '" + std::string{r->name()} + "', an output of '" +
                                         children_[j]->path() + "'";
+                if (mode_ == Mode::parallel) {
+                    // The stages run unordered: ANY producer-consumer pair inside the wave is a race,
+                    // unless the user asserted otherwise (allow_producer_consumer(), the trust model).
+                    if (allow_pc_) continue;
+                    throw std::invalid_argument(
+                        "naga::cospan: " + describe() + ": forward: " + who +
+                        "; the stages of a parallel-mode wave run unordered, so no stage may read another's output "
+                        "(call allow_producer_consumer() if the pair is known to be safe)");
+                }
                 if (j > i)
                     throw std::invalid_argument("naga::cospan: " + describe() + ": forward: " + who +
                                                 ", a LATER stage of the wave");
@@ -258,7 +278,7 @@ private:
         std::size_t              total_groups = 0, local_bytes = 0;
         for (const KernelParts* p : parts) {
             StageRecord r  = p->record;
-            r.group_offset = 0;  // sequential: every stage starts at group 0
+            // group_offset is stamped below, once this stage's group_count is known
             if (p->group_body) {
                 for (int d = 0; d < 3; ++d) r.group_range[d] = (r.range[d] + w[d] - 1) / w[d];
                 r.group_count = r.group_range[0] * r.group_range[1] * r.group_range[2];
@@ -270,7 +290,13 @@ private:
             r.output_off  = append(out, p->outputs);
             r.body_off    = append(body, p->body);
             r.scratch_off = p->has_scratch ? r.body_off + p->record.scratch_off : 0;  // record's is 0-relative to the body
-            total_groups  = std::max(total_groups, r.group_count);
+            if (mode_ == Mode::parallel) {
+                r.group_offset = total_groups;  // this stage's slice starts after all previous slices
+                total_groups += r.group_count;  // the launch is the sum of the slices
+            } else {
+                r.group_offset = 0;  // sequential: every stage starts at group 0
+                total_groups   = std::max(total_groups, r.group_count);
+            }
             local_bytes   = std::max<std::size_t>(local_bytes, r.scratch_bytes);
             recs.push_back(r);
         }
@@ -300,6 +326,7 @@ private:
     }
 
     Mode                          mode_;
+    bool                          allow_pc_ = false;  // parallel mode: producer-consumer pairs are allowed
     std::optional<sycl::range<3>> wg_;
     int                           rank_ = 0;
     std::unique_ptr<sycl::AdaptiveCpp_jit::dynamic_function_config> cfg_;
