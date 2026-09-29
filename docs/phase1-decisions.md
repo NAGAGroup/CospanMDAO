@@ -69,12 +69,12 @@ peer may carry an optional `SubarrayRef` (`view()`), and its wrapper geometry is
 the view extents over the ROOT storage with the ROOT contiguous strides and the
 offset folded into the pointer. r01 §3, §4.
 
-## D7 — Substrates are declared in metadata.hpp
+## D7 — Substrates are declared in subsystem.hpp (amended in step 2a; was metadata.hpp)
 `MemorySubstrate { optional<sk::DeviceArena> arena; optional<sk::DevicePool>
-pool; }` and `Substrates = unordered_map<sycl::device, MemorySubstrate>` are in
-metadata.hpp because `IOEntry::allocate(queue, Substrates&)` takes them. r01
-§7.1 defines the substrate but not the header. The System (later step) will own
-and fill the map; the smoke test fills one by hand.
+pool; }` and `Substrates = unordered_map<sycl::device, MemorySubstrate>` live in
+subsystem.hpp (D19); metadata.hpp includes it because `IOEntry::allocate(queue,
+Substrates&)` takes them. r01 §7.1 defines the substrate but not the header. The
+System (later step) will own and fill the map; the smokes fill one by hand.
 
 ## D8 — MarkRecord sits with the geometry types
 `MarkRecord { root, optional<SubarrayRef> region, Bounds, optional equals,
@@ -152,3 +152,63 @@ storage goes through non-const usm_vector paths, so they take
 ## D18 — `sk` alias
 `namespace sk = ::naga::slabkit;` is declared in `naga::cospan` (metadata.hpp).
 SlabKit does not provide the alias. Internal, not part of the public surface.
+
+## D19 — subsystem.hpp is standalone
+It holds `MemorySubstrate`/`Substrates` (D7), `SubmitTarget`, `ExecCtx`, `LaunchDescription`, and `Subsystem`. It forward-declares `KernelParts` and `System` only, so metadata.hpp (substrates) and kernel.hpp (`SubmitTarget`) can include it without a cycle. `LaunchDescription` is declared before its users; r01 §7.1 lists it after them.
+
+## D20 — LaunchDescription gains `is_host()`
+Pure virtual beside `is_custom_op()`; `kernel()` returns `nullptr` by default (custom-op and host descriptions). The owner routes host bodies on `is_host()`. r01 §7.1 names only `is_custom_op()`.
+
+## D21 — `path()` is stored, and `run_system_init` is pure in Subsystem
+`Subsystem` keeps `name_`, `path_` and `owner_`, written by the owner (System through friendship; `detail::SubsystemAccess::place` stands in until System exists); `path()` is not computed. `run_system_init()` is pure in `Subsystem` and a no-op in `ComponentBase` (a Component's System pass does nothing).
+
+## D22 — Runner bodies live in ComponentBase
+Friendship with `detail::IOEntry` is not inherited, so every runner body that touches no KB-typed state (`run_setup`, `get_exec_info`, `prepare_exec`, `run_init`, `run_pre_compute`, `run_post_compute`) is in `ComponentBase`. `Component<KB>` overrides only `compile()` and `run_compute_forward()`. It keeps no `CompiledKernelMeta`; the config pointer is its only compiled state. r01 §6.3 puts all runners in `Component<KB>`.
+
+## D23 — A Component keeps the queue and substrates from prepare_exec
+`ComponentBase` stores `sk::queue*` and `Substrates*` in `prepare_exec` and uses them to allocate roots and to read values on the host; it holds the whole map because root allocation takes `Substrates&` (`ExecCtx::substrate` is one device's substrate only). The device is recorded in `get_exec_info`.
+
+## D24 — "Known shape" and allocation timing
+A root is allocated when its shape is known, meaning `flat_size() > 0`. Roots with a known shape are allocated in `prepare_exec`; the rest (value-driven or derived shapes) at the first `run_pre_compute` that resolves them, after `pre_forward()`. A root left empty is never allocated. Allocation is idempotent per device (D13).
+
+## D25 — Entry and wrapper additions
+`IOEntry::has_storage()` (pure; the root has been allocated) guards `point_wrapper`, which throws on an unallocated root. `InputEntry::member()`/`OutputEntry::member()` return the wrapper a declaration bound. `friend struct CustomOp;` was added to `Input`, `Output` and `Initializer`; `friend struct detail::ScratchLayout;` to `Local`.
+
+## D26 — CustomOp::device_ptr
+Only `device_ptr` exists (D1). It returns `const value_type*` for an `Input` and `value_type*` for an `Output` or `Initializer` (the wrapper's `data_`). r01 §5.1 says `W::value_type*`, which loses the `Input` constness.
+
+## D27 — KernelBodyC and launch_rank_v
+`KernelBodyC` accepts exactly one of plain, group, custom-op and host (`HostBody` is a fourth kind, D3): a trivially copyable `KB`, `Inputs`, `Outputs` and `Scratch`. `kernel_rank_v<KB>` is 0 for custom-op and host bodies; `launch_rank_v<KB>` (never 0) types the `range` parameters of `create_launch_config`.
+
+## D28 — GroupItem stores stage-local group ids
+`GroupItem<R>` holds the physical `nd_item`, a stage-local `group_id_` and `group_range_` (from `StageRecord::group_offset` and `group_range`), instead of r01's `group_offset_`. `get_group()` returns the physical `sycl::group<R>` for barriers and reductions. Only `detail::ItemFixup` constructs one.
+
+## D29 — Scratch layout by structured bindings
+The Locals of a `Scratch` are enumerated by structured bindings over an aggregate (`field_count` by conversion probe): at most 6 members, all `Local`. `layout_scratch` aligns each Local to its element type, sums, and rounds the total to 16 bytes; `fixup_scratch` sets each pointer from the work-group's local base.
+
+## D30 — Default work-groups and group counts
+Default work-group: rank 1 `{128}`, rank 2 `{8,8}`, rank 3 `{4,4,4}` (`detail::default_wg`); a `wg` argument overrides it for group bodies. Physical launch: `global = {G*wg0, wg1, wg2}`, `local = wg`, groups laid along dim 0 only. A group body has `group_range[d] = ceil(range[d]/wg[d])` and `group_count` their product. A plain body has `group_count = ceil(flat_extent / wg_size)` and `group_range = {group_count, 1, 1}`, with the tail masked in `kb_fn`.
+
+## D31 — Individual launches capture typed structs by value
+`detail::KernelLaunch<KB>` (in component.hpp) captures one `Payload { StageRecord; Inputs; Outputs; { KB; Scratch } }` by value in the outer kernel's lambda. There is no staging allocation. `KernelParts.record` offsets are 0-relative to its spans (`input_off = output_off = body_off = 0`, `scratch_off` = the Scratch's offset in the body span); the owner re-bases them. A launch with `flat_extent == 0` submits nothing. Fused waves (step 3) stage the same bytes through device buffers.
+
+## D32 — compile() builds the config once
+`Component<KB>::compile()` makes one `dynamic_function_config` and calls `define(&kb_entry_rR, &kb_fn<KB>)` for the body's rank, naming both functions in source as the spike did. `create_launch_config` before `compile()` throws. Custom-op and host bodies throw `logic_error` "step 2b" from `compile()`.
+
+## D33 — FromInput is honored on own inputs and outputs
+Shape resolution (`run_pre_compute`) covers every own entry, inputs first, then outputs, with cycle detection. `FromInputDim` reads the sibling input's extent; `FromInput` reads the driving input's value with `take_snapshot` (integer dtypes only; a negative value throws), allocating the sibling root first if it is still unallocated. r01 §6.5 says "each own input", but its example (a) uses `FromInput` on an output.
+
+## D34 — Initializers on an unallocated root
+`fill_*`, `zero_*` and the initializer getters are legal in `init()` only. `fill_*`/`zero_*` write the root's PRIMARY storage, then sync the other devices. On a root that is unallocated and empty (`flat_size() == 0`, a shape still to be resolved) they are a no-op, since a fresh allocation is zero-filled; on an unallocated non-empty root they throw. r01 §6.7(a) `zero_output("bins")` conflicts with §11.2.6 "An initializer on unallocated storage throws."
+
+## D35 — Declaration overloads
+`declare_input`/`declare_output` accept: a variadic pack of `DimSpec` (count = Rank); a `std::array<S, Rank>` (what `from_source_shape`/`from_input_shape` return); and the `FromInputArray` marker, expanded against the member's Rank. `get_inputs()`/`get_outputs()` return `std::vector<std::reference_wrapper<const detail::IOEntry>>` in declaration order.
+
+## D36 — create_launch_config overloads
+`(range, in, out, body = {})` for plain and scratch-free group bodies; `(range, wg, in, out, body = {})` for scratch-free group bodies; `(range, wg, in, out, scratch, body = {})` for `HasScratch`; `(in, out, body = {})` for custom-op and host bodies, which `static_assert` "step 2b" when used. The scratch parameter is typed `detail::scratch_t<KB>` so a body without Scratch still declares the class.
+
+## D37 — Post-compute sync and host-kind storage
+`run_post_compute` refreshes the other-device copies of every own output ROOT that has storage on more than one device. A Component's I/O uses device storage, host storage for a host body (`default_storage_kind()`).
+
+## D38 — TestDriver is test-only
+`detail::TestDriver` (in tests/smoke/smoke_component.cpp) stands in for System: `run_setup`, `get_exec_info`, arena sized from the returned bytes plus 4096 per component and a 1 MiB pool, `prepare_exec`, `compile`, `run_init`; per forward `run_pre_compute`, `run_compute_forward`, `submit`, `run_post_compute`. Components are connected with `EntryAccess::merge(producer_out, consumer_in)`; producers are added before consumers.
