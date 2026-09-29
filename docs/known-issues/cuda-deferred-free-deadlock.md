@@ -1,15 +1,17 @@
 # CUDA: deadlock after a deferred OS-route free (no pool)
 
-Status: WORKED AROUND in SlabKit (see "Status" below); root cause in the AdaptiveCpp fork, fix pending.
+Status: the fork bug is still present in naga-acpp 2026.09.29; the fix is committed in the fork, unbuilt (see "Status" below).
 Below CoSpan: the tests are correct and no longer need a tag; the CUDA runs are unfiltered.
 
 ## Status
 
-The issue was worked around in SlabKit e5e2ac1 (full sha e5e2ac15f31a88bb4a565b2eb18933f5aba140e1), where frees run on their own lane, so no kernel depends on one.
+SlabKit e5e2ac1 (full sha e5e2ac15f31a88bb4a565b2eb18933f5aba140e1) puts deferred frees on their own queue. That is the design (nothing depends on a free), not a workaround. As a side effect SlabKit no longer triggers the fork bug, so CoSpan's suite passes on CUDA.
 
-The root cause is the fork: `cuda_queue::needs_completed_requirements` (and hip_queue's) defers only when the requirement's device backend differs. The scheduler assigns an async_host node the target device (`dag_direct_scheduler.cpp`: `return std::make_pair(&rt->async_host(), dev)`), so it is not deferred. `inorder_executor::submit_inline` then classes it as external (`!is_backend_queue()`) and uses `submit_external_wait_for`, which calls cudaLaunchHostFunc with a blocking callback.
+The fork bug is still present in naga-acpp 2026.09.29: on CUDA and HIP, a kernel that depends on an unfinished async_host node gets that dependency as a blocking host callback in the stream. CoSpan host components (D3) followed by a device consumer still take that path until a fixed fork build is used.
 
-The fix is pending a fork rebuild: apply the same `is_backend_queue` test in `needs_completed_requirements`.
+The cause: `cuda_queue::needs_completed_requirements` (and hip_queue's) defers only when the requirement's device backend differs. The scheduler assigns an async_host node the target device (`dag_direct_scheduler.cpp`: `return std::make_pair(&rt->async_host(), dev)`), so it is not deferred. `inorder_executor::submit_inline` then classes it as external (`!is_backend_queue()`) and uses `submit_external_wait_for`, which calls cudaLaunchHostFunc with a blocking callback.
+
+The fix is committed in the fork at b04d8349 (naga/develop, unbuilt, unpushed): `needs_completed_requirements` now also defers requirements not issued to a backend queue. Verifying it needs a CUDA build plus a program where a kernel depends on a still-running async_host task on the same device, since CoSpan and SlabKit no longer trigger it.
 
 ## Symptom
 
@@ -138,7 +140,7 @@ so the affected tests keep exercising the OS route.
 ## Test tag
 
 The `[os-free]` tag is gone. It marked the WeightedHistogram case in `test_component.cpp` and
-the `[transient]` case in `test_system.cpp`; with the SlabKit workaround they run in the full
+the `[transient]` case in `test_system.cpp`; with SlabKit's free lane they run in the full
 CUDA suite, so `pixi run -e cuda timeout 600 cospan-tests` runs everything.
 
 ## Where a fix belongs
