@@ -21,6 +21,7 @@ find_package(Catch2 3 REQUIRED)
 set(COSPAN_TEST_SOURCES
     test_component.cpp
     test_flavors.cpp
+    test_model.cpp
     test_system.cpp
 )
 
