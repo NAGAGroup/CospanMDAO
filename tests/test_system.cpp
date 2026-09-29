@@ -1050,7 +1050,7 @@ std::vector<float> want_sink() {
 }
 }  // namespace
 
-TEST_CASE("transient: release after forward, kept outputs, revive, back-to-back forwards", "[system][transient]") {
+TEST_CASE("transient: release after forward, kept outputs, revive, back-to-back forwards", "[system][transient][os-free]") {
     tsys::g_inits.clear();
     cs::Model model = cs::create_model<tsys::TopC>(default_config());
     model.setup();

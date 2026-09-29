@@ -451,3 +451,18 @@ After `setup()`, the test reaches a test component with `dynamic_cast<InitDemo&>
 
 ## D117 — Rank coverage by one templated body
 The rank 1, 2 and 3 plain-body cases are one `AffineBody<R>` / `Affine<R>` / `TopAffine<R>` template (sizes 1000, 40x30, 7x9x11; two forwards on different input). `cs::Model` is spelled out instead of `auto` in the template, so `model.set_input<...>` needs no `template` keyword. r01 §11.
+
+## D118 — One namespace per test file
+`test_component.cpp` keeps `tc`, `test_system.cpp` uses `tsys`. All test files link into the one `cospan-tests` executable, so two files defining a component or body of the same name (an `Axpb`, a `Src`) in the same namespace would be an ODR clash the linker may not report. r01 §11.
+
+## D119 — Transient release is observed through the System
+The transient test reaches the transient System with `get_subsystem("tr")` (a `dynamic_cast` to `cs::System&`) and checks `transient()` and `released()` after `forward()` and `wait()`, and the roots' `released()` / `has_storage()` through `model.root().entry_at(...)`. A `view_output` of a released root must throw, and the message must name `top.tr` and "transient System". Revival is observed through init counters (`count_of`), not storage pointers. r01 §4 (transient subtrees), §7.4.
+
+## D120 — View composition is a Slice on a promoted Slice alias
+"View composition" is tested by connecting a `Slice` on top of a promoted alias that already carries a `Slice`: the offsets add (2 + 1 = 3, elements 3..4), and the consumer's result is the check. It goes through `connect`, not through a hand-built view. r01 §8.2.
+
+## D121 — KNOWN ISSUE: CUDA deferred-free deadlock without a pool
+A no-pool Model on CUDA hangs in the first kernel submit after an OS-route free (a transient release, or a value-driven root growing): SlabKit's free runs `cuMemFree` in an `async_host` task while the next kernel's host callback blocks the stream on that task. Not a CoSpan bug; the fix (SlabKit's free path or the fork's `async_host`/CUDA integration) is pending Jack's decision. The tests are unchanged and tagged `[os-free]` (the WeightedHistogram case and the `[transient]` case); the CUDA runs use `"~[os-free]"`, and a pool in `ModelConfig` is the workaround. Details and stacks: `docs/known-issues/cuda-deferred-free-deadlock.md`. r01 §4, §9.
+
+## D122 — Release without -g is the only working build for now
+`RelWithDebInfo` (`-O2 -g`) and `-gline-tables-only` builds of CoSpan translation units crash clang 21.1.8 (exit 139) in the "Debug Variable Analysis" pass (`LiveDebugVariables::computeIntervals` -> `LexicalScopes::initialize`) on `naga::cospan::kb_entry_r1`, in both test TUs. Until that is fixed or worked around, build Release without `-g`; libraries still resolve exported symbols in gdb, header-only CoSpan frames stay unsymbolized. Not a CoSpan source problem. r01 §11.
