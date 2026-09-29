@@ -28,13 +28,14 @@ environments:
       - conda: https://prefix.dev/conda-forge/linux-64/llvm-openmp-23.1.2-h7148c6a_0.conda
       - conda: https://prefix.dev/conda-forge/linux-64/numactl-2.0.18-hb03c661_4.conda
       - conda: https://prefix.dev/conda-forge/linux-64/zstd-1.5.7-hb78ec9c_7.conda
+      - conda: https://prefix.dev/conda-forge/noarch/cereal-1.3.2-hd8ed1ab_1.conda
       - conda: https://prefix.dev/conda-forge/noarch/cuda-cudart_linux-64-12.9.79-h3f2d84a_0.conda
       - conda: https://prefix.dev/conda-forge/noarch/cuda-version-12.9-h4f385c5_3.conda
       - conda: https://prefix.dev/jackm97/naga-labs-staging/linux-64/naga-acpp-runtime-2026.09.29-llvm21_1_8_hfe378ba_2.conda
       - conda: https://prefix.dev/jackm97/naga-labs-staging/linux-64/naga-acpp-runtime-cuda-2026.09.29-llvm21_1_8_h8062177_2.conda
       - conda: https://prefix.dev/jackm97/naga-labs-staging/noarch/naga-acpp-llvm-21-h6ee9b8c_0.conda
-      - conda_source: cospanmdao-tests[6a50004b] @ tests
-      - conda_source: cospanmdao[60074576] @ .
+      - conda_source: cospanmdao-tests[6a5bde3d] @ tests
+      - conda_source: cospanmdao[df53c8a5] @ .
       - conda_source: slabkit[aef817b7] @ git+https://github.com/nagagroup/slabkit?rev=5d6b7b5e6cb6563cfb285361ce05686518c18f04#5d6b7b5e6cb6563cfb285361ce05686518c18f04
   default:
     channels:
@@ -55,10 +56,11 @@ environments:
       - conda: https://prefix.dev/conda-forge/linux-64/llvm-openmp-23.1.2-h7148c6a_0.conda
       - conda: https://prefix.dev/conda-forge/linux-64/numactl-2.0.18-hb03c661_4.conda
       - conda: https://prefix.dev/conda-forge/linux-64/zstd-1.5.7-hb78ec9c_7.conda
+      - conda: https://prefix.dev/conda-forge/noarch/cereal-1.3.2-hd8ed1ab_1.conda
       - conda: https://prefix.dev/jackm97/naga-labs-staging/linux-64/naga-acpp-runtime-2026.09.29-llvm21_1_8_hfe378ba_2.conda
       - conda: https://prefix.dev/jackm97/naga-labs-staging/noarch/naga-acpp-llvm-21-h6ee9b8c_0.conda
-      - conda_source: cospanmdao-tests[6a50004b] @ tests
-      - conda_source: cospanmdao[60074576] @ .
+      - conda_source: cospanmdao-tests[6a5bde3d] @ tests
+      - conda_source: cospanmdao[df53c8a5] @ .
       - conda_source: slabkit[aef817b7] @ git+https://github.com/nagagroup/slabkit?rev=5d6b7b5e6cb6563cfb285361ce05686518c18f04#5d6b7b5e6cb6563cfb285361ce05686518c18f04
   dev:
     channels:
@@ -108,6 +110,7 @@ environments:
       - conda: https://prefix.dev/conda-forge/linux-64/tk-8.6.13-noxft_h1df4ec4_4.conda
       - conda: https://prefix.dev/conda-forge/linux-64/zstd-1.5.7-hb78ec9c_7.conda
       - conda: https://prefix.dev/conda-forge/noarch/ca-certificates-2026.7.22-hbd8a1cb_0.conda
+      - conda: https://prefix.dev/conda-forge/noarch/cereal-1.3.2-hd8ed1ab_1.conda
       - conda: https://prefix.dev/conda-forge/noarch/kernel-headers_linux-64-4.18.0-he073ed8_9.conda
       - conda: https://prefix.dev/conda-forge/noarch/libgcc-devel_linux-64-16.2.0-he3ce08f_107.conda
       - conda: https://prefix.dev/conda-forge/noarch/libstdcxx-devel_linux-64-16.2.0-h86e191b_107.conda
@@ -171,6 +174,7 @@ environments:
       - conda: https://prefix.dev/conda-forge/linux-64/tk-8.6.13-noxft_h1df4ec4_4.conda
       - conda: https://prefix.dev/conda-forge/linux-64/zstd-1.5.7-hb78ec9c_7.conda
       - conda: https://prefix.dev/conda-forge/noarch/ca-certificates-2026.7.22-hbd8a1cb_0.conda
+      - conda: https://prefix.dev/conda-forge/noarch/cereal-1.3.2-hd8ed1ab_1.conda
       - conda: https://prefix.dev/conda-forge/noarch/cuda-cudart_linux-64-12.9.79-h3f2d84a_0.conda
       - conda: https://prefix.dev/conda-forge/noarch/cuda-version-12.9-h4f385c5_3.conda
       - conda: https://prefix.dev/conda-forge/noarch/kernel-headers_linux-64-4.18.0-he073ed8_9.conda
@@ -1025,6 +1029,14 @@ packages:
   run_exports: {}
   size: 131780
   timestamp: 1784754889428
+- conda: https://prefix.dev/conda-forge/noarch/cereal-1.3.2-hd8ed1ab_1.conda
+  sha256: c32c97e0238aa0a9c480ca2cdffbbe1d898298f4e50ec19b21df87ebf3ad12f2
+  md5: 78be8886fc8b989bd9f2a805a3ceca8f
+  license: BSD-3-Clause
+  license_family: BSD
+  run_exports: {}
+  size: 203811
+  timestamp: 1770054823665
 - conda: https://prefix.dev/conda-forge/noarch/cuda-cudart_linux-64-12.9.79-h3f2d84a_0.conda
   sha256: 6cde0ace2b995b49d0db2eefb7bc30bf00ffc06bb98ef7113632dec8f8907475
   md5: 64508631775fbbf9eca83c84b1df0cae
@@ -1255,7 +1267,7 @@ packages:
     - naga-acpp-llvm >=21,<22.0a0
   size: 3556
   timestamp: 1790580982524
-- conda_source: cospanmdao-tests[6a50004b] @ tests
+- conda_source: cospanmdao-tests[6a5bde3d] @ tests
   variants:
     cmake: 3.31.*
     cxx_compiler: naga-acpp-clangxx
@@ -1335,11 +1347,12 @@ packages:
   - conda: https://prefix.dev/conda-forge/linux-64/llvm-openmp-23.1.2-h7148c6a_0.conda
   - conda: https://prefix.dev/conda-forge/linux-64/numactl-2.0.18-hb03c661_4.conda
   - conda: https://prefix.dev/conda-forge/linux-64/zstd-1.5.7-hb78ec9c_7.conda
+  - conda: https://prefix.dev/conda-forge/noarch/cereal-1.3.2-hd8ed1ab_1.conda
   - conda: https://prefix.dev/jackm97/naga-labs-staging/linux-64/naga-acpp-runtime-2026.09.29-llvm21_1_8_hfe378ba_2.conda
   - conda: https://prefix.dev/jackm97/naga-labs-staging/noarch/naga-acpp-llvm-21-h6ee9b8c_0.conda
-  - conda_source: 'cospanmdao[6d6065ce] @ '
+  - conda_source: 'cospanmdao[fe932111] @ '
   - conda_source: slabkit[aef817b7] @ git+https://github.com/nagagroup/slabkit?rev=5d6b7b5e6cb6563cfb285361ce05686518c18f04#5d6b7b5e6cb6563cfb285361ce05686518c18f04
-- conda_source: cospanmdao[60074576] @ .
+- conda_source: cospanmdao[df53c8a5] @ .
   variants:
     cmake: 3.31.*
     cxx_compiler: naga-acpp-clangxx
@@ -1347,6 +1360,7 @@ packages:
     target_platform: linux-64
   depends:
   - slabkit
+  - cereal >=1.3
   - __glibc >=2.28
   - naga-acpp-runtime ==2026.9.29 llvm21_1_8_hfe378ba_2
   source_depends:
@@ -1422,10 +1436,11 @@ packages:
   - conda: https://prefix.dev/conda-forge/linux-64/llvm-openmp-23.1.2-h7148c6a_0.conda
   - conda: https://prefix.dev/conda-forge/linux-64/numactl-2.0.18-hb03c661_4.conda
   - conda: https://prefix.dev/conda-forge/linux-64/zstd-1.5.7-hb78ec9c_7.conda
+  - conda: https://prefix.dev/conda-forge/noarch/cereal-1.3.2-hd8ed1ab_1.conda
   - conda: https://prefix.dev/jackm97/naga-labs-staging/linux-64/naga-acpp-runtime-2026.09.29-llvm21_1_8_hfe378ba_2.conda
   - conda: https://prefix.dev/jackm97/naga-labs-staging/noarch/naga-acpp-llvm-21-h6ee9b8c_0.conda
   - conda_source: slabkit[aef817b7] @ git+https://github.com/nagagroup/slabkit?rev=5d6b7b5e6cb6563cfb285361ce05686518c18f04#5d6b7b5e6cb6563cfb285361ce05686518c18f04
-- conda_source: 'cospanmdao[6d6065ce] @ '
+- conda_source: 'cospanmdao[fe932111] @ '
   variants:
     cmake: 3.31.*
     cxx_compiler: naga-acpp-clangxx
@@ -1433,6 +1448,7 @@ packages:
     target_platform: linux-64
   depends:
   - slabkit
+  - cereal >=1.3
   - __glibc >=2.28
   - naga-acpp-runtime ==2026.9.29 llvm21_1_8_hfe378ba_2
   source_depends:
@@ -1508,6 +1524,7 @@ packages:
   - conda: https://prefix.dev/conda-forge/linux-64/llvm-openmp-23.1.2-h7148c6a_0.conda
   - conda: https://prefix.dev/conda-forge/linux-64/numactl-2.0.18-hb03c661_4.conda
   - conda: https://prefix.dev/conda-forge/linux-64/zstd-1.5.7-hb78ec9c_7.conda
+  - conda: https://prefix.dev/conda-forge/noarch/cereal-1.3.2-hd8ed1ab_1.conda
   - conda: https://prefix.dev/jackm97/naga-labs-staging/linux-64/naga-acpp-runtime-2026.09.29-llvm21_1_8_hfe378ba_2.conda
   - conda: https://prefix.dev/jackm97/naga-labs-staging/noarch/naga-acpp-llvm-21-h6ee9b8c_0.conda
   - conda_source: slabkit[aef817b7] @ git+https://github.com/nagagroup/slabkit?rev=5d6b7b5e6cb6563cfb285361ce05686518c18f04#5d6b7b5e6cb6563cfb285361ce05686518c18f04
