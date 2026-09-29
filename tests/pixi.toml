@@ -1,0 +1,16 @@
+[package]
+name    = "cospanmdao-tests"
+version = "0.1.0"
+
+[package.build.backend]
+name     = "pixi-build-cmake"
+version  = "*"
+channels = ["https://prefix.dev/pixi-build-backends"]
+
+[package.build.config]
+extra-input-globs = ["**/*.hpp"]
+
+# Linked into the runner, so HOST dependencies.
+[package.host-dependencies]
+cospanmdao = { workspace = true }
+catch2     = { workspace = true }

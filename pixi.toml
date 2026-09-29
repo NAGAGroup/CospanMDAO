@@ -1,23 +1,93 @@
 [workspace]
-authors = ["Jack Myers <jack@myersjack.dev>"]
-channels = ["https://prefix.dev/conda-forge"]
-name = "cospanmdao"
+authors   = ["Jack Myers <jack@myersjack.dev>"]
+name      = "cospanmdao"
+version   = "0.1.0"
+channels  = ["https://prefix.dev/jackm97/naga-labs-staging"]
 platforms = ["linux-64"]
-version = "0.1.0"
+preview   = ["pixi-build"]
 
-# TEMPORARY (2026-09-28). Every toolchain-bound section was removed so the
-# workspace solves while the naga AdaptiveCpp toolchain is republished:
-# the acpp pins, the slabkit/cereal path dependencies, the pixi-build
-# [package] tables, the build-variants, the env.sh activation, the
-# per-backend (cuda/l0/amd) features and the dev-* environments. Both this
-# manifest and slabkit's get redone against the new toolchain. The full
-# previous manifest is `git show dbebc3a:pixi.toml`.
+# One pool of specs; every table inherits with { workspace = true }.
+[workspace.dependencies]
+cospanmdao             = { path = "." }
+cospanmdao-tests       = { path = "tests" }
+slabkit                = { git = "https://github.com/NAGAGroup/SlabKit.git", rev = "5d6b7b5e6cb6563cfb285361ce05686518c18f04" }
+catch2                 = ">=3.8"
+naga-acpp-runtime-cuda = "*"
+naga-acpp-tools        = "==2026.09.29"
+nushell                = ">=0.110.0,<0.111"
 
+# Compiler stems resolve to <stem>_<platform> activation packages; their
+# run-exports bring the toolchain. The backend supplies cmake/ninja.
+[workspace.build-variants]
+c_compiler           = ["naga-acpp-clang"]
+cxx_compiler         = ["naga-acpp-clangxx"]
+c_compiler_version   = ["2026.09.29"]
+cxx_compiler_version = ["2026.09.29"]
+naga-acpp-llvm       = ["21"]
+cmake                = ["3.31.*"]
+
+# ---- default environment: the built library and its tests ------------------
 [dependencies]
-nushell = ">=0.110.0,<0.111"
-cmake = ">=3.28,<4"
-ninja = ">=1.12"
-catch2 = ">=3.8"
+cospanmdao       = { workspace = true }
+cospanmdao-tests = { workspace = true }
 
 [tasks]
+test = "cospan-tests"
+
+# ---- CUDA runtime, opt-in ---------------------------------------------------
+[feature.cuda.dependencies]
+naga-acpp-runtime-cuda = { workspace = true }
+
+[environments.cuda]
+features = ["cuda"]
+solve-group = "default"
+
+# ---- the library package ----------------------------------------------------
+[package]
+name    = "cospanmdao"
+version = "0.1.0"
+
+[package.build.backend]
+name     = "pixi-build-cmake"
+version  = "*"
+channels = ["https://prefix.dev/pixi-build-backends"]
+
+[package.build.config]
+# Headers are installed, not compiled; without this, editing one does not
+# invalidate pixi's build cache.
+extra-input-globs = ["include/**/*.hpp"]
+
+[package.host-dependencies]
+slabkit = { workspace = true }
+
+# Library with PUBLIC header deps: consumers compile against slabkit too.
+[package.run-dependencies]
+slabkit = { workspace = true }
+
+# ---- dev environment: full build closure of both packages, neither built -----
+[feature.dev.dev]
+cospanmdao       = { path = "." }
+cospanmdao-tests = { path = "tests" }
+
+[feature.dev.dependencies]
+nushell         = { workspace = true }
+naga-acpp-tools = { workspace = true }
+
+[environments.dev]
+features = ["dev"]
+solve-group = "default"
+no-default-feature = true
+
+[environments.dev-cuda]
+features = ["dev", "cuda"]
+solve-group = "default"
+no-default-feature = true
+
+[feature.git.dependencies]
+git = "*"
+[feature.git.tasks]
 setup-git = "git config core.hooksPath .project/hooks"
+
+[environments.git]
+features = ["git"]
+no-default-feature = true
