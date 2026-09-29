@@ -146,11 +146,8 @@ r01 §8.3 declares them over `const detail::IOEntry&`. Reading the primary
 storage goes through non-const usm_vector paths, so they take
 `HostView(detail::IOEntry&, sk::queue&)`.
 
-## D17 — HostViewMut commits on destruction if dirty
-`HostViewMut` is move-only, snapshots the region, keeps a dirty flag set by
-mutable access, and on destruction writes back only if dirty. A failed commit in
-the destructor cannot throw; it writes the message to stderr. r01 §8.3 gives
-the type but not when the write-back happens.
+## D17 — HostViewMut writes back on commit and on destruction
+`HostViewMut` is move-only and snapshots the region. commit() and destruction write the buffer back unconditionally; there is no dirty tracking (from_host owns its copy of the bytes, so an unneeded write-back costs one copy). A moved-from view writes nothing. A failed write-back in the destructor cannot throw; it writes the message to stderr. r01 §8.3.
 
 ## D18 — `sk` alias
 `namespace sk = ::naga::slabkit;` is declared in `naga::cospan` (metadata.hpp).

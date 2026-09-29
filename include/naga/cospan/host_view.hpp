@@ -6,8 +6,8 @@
 //
 // HostView is a read-only host copy of one entry, shaped like it, taken at
 // construction. HostViewMut is the same copy, writable: commit() and
-// destruction (when something may have changed) write it back into the root's
-// storage and refresh the root's copies on other devices.
+// destruction write it back (unconditionally, D17) into the root's storage and
+// refresh the root's copies on other devices.
 //
 // Both read and write the root's PRIMARY storage (the root's producer's
 // device), which is authoritative; the other devices' copies follow it. A peer
@@ -18,6 +18,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <sycl/sycl.hpp>
@@ -27,6 +28,7 @@
 namespace naga::cospan {
 
 class Model;
+class ComponentBase;
 
 namespace detail {
 
@@ -149,11 +151,12 @@ private:
     sycl::range<Rank>       shape_ = detail::filled_range<Rank>(0);
     friend struct detail::HostViewAccess;
     friend class Model;
+    friend class ComponentBase;
 };
 
 /// HostViewMut<DT, Rank> — the same host copy, writable. commit() writes it
-/// into the entry's root storage; destruction commits if it was handed out
-/// writable since the last commit.
+/// into the entry's root storage; so does destruction (no dirty tracking, D17;
+/// a moved-from view writes nothing).
 template <DType DT, int Rank>
 class HostViewMut {
 public:
@@ -167,37 +170,26 @@ public:
         : entry_{std::exchange(o.entry_, nullptr)}
         , q_{o.q_}
         , host_{std::move(o.host_)}
-        , shape_{o.shape_}
-        , dirty_{std::exchange(o.dirty_, false)} {}
+        , shape_{o.shape_} {}
 
-    value_type& operator[](sycl::id<Rank> idx) {
-        dirty_ = true;
-        return host_[detail::flat_of<Rank>(idx, shape_)];
-    }
-    value_type& operator[](std::size_t flat) {
-        dirty_ = true;
-        return host_[flat];
-    }
+    value_type& operator[](sycl::id<Rank> idx) { return host_[detail::flat_of<Rank>(idx, shape_)]; }
+    value_type& operator[](std::size_t flat) { return host_[flat]; }
     sycl::range<Rank> shape() const { return shape_; }
     std::size_t       size() const { return host_.size(); }
-    std::span<value_type> span() {
-        dirty_ = true;
-        return {host_.data(), host_.size()};
-    }
+    std::span<value_type> span() { return {host_.data(), host_.size()}; }
 
     void commit() {
         if (entry_ == nullptr) return;
         detail::write_back<value_type>(*entry_, *q_,
                                        std::span<const value_type>{host_.data(), host_.size()});
-        dirty_ = false;
     }
 
     ~HostViewMut() {
-        if (entry_ == nullptr || !dirty_) return;
+        if (entry_ == nullptr) return;
         try {
             commit();
         } catch (const std::exception& e) {
-            std::fprintf(stderr, "naga::cospan: HostViewMut commit on destruction failed: %s\n",
+            std::fprintf(stderr, "naga::cospan: HostViewMut write-back on destruction failed: %s\n",
                          e.what());
         }
     }
@@ -214,7 +206,6 @@ private:
     sk::queue*              q_     = nullptr;
     std::vector<value_type> host_;
     sycl::range<Rank>       shape_ = detail::filled_range<Rank>(0);
-    bool                    dirty_ = false;
     friend struct detail::HostViewAccess;
     friend class Model;
     friend class ComponentBase;
