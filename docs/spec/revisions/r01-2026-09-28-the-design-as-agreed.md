@@ -2406,7 +2406,7 @@ public:
     std::span<const MarkRecord> constraints() const;
     std::span<const MarkRecord> objectives()  const;
 
-    /// Waits the stream as a convenience (§9.4). Everything else is RAII.
+    /// Does not wait (D135): call wait() before destroying or reassigning.
     ~Model();
 
 private:
