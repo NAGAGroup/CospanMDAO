@@ -27,7 +27,7 @@ struct RootDriver {
     /// run_setup -> get_exec_info -> substrates (arena from bytes if > 0, pool)
     /// -> prepare_exec -> compile -> run_init -> run_system_init.
     void start() {
-        SubsystemAccess::place(root, "top", "top", nullptr);
+        SubsystemAccess::place(root, "", "", nullptr);
         root.run_setup();
         info              = root.get_exec_info(dev);
         std::size_t total = 0;

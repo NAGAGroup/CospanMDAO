@@ -114,7 +114,7 @@ public:
         System&             root = *s.root;
         const sycl::device& dev  = s.queue.get_device();  // the default device (step 0)
 
-        detail::SubsystemAccess::place(root, "top", "top", nullptr);
+        detail::SubsystemAccess::place(root, "", "", nullptr);
         root.run_setup();                                            // 1. declare
         const auto info = root.get_exec_info(dev);                   // 2. device -> bytes
         for (const auto& [d, bytes] : info) {                        // 3. substrates

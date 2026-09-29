@@ -578,7 +578,7 @@ TEST_CASE("parallel: an input connected to a sibling's output throws at forward,
             s.connect("par.a.y", "par.b.x");  // b.x takes its shape from a sibling's output
         });
         model.setup();  // the wiring is legal; only the forward refuses
-        tfl::expect_throws([&] { model.forward(); }, {"top.par.a", "top.par.b", "run unordered"});
+        tfl::expect_throws([&] { model.forward(); }, {"par.a", "par.b", "run unordered"});
         model.wait();
     }
     SECTION("a fixed-shape input") {
@@ -588,7 +588,7 @@ TEST_CASE("parallel: an input connected to a sibling's output throws at forward,
             s.connect("par.a.y", "par.b.p");  // not a shape dependency, still a connection
         });
         model.setup();
-        tfl::expect_throws([&] { model.forward(); }, {"top.par.a", "top.par.b", "run unordered"});
+        tfl::expect_throws([&] { model.forward(); }, {"par.a", "par.b", "run unordered"});
         model.wait();
     }
 }
@@ -609,7 +609,7 @@ TEST_CASE("parallel: tied outputs throw at forward, naming both, unless allow_ti
         cs::Model model = tied(false);
         model.setup();
         tfl::expect_throws([&] { model.forward(); },
-                           {"top.par.a", "top.par.b", "share one root", "allow_tied_outputs"});
+                           {"par.a", "par.b", "share one root", "allow_tied_outputs"});
         model.wait();
     }
     SECTION("allowed: the atomic writers accumulate") {
@@ -850,13 +850,13 @@ TEST_CASE("fused parallel: a connection between stages throws naming both, and a
     SECTION("refused") {
         cs::Model model = chain(false);
         model.setup();  // only the forward sees the pair
-        tfl::expect_throws([&] { model.forward(); }, {"top.f.a", "top.f.b", "run unordered"});
+        tfl::expect_throws([&] { model.forward(); }, {"f.a", "f.b", "run unordered"});
         model.wait();
     }
     SECTION("no override: allow_tied_outputs() is about ties only") {
         cs::Model model = chain(true);
         model.setup();
-        tfl::expect_throws([&] { model.forward(); }, {"top.f.a", "top.f.b", "run unordered"});
+        tfl::expect_throws([&] { model.forward(); }, {"f.a", "f.b", "run unordered"});
         model.wait();
     }
 }
@@ -878,7 +878,7 @@ TEST_CASE("fused: tied outputs throw in parallel mode unless allow_tied_outputs(
     SECTION("parallel, refused") {
         cs::Model model = tied(cs::FusedSystem::Mode::parallel, false);
         model.setup();
-        tfl::expect_throws([&] { model.forward(); }, {"top.f.a", "top.f.b", "share one root", "allow_tied_outputs"});
+        tfl::expect_throws([&] { model.forward(); }, {"f.a", "f.b", "share one root", "allow_tied_outputs"});
         model.wait();
     }
     SECTION("parallel, allowed: the atomic writers accumulate") {
@@ -912,7 +912,7 @@ TEST_CASE("fused: a value-driven size driven by a stage of the same fuse throws 
                                        }});
             s.connect("f.a.n", "f.b.n");  // b's output size is the VALUE of a's output
         });
-        tfl::expect_throws([&] { model.setup(); }, {"top.f.b", "top.f.a", "VALUE"});
+        tfl::expect_throws([&] { model.setup(); }, {"f.b", "f.a", "VALUE"});
         model.wait();  // setup() may have submitted initializer work before it threw (D135)
     };
     SECTION("sequential") { refused(cs::FusedSystem::Mode::sequential); }
@@ -969,7 +969,7 @@ TEST_CASE("fused: a wave's local memory over the device limit throws at forward,
     SECTION("sequential: the slices add up, over the limit") {
         cs::Model model = make_wave(cs::FusedSystem::Mode::sequential);
         model.setup();
-        tfl::expect_throws([&] { model.forward(); }, {"top.f.a", "top.f.b", "bytes of local memory"});
+        tfl::expect_throws([&] { model.forward(); }, {"f.a", "f.b", "bytes of local memory"});
         model.wait();
     }
     SECTION("parallel: one shared slice, within the limit") {
@@ -1011,17 +1011,17 @@ TEST_CASE("fused: a custom-op child, a host child and mixed ranks throw at setup
     };
     SECTION("custom-op child") {
         cs::Model model = bad_wave(std::type_identity<tfl::NopCustom>{}, true);
-        tfl::expect_throws([&] { model.setup(); }, {"top.f.bad", "custom-op", "cannot be fused"});
+        tfl::expect_throws([&] { model.setup(); }, {"f.bad", "custom-op", "cannot be fused"});
         model.wait();  // setup() may have submitted initializer work before it threw (D135)
     }
     SECTION("host child") {
         cs::Model model = bad_wave(std::type_identity<tfl::NopHost>{}, true);
-        tfl::expect_throws([&] { model.setup(); }, {"top.f.bad", "host", "cannot be fused"});
+        tfl::expect_throws([&] { model.setup(); }, {"f.bad", "host", "cannot be fused"});
         model.wait();  // setup() may have submitted initializer work before it threw (D135)
     }
     SECTION("children of different ranks") {
         cs::Model model = bad_wave(std::type_identity<tfl::Src2>{}, false);
-        tfl::expect_throws([&] { model.setup(); }, {"top.f.bad", "share one rank"});
+        tfl::expect_throws([&] { model.setup(); }, {"f.bad", "share one rank"});
         model.wait();  // setup() may have submitted initializer work before it threw (D135)
     }
 }

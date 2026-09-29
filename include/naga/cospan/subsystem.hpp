@@ -129,5 +129,8 @@ struct SubsystemAccess {
     }
 };
 
+/// Defined here, where Subsystem is complete; metadata.hpp declares it for IOEntry::full_path().
+inline std::string subsystem_path(const Subsystem* s) { return s->path(); }
+
 }  // namespace detail
 }  // namespace naga::cospan

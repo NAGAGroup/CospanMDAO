@@ -50,6 +50,8 @@ class Subsystem;
 namespace detail {
 class IOEntry;
 struct EntryAccess;
+/// The dotted path of a Subsystem from the root System (empty at the root); defined in subsystem.hpp.
+std::string subsystem_path(const Subsystem*);
 }  // namespace detail
 
 enum class IOKind : uint8_t { input, output };
@@ -225,6 +227,12 @@ public:
 
     // ---- identity & classification ---------------------------------------
     std::string_view name() const noexcept { return name_; }
+    /// The entry's dotted path from the root System: its declarer's path plus its name, or the name alone at the root.
+    std::string full_path() const {
+        return (declarer_ == nullptr || subsystem_path(declarer_).empty())
+                   ? std::string{name()}
+                   : subsystem_path(declarer_) + "." + std::string{name()};
+    }
     IOKind           kind() const noexcept { return io_kind_; }
     DType            dtype() const noexcept { return dtype_; }  ///< atomic-ness preserved
     int              rank() const noexcept { return rank_; }    ///< AUTHORITATIVE (§3.1)
@@ -595,7 +603,7 @@ protected:
         Slot* s = find_slot(p);
         if (s == nullptr) {
             if (released_) throw_released();
-            throw std::logic_error("naga::cospan: '" + std::string{name()} +
+            throw std::logic_error("naga::cospan: '" + full_path() +
                                    "' has no storage on that placement");
         }
         return s->data.data();
@@ -603,7 +611,7 @@ protected:
 
     /// Host access to a released root: the error names the transient System.
     [[noreturn]] void throw_released() const {
-        throw std::logic_error("naga::cospan: '" + std::string{name()} + "' belongs to transient System '" +
+        throw std::logic_error("naga::cospan: '" + full_path() + "' belongs to transient System '" +
                                transient_by_ + "' and its storage is released; it exists only while that "
                                "System runs");
     }
@@ -624,7 +632,7 @@ private:
     Slot& primary_slot() const {
         if (released_) throw_released();
         if (!is_root() || placements_.empty())
-            throw std::logic_error("naga::cospan: '" + std::string{name()} + "' has no storage");
+            throw std::logic_error("naga::cospan: '" + full_path() + "' has no storage");
         Slot* s = find_slot(placements_.front());
         if (s == nullptr)
             throw std::logic_error("naga::cospan: '" + std::string{name()} + "' is not allocated");

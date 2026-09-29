@@ -1018,13 +1018,13 @@ TEST_CASE("init order: Component pass, then System pass, children before owners,
 
     REQUIRE(tsys::g_inits.size() == 5);  // 3 Components + 2 Systems, each once
     const std::size_t last_comp =
-        std::max({tsys::index_of("top.inner.c1"), tsys::index_of("top.inner.c2"), tsys::index_of("top.c3")});
-    const std::size_t first_sys = std::min(tsys::index_of("top.inner"), tsys::index_of("top"));
-    CHECK(tsys::count_of("top.inner.c1") == 1);
-    CHECK(tsys::count_of("top.inner.c2") == 1);
-    CHECK(tsys::count_of("top.c3") == 1);
+        std::max({tsys::index_of("inner.c1"), tsys::index_of("inner.c2"), tsys::index_of("c3")});
+    const std::size_t first_sys = std::min(tsys::index_of("inner"), tsys::index_of(""));
+    CHECK(tsys::count_of("inner.c1") == 1);
+    CHECK(tsys::count_of("inner.c2") == 1);
+    CHECK(tsys::count_of("c3") == 1);
     CHECK(last_comp < first_sys);                                          // Component pass first
-    CHECK(tsys::index_of("top.inner") < tsys::index_of("top"));            // a child System before its owner
+    CHECK(tsys::index_of("inner") < tsys::index_of(""));            // a child System before its owner
 
     // c1's own init wrote 99; the owner System's init wrote 1.5 afterwards.
     CHECK(to_vector(model.view_input<DType::f32, 1>("inner.c1.x")) == std::vector<float>(tsys::kLen, tsys::kSysInit));
@@ -1060,7 +1060,7 @@ TEST_CASE("transient: release after forward, kept outputs, revive, back-to-back 
         CHECK(sys.entry_at("tr.prod.y").root()->released());
         CHECK(sys.entry_at("tr.mid.y").root()->released());
         CHECK(!sys.entry_at("tr.mid.y").root()->has_storage());
-        tsys::expect_throws([&] { (void)model.view_output<DType::f32, 1>("tr.mid.y"); }, "top.tr");
+        tsys::expect_throws([&] { (void)model.view_output<DType::f32, 1>("tr.mid.y"); }, "tr");
         tsys::expect_throws([&] { (void)model.view_output<DType::f32, 1>("tr.prod.y"); }, "transient System");
     }
 
@@ -1080,20 +1080,20 @@ TEST_CASE("transient: release after forward, kept outputs, revive, back-to-back 
     SECTION("forward 2 revives and re-runs only the subtree's inits") {
         model.forward();
         model.wait();
-        CHECK(tsys::count_of("top.tr.prod") == 1);  // setup's init: nothing re-ran yet
-        CHECK(tsys::count_of("top.tr") == 1);
+        CHECK(tsys::count_of("tr.prod") == 1);  // setup's init: nothing re-ran yet
+        CHECK(tsys::count_of("tr") == 1);
         CHECK(tr.released());
 
         model.forward();  // revive: re-allocate, re-run tr's subtree init (both passes), run, release
         model.wait();
         CHECK(to_vector(model.view_output<DType::f32, 1>("tr.cons.y")) == want_cons());
         CHECK(to_vector(model.view_output<DType::f32, 1>("sink.y")) == want_sink());
-        for (const char* p : {"top.tr.prod", "top.tr.mid", "top.tr.cons", "top.tr"}) {
+        for (const char* p : {"tr.prod", "tr.mid", "tr.cons", "tr"}) {
             INFO(p);
             CHECK(tsys::count_of(p) == 2);  // both passes re-ran
         }
-        CHECK(tsys::count_of("top.sink") == 1);  // nothing outside tr re-ran
-        CHECK(tsys::count_of("top") == 1);
+        CHECK(tsys::count_of("sink") == 1);  // nothing outside tr re-ran
+        CHECK(tsys::count_of("") == 1);
         CHECK(tr.released());
     }
 
@@ -1104,8 +1104,8 @@ TEST_CASE("transient: release after forward, kept outputs, revive, back-to-back 
         model.wait();
         CHECK(to_vector(model.view_output<DType::f32, 1>("tr.cons.y")) == want_cons());
         CHECK(to_vector(model.view_output<DType::f32, 1>("sink.y")) == want_sink());
-        CHECK(tsys::count_of("top.tr.prod") == 3);  // setup, then a revive before forwards 2 and 3
-        CHECK(tsys::count_of("top.sink") == 1);
+        CHECK(tsys::count_of("tr.prod") == 3);  // setup, then a revive before forwards 2 and 3
+        CHECK(tsys::count_of("sink") == 1);
         CHECK(tr.released());
     }
 }

@@ -38,7 +38,7 @@ template <class T>
 StorageEntry<T>& storage_of(IOEntry& e) {
     auto* s = dynamic_cast<StorageEntry<T>*>(e.root());
     if (s == nullptr)
-        throw std::invalid_argument("naga::cospan: '" + std::string{e.name()} +
+        throw std::invalid_argument("naga::cospan: '" + e.full_path() +
                                     "': element type does not match its root's storage");
     return *s;
 }
@@ -60,7 +60,7 @@ inline std::size_t element_count(const IOEntry::Geometry& g) {
 
 inline void check_entry(const IOEntry& e, DType dt, int rank) {
     if (!dtype_compatible(e.dtype(), dt) || e.rank() != rank)
-        throw std::invalid_argument("naga::cospan: host view of '" + std::string{e.name()} +
+        throw std::invalid_argument("naga::cospan: host view of '" + e.full_path() +
                                     "' asked for the wrong dtype or rank");
 }
 
@@ -79,7 +79,7 @@ Snapshot<T> take_snapshot(IOEntry& entry, sk::queue& q) {
     for (std::size_t f = 0; f < out.size(); ++f) {
         const std::size_t off = element_offset(f, g);
         if (off >= whole.size())
-            throw std::out_of_range("naga::cospan: '" + std::string{entry.name()} +
+            throw std::out_of_range("naga::cospan: '" + entry.full_path() +
                                     "' presents elements past its root's storage");
         out[f] = whole[off];
     }
@@ -93,11 +93,11 @@ void write_back(IOEntry& entry, sk::queue& q, std::span<const T> host) {
     const IOEntry::Geometry g    = entry.geometry();
     StorageEntry<T>&        root = storage_of<T>(entry);
     if (host.size() != element_count(g))
-        throw std::logic_error("naga::cospan: host copy of '" + std::string{entry.name()} +
+        throw std::logic_error("naga::cospan: host copy of '" + entry.full_path() +
                                "' no longer matches its shape");
     if (!entry.view()) {
         if (host.size() != entry.root()->flat_size())
-            throw std::logic_error("naga::cospan: '" + std::string{entry.name()} +
+            throw std::logic_error("naga::cospan: '" + entry.full_path() +
                                    "' no longer matches its root's size");
         root.write_primary(q, host);
         return;
@@ -106,7 +106,7 @@ void write_back(IOEntry& entry, sk::queue& q, std::span<const T> host) {
     for (std::size_t f = 0; f < host.size(); ++f) {
         const std::size_t off = element_offset(f, g);
         if (off >= whole.size())
-            throw std::out_of_range("naga::cospan: '" + std::string{entry.name()} +
+            throw std::out_of_range("naga::cospan: '" + entry.full_path() +
                                     "' presents elements past its root's storage");
         whole[off] = host[f];
     }

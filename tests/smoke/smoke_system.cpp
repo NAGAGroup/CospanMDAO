@@ -403,12 +403,12 @@ static void case_b(const sycl::device& dev, sk::queue& q) {
     d.start();
 
     check(g_inits.size() == 5, "b: five inits ran (3 Components, 2 Systems), each once");
-    const std::size_t last_comp = std::max({index_of("top.inner.c1"), index_of("top.inner.c2"), index_of("top.c3")});
-    const std::size_t first_sys = std::min(index_of("top.inner"), index_of("top"));
-    check(count_of("top.inner.c1") == 1 && count_of("top.inner.c2") == 1 && count_of("top.c3") == 1 &&
+    const std::size_t last_comp = std::max({index_of("inner.c1"), index_of("inner.c2"), index_of("c3")});
+    const std::size_t first_sys = std::min(index_of("inner"), index_of(""));
+    check(count_of("inner.c1") == 1 && count_of("inner.c2") == 1 && count_of("c3") == 1 &&
               last_comp < first_sys,
           "b: every Component init precedes every System init");
-    check(index_of("top.inner") < index_of("top"), "b: a child System's init precedes its owner's");
+    check(index_of("inner") < index_of(""), "b: a child System's init precedes its owner's");
 }
 
 // ---- c. transient --------------------------------------------------------------------
@@ -463,18 +463,18 @@ static void case_c(const sycl::device& dev, sk::queue& q) {
         (void)HostViewAccess::view<DType::f32, 1>(top.entry_at("tr.mid.y"), q);
     } catch (const std::exception& e) {
         threw    = true;
-        names_tr = std::string{e.what()}.find("top.tr") != std::string::npos;
+        names_tr = std::string{e.what()}.find("tr") != std::string::npos;
         std::printf("      released-root HostView threw: %s\n", e.what());
     }
     check(threw && names_tr, "c: a HostView on the released root throws, naming the transient System");
 
-    check(count_of("top.tr.prod") == 1 && count_of("top.tr.mid") == 1 && count_of("top.tr") == 1,
+    check(count_of("tr.prod") == 1 && count_of("tr.mid") == 1 && count_of("tr") == 1,
           "c: before the revive, tr's subtree inits ran once");
     d.forward();  // revive: re-allocate, re-run tr's subtree init (both passes), run, release
     check(values_of(q, top.entry_at("tr.cons.y")) == want_cons, "c: forward 2 (revived): cons.y is the same");
     check(values_of(q, top.entry_at("sink.y")) == want_sink, "c: forward 2 (revived): sink.y is the same");
-    check(count_of("top.tr.prod") == 2 && count_of("top.tr.mid") == 2 && count_of("top.tr.cons") == 2 &&
-              count_of("top.tr") == 2 && count_of("top.sink") == 1 && count_of("top") == 1,
+    check(count_of("tr.prod") == 2 && count_of("tr.mid") == 2 && count_of("tr.cons") == 2 &&
+              count_of("tr") == 2 && count_of("sink") == 1 && count_of("") == 1,
           "c: the revive re-ran tr's subtree init in both passes; nothing outside tr re-ran");
     check(tr.released() && !mid.has_storage(), "c: after forward 2, tr is released again");
 }
@@ -484,7 +484,7 @@ static void case_c(const sycl::device& dev, sk::queue& q) {
 template <class T>
 static bool setup_throws(std::string& msg) {
     T s;
-    cs::detail::SubsystemAccess::place(s, "top", "top", nullptr);
+    cs::detail::SubsystemAccess::place(s, "", "", nullptr);
     try {
         s.run_setup();
     } catch (const std::exception& e) {
@@ -555,7 +555,7 @@ static void case_d() {
 
     // connect from outside setup(): the System is fully set up, then called into.
     OutsideSetup s;
-    cs::detail::SubsystemAccess::place(s, "top", "top", nullptr);
+    cs::detail::SubsystemAccess::place(s, "", "", nullptr);
     s.run_setup();
     bool threw = false;
     try {

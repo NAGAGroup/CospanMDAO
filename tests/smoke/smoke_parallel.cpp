@@ -337,7 +337,7 @@ static void case_c(const sycl::device& dev, sk::queue& q) {
     }
     d.wait();
     check(threw, "c: the forward throws");
-    check(what.find("top.par.a") != std::string::npos && what.find("top.par.b") != std::string::npos,
+    check(what.find("par.a") != std::string::npos && what.find("par.b") != std::string::npos,
           "c: the message names both siblings");
 }
 

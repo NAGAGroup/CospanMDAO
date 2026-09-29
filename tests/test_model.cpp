@@ -700,10 +700,10 @@ TEST_CASE("Host access: errors name the path; view_output_mut survives a forward
         tmod::expect_throws([&] { (void)model.view_output<DType::f32, 1>("d1.z"); }, {"d1.z", "an input"});
         tmod::expect_throws([&] { model.set_input<DType::f32, 1>("obj.f", std::span<const float>{two}); },
                             {"obj.f", "an output"});
-        // The wrong dtype and rank name the entry (by its own name, which for a top-level alias is the path).
+        // The wrong dtype, rank and size name the entry's full dotted path from the root System.
         tmod::expect_throws([&] { model.set_input<DType::f64, 1>("z", std::span<const double>{}); }, {"'z'", "dtype or rank"});
         tmod::expect_throws([&] { model.set_input<DType::f32, 2>("z", std::span<const float>{two}); }, {"'z'", "dtype or rank"});
-        tmod::expect_throws([&] { model.set_input<DType::f64, 1>("d1.y2", std::span<const double>{}); }, {"'y2'", "dtype or rank"});
+        tmod::expect_throws([&] { model.set_input<DType::f64, 1>("d1.y2", std::span<const double>{}); }, {"'d1.y2'", "dtype or rank"});
         // The wrong size (z has two elements).
         tmod::expect_throws([&] { model.set_input<DType::f32, 1>("z", std::span<const float>{three}); }, {"'z'", "shape"});
         tmod::expect_throws([&] { model.set_input<DType::f32, 1>("z", std::span<const float>{two.data(), 1}); }, {"'z'", "shape"});

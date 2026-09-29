@@ -536,7 +536,7 @@ static void case_f(const sycl::device& dev, sk::queue& q) {
             std::printf("      %s\n", what.c_str());
         }
         check(threw, "f: B reading A's output in a parallel-mode wave throws");
-        check(what.find("top.f.a") != std::string::npos && what.find("top.f.b") != std::string::npos,
+        check(what.find("f.a") != std::string::npos && what.find("f.b") != std::string::npos,
               "f: the message names both stages");
     }
     {
