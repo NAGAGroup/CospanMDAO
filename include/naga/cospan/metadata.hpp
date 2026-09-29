@@ -50,8 +50,6 @@ class Subsystem;
 namespace detail {
 class IOEntry;
 struct EntryAccess;
-/// The dotted path of a Subsystem from the root System (empty at the root); defined in subsystem.hpp.
-std::string subsystem_path(const Subsystem*);
 }  // namespace detail
 
 enum class IOKind : uint8_t { input, output };
@@ -229,9 +227,9 @@ public:
     std::string_view name() const noexcept { return name_; }
     /// The entry's dotted path from the root System: its declarer's path plus its name, or the name alone at the root.
     std::string full_path() const {
-        return (declarer_ == nullptr || subsystem_path(declarer_).empty())
+        return (declarer_ == nullptr || declarer_->path().empty())
                    ? std::string{name()}
-                   : subsystem_path(declarer_) + "." + std::string{name()};
+                   : declarer_->path() + "." + std::string{name()};
     }
     IOKind           kind() const noexcept { return io_kind_; }
     DType            dtype() const noexcept { return dtype_; }  ///< atomic-ness preserved
