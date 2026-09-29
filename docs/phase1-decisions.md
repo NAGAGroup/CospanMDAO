@@ -466,3 +466,12 @@ A no-pool Model on CUDA hangs in the first kernel submit after an OS-route free 
 
 ## D122 — Release without -g is the only working build for now
 `RelWithDebInfo` (`-O2 -g`) and `-gline-tables-only` builds of CoSpan translation units crash clang 21.1.8 (exit 139) in the "Debug Variable Analysis" pass (`LiveDebugVariables::computeIntervals` -> `LexicalScopes::initialize`) on `naga::cospan::kb_entry_r1`, in both test TUs. Until that is fixed or worked around, build Release without `-g`; libraries still resolve exported symbols in gdb, header-only CoSpan frames stay unsymbolized. Not a CoSpan source problem. r01 §11.
+
+## D123 — Flavor refusals are observed at the phase that throws them
+The wiring rules of the two flavors are checked where the implementation checks them, and the tests follow: a `FromSourceDim` input fed by a Parallel sibling's output, the D91 chained-dependency rule and a producer-consumer pair in a parallel Fused all set up cleanly and throw at `forward()` (the test then calls `wait()`); a non-device property on a Parallel child, two flavors on one System, and a custom-op, host or mixed-rank Fused child throw at `setup()`. Every case names the offending child or children (`top.par.a`, `top.f.bad`) in the message, and the test checks the names. r01 §7.5.
+
+## D124 — Fused against unfused is compared bitwise
+Four element-wise stages as a plain System and as a sequential FusedSystem (777 non-round floats) are compared with `memcmp`, not a tolerance: a fused wave runs the same body on the same operands in the same order, so nothing may differ, and the test passed bitwise on omp and on CUDA. A host recomputation with `cst::all_close` keeps the check from being vacuous (two equally wrong outputs would not pass). If a backend ever differs by float rounding alone, relax this one case to rel 1e-6. r01 §7.5.
+
+## D125 — The flavor tests never free through the OS route
+`test_flavors.cpp` (namespace `tfl`, tags `[flavors]` plus `[parallel]` or `[fused]`, `[errors]` on refusals) has no transient subtree and no growing root, so no case is tagged `[os-free]` (D121) and every case runs on CUDA. r01 §7.5, §11.
