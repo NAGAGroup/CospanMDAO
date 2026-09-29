@@ -26,17 +26,24 @@ Host work in a model is a Component whose body's first parameter is the tag
 `cospan::Host`: `void operator()(Host, Inputs, Outputs) const`, with the same
 Input/Output wrappers as every other body. It is submitted with the fork's
 async_host through SlabKit's async_host_in_order: a host callable run by the
-runtime, placed on no device, that joins the kernel order as an ordinary work
-item. Plain async_host is not ordered against memory tasks, so it could run
-before its inputs finished copying in.
+runtime that joins the kernel order as an ordinary work item. Plain async_host
+is not ordered against memory tasks, so it could run before its inputs
+finished copying in.
 
-The only real constraint is memory: device memory is not host-readable, so a
-host component's entries live in HOST-kind USM (pinned host memory, addressable
-by the host and by devices; not managed memory, so CUDA-under-WSL2's
-shared-memory limit does not apply). Root storage is keyed by placement — a
-device, or the host — instead of by device alone. A host component's input
-whose root lives on a device gets a host-placement copy, refreshed by the
-producer's post-compute like any other-device copy; its outputs are host-kind
-roots that device consumers read directly or receive copies of by the same
-rule. Custom operations stay separate and are for native backend work only
-(D1).
+A host component has a device like any Component (its parent's, or its own if
+placed). That device selects the SYCL context that owns its memory, as for any
+USM allocation. Every input and output of a host component is HOST-kind USM on
+that device: pinned host memory the body reads and writes directly, not
+managed memory, so CUDA-under-WSL2's shared-memory limit does not apply. Data
+reaches it and leaves it by the ordinary rule for a producer and a consumer on
+different placements: root storage stays keyed by device, a host component's
+roots are host-kind, and the existing per-device copies in post-compute move
+data in and out. Custom operations stay separate and are for native backend
+work only (D1).
+
+## D4 — Stages and the outer kernel instantiate in the consumer's translation unit
+Follows from D2. Everything CoSpan provides is a header; a Component's device
+function and the outer kernel that calls it are both instantiated in the
+translation unit that builds the model. The tested pattern is one translation
+unit per model. Models split across several translation units are tested in
+the test pass; the result is recorded here.
