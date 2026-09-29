@@ -1,5 +1,9 @@
 # CUDA: deadlock after a deferred OS-route free (no pool)
 
+## Status
+
+Resolved. SlabKit no longer defers frees (a484713: frees are synchronous, on the calling thread, never in async_host), and the fork's async_host fix is in the build-4 packages CoSpan locks (D135). The history below is kept.
+
 Status: the fork bug is still present in naga-acpp 2026.09.29; the fix is committed in the fork, unbuilt (see "Status" below).
 Below CoSpan: the tests are correct and no longer need a tag; the CUDA runs are unfiltered.
 

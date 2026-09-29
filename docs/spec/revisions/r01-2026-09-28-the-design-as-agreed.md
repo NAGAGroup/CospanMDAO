@@ -1915,7 +1915,7 @@ protected:
     /// both are no-ops for a System that is not transient. A custom type
     /// that returns early without running its subtree calls neither.
     void revive();    ///< re-allocate released roots (pool route, current extents); re-run the subtree's init, both passes
-    void release();   ///< drop the usm_vector of every root in the subtree with no outside peer; SlabKit defers the free
+    void release();   ///< drop the usm_vector of every root in the subtree with no outside peer; waits the stream, then SlabKit frees synchronously (D135)
     bool transient_ = false;   ///< set by add_subsystem from property::transient
     bool released_  = false;
 
@@ -2455,7 +2455,7 @@ auto m2 = create_model<Top>(std::move(cfg));
 Each layer orders what it submits: SlabKit its tasks, CoSpan the kernels it
 launches, the user anything they launch over a root outside the framework.
 Teardown relies on AdaptiveCpp queue destruction; waiting before exit is
-the user's obligation. `~Model` waits the stream as a convenience.
+the user's obligation. `~Model` does not wait; call `wait()` before destroying or reassigning a Model (D135).
 Members are destroyed in reverse declaration order: `cfg_`, `root_` (every
 root's `usm_vector` releases), `substrates_` (arenas and pools), `queue_`,
 `ctx_` — no destruction order is relied on beyond that (P9).
@@ -2800,7 +2800,7 @@ the transient System.
 
 The layering rule (§9.4): each layer orders what it submits; teardown
 relies on AdaptiveCpp queue destruction, and waiting before exit is the
-user's obligation. `~Model` waits the stream as a convenience. Everything
+user's obligation. `~Model` does not wait; call `wait()` before destroying or reassigning a Model (D135). Everything
 else is RAII, in reverse declaration order, identical to §9.4: `cfg_`,
 `root_` (roots' `usm_vector`s release), `substrates_` (arenas, pools),
 `queue_`, `ctx_` (P9).

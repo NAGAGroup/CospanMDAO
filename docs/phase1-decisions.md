@@ -431,6 +431,7 @@ view_input/set_input require an input entry and view_output/view_output_mut/set_
 
 ## D110 — ~Model and the moved Model
 `~Model` and move-assignment call `queue.wait_and_throw()` inside try/catch (a stream error is printed to stderr, never thrown), then release the Impl so members go in the D104 order. r01 §9.4.
+Superseded by D135.
 
 ## D111 — smoke_model notes
 The Sellar Systems are copied from smoke_system (no shared header). Case d writes through `view_output_mut` on an OUTPUT root whose elements the producer does not overwrite (Hold writes y[0] of 4; the host owns y[1..3]): the dispatch said "a free input's root", but view_output_mut is the output view and a free input is written with set_input, so that literal case cannot exist. Case c's default_device-outside-context check needs two visible devices and is skipped with one. Observation: under `ACPP_VISIBILITY_MASK=cuda` the OpenMP host device was still enumerated, so case b also ran with that mask; with the mask removed the same result.
@@ -464,6 +465,7 @@ The transient test reaches the transient System with `get_subsystem("tr")` (a `d
 
 ## D121 — KNOWN ISSUE: CUDA deferred-free deadlock without a pool
 A no-pool Model on CUDA hangs in the first kernel submit after an OS-route free (a transient release, or a value-driven root growing): SlabKit's free runs `cuMemFree` in an `async_host` task while the next kernel's host callback blocks the stream on that task. Not a CoSpan bug. SlabKit e5e2ac1 puts deferred frees on their own queue (the design: nothing depends on a free), which as a side effect no longer triggers the fork bug, so the tags are removed and the WeightedHistogram and `[transient]` cases run in the full CUDA suite. The fork bug is still present in naga-acpp 2026.09.29 (a kernel depending on an unfinished async_host node gets a blocking host callback in the CUDA/HIP stream, which CoSpan host components followed by a device consumer still take); the fix is committed in the fork at b04d8349 (naga/develop, unbuilt, unpushed), see the doc. A pool in `ModelConfig` is still an option. Details and stacks: `docs/known-issues/cuda-deferred-free-deadlock.md`. r01 §4, §9.
+Superseded by D135.
 
 ## D122 — Release without -g is the only working build for now
 `RelWithDebInfo` (`-O2 -g`) and `-gline-tables-only` builds of CoSpan translation units crash clang 21.1.8 (exit 139) in the "Debug Variable Analysis" pass (`LiveDebugVariables::computeIntervals` -> `LexicalScopes::initialize`) on `naga::cospan::kb_entry_r1`, in both test TUs. Until that is fixed or worked around, build Release without `-g`; libraries still resolve exported symbols in gdb, header-only CoSpan frames stay unsymbolized. Not a CoSpan source problem. r01 §11.
@@ -476,9 +478,11 @@ Four element-wise stages as a plain System and as a sequential FusedSystem (777 
 
 ## D125 — The flavor tests and the OS free route
 `test_flavors.cpp` (namespace `tfl`, tags `[flavors]` plus `[parallel]` or `[fused]`, `[errors]` on refusals) carries no `[os-free]` tag (D121) and every case except the local-memory-limit one runs on CUDA. Amended: the value-driven allowed cases (D129) now grow a root (`set_input` 8 then 13), which frees through the OS route when the substrate has no pool; that is acceptable since the free lane (D126) means no kernel depends on a free. The local-memory-limit case skips on a device with no usable limit (omp reports the size_t maximum). r01 §7.5, §11.
+Superseded by D135.
 
 ## D126 — SlabKit repinned to the frees-lane commit
 `pixi.toml` pins slabkit to `e5e2ac15f31a88bb4a565b2eb18933f5aba140e1` (was `5d6b7b5e6cb6563cfb285361ce05686518c18f04`): deferred frees run on their own lane, `begin_item` and `open_group` do not merge it, and `wait()` and the stream's wait list do, so no kernel depends on a free (D121). Lock refreshed with `pixi lock`. The `[os-free]` tag is removed from `test_component.cpp` and `test_system.cpp`, and the CUDA verification runs the whole suite with no filter, three times. The fork's root cause is unchanged and still pending a rebuild; see `docs/known-issues/cuda-deferred-free-deadlock.md`. r01 §4, §9.
+Superseded by D135.
 
 ## D127 — StageRecord::local_off
 `StageRecord` gets `uint32_t local_off`, between `scratch_bytes` and `rank`; `kb_fn` fixes a stage's scratch up at `local_base + local_off`. `submit_wave` fills it: sequential running sum with each slice rounded up to 16, parallel 0 (D90). Reason: per-stage slices without a barrier. r01 §5.6.
@@ -505,3 +509,6 @@ A model with roots gen.y f32[100], cvt.d f64[64], a tie alias bc f32[8] and comb
 ## D134 — A CUDA run of the whole suite hung once in an existing flavors case
 One of four CUDA runs of the full suite at this commit hit the 600 s timeout in `test_flavors.cpp:943` (`fused: a value-driven size driven from outside the fuse runs and follows the value, in both modes`, parallel section) before reaching the model tests; the other three passed (44 cases, 543 assertions). Not diagnosed here. That case grows a root and frees it through the free route (D125); whether the hang is related to `docs/known-issues/cuda-deferred-free-deadlock.md` is not established. No library change was made in this step.
 A later CUDA run (run 1 of a repeat set) passed the whole suite (543 assertions in 44 test cases) and then the process dumped core (SIGSEGV, exit 245) after Catch2's summary, i.e. at teardown. Undiagnosed. Both symptoms (the hang and the exit crash) were seen on naga-acpp 2026.09.29 before the fork fix, and both may be the known fork bug (a value-driven root growing in a no-pool fused wave means an OS free plus SlabKit async_host copies). The next step is to move the lock to the fixed 2026.09.29 build and see what is left.
+
+## D135 — Synchronous frees
+SlabKit a484713 removes the frees lane: `deallocate` waits the events it is given, then frees on the calling thread (pool slot or sycl::free), and a usm_vector passes its own last task. CoSpan's kernels over a root are CoSpan's to wait for, so `StorageEntry::release_storage` (transient release) waits the stream before dropping its slots, and `reshape` waits the stream once before growing a stored root past its capacity. `~Model` and move-assignment do not wait, as a sycl::queue's destructor does not: work the user submitted through the Model's verbs (setup's initializers, set_input/set_output, a view_output_mut write-back, forward) is theirs to wait for with `Model::wait()` before the Model is destroyed or reassigned; a Model dropped with work in flight is undefined. The pin moves to a484713, and the lock stays on fork build 4, which carries the async_host fix. Accepted costs: a transient System's forward blocks until its subtree finishes, and a value-driven grow blocks once. Per-root events were considered and not taken: the primary lane is in order, so a subtree's last launch follows everything before it. r01 §4.4, §9.4.
