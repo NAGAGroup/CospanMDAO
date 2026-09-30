@@ -33,7 +33,7 @@ Principle: fusion is always the user's explicit decision. The framework never gu
 - [ ] LRPIM module + nonlocal gradient over it.
 - [ ] MLS-MPM.
 - [ ] FE heat conduction (a client demonstration, not only a test).
-- [ ] GEMVER→BiCGK→GEMVER chain (examples/gemver-chain)
+- [x] GEMVER→BiCGK→GEMVER chain (examples/gemver-chain)
 
 ## Later, wanted
 
