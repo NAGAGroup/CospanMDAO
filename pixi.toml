@@ -97,3 +97,28 @@ setup-git = "git config core.hooksPath .project/hooks"
 [environments.git]
 features = ["git"]
 no-default-feature = true
+
+# ---- cuBLAS reference for examples/gemver-chain -----------------------------
+# A plain CUDA toolchain from conda-forge, apart from the AdaptiveCpp stack (its
+# own solve group). cuda-version is pinned to what the driver supports (nvidia-smi:
+# CUDA 13.3); gxx 14 is inside nvcc 13.x host-compiler support. Release builds only.
+[feature.cublas]
+channels = ["conda-forge"]
+
+[feature.cublas.dependencies]
+cuda-nvcc       = "13.3.*"
+cuda-cudart-dev = "13.3.*"
+libcublas-dev   = "*"
+cuda-version    = "13.3.*"
+gxx             = "14.*"
+cmake           = "*"
+ninja           = "*"
+
+[feature.cublas.tasks]
+build-cublas          = "cmake -S examples/gemver-chain/cublas -B build/cublas -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=89 && cmake --build build/cublas"
+gemver-chain-cublas   = "build/cublas/gemver-chain-cublas"
+
+[environments.cublas]
+features = ["cublas"]
+no-default-feature = true
+solve-group = "cublas"

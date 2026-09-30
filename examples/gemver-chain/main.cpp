@@ -2,7 +2,7 @@
 //
 //   gemver-chain [--n 16384] [--R 64] [--iters 20] [--warmup 3]
 //                [--variant all|unfused|parallel|fused|barrier|onepass]
-//                [--blocks-per-cu 2] [--spin-limit 16777216] [--check]
+//                [--blocks-per-cu 2] [--spin-limit 16777216] [--check] [--dump <dir>]
 //
 // Per variant: create the model, set the inputs from the shared generator, warm up
 // (forward + wait), then time `iters` forwards followed by ONE wait. --check compares
@@ -15,6 +15,8 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <filesystem>
+#include <fstream>
 #include <map>
 #include <optional>
 #include <span>
@@ -44,6 +46,7 @@ struct Options {
     std::uint32_t spin_limit     = 1u << 24;  // barrier polls before a group gives up
     bool          check          = false;
     bool          verbose        = false;
+    std::string   dump;                       // a directory: write x1 w1 q s x2 w2 of every variant as raw f32
     double        tol            = 1e-4;      // relative L2 against the host reference
 };
 
@@ -65,6 +68,7 @@ Options parse(int argc, char** argv) {
         else if (a == "--tol") o.tol = std::stod(val());
         else if (a == "--check") o.check = true;
         else if (a == "--verbose") o.verbose = true;
+        else if (a == "--dump") o.dump = val();
         else throw std::invalid_argument("unknown argument " + a);
     }
     return o;
@@ -178,7 +182,7 @@ Report run_variant(Variant v, const Options& o, const Data& d, std::size_t group
             rep.ok   = false;
             rep.note = "grid not co-resident at G=" + std::to_string(groups);
         }
-        if (o.check && rep.ok) {
+        if ((o.check || !o.dump.empty()) && rep.ok) {
             rep.out      = read_outputs(model, need_B2);
             rep.have_out = true;
         }
@@ -304,6 +308,18 @@ int main(int argc, char** argv) {
                 all_ok = false;
             }
             std::printf("\n");
+        }
+
+        if (!o.dump.empty()) {
+            std::filesystem::create_directories(o.dump);
+            for (const Report& r : reports) {
+                if (!r.have_out) continue;
+                const auto vs = r.out.vectors();
+                for (int i = 0; i < 6; ++i) {
+                    std::ofstream f(o.dump + "/" + name_of(r.variant) + "_" + kVecNames[i] + ".f32", std::ios::binary);
+                    f.write(reinterpret_cast<const char*>(vs[i]->data()), static_cast<std::streamsize>(vs[i]->size() * sizeof(float)));
+                }
+            }
         }
 
         // ---- checks ----
