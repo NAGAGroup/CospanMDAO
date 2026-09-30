@@ -1,0 +1,15 @@
+[package]
+name    = "cospanmdao-examples"
+version = "0.1.0"
+
+[package.build.backend]
+name     = "pixi-build-cmake"
+version  = "*"
+channels = ["https://prefix.dev/pixi-build-backends"]
+
+[package.build.config]
+extra-input-globs = ["**/*.hpp", "**/*.cpp"]
+
+# Linked into the executables, so HOST dependencies (as the tests package).
+[package.host-dependencies]
+cospanmdao = { workspace = true }
