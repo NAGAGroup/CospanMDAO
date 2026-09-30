@@ -20,6 +20,8 @@
 //   parallel  as unfused, but BiCGK's gemv_q and gtp_s are a ParallelSystem
 //   fused     GEMVER: FusedSystem(sequential) [r2u, gtp], cred, gemv;
 //             BiCGK : FusedSystem(parallel) [gemv_q, gtp_s], cred_s
+// and, as its own root, BarrierChain: the whole chain as ONE FusedSystem with
+// software grid barriers between the dependent stages.
 
 #include <cmath>
 #include <cstddef>
@@ -163,6 +165,90 @@ public:
         promote("g2.B", "B2");
         promote("g2.x", "x2");
         promote("g2.w", "w2");
+    }
+};
+
+// =============================================================================
+// The barrier variant: the whole chain as ONE sequential FusedSystem, flat
+// =============================================================================
+// Every stage runs over `groups` resident work-groups (groups * 256 items, grid-stride),
+// and a GridBarrier stands between every pair of stages that depend on each other across
+// groups. Sequential-mode stages run one after the other inside each work-group, so the
+// barrier stage is where the groups of the WHOLE grid meet.
+class BarrierChain : public cs::FusedSystem {
+    int           n_, R_;
+    std::size_t   groups_;
+    std::uint32_t spin_limit_;
+
+public:
+    static constexpr int kBarriers = 7;
+
+    BarrierChain(int n, int R, std::size_t groups, std::uint32_t spin_limit)
+        : cs::FusedSystem(Mode::sequential, std::optional<sycl::range<3>>{wg256()})
+        , n_{n}, R_{R}, groups_{groups}, spin_limit_{spin_limit} {}
+
+    void setup() override {
+        const float       ab  = 1.0f / std::sqrt(static_cast<float>(n_));
+        const std::size_t res = groups_ * kWg;  // resident_items of every stage
+
+        add_subsystem<Rank2Update>("r2u1", n_, R_, res);
+        add_subsystem<GemvTPartial>("gtp1", n_, R_, res);
+        add_subsystem<GridBarrier>("bar1", groups_, spin_limit_);
+        add_subsystem<ColReduce<true>>("cred1", n_, R_, ab, res);
+        add_subsystem<GridBarrier>("bar2", groups_, spin_limit_);
+        add_subsystem<Gemv>("gemv1", n_, ab, res);
+        add_subsystem<GridBarrier>("bar3", groups_, spin_limit_);
+        add_subsystem<Gemv>("gemv_q", n_, 1.0f, res);
+        add_subsystem<GemvTPartial>("gtp_s", n_, R_, res);
+        add_subsystem<GridBarrier>("bar4", groups_, spin_limit_);
+        add_subsystem<ColReduce<false>>("cred_s", n_, R_, 1.0f, res);
+        add_subsystem<GridBarrier>("bar5", groups_, spin_limit_);
+        add_subsystem<Rank2Update>("r2u2", n_, R_, res);
+        add_subsystem<GemvTPartial>("gtp2", n_, R_, res);
+        add_subsystem<GridBarrier>("bar6", groups_, spin_limit_);
+        add_subsystem<ColReduce<true>>("cred2", n_, R_, ab, res);
+        add_subsystem<GridBarrier>("bar7", groups_, spin_limit_);
+        add_subsystem<Gemv>("gemv2", n_, ab, res);
+
+        // G1
+        connect("r2u1.B", "gtp1.B");
+        connect("gtp1.P", "cred1.P");
+        connect("r2u1.B", "gemv1.B");
+        connect("cred1.x", "gemv1.x");
+        // BiCGK on B1: p = x1, r = w1
+        connect("r2u1.B", "gemv_q.B");
+        connect("cred1.x", "gemv_q.x");
+        connect("r2u1.B", "gtp_s.B");
+        connect("gemv1.y", "gtp_s.y");
+        connect("gtp_s.P", "cred_s.P");
+        // G2: A = B1, y = q, z = s
+        connect("r2u1.B", "r2u2.A");
+        connect("r2u2.B", "gtp2.B");
+        connect("gemv_q.y", "gtp2.y");
+        connect("gtp2.P", "cred2.P");
+        connect("cred_s.x", "cred2.z");
+        connect("r2u2.B", "gemv2.B");
+        connect("cred2.x", "gemv2.x");
+
+        promote("r2u1.A", "A");
+        promote("r2u1.u1", "u1a");
+        promote("r2u1.v1", "v1a");
+        promote("r2u1.u2", "u2a");
+        promote("r2u1.v2", "v2a");
+        promote("gtp1.y", "ya");
+        promote("cred1.z", "za");
+        promote("r2u2.u1", "u1b");
+        promote("r2u2.v1", "v1b");
+        promote("r2u2.u2", "u2b");
+        promote("r2u2.v2", "v2b");
+        promote("r2u1.B", "B1");
+        promote("cred1.x", "x1");
+        promote("gemv1.y", "w1");
+        promote("gemv_q.y", "q");
+        promote("cred_s.x", "s");
+        promote("r2u2.B", "B2");
+        promote("cred2.x", "x2");
+        promote("gemv2.y", "w2");
     }
 };
 

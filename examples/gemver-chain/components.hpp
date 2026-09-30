@@ -22,6 +22,7 @@
 //   GemvTPartial  P[c][j] = sum_{k<R} B[c R + k][j] * y[c R + k]   (same item mapping)
 //   ColReduce<Z>  x[j] = (Z ? z[j] : 0) + scale * sum_c P[c][j]
 //   Gemv          out[i] = scale * (B[i] . x), a group per row (grid-stride over rows)
+//   GridBarrier   a software grid barrier over atomics (needs every group co-resident)
 
 #include <cstddef>
 #include <cstdint>
@@ -254,6 +255,59 @@ public:
         const std::size_t range = launch_items(static_cast<std::size_t>(n_) * kWg, resident_);  // a group per row
         return create_launch_config(sycl::range<1>{range}, sycl::range<1>{kWg}, GemvBody::Inputs{B_, x_},
                                     GemvBody::Outputs{y_}, GemvBody{u32(n_), scale_});
+    }
+};
+
+// =============================================================================
+// GridBarrier: a software grid barrier. Only valid when EVERY group of the launch is
+// co-resident, which is why the whole chain runs on a capped, resident number of groups.
+// =============================================================================
+// `count` is never reset: it grows by G per crossing, and crossing k waits for count >= k * G.
+// A group that waits `spin_limit` polls without seeing the target gives up and sets `timeout`.
+struct GridBarrierBody {
+    struct Inputs {};
+    struct Outputs {
+        cs::Output<DType::atomic_u32, 1> count, timeout;
+    };
+    std::uint32_t target, spin_limit;
+
+    void operator()(cs::GroupItem<1> it, Inputs, Outputs out) const {
+        // Publish this work-item's earlier global writes at device scope, then gather the group.
+        sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::device);
+        sycl::group_barrier(it.get_group());
+        if (it.get_local_id(0) == 0) {
+            auto count = out.count[sycl::id<1>{std::size_t{0}}];
+            count.fetch_add(1u);
+            std::uint32_t spins = 0;
+            while (count.load() < target && spins < spin_limit) ++spins;
+            if (count.load() < target) out.timeout[sycl::id<1>{std::size_t{0}}].store(1u);
+        }
+        sycl::group_barrier(it.get_group());
+        sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::device);
+    }
+};
+
+class GridBarrier : public cs::Component<GridBarrierBody> {
+    cs::Output<DType::atomic_u32, 1> count_, timeout_;
+    std::size_t                      groups_;
+    std::uint32_t                    spin_limit_;
+    std::uint32_t                    crossings_ = 0;  // host member: forwards seen so far
+
+public:
+    GridBarrier(std::size_t groups, std::uint32_t spin_limit) : groups_{groups}, spin_limit_{spin_limit} {}
+    void setup() override {
+        declare_output(count_, "count", 1);
+        declare_output(timeout_, "timeout", 1);
+    }
+    void init(sk::queue&, const sycl::device&) override {
+        zero_output("count");
+        zero_output("timeout");
+    }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+        ++crossings_;
+        return create_launch_config(sycl::range<1>{groups_ * kWg}, sycl::range<1>{kWg}, GridBarrierBody::Inputs{},
+                                    GridBarrierBody::Outputs{count_, timeout_},
+                                    GridBarrierBody{static_cast<std::uint32_t>(crossings_ * groups_), spin_limit_});
     }
 };
 

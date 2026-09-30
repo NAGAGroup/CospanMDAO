@@ -1,7 +1,8 @@
 // examples/gemver-chain/main.cpp — the GEMVER -> BiCGK -> GEMVER chain on CoSpan, in several fusion styles.
 //
 //   gemver-chain [--n 16384] [--R 64] [--iters 20] [--warmup 3]
-//                [--variant all|unfused|parallel|fused] [--check]
+//                [--variant all|unfused|parallel|fused|barrier|onepass]
+//                [--blocks-per-cu 2] [--spin-limit 16777216] [--check]
 //
 // Per variant: create the model, set the inputs from the shared generator, warm up
 // (forward + wait), then time `iters` forwards followed by ONE wait. --check compares
@@ -39,6 +40,8 @@ struct Options {
     int           iters          = 20;
     int           warmup         = 3;
     std::string   variant        = "all";
+    int           blocks_per_cu  = 2;
+    std::uint32_t spin_limit     = 1u << 24;  // barrier polls before a group gives up
     bool          check          = false;
     bool          verbose        = false;
     double        tol            = 1e-4;      // relative L2 against the host reference
@@ -57,6 +60,8 @@ Options parse(int argc, char** argv) {
         else if (a == "--iters") o.iters = std::stoi(val());
         else if (a == "--warmup") o.warmup = std::stoi(val());
         else if (a == "--variant") o.variant = val();
+        else if (a == "--blocks-per-cu") o.blocks_per_cu = std::stoi(val());
+        else if (a == "--spin-limit") o.spin_limit = static_cast<std::uint32_t>(std::stoul(val()));
         else if (a == "--tol") o.tol = std::stod(val());
         else if (a == "--check") o.check = true;
         else if (a == "--verbose") o.verbose = true;
@@ -104,23 +109,38 @@ Outputs read_outputs(cs::Model& m, bool with_B2) {
 }
 
 // ---- variants -------------------------------------------------------------------------------------------
-enum class Variant { unfused, parallel, fused };
+enum class Variant { unfused, parallel, fused, barrier };
 constexpr const char* name_of(Variant v) {
     switch (v) {
         case Variant::unfused: return "unfused";
         case Variant::parallel: return "parallel";
         case Variant::fused: return "fused";
+        case Variant::barrier: return "barrier";
     }
     return "?";
 }
 
-cs::Model make_model(Variant v, const Options& o) {
+cs::Model make_model(Variant v, const Options& o, std::size_t groups) {
     switch (v) {
         case Variant::unfused: return cs::create_model<gc::Chain>(cs::ModelConfig{}, gc::Style::unfused, o.n, o.R);
         case Variant::parallel: return cs::create_model<gc::Chain>(cs::ModelConfig{}, gc::Style::parallel, o.n, o.R);
         case Variant::fused: return cs::create_model<gc::Chain>(cs::ModelConfig{}, gc::Style::fused, o.n, o.R);
+        case Variant::barrier:
+            return cs::create_model<gc::BarrierChain>(cs::ModelConfig{}, o.n, o.R, groups, o.spin_limit);
     }
     throw std::logic_error("unknown variant");
+}
+
+/// The value of every barrier's timeout flag; nonzero = some group gave up waiting.
+/// A view of an atomic output is read through its value dtype.
+std::uint32_t barrier_timeouts(cs::Model& m) {
+    std::uint32_t any = 0;
+    for (int i = 1; i <= gc::BarrierChain::kBarriers; ++i) {
+        const std::string path = "bar" + std::to_string(i) + ".timeout";
+        const auto        view = m.view_output<DType::u32, 1>(path);  // the view owns the snapshot
+        any |= view.span()[0];
+    }
+    return any;
 }
 
 struct Report {
@@ -132,10 +152,10 @@ struct Report {
     bool        have_out = false;
 };
 
-Report run_variant(Variant v, const Options& o, const Data& d, bool need_B2) {
+Report run_variant(Variant v, const Options& o, const Data& d, std::size_t groups, bool need_B2) {
     Report rep;
     rep.variant = v;
-    cs::Model model = make_model(v, o);
+    cs::Model model = make_model(v, o, groups);
     try {
         model.setup();
         set_inputs(model, d);
@@ -143,12 +163,21 @@ Report run_variant(Variant v, const Options& o, const Data& d, bool need_B2) {
             model.forward();
             model.wait();
         }
-        const auto t0 = std::chrono::steady_clock::now();
-        for (int i = 0; i < o.iters; ++i) model.forward();
-        model.wait();  // ONE wait for the whole batch
-        const auto t1 = std::chrono::steady_clock::now();
-        rep.ms        = std::chrono::duration<double, std::milli>(t1 - t0).count() / o.iters;
-        rep.ran       = true;
+        bool timed_out = false;
+        if (v == Variant::barrier && barrier_timeouts(model) != 0) timed_out = true;
+        if (!timed_out) {
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < o.iters; ++i) model.forward();
+            model.wait();  // ONE wait for the whole batch
+            const auto t1 = std::chrono::steady_clock::now();
+            rep.ms        = std::chrono::duration<double, std::milli>(t1 - t0).count() / o.iters;
+            rep.ran       = true;
+            if (v == Variant::barrier && barrier_timeouts(model) != 0) timed_out = true;
+        }
+        if (timed_out) {
+            rep.ok   = false;
+            rep.note = "grid not co-resident at G=" + std::to_string(groups);
+        }
         if (o.check && rep.ok) {
             rep.out      = read_outputs(model, need_B2);
             rep.have_out = true;
@@ -220,10 +249,14 @@ int main(int argc, char** argv) {
     try {
         const Options o = parse(argc, argv);
         gd::check_problem(static_cast<std::size_t>(o.n), static_cast<std::size_t>(o.R));
-        if (o.variant != "all" && o.variant != "unfused" && o.variant != "parallel" && o.variant != "fused")
-            throw std::invalid_argument("--variant must be all|unfused|parallel|fused");
+        if (o.variant != "all" && o.variant != "unfused" && o.variant != "parallel" && o.variant != "fused" &&
+            o.variant != "barrier")
+            throw std::invalid_argument("--variant must be all|unfused|parallel|fused|barrier");
 
         const sycl::device dev{sycl::default_selector_v};
+        const bool         is_omp = dev.get_backend() == sycl::backend::omp;
+        const std::size_t  groups = static_cast<std::size_t>(dev.get_info<sycl::info::device::max_compute_units>()) *
+                                    static_cast<std::size_t>(o.blocks_per_cu);
         std::printf("gemver-chain: n=%d R=%d iters=%d warmup=%d device=\"%s\"\n", o.n, o.R, o.iters, o.warmup,
                     dev.get_info<sycl::info::device::name>().c_str());
         std::printf("effective GB/s uses a NOMINAL traffic of 8*n^2*4 bytes = %.3f GB per chain (not measured)\n",
@@ -234,6 +267,12 @@ int main(int argc, char** argv) {
         if (want("unfused")) todo.push_back(Variant::unfused);
         if (want("parallel")) todo.push_back(Variant::parallel);
         if (want("fused")) todo.push_back(Variant::fused);
+        if (want("barrier")) {
+            if (is_omp)
+                std::printf("barrier: skipped on the omp backend (a software grid barrier needs co-resident groups)\n");
+            else
+                todo.push_back(Variant::barrier);
+        }
         if (todo.empty()) throw std::invalid_argument("--variant: nothing to run for '" + o.variant + "'");
 
         Data data;
@@ -242,7 +281,7 @@ int main(int argc, char** argv) {
         const bool with_B2 = o.n <= 4096;
 
         std::vector<Report> reports;
-        for (Variant v : todo) reports.push_back(run_variant(v, o, data, with_B2));
+        for (Variant v : todo) reports.push_back(run_variant(v, o, data, groups, with_B2));
 
         // ---- timing table ----
         double base = 0.0;
