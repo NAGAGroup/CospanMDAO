@@ -17,6 +17,9 @@
 //
 // Styles (Style):
 //   unfused   every component is its own kernel
+//   parallel  as unfused, but BiCGK's gemv_q and gtp_s are a ParallelSystem
+//   fused     GEMVER: FusedSystem(sequential) [r2u, gtp], cred, gemv;
+//             BiCGK : FusedSystem(parallel) [gemv_q, gtp_s], cred_s
 
 #include <cmath>
 #include <cstddef>
@@ -32,7 +35,9 @@
 
 namespace gc {
 
-enum class Style { unfused };
+enum class Style { unfused, parallel, fused };
+
+inline sycl::range<3> wg256() { return sycl::range<3>{kWg, 1, 1}; }
 
 // =============================================================================
 // GEMVER: ports A u1 v1 u2 v2 y z -> B x w
@@ -47,24 +52,33 @@ public:
 
     void setup() override {
         const float ab = 1.0f / std::sqrt(static_cast<float>(n_));  // alpha = beta
-        add_subsystem<Rank2Update>("r2u", n_, R_);
-        add_subsystem<GemvTPartial>("gtp", n_, R_);
+        std::string pre;                                             // the path prefix of r2u and gtp
+        if (style_ == Style::fused) {
+            // r2u and gtp share their (c, j) mapping, so the same work-item reads its own B writes.
+            add_subsystem("fw",
+                          cs::property_list{cs::property::fused{cs::property::fused::Mode::sequential, wg256()}},
+                          child<Rank2Update>("r2u", n_, R_), child<GemvTPartial>("gtp", n_, R_));
+            pre = "fw.";
+        } else {
+            add_subsystem<Rank2Update>("r2u", n_, R_);
+            add_subsystem<GemvTPartial>("gtp", n_, R_);
+        }
         add_subsystem<ColReduce<true>>("cred", n_, R_, ab);
         add_subsystem<Gemv>("gemv", n_, ab);
 
-        connect("r2u.B", "gtp.B");
-        connect("gtp.P", "cred.P");
-        connect("r2u.B", "gemv.B");
+        connect(pre + "r2u.B", pre + "gtp.B");
+        connect(pre + "gtp.P", "cred.P");
+        connect(pre + "r2u.B", "gemv.B");
         connect("cred.x", "gemv.x");
 
-        promote("r2u.A", "A");
-        promote("r2u.u1", "u1");
-        promote("r2u.v1", "v1");
-        promote("r2u.u2", "u2");
-        promote("r2u.v2", "v2");
-        promote("gtp.y", "y");
+        promote(pre + "r2u.A", "A");
+        promote(pre + "r2u.u1", "u1");
+        promote(pre + "r2u.v1", "v1");
+        promote(pre + "r2u.u2", "u2");
+        promote(pre + "r2u.v2", "v2");
+        promote(pre + "gtp.y", "y");
         promote("cred.z", "z");
-        promote("r2u.B", "B");
+        promote(pre + "r2u.B", "B");
         promote("cred.x", "x");
         promote("gemv.y", "w");
     }
@@ -81,16 +95,29 @@ public:
     Bicgk(Style style, int n, int R) : style_{style}, n_{n}, R_{R} {}
 
     void setup() override {
-        add_subsystem<Gemv>("gemv_q", n_, 1.0f);
-        add_subsystem<GemvTPartial>("gtp_s", n_, R_);
+        std::string pre;  // the path prefix of gemv_q and gtp_s
+        if (style_ == Style::parallel) {
+            add_subsystem("par", cs::property_list{cs::property::parallel{}}, child<Gemv>("gemv_q", n_, 1.0f),
+                          child<GemvTPartial>("gtp_s", n_, R_));
+            pre = "par.";
+        } else if (style_ == Style::fused) {
+            // Independent stages: each gets its own slice of groups.
+            add_subsystem("fw",
+                          cs::property_list{cs::property::fused{cs::property::fused::Mode::parallel, wg256()}},
+                          child<Gemv>("gemv_q", n_, 1.0f), child<GemvTPartial>("gtp_s", n_, R_));
+            pre = "fw.";
+        } else {
+            add_subsystem<Gemv>("gemv_q", n_, 1.0f);
+            add_subsystem<GemvTPartial>("gtp_s", n_, R_);
+        }
         add_subsystem<ColReduce<false>>("cred_s", n_, R_, 1.0f);
 
-        connect("gtp_s.P", "cred_s.P");
-        tie_inputs({"gemv_q.B", "gtp_s.B"}, "B");  // one B feeds both kernels
+        connect(pre + "gtp_s.P", "cred_s.P");
+        tie_inputs({pre + "gemv_q.B", pre + "gtp_s.B"}, "B");  // one B feeds both kernels
 
-        promote("gemv_q.x", "p");
-        promote("gtp_s.y", "r");
-        promote("gemv_q.y", "q");
+        promote(pre + "gemv_q.x", "p");
+        promote(pre + "gtp_s.y", "r");
+        promote(pre + "gemv_q.y", "q");
         promote("cred_s.x", "s");
     }
 };

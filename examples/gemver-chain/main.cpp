@@ -1,7 +1,7 @@
 // examples/gemver-chain/main.cpp — the GEMVER -> BiCGK -> GEMVER chain on CoSpan, in several fusion styles.
 //
 //   gemver-chain [--n 16384] [--R 64] [--iters 20] [--warmup 3]
-//                [--variant all|unfused] [--check]
+//                [--variant all|unfused|parallel|fused] [--check]
 //
 // Per variant: create the model, set the inputs from the shared generator, warm up
 // (forward + wait), then time `iters` forwards followed by ONE wait. --check compares
@@ -104,10 +104,12 @@ Outputs read_outputs(cs::Model& m, bool with_B2) {
 }
 
 // ---- variants -------------------------------------------------------------------------------------------
-enum class Variant { unfused };
+enum class Variant { unfused, parallel, fused };
 constexpr const char* name_of(Variant v) {
     switch (v) {
         case Variant::unfused: return "unfused";
+        case Variant::parallel: return "parallel";
+        case Variant::fused: return "fused";
     }
     return "?";
 }
@@ -115,6 +117,8 @@ constexpr const char* name_of(Variant v) {
 cs::Model make_model(Variant v, const Options& o) {
     switch (v) {
         case Variant::unfused: return cs::create_model<gc::Chain>(cs::ModelConfig{}, gc::Style::unfused, o.n, o.R);
+        case Variant::parallel: return cs::create_model<gc::Chain>(cs::ModelConfig{}, gc::Style::parallel, o.n, o.R);
+        case Variant::fused: return cs::create_model<gc::Chain>(cs::ModelConfig{}, gc::Style::fused, o.n, o.R);
     }
     throw std::logic_error("unknown variant");
 }
@@ -216,7 +220,8 @@ int main(int argc, char** argv) {
     try {
         const Options o = parse(argc, argv);
         gd::check_problem(static_cast<std::size_t>(o.n), static_cast<std::size_t>(o.R));
-        if (o.variant != "all" && o.variant != "unfused") throw std::invalid_argument("--variant must be all|unfused");
+        if (o.variant != "all" && o.variant != "unfused" && o.variant != "parallel" && o.variant != "fused")
+            throw std::invalid_argument("--variant must be all|unfused|parallel|fused");
 
         const sycl::device dev{sycl::default_selector_v};
         std::printf("gemver-chain: n=%d R=%d iters=%d warmup=%d device=\"%s\"\n", o.n, o.R, o.iters, o.warmup,
@@ -227,6 +232,8 @@ int main(int argc, char** argv) {
         std::vector<Variant> todo;
         const auto           want = [&](const char* nm) { return o.variant == "all" || o.variant == nm; };
         if (want("unfused")) todo.push_back(Variant::unfused);
+        if (want("parallel")) todo.push_back(Variant::parallel);
+        if (want("fused")) todo.push_back(Variant::fused);
         if (todo.empty()) throw std::invalid_argument("--variant: nothing to run for '" + o.variant + "'");
 
         Data data;
