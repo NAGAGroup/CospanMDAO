@@ -35,6 +35,21 @@ Principle: fusion is always the user's explicit decision. The framework never gu
 - [ ] FE heat conduction (a client demonstration, not only a test).
 - [x] GEMVER→BiCGK→GEMVER chain (examples/gemver-chain)
 
+## User documentation (tutorial-style; before cycles and optimizers)
+
+Topics learned while building the light-transport forcing case (2026-09-30). Each becomes a tutorial section with a worked example.
+
+- [ ] The functional model: outputs are computed fresh and are never initialized; no global scratch; multi-step work is several components, producer to consumer.
+- [ ] Accumulation patterns: group work with local memory inside one kernel; or a zeroing producer component plus the accumulators, joined with tie_outputs (atomic by default, allow_plain when writes are disjoint).
+- [ ] Atomics are relaxed; use sycl::atomic_fence(acq_rel, device) where ordering matters (e.g. bottom-up tree builds).
+- [ ] Namespaces, promotions and ties: subsystems get their own namespaces; Systems declare no I/O of their own; promote exposes one entry as a public alias (optional, only for what matters outside); ties are how inputs or outputs share a root; connect makes data links; names at one level are unique.
+- [ ] Registration order is execution order: add children in dataflow order.
+- [ ] Value-driven sizes: a size computed by an earlier sibling in the same forward drives a later sibling's shape (count → scan → fill); not inside Fused or Parallel systems.
+- [ ] Transient subsystems: transientness is registration metadata (the highest level wins); a root is released after its last user; durability comes from any non-transient user or a promotion at a non-transient level.
+- [ ] RunNSystem: do-once is n = 1; combined with transient for setup-time construction.
+- [ ] Initialization as metadata: init_input on free inputs, the highest level wins, ignored when the input is connected, zero by default.
+- [ ] Packaging a CoSpan consumer with pixi: depend on cospanmdao as a host AND run dependency (SlabKit's shared library comes with it).
+
 ## Later, wanted
 
 - [ ] Parallel Systems (beyond Components).
@@ -46,3 +61,4 @@ Principle: fusion is always the user's explicit decision. The framework never gu
 - [ ] CoSpan pixi manifest repinned to the naga toolchain (full previous manifest at dbebc3a:pixi.toml).
 - [ ] README.md rewrite (it still describes the first-pass framework).
 - [ ] Tests from the first code commit.
+- [ ] Clean up tests/smoke and tests/spike: standalone, unbuilt, and stale after D138 (they use init() hooks, initializers, EntryAccess/RootDriver). Fold anything still worth checking into the Catch2 suite, then remove them (Jack decides at cleanup time).
