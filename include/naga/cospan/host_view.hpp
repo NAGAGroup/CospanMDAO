@@ -223,9 +223,17 @@ private:
     HostRagged(detail::IOEntry& entry, sk::queue& q) {
         detail::check_entry_type(entry, DT, Rank);
         if (entry.is_ragged()) {
-            data    = detail::storage_of<value_type>(entry).read_primary(q);
-            offsets = entry.block_offsets();
-            data.resize(static_cast<std::size_t>(offsets.back()));
+            // Under a runtime leading range [a, b) (D140 B1) the view is that range: its offsets start at 0
+            // and its data starts at the root's block a.
+            std::vector<value_type> whole = detail::storage_of<value_type>(entry).read_primary(q);
+            offsets                       = entry.block_offsets();
+            const std::size_t start =
+                entry.leading_range() ? static_cast<std::size_t>(entry.root()->block_offset_at(entry.leading_range()->first)) : 0;
+            const std::size_t total = static_cast<std::size_t>(offsets.back());
+            if (start + total > whole.size())
+                throw std::out_of_range("naga::cospan: '" + entry.full_path() + "' presents elements past its root's storage");
+            data.assign(whole.begin() + static_cast<std::ptrdiff_t>(start),
+                        whole.begin() + static_cast<std::ptrdiff_t>(start + total));
             for (int d = 1; d < Rank; ++d) {
                 per_[static_cast<std::size_t>(d - 1)]     = entry.dim(d).per;
                 extents_[static_cast<std::size_t>(d - 1)] = entry.per_index_extents(d);

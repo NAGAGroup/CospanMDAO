@@ -720,6 +720,8 @@ declare_output(pts_, "pts", cs::FromInputDim{"counts", 0}, cs::FromInputValues{"
 
 **Host views.** `model.view_ragged_input<DT,R>(path)` / `view_ragged_output<DT,R>(path)`: `data`, `offsets`, `size()`, `extents(d)`, `is_per_index(d)`, `block(i)`; also on dense entries. `view_input`/`view_output` on a ragged entry throw and point to them.
 
+**Runtime leading ranges (D140 B1).** Framework-only (`detail::LeadingRangeAccess`, no user API): a connected input (a non-root peer) can be pointed, between forwards, at rows / blocks [a, b) of its root along dim 0, and back (`clear`). Dense root: its view becomes the SubarrayRef with dim-0 offset a and extent b-a (composed with a setup-time Slice, which is restored by `clear`). Ragged root: N = b-a, the peer's host per-index arrays are the root's [a, b) slice, its device offsets and per-index pointers are the root's shifted by a, and its data starts at the root's offsets[a]; ragged wrappers address block i at `data + (off[i] - off[0])`, so a shifted pointer works. Setting a range re-runs the peer's shape update and `validate_connection` and re-points its wrapper. `a > b` and `b > N` are errors that leave the previous range in place. `view_ragged_input` of such a peer shows the range (offsets rebased to 0).
+
 **Errors.** A per-index spec on dim 0; a dense wrapper declared with a per-index spec (setup); a dense wrapper whose entry inherits a per-index dim, a per-index length different from N, a negative extent, mismatching per-index extents or totals on a connection (forward); a Slice onto a ragged port (setup).
 
 **Not supported yet.** Ragged ports in a FusedSystem or ParallelSystem (a setup error).

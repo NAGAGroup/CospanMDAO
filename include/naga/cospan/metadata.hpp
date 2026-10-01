@@ -403,6 +403,17 @@ public:
         for (std::size_t i = 0; i < extents_[0]; ++i) out[i + 1] = out[i] + block;
         return out;
     }
+    /// The block offset of index i (0 <= i <= N): offsets()[i] of a ragged entry, i * the block size of a
+    /// dense one. No copy of the whole array.
+    std::uint64_t block_offset_at(std::size_t i) const {
+        if (mirror_of_ != nullptr) return mirror_of_->block_offset_at(i);
+        if (ragged_) return offsets_.at(i);
+        std::uint64_t block = 1;
+        for (int d = 1; d < rank_; ++d) block *= extents_[static_cast<std::size_t>(d)];
+        return i * block;
+    }
+    /// The runtime leading range [a, b) this connected input sees of its root (D140 B1); none = whole.
+    std::optional<std::pair<std::size_t, std::size_t>> leading_range() const { return lead_; }
     /// The raw per-index array of dimension d (empty: scalar). Internal.
     const std::vector<std::size_t>& per_index_raw(int d) const { return dims_[static_cast<std::size_t>(d)].per_index; }
     const DimRecord& dim(int d) const {
@@ -702,6 +713,63 @@ private:
     friend class naga::cospan::System;
     friend class naga::cospan::ComponentBase;
     friend struct EntryAccess;
+    friend struct LeadingRangeAccess;
+
+    /// D140 B1, framework only (through LeadingRangeAccess). A NON-root input peer sees rows / blocks
+    /// [a, b) of its root along dim 0. Dense root: its view becomes the SubarrayRef with dim-0 offset a
+    /// and extent b - a (composed with a setup-time Slice, which is kept and restored by clear); the
+    /// peer's extents follow through update_shape. Ragged root: N = b - a, the host per-index arrays are
+    /// the root's [a, b) slice, and point_ragged shifts the device pointers by a. Re-runs the peer's shape
+    /// update and validate_connection and re-points its wrapper, so the next forward uses the range.
+    void set_leading_range(std::size_t a, std::size_t b) {
+        if (is_root() || mirror_of_ != nullptr || io_kind_ != IOKind::input)
+            throw std::logic_error("naga::cospan: '" + name_ + "': a leading range is set on a connected input (a non-root peer)");
+        const IOEntry&                    r    = *root_;
+        const std::optional<SubarrayRef>& base = lead_ ? pre_lead_view_ : view_;
+        if (rank_ != r.rank_)
+            throw std::invalid_argument("naga::cospan: '" + name_ + "' is rank " + std::to_string(rank_) + " but its root '" +
+                                        r.name_ + "' is rank " + std::to_string(r.rank_) + "; a leading range needs the root's rank");
+        if (r.is_ragged() && base)
+            throw std::invalid_argument("naga::cospan: '" + name_ + "' sees a subarray of the ragged '" + r.name_ +
+                                        "'; ragged roots cannot be sliced");
+        const std::size_t n = base ? base->extents[0] : r.extents_[0];
+        if (a > b)
+            throw std::invalid_argument("naga::cospan: '" + name_ + "': leading range [" + std::to_string(a) + ", " +
+                                        std::to_string(b) + ") has a > b");
+        if (b > n)
+            throw std::invalid_argument("naga::cospan: '" + name_ + "': leading range [" + std::to_string(a) + ", " +
+                                        std::to_string(b) + ") is past the " + std::to_string(n) +
+                                        " leading indices of '" + r.name_ + "'");
+        if (!r.is_ragged()) {
+            SubarrayRef v;
+            v.rank = r.rank_;
+            for (std::size_t d = 0; d < 3; ++d) {
+                v.offset[d]  = base ? base->offset[d] : 0;
+                v.extents[d] = base ? base->extents[d] : r.extents_[d];
+            }
+            v.offset[0] += a;
+            v.extents[0] = b - a;
+            if (!lead_) pre_lead_view_ = view_;
+            view_ = v;
+        } else if (!lead_) {
+            pre_lead_view_ = view_;  // empty: ragged roots have no views
+        }
+        lead_ = std::make_pair(a, b);
+        refresh_after_range();
+    }
+    /// Back to the whole range (and the setup-time view, if any).
+    void clear_leading_range() {
+        if (!lead_) return;
+        view_ = pre_lead_view_;
+        pre_lead_view_.reset();
+        lead_.reset();
+        refresh_after_range();
+    }
+    void refresh_after_range() {
+        update_shape();
+        validate_connection();
+        if (root_->present_) point_wrapper();
+    }
 
     /// merge(into, from): `from` and its peers become peers of `into`.
     static void merge(IOEntry& into, IOEntry& from) {
@@ -728,6 +796,8 @@ private:
     bool                  can_be_source_;
     bool                  can_be_target_;
     std::optional<SubarrayRef> view_;
+    std::optional<std::pair<std::size_t, std::size_t>> lead_;  ///< D140 B1: the runtime leading range
+    std::optional<SubarrayRef> pre_lead_view_;                 ///< the setup-time view saved while lead_ is set
     bool                  transient_ = false;     ///< roots, set by System::resolve
     const Subsystem*      declarer_  = nullptr;
 
@@ -859,18 +929,31 @@ public:
             if (view())
                 throw std::invalid_argument("naga::cospan: '" + std::string{name()} + "' sees a subarray of the ragged '" +
                                             std::string{r.name()} + "'; ragged roots cannot be sliced");
-            if (extents()[0] != r.extents()[0])
+            const auto        lr = leading_range();  // D140 B1: compare against the root's [a, b)
+            const std::size_t a  = lr ? lr->first : 0;
+            const std::size_t rn = lr ? lr->second - lr->first : r.extents()[0];
+            if (extents()[0] != rn)
                 throw std::invalid_argument("naga::cospan: ragged input '" + std::string{name()} + "' has " +
                                             std::to_string(extents()[0]) + " blocks but '" + std::string{r.name()} +
-                                            "' has " + std::to_string(r.extents()[0]));
-            for (int d = 1; d < rank(); ++d)
-                if (per_index_extents(d) != r.per_index_extents(d))
+                                            "' has " + std::to_string(rn));
+            for (int d = 1; d < rank(); ++d) {
+                std::vector<std::size_t> want = r.per_index_extents(d);
+                if (lr) {
+                    if (lr->second > want.size())
+                        throw std::invalid_argument("naga::cospan: ragged input '" + std::string{name()} + "': its leading range is past the blocks of '" + std::string{r.name()} + "'");
+                    want = std::vector<std::size_t>(want.begin() + static_cast<std::ptrdiff_t>(a),
+                                                    want.begin() + static_cast<std::ptrdiff_t>(lr->second));
+                }
+                if (per_index_extents(d) != want)
                     throw std::invalid_argument("naga::cospan: ragged input '" + std::string{name()} + "': the per-index extents of dimension " +
                                                 std::to_string(d) + " differ from those of '" + std::string{r.name()} + "'");
-            if (flat_size() != r.flat_size())
+            }
+            const std::size_t want_total =
+                lr ? static_cast<std::size_t>(r.block_offset_at(lr->second) - r.block_offset_at(lr->first)) : r.flat_size();
+            if (flat_size() != want_total)
                 throw std::invalid_argument("naga::cospan: ragged input '" + std::string{name()} + "' holds " +
                                             std::to_string(flat_size()) + " elements but '" + std::string{r.name()} +
-                                            "' holds " + std::to_string(r.flat_size()));
+                                            "' holds " + std::to_string(want_total));
             return;
         }
         const Geometry g        = geometry();  // throws on a rank mismatch under a view
@@ -1024,7 +1107,16 @@ private:
     std::vector<std::size_t> source_per_index(uint8_t d) const {
         if (is_root()) return {};  // source_extent throws for it before this is reached
         if (view()) return {};
-        return root()->per_index_raw(d);
+        const std::vector<std::size_t>& full = root()->per_index_raw(d);
+        if (const auto lr = leading_range(); lr && source_per_flag(d)) {  // D140 B1: the root's [a, b) slice
+            if (lr->second > full.size())
+                throw std::out_of_range("naga::cospan: '" + std::string{name()} + "': leading range [" +
+                                        std::to_string(lr->first) + ", " + std::to_string(lr->second) +
+                                        ") is past the root's " + std::to_string(full.size()) + " blocks");
+            return std::vector<std::size_t>(full.begin() + static_cast<std::ptrdiff_t>(lr->first),
+                                            full.begin() + static_cast<std::ptrdiff_t>(lr->second));
+        }
+        return full;
     }
 
     /// Whether the root's dimension d is per-index AND already resolved (its array has one entry per
@@ -1083,6 +1175,7 @@ private:
         }
         if (d >= root()->rank())
             throw std::out_of_range("naga::cospan: FromSourceDim past the source's rank");
+        if (const auto lr = leading_range(); lr && d == 0) return lr->second - lr->first;  // a ragged root (D140 B1)
         return root()->extents()[d];
     }
 
@@ -1093,6 +1186,9 @@ private:
     /// device has one, else the OS.
     sk::allocator<T> route(sk::queue& q, Substrates& subs, const Placement& p) const {
         if (p.kind != sk::kind::device) return sk::allocator<T>{q, p.kind, p.device};
+        // An empty root (D139) allocates nothing, so it needs no arena or pool: a fixed size-0 root is
+        // arena-eligible but its device has no arena (the arena is sized from the non-empty roots).
+        if (flat_size() == 0) return sk::allocator<T>{q, sk::kind::device, p.device};
         const sycl::device& d = p.device;
         const auto it = subs.find(d);
         if (arena_eligible()) {
@@ -1159,13 +1255,22 @@ protected:
         std::array<const std::uint64_t*, 2> per{nullptr, nullptr};
         if (this->is_ragged()) {
             const Placement pl = this->placement();
+            // D140 B1: under a leading range [a, b) the device arrays are the root's, shifted by a (the
+            // wrapper addresses blocks relative to offsets[0]); the data starts at the root's offsets[a].
+            const auto        lr = this->leading_range();
+            const std::size_t a  = lr ? lr->first : 0;
             for (int d = 1; d < Rank; ++d) {
-                if (!this->dim(d).per)
+                if (!this->dim(d).per) {
                     ext[static_cast<std::size_t>(d - 1)] = this->dim(d).extent;
-                else
-                    per[static_cast<std::size_t>(d - 1)] = r->ragged_ptr_on(pl, d);
+                } else {
+                    const std::uint64_t* p = r->ragged_ptr_on(pl, d);
+                    per[static_cast<std::size_t>(d - 1)] = p != nullptr ? p + a : nullptr;
+                }
             }
-            IOEntry::write_ragged(w, this->extents()[0], base, r->ragged_ptr_on(pl, 0), ext, per);
+            const std::uint64_t* offs = r->ragged_ptr_on(pl, 0);
+            if (offs != nullptr) offs += a;
+            if (base != nullptr && a > 0) base += r->block_offset_at(a);
+            IOEntry::write_ragged(w, this->extents()[0], base, offs, ext, per);
         } else {
             const IOEntry::Geometry g = this->geometry();
             if (g.stride != contiguous_strides(g.shape))
@@ -1327,6 +1432,13 @@ struct EntryAccess {
         if (d < 0 || d >= e.rank_) throw std::out_of_range("naga::cospan: dim index >= rank");
         e.dims_[static_cast<std::size_t>(d)].extent = extent;
     }
+};
+
+/// INTERNAL (D140 B1). The one runtime-changeable view: the framework (the chunked system, later) and
+/// the tests set the leading range [a, b) a connected input sees of its root along dim 0.
+struct LeadingRangeAccess {
+    static void set(IOEntry& e, std::size_t a, std::size_t b) { e.set_leading_range(a, b); }
+    static void clear(IOEntry& e) { e.clear_leading_range(); }
 };
 
 }  // namespace detail
