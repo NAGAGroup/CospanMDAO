@@ -1291,11 +1291,13 @@ private:
     }
     bool root_per_flag(uint8_t d) const { return source_per_flag(d); }
 
-    /// A tied entry's per-index array of dimension d: its root's.
+    /// A tied entry's per-index array of dimension d: its root's. Under a runtime leading range (D140 B1/B2:
+    /// an inside peer of a boundary root in a ChunkedSystem) it is the root's [a, b) slice, exactly as
+    /// source_per_index gives it.
     std::vector<std::size_t> root_per_index(uint8_t d) const {
         if (is_root()) return {};
         if (view()) return {};
-        return root()->per_index_raw(d);
+        return source_per_index(d);
     }
 
     Slot* find_slot(const Placement& p) const {
@@ -1324,6 +1326,7 @@ private:
         if (is_root())
             throw std::logic_error("naga::cospan: '" + full_path() + "' is tied (cs::tied) but is not in a tie");
         if (const auto v = view()) return v->extents[d];
+        if (const auto lr = leading_range(); lr && d == 0) return lr->second - lr->first;  // under a range (D140 B1)
         return root()->extents()[d];
     }
 

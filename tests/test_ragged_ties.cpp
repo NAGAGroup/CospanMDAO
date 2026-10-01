@@ -12,6 +12,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <iostream>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -532,6 +533,75 @@ std::vector<float> chunk_ref(const Sizes& sizes) {
     return out;
 }
 
+// ---- a tie_inputs alias (tied RaggedInput members) INSIDE a ChunkedSystem, connected from an outside ragged output --------
+/// Copy3: cp = 2 pts, an INTERNAL ragged output of a chunked system; `pts` is a tied member.
+struct Copy3Body {
+    struct Inputs {
+        cs::RaggedInput<DType::f32, 3> pts;
+    };
+    struct Outputs {
+        cs::RaggedOutput<DType::f32, 3> cp;
+    };
+    void operator()(sycl::id<1> id, Inputs in, Outputs out) const {
+        auto a = in.pts.block(id[0]);
+        auto b = out.cp.block(id[0]);
+        for (std::size_t q = 0; q < a.size(); ++q) b[q] = 2.0f * a[q];
+    }
+};
+class Copy3 : public cs::Component<Copy3Body> {
+    cs::RaggedInput<DType::f32, 3>  pts_;
+    cs::RaggedOutput<DType::f32, 3> cp_;
+
+public:
+    void setup() override {
+        declare_input(pts_, "pts", cs::tied);
+        declare_output(cp_, "cp", cs::FromInputDim{"pts", 0}, cs::FromInputDim{"pts", 1}, cs::FromInputDim{"pts", 2});
+    }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+        return create_launch_config(sycl::range<1>{pts_.size()}, {pts_}, {cp_}, {});
+    }
+};
+/// sa (sums, a tied member) and cp (a tied member) share the alias `pts`; cp's output feeds st.
+class TieChunkG : public cs::System {
+public:
+    void setup() override {
+        add_subsystem<SumK<1>>("sa");
+        add_subsystem<Copy3>("cp");
+        add_subsystem<SumT>("st");
+        tie_inputs<DType::f32, 3>({"sa.pts", "cp.pts"}, "pts", cs::alias::from_connection());
+        connect("cp.cp", "st.pts");
+    }
+};
+class TieChunkPlain : public cs::System {
+public:
+    explicit TieChunkPlain(std::size_t) {}
+    void setup() override { add_subsystem<TieChunkG>("g"); }
+};
+class TieChunkChunked : public cs::ChunkedSystem {
+public:
+    explicit TieChunkChunked(std::size_t budget) : cs::ChunkedSystem(budget) {}
+    void setup() override { add_subsystem<TieChunkG>("g"); }
+};
+template <class Inner>
+class TieChunkTop : public cs::System {
+    Counts      init_;
+    std::size_t budget_;
+
+public:
+    TieChunkTop(Counts init, std::size_t budget) : init_{std::move(init)}, budget_{budget} {}
+    void setup() override {
+        add_subsystem<CProd>("sz", init_);
+        add_subsystem<Gen>("gen");
+        add_subsystem<Inner>("inner", budget_);
+        add_subsystem<Cons>("c1");
+        add_subsystem<Cons>("c2");
+        connect("sz.counts", "gen.counts");
+        connect("gen.pts", "inner.g.pts");
+        connect("inner.g.sa.sums", "c1.in");
+        connect("inner.g.st.sums", "c2.in");
+    }
+};
+
 // ---- alias shapes from INPUTS, and shape inheritance from internal entries, inside a ChunkedSystem ------------------------
 /// BuildS: t = in (q + 1); also has the u32 input `sizes` (promoted by G; the alias reads its values).
 struct BuildSBody {
@@ -1000,6 +1070,59 @@ TEST_CASE("Ragged ties: alias shapes from inputs and from internal entries insid
                     CHECK(r.allocation_count() == static_cast<std::size_t>(rep + 1));
                 }
             }
+        }
+    }
+}
+
+TEST_CASE("Ragged ties: tied ragged members of an alias inside a ChunkedSystem slice the per-index arrays per chunk",
+          "[ragged][tie][chunked]") {
+    // internal bytes per index: cp is [c, 3] floats = 12 c; the greedy scan of the framework
+    const auto chunks_for = [](const trt::Counts& counts, std::size_t budget) {
+        std::size_t chunks = 0, acc = 0;
+        for (const std::uint32_t c : counts) {
+            if (acc + 12u * c > budget) {
+                ++chunks;
+                acc = 0;
+            }
+            acc += 12u * c;
+        }
+        return chunks + 1;
+    };
+    const trt::Counts first{3, 1, 4, 0, 2, 5, 1, 3, 2, 4};
+    const trt::Counts second{2, 0, 5, 5, 1, 1, 3, 4, 0, 2};
+    // total 300 B (1 chunk), 150 (about 2), 70 and 60 (many; 60 fits the largest group, c = 5)
+    for (const std::size_t budget : {std::size_t{300}, std::size_t{150}, std::size_t{70}, std::size_t{60}}) {
+        INFO("budget " << budget);
+        cs::Model plain = cs::create_model<trt::TieChunkTop<trt::TieChunkPlain>>(default_config(), first, std::size_t{0});
+        plain.setup();
+        cs::Model m = cs::create_model<trt::TieChunkTop<trt::TieChunkChunked>>(default_config(), first, budget);
+        m.setup();
+        for (const trt::Counts* counts : {&first, &second}) {
+            plain.init_input("sz.raw", cs::init::from_host(*counts));
+            m.init_input("sz.raw", cs::init::from_host(*counts));
+            plain.forward();
+            plain.wait();
+            m.forward();
+            m.wait();
+            for (const char* out : {"c1.out", "c2.out"}) {
+                const auto p = plain.view_output<DType::f32, 1>(out);
+                const auto c = m.view_output<DType::f32, 1>(out);
+                REQUIRE(p.size() == counts->size());
+                REQUIRE(c.size() == counts->size());
+                for (std::size_t i = 0; i < counts->size(); ++i) CHECK(c.span()[i] == p.span()[i]);  // bitwise
+            }
+            // host reference: c1 = 2 sum(pts) + 1, c2 = 2 sum(2 pts) + 1
+            const auto c1 = m.view_output<DType::f32, 1>("c1.out");
+            const auto c2 = m.view_output<DType::f32, 1>("c2.out");
+            for (std::size_t i = 0; i < counts->size(); ++i) {
+                float s = 0.0f;
+                for (std::size_t q = 0; q < (*counts)[i] * 3u; ++q) s += static_cast<float>(i * 1000 + q);
+                CHECK(c1.span()[i] == 2.0f * s + 1.0f);
+                CHECK(c2.span()[i] == 2.0f * (2.0f * s) + 1.0f);
+            }
+            CHECK(dynamic_cast<cs::ChunkedSystem&>(m.get_subsystem("inner")).last_chunk_count() == chunks_for(*counts, budget));
+            std::cout << "[obs] tied ragged members chunked: budget " << budget << ", chunks "
+                      << dynamic_cast<cs::ChunkedSystem&>(m.get_subsystem("inner")).last_chunk_count() << "\n";
         }
     }
 }
