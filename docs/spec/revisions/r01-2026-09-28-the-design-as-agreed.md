@@ -148,8 +148,9 @@ are their own components, composed in systems.
   (neighbour searches, sort permutations, sparse operator structure) and
   consumed by gathers and scatters. Connectivity is
   computable by the model.
-- **Transient subtrees** — a property on a subsystem: the subtree's memory is
-  released after each of its runs and revived when it runs again (§4.4).
+- **Transient subtrees** — a property an owner gives a subsystem at
+  registration: the roots that live only inside it are allocated by the
+  components that touch them and released after their last user (§4.4).
 - **Chunked execution over bounded scratch** — N independent instances
   whose per-instance intermediate scratch would cap problem size if
   materialized at once (per-node dense solves, operator fits): run in
@@ -157,9 +158,11 @@ are their own components, composed in systems.
   full-shaped output. A first-class pattern with its own ergonomics;
   touches shapes and transient subtrees (§4.4). (Not specified in this revision;
   see the roadmap.)
-- **Initialization** — free inputs and outputs receive initial values
-  without a component existing to produce them; an owner can override
-  initialization anywhere in its subtree by path.
+- **Initialization** — free input roots receive initial values without a
+  component existing to produce them; the value is metadata on the root,
+  declared by a component or by any owner above it, and the highest level
+  that declares one wins (§4.4). Outputs are always computed fresh and are
+  never initialized (§6.0).
 - **Host access** — reading any I/O on the host by path; writing free
   inputs (driving design variables and parameters) and outputs
   (injecting external results), with host-side views that behave like
@@ -322,11 +325,12 @@ private:
     friend class detail::IOEntry;
 };
 
-/// Initializer<DT, Rank> — the writable twin of an I/O for init(): the
-/// same accessor discipline as Output (bare references for plain dtypes,
-/// sycl::atomic_ref for atomic dtypes), over the entry's root storage on
-/// the Component's device. Obtained inside init() only (§6.2); captured
-/// by value into a kernel the user launches on the queue init() receives.
+/// Initializer<DT, Rank> — the writable twin of an I/O for a custom
+/// initial value: the same accessor discipline as Output (bare references
+/// for plain dtypes, sycl::atomic_ref for atomic dtypes), over the free
+/// input root's primary storage. Handed to the function
+/// of cs::init::custom (§4.4); captured by value into a kernel that
+/// function launches on the queue it receives.
 template <DType DT, int Rank>
 struct Initializer {
     using value_type = cpp_type_t<DT>;
@@ -383,8 +387,8 @@ private:
 /// destruction write the buffer into the entry's root storage
 /// (usm_vector::from_host, which owns its copy of the bytes before
 /// returning) and refresh the root's copies at other placements. Obtained
-/// from Model::view_output_mut (§9) and, as HostInitializer, from the
-/// initializer helpers inside init() (§6.2).
+/// from Model::view_output_mut (§9) and, as the argument of the function of
+/// cs::init::custom_host, by an initial-value declaration (§4.4).
 template <DType DT, int Rank>
 class HostViewMut {
 public:
@@ -408,8 +412,6 @@ private:
     friend class Model;
     friend class ComponentBase;
 };
-
-template <DType DT, int Rank> using HostInitializer = HostViewMut<DT, Rank>;
 
 static_assert(std::is_trivially_copyable_v<Input<DType::f32, 2>>);
 static_assert(std::is_trivially_copyable_v<Output<DType::atomic_f32, 1>>);
@@ -610,6 +612,13 @@ public:
     /// Device placement and per-placement root storage — device(),
     /// placement(), storage_on(), storage_placements() — are declared in §4.
 
+    // ---- registration metadata (ROOTS; recorded by the resolution pass, §4.4) --
+    bool transient() const;                          ///< every registration in the set is transient
+    const std::optional<InitSpec>& init_spec() const;  ///< free input roots: the winning initial value, if any
+    const Subsystem* last_user() const;              ///< transient roots: the last component that touches it
+    bool released() const;                           ///< transient roots: storage currently dropped
+    const Subsystem* declarer() const;               ///< every entry: the Subsystem that registered it
+
     // ---- capabilities ---------------------------------------------------
 
     /// Automatic shape update: applies the DimRecords. Invoked by the
@@ -632,10 +641,12 @@ public:
     /// after update_shape.
     virtual void validate_connection() const = 0;
 
-    /// Allocation, in prepare_exec: ROOTS ONLY. Builds the root's
+    /// Allocation: ROOTS ONLY. A durable root is allocated in prepare_exec;
+    /// a transient root is allocated by the first component that touches it
+    /// in a forward (§4.4). Builds the root's
     /// slabkit::usm_vector for each placement the set spans. A device
     /// placement takes its device's substrate (§7.1): a device-kind root
-    /// that is fully fixed and outside every transient subtree → the arena
+    /// that is fully fixed and not transient → the arena
     /// route (its bytes are what get_exec_info counted); everything else →
     /// the pool route when the device has a pool, else the OS. A host-kind
     /// placement takes the OS route on its device and counts no arena bytes.
@@ -858,40 +869,86 @@ including unconnected inputs and unconnected `tie_inputs` aliases: that
 is how top-level design variables and shared inputs get memory with no
 IndepVarComp (why: §1 need 2.3 initialization, §1 need 2.4 design
 variables). Route (§7.1 `MemorySubstrate`): a device placement of a device-kind root
-that is static and outside every transient subtree takes its device's
+that is static and not transient takes its device's
 arena; any other device placement takes that device's pool when it has one,
 else the OS; a host-kind placement takes the OS route on its device (a
 host-kind slot counts no arena bytes, and a host-primary root has no
 static bytes) — all at first need and on growth. Peers own nothing, ever:
 a root holds one allocation per placement its set spans (§4.2).
 
-TRANSIENT SUBTREES. A System added with `property::transient` (§7.4)
-releases, when its run of the subtree returns, every root declared anywhere
-in its subtree that has no peer declared outside the subtree. A root with
-an outside peer — a consumer connected from outside the subtree, or a
-promotion made by an owner above it — keeps its storage. Every entry
-records the Subsystem that declared it (`declarer()`); marking walks from
-the declarer up through the owners to find the System an entry lives in.
-Marking runs once, at the END of the ROOT System's setup (the System with
-no owner), not per System, because peers declared later by an outer System
-decide whether a root escapes. A root declared in a transient subtree with
-no peer outside it belongs to the INNERMOST qualifying transient System and
-takes no arena bytes: it is allocated in `prepare_exec` like every other
-root, through the pool route. A System releases the storage of the roots
-it owns and reports itself released only if it dropped storage, so an
-empty transient System is never released. A forward that reaches a
-transient System whose roots are released first REVIVES the subtree,
-before its children's loop: the released roots are re-allocated through
-the pool route at their current extents, nested released transient Systems
-revive the same way, and the subtree's init runs again (Component pass,
-then System pass, children before owners; the stream orders that work
-before the loop's submissions), so a revived root holds its initial values
-again; nothing outside the subtree re-initializes. Then the child loop
-runs; then the subtree is released again. Nested transient Systems release
-their own subtrees first. Host access to a released root — a view or a
-setter — throws, naming the root and the transient System and saying the
-storage exists only while that System runs; a silent empty view would read
-as valid data. Why: §1 need 2.1 transient subtrees · P3.
+TRANSIENTNESS IS REGISTRATION METADATA. Only an OWNER declares a subsystem
+transient, by passing `property::transient` to `add_subsystem` (§7.4); the
+subsystem may be a Component or a System. (A ParallelSystem's children
+still take only `property::device`, §7.5.) A REGISTRATION is a Component's
+entry, or a promoted or tied alias made by a System; every registration
+records the Subsystem that made it (`declarer()`). A registration is
+transient if its registering subsystem, or any ancestor of it, was added
+transient: the highest level wins, and an inner level cannot undo an outer
+transient. A ROOT is transient if and only if EVERY registration in its
+alias set is transient. A promotion or tie made at a non-transient level,
+or any non-transient component touching the root, makes it durable — which
+is how an output consumed from outside a transient subtree, or promoted by
+an owner above it, keeps its storage. The decision is recorded once per
+root by the RESOLUTION PASS, at the END of the ROOT System's setup (the
+System with no owner), not per System, because registrations made later by
+an outer System decide whether a root is transient. The pass also records,
+per root, its initial value (below) and, for a transient root, its LAST
+USER: the last Component, in depth-first registration order, that touches
+the root. A transient root is never arena-eligible and counts no static
+bytes: it takes the pool route, or the OS route when the device has no
+pool. A mark (§8.4) on a transient root is an error at setup.
+
+INITIAL VALUES ARE METADATA ON FREE INPUT ROOTS. A FREE INPUT ROOT is an
+input root with no source. Its initial value is declared during `setup()`
+and applied by the framework; outputs are never initialized (§6.0).
+
+```cpp
+namespace naga::cospan::init {
+template <class T> InitSpec fill(T value);                 // every element = value
+InitSpec                    zero();                        // every element = 0
+template <class T> InitSpec from_host(std::vector<T> v);   // element i = v[i]; size = the root's flat size
+template <DType DT, int Rank>
+InitSpec custom(std::function<void(sk::queue&, Initializer<DT, Rank>)> fn);   // device-side; the function enqueues on the queue
+template <DType DT, int Rank>
+InitSpec custom_host(std::function<void(HostViewMut<DT, Rank>&)> fn);         // host-side; committed on return
+}
+// ComponentBase::init_input(std::string_view name, InitSpec)   — on the Component's OWN input
+// System::init_input(std::string_view path, InitSpec)          — a child input path, or one of
+//                                                                this System's promoted or tied input aliases
+```
+
+- **Highest level wins.** The declaring subsystem's depth decides, the
+  root System being depth 0; the smallest depth wins. Two declarations at
+  the same depth on one root are an error at setup (the resolution pass).
+- **A root with a source ignores its init.** An init declared on an input
+  whose root ends up with a source (a connected input) is ignored, so a
+  reusable component can carry a default for the case it is left
+  unconnected. An init declared on an output is an error at setup.
+- **No init, zeros.** A free input root with no init is zero-filled.
+- **When it applies.** The framework applies a root's init when it
+  allocates that root from nothing: at setup for a durable root (§11.2.6),
+  and at each (re)allocation for a transient one. A value-driven resize
+  preserves the existing content and does not re-init.
+
+THE LIFECYCLE IS THE COMPONENT'S, and the component is always the leaf.
+In `run_pre_compute`, after shape resolution and `pre_forward`, a
+Component allocates every root it touches that has no storage and applies
+that root's init when it is a free input root. In `run_post_compute`, after
+the other-placement sync, it releases the transient roots for which it is
+the LAST USER: each root waits on the stream, then is freed (synchronous
+frees, D135), with one stream wait for the component's batch. Children of a
+ParallelSystem or FusedSystem are ordered within their flavor, and their
+`post_compute` runs after the group or wave returns, so a root's release
+follows the work of every child in it. A Component that does not run in a
+forward (a RunNSystem that is exhausted, a gate not taken) neither
+allocates nor releases; its roots simply wait. An exception thrown
+mid-forward leaves roots unreleased (D84). Host access to a released root —
+a view or a setter — throws, naming the root and the transient subsystem
+whose registration made it transient, and saying the storage exists only
+while that subsystem's components run; a silent empty view would read as
+valid data. The one cost is a host stream wait per releasing component per
+forward. Why: §1 need 2.1 transient subtrees, §1 need 2.3 initialization ·
+P3 · P6 (declaration is one phase; the resolution pass is its end).
 
 ### 4.5 From sets to storage
 
@@ -899,9 +956,11 @@ Aliasing is complete the moment each structural call returns. Storage
 follows in the setup chain (§11): `get_exec_info` registers on
 each root the placements its set spans (the root's own placement first)
 and counts the root's bytes once per such device-kind placement, none for
-a host-kind one; `prepare_exec` allocates each root's per-placement
-storage from the substrates and points every wrapper at
-`root()->storage_on(own placement)`. Regrowth of a root needs no
+a host-kind one or a transient root; `prepare_exec` allocates each DURABLE
+root's per-placement storage from the substrates and points the wrappers
+of every allocated root at `root()->storage_on(own placement)` (a transient
+root is allocated, and its wrappers pointed, by the components that touch
+it in a forward, §4.4). Regrowth of a root needs no
 notification: peers re-point at their next turn. Copies at the
 non-primary placements are refreshed by the root's producer after every
 launch.
@@ -1369,6 +1428,29 @@ q.submit([&](sycl::handler& cgh){
 Binding contract; declarations only. Wrappers: §2. Metadata/shapes: §3.
 Kernel machinery: §5. System: §7. The end-to-end lifecycle: §11.
 
+### 6.0 The functional model
+
+A model is a function from its free inputs to its outputs, and a component
+is one step of it:
+
+- **Outputs are always computed fresh from inputs.** No component may
+  assume an initial output value, and outputs are not initializable. Only
+  a free input root has an initial value (§4.4).
+- **There is no global scratch.** Multi-step work is several components,
+  producer to consumer; an intermediate is one component's output and the
+  next one's input, transient (§4.4) when it should not outlive its last
+  user.
+- **Accumulation takes one of two forms.** Either group work with local
+  memory inside one kernel (§5.2), or a zeroing producer component
+  followed by the accumulating components, all joined by `tie_outputs`
+  (§4.3), whose default stays `require_atomic` with `allow_plain` as the
+  user's opt-out.
+- **Atomic accesses are relaxed** (§2). A kernel that needs acquire/release
+  ordering uses `sycl::atomic_fence(sycl::memory_order::acq_rel,
+  sycl::memory_scope::device)`, which SYCL 2020 guarantees on every device.
+
+Why: §1 need 2.1 possibility floor (the general map) · P1 · P3.
+
 ### 6.1 Subsystem — the ONE contract between an owner and what it owns
 
 A System owns Subsystems and never learns which kind they are. Everything
@@ -1399,18 +1481,16 @@ public:
     /// per-entry logic.
     virtual std::unordered_map<sycl::device, size_t>
         get_exec_info(const sycl::device& parent_device) = 0;
-    /// Allocate what can be allocated now and point every wrapper at its
-    /// storage (own allocation, else root()->data() — roots are allocated
-    /// before their peers); Systems complete their ExecCtx.
+    /// Allocate the DURABLE roots that can be allocated now and point their
+    /// wrappers at the storage (own allocation, else root()->data() — roots
+    /// are allocated before their peers); Systems complete their ExecCtx.
+    /// Transient roots are the components' to allocate, in a forward (§4.4).
     virtual void prepare_exec(sk::queue& queue, Substrates& substrates) = 0;
     /// Compile bodies (Components); recurse (Systems). A FusedSystem also
     /// checks its structure here (children, ranks, value-driven sizes);
     /// the rest of a flavor's legality is checked per forward on the
     /// descriptions (§7.5).
     virtual void compile() = 0;
-    /// Component pass of init_tree (§11): a Component runs its init(); a
-    /// System forwards to its children in order.
-    virtual void run_init(const ExecCtx& owner_ctx) = 0;
 
     // ---- forward (per forward; §6.5) ------------------------------------
     virtual void run_pre_compute(ExecCtx& owner_ctx) = 0;
@@ -1456,16 +1536,9 @@ public:
     /// Declare I/O. Runs once, during the declare pass. ZERO allocation,
     /// no device, no queue.
     virtual void setup() = 0;
-    /// Initialize own I/O. Runs once, after allocation and compilation,
-    /// in the Component pass of init_tree (§11). Not limited beyond what `q` permits:
-    /// write with an initializer inside your own kernel, fill, copy —
-    /// anything (anything launched over a root outside the framework is
-    /// ordered by its launcher, §9.4). Initializing a connected input is
-    /// harmless: the producer overwrites it at the first forward. Default
-    /// no-op.
-    /// Why: §1 need 2.3 initialization · P2 (an adopted subsystem's
-    /// inits must not need editing when its inputs get connected).
-    virtual void init(sk::queue& q, const sycl::device& dev) {}
+    /// There is no init hook: a free input's initial value is declared in
+    /// setup() with init_input (below, §4.4), and outputs are never
+    /// initialized (§6.0).
     /// Per-forward manual shape control of a subset of entries; runs
     /// inside the automatic pre-compute after automatic derivation.
     /// Default no-op.
@@ -1494,28 +1567,19 @@ public:
                                 ///  why: §1 need 2.3 host access)
     auto get_outputs() const;
 
-    // ---- initializers (legal inside init() only; else throw) --------------
-    /// Device initializer: the writable twin of Input/Output with Output's
-    /// accessor discipline (§2) — usable directly inside a kernel the user
-    /// writes on `q`.
-    /// Why: §1 need 2.3 initialization (not limited beyond the queue).
-    template <DType DT, int Rank> Initializer<DT, Rank> get_input_initializer(std::string_view name);
-    template <DType DT, int Rank> Initializer<DT, Rank> get_output_initializer(std::string_view name);
-    /// Host initializer: a HostViewMut (§2) over the entry — the current values on the host, written back to the root and its other-placement copies on commit() and destruction.
-    template <DType DT, int Rank> HostInitializer<DT, Rank> get_input_host_initializer(std::string_view name);
-    template <DType DT, int Rank> HostInitializer<DT, Rank> get_output_host_initializer(std::string_view name);
-    /// Common-case helpers, by name.
-    /// Every helper writes the ROOT's primary storage, then refreshes the
-    /// root's other-placement copies (`copy_d = root`, §6.5 step 3). On a
-    /// root that is unallocated and empty (a shape still to be resolved)
-    /// fill_* and zero_* are a no-op — a fresh allocation is zero-filled;
-    /// on an unallocated non-empty root they throw.
-    template <class T> void fill_input (std::string_view name, T value);
-    template <class T> void fill_output(std::string_view name, T value);
-    void zero_input (std::string_view name);
-    void zero_output(std::string_view name);
-    template <class T> void set_input_from_host (std::string_view name, std::span<const T>);
-    template <class T> void set_output_from_host(std::string_view name, std::span<const T>);
+    // ---- initial values (declared in setup(); else throw; §4.4) -------------
+    /// Declare the initial value of one of this Component's OWN inputs, by
+    /// name: cs::init::fill(v), zero(), from_host(vector), custom(fn) or
+    /// custom_host(fn). Metadata on the input's root, applied by the
+    /// framework when the root is allocated from nothing; the highest level
+    /// that declares one wins, and it is ignored when the input ends up with
+    /// a source — so a reusable component can carry a default for the case
+    /// it is left unconnected. An input is the only thing it applies to:
+    /// naming an output throws at setup. Components have no init() hook and
+    /// no initializer helpers.
+    /// Why: §1 need 2.3 initialization · P2 (an adopted subsystem's
+    /// defaults must not need editing when its inputs get connected).
+    void init_input(std::string_view name, InitSpec init);
 
     // ---- body facts, read off the body's signature -------------------------
     /// Answered by Component<KB>; a fused owner holds type-erased children
@@ -1589,7 +1653,6 @@ private:
         get_exec_info(const sycl::device& parent) override;   // §6.4
     void prepare_exec(sk::queue&, Substrates&) override;      // §6.4
     void compile() override;
-    void run_init(const ExecCtx& c) override;        // -> init(*c.queue, c.device)
     void run_pre_compute(ExecCtx&) override;         // §6.5
     std::unique_ptr<LaunchDescription> run_compute_forward() override; // -> compute_forward()
     void run_post_compute(ExecCtx&) override;        // §6.5
@@ -1611,12 +1674,12 @@ private:
   - `e` is root: register this placement as its primary
     (`set_primary_placement`: it goes first even when an input peer's
     owner registered before it); count its static bytes here (zero for a
-    root inside a transient subtree, and zero for a host-kind primary).
+    transient root, and zero for a host-kind primary).
   - `e` is an input peer: if `root(e)` already has storage registered at
     this placement → nothing; else register this placement on `root(e)`
     and count the root's static bytes here — a device-kind placement adds
-    them once per device, a host-kind one adds none (the root owns one
-    copy per placement its set spans — §4.2).
+    them once per device, a host-kind one or a transient root adds none
+    (the root owns one copy per placement its set spans — §4.2).
   - `e` is an output peer (only a tied output is one): `root(e)`'s
     placement must equal this placement, else ERROR naming the tie —
     producers cannot write one storage from two placements.
@@ -1625,20 +1688,19 @@ private:
   producers precede consumers. Cycles are on the roadmap; their design
   owns the exception.)
   - Return `{device: bytes}`.
-- **`prepare_exec`**: for every own ROOT allocatable now, build its
+- **`prepare_exec`**: for every own DURABLE ROOT allocatable now, build its
   `usm_vector` per registered placement — a device placement from that
-  device's substrate (static, device-kind and outside every transient
-  subtree → arena route; otherwise, with a known shape → pool route with
+  device's substrate (static, device-kind and not transient → arena
+  route; otherwise, with a known shape → pool route with
   OS fallback), a host placement through the OS route on its device;
-  then point every member wrapper at
+  then point the wrapper of every member of an allocated root at
   `root()->storage_on(own placement)` and validate static input peers
-  against their roots. An unconnected input with a `FromSourceDim`
-  dimension errors here.
+  against their roots. A transient root is left unallocated: this
+  Component allocates it in its own `run_pre_compute` (§6.5). An
+  unconnected input with a `FromSourceDim` dimension errors here.
 - **`compile`**: the device function at the body's own rank (`kernel_rank_v<KB>`);
   the individual config; a custom-op or host body compiles nothing. A
   Component knows nothing of fusing.
-- **`run_init`**: `init(queue, device)` with the Model's queue and this
-  Component's device.
 
 ### 6.5 A Component's forward turn
 
@@ -1659,20 +1721,31 @@ work and never sees a queue except through the owner's ctx.
    it). Then shape-derived dims, `pre_forward()` hook (per-entry
    override, last write wins), dynamic connection validation, wrapper
    sync (a root that grew was reallocated by its own allocator route).
+   Then ALLOCATE every root this Component touches that has no storage
+   (pool route, or OS when there is no pool; current extents) and, for a
+   free input root, apply that root's init (§4.4) — at whichever
+   allocation from nothing comes first, which for a value-driven root is
+   the resize above; the stream orders the init before this turn's
+   launch. A root that already has storage is left alone, so a
+   value-driven resize keeps its content and does not re-init.
 2. **`run_compute_forward()`**: `compute_forward()` — returns the
    description. The owner submits it (§7.3).
 3. **`run_post_compute(ctx)`**: through `ctx`, after the owner's
    submission: for each output root with storage at other placements, for
    each other placement `copy_d = root` — one assignment resizes to match
    and copies, routed by SlabKit. Ordered after the work it depends on by
-   the stream (§7.3).
+   the stream (§7.3). Then RELEASE every transient root for which this
+   Component is the last user (§4.4): each root waits on the stream, then
+   is freed (synchronous frees, D135), with one stream wait for this
+   Component's batch.
 
 ### 6.6 Provided kernels — v1
 
 ```cpp
 namespace naga::cospan::kernels {
 template <DType DT, class Op = sycl::plus<cpp_type_t<DT>>>
-struct GroupReduce {      // fast; reduce_over_group + leader atomic; accumulates ONTO out
+struct GroupReduce {      // fast; reduce_over_group + leader atomic; its `out` is tied (tie_outputs) with a
+                          // zeroing producer that runs before it (§6.0), because outputs are never initialized
     struct Inputs  { Input<DT, 1> in; };
     struct Outputs { Output<to_atomic_v<DT>, 1> out; };
     void operator()(GroupItem<1>, Inputs, Outputs) const;
@@ -1731,12 +1804,45 @@ public:
         declare_input (n_bins_, "n_bins",  1);
         declare_output(bins_,   "bins",    FromInput{"n_bins", 0});
     }
-    void init(sk::queue&, const sycl::device&) override { zero_output("bins"); }   // accumulate-onto needs a zero
     std::unique_ptr<LaunchDescription> compute_forward() override {
         return create_launch_config(values_.shape(),
             {values_, weights_, n_bins_}, {bins_}, {lo_, hi_});
     }
 };
+
+// (a') The zeroing producer. Outputs are never initialized (§6.0), so what a
+// histogram accumulates onto is the output of a component that computes zero.
+struct ZeroBody {
+    struct Inputs  { Input<DType::u32,1> n_bins; };
+    struct Outputs { Output<DType::atomic_f32,1> bins; };
+    void operator()(sycl::id<1> i, Inputs, Outputs out) const { out.bins[i].store(0.0f); }
+};
+class ZeroBins : public Component<ZeroBody> {
+    Input<DType::u32,1> n_bins_;  Output<DType::atomic_f32,1> bins_;
+public:
+    void setup() override {
+        declare_input (n_bins_, "n_bins", 1);
+        declare_output(bins_,   "bins",   FromInput{"n_bins", 0});   // sized like the histogram's bins
+    }
+    std::unique_ptr<LaunchDescription> compute_forward() override
+        { return create_launch_config(bins_.shape(), {n_bins_}, {bins_}); }
+};
+
+class Histogram : public System {
+public:
+    void setup() override {
+        add_subsystem<ZeroBins>("zero");                           // BEFORE hist: registration order is execution order
+        add_subsystem<WeightedHistogram>("hist", 0.0f, 1.0f);
+        tie_inputs({"zero.n_bins", "hist.n_bins"}, "n_bins");
+        tie_outputs({"zero.bins", "hist.bins"}, "bins");           // atomic by default
+    }
+};
+```
+
+The zeroing producer runs first in registration order, the histogram
+accumulates atomically onto the tied root, and nothing is initialized.
+
+```cpp
 
 // (b) Group + wg override + Local scratch; GroupItem body.
 struct TransposeBody {
@@ -1791,8 +1897,8 @@ public:
 ```
 
 None of these contains a guard for machinery, a queue, a submission, an
-allocation, or a pointer the user manages. `setup()`, `compute_forward()`,
-optionally `init()` — and physics.
+allocation, or a pointer the user manages. `setup()`, `compute_forward()` —
+and physics.
 
 ---
 
@@ -1859,25 +1965,18 @@ namespace naga::cospan {
 class System : public Subsystem {
 public:
     // ---- HOOKS ------------------------------------------------------------
-    virtual void setup() {}                     ///< structure & wiring (§7.4)
-    virtual void init(sk::queue& q, const sycl::device& dev) {}   ///< runs in the System pass of init_tree (§11), children before owners
+    virtual void setup() {}                     ///< structure & wiring (§7.4); there is no init hook (§4.4)
 
     // ---- Model's entries ------------------------------------------------------
     /// Model knows its root is a System and has no ctx of its own, so the
-    /// root supplies its own. init_tree() is run_init(ctx_) then run_system_init().
+    /// root supplies its own. The root's two end-of-step verbs:
+    /// resolve() — the resolution pass that ends declare (§4.4, §11.2.1) —
+    /// and apply_inits() — each durable free input root's init (§11.2.6).
     /// forward() == run_compute_forward() (no pre/post-compute exists for
     /// the root).
-    void init_tree();
-    void run_system_init();   ///< System pass of init_tree: child Systems first, then this System's init(*ctx_.queue, ctx_.device)
+    void resolve();
+    void apply_inits();
     void forward();
-
-    // ---- initializers by path (legal inside init() only) ----------------------
-    template <DType DT, int Rank> Initializer<DT, Rank>     get_input_initializer (std::string_view path);
-    template <DType DT, int Rank> Initializer<DT, Rank>     get_output_initializer(std::string_view path);
-    template <DType DT, int Rank> HostInitializer<DT, Rank> get_input_host_initializer (std::string_view path);
-    template <DType DT, int Rank> HostInitializer<DT, Rank> get_output_host_initializer(std::string_view path);
-    template <class T> void fill_input (std::string_view path, T v);
-    template <class T> void fill_output(std::string_view path, T v);
 
     // ---- retrieval & enumeration (hierarchy-aware; §3.3 guarantee) ------------
     template <DType DT, int Rank> Input<DT, Rank>&  get_input (std::string_view path);
@@ -1898,26 +1997,21 @@ protected:
         get_exec_info(const sycl::device& parent_device) override;
     /// Complete ctx (queue = the Model's; group = null — only a Parallel
     /// owner sets one; substrate = &substrates[device]); allocate own
-    /// alias roots and point their wrappers; then children.
+    /// durable alias roots and point their wrappers; then children.
     void prepare_exec(sk::queue&, Substrates&) override;
     /// children.compile() in order.
     void compile() override;
-    /// Forwards run_init to its children in order (the Component pass).
-    void run_init(const ExecCtx&) override;
     void run_pre_compute(ExecCtx&) override {}     ///< Systems do no work
     void run_post_compute(ExecCtx&) override {}
     /// THE DEFAULT LOOP (§7.3).
     std::unique_ptr<LaunchDescription> run_compute_forward() override;
 
-    /// Transient subtrees (§4.4). Every run_compute_forward that runs the
-    /// subtree — the default loop, Parallel, Fused, and any custom type that
-    /// calls one of them — calls revive() on entry and release() on exit;
-    /// both are no-ops for a System that is not transient. A custom type
-    /// that returns early without running its subtree calls neither.
-    void revive();    ///< re-allocate released roots (pool route, current extents); re-run the subtree's init, both passes
-    void release();   ///< drop the usm_vector of every root in the subtree with no outside peer; waits the stream, then SlabKit frees synchronously (D135)
-    bool transient_ = false;   ///< set by add_subsystem from property::transient
-    bool released_  = false;
+    /// Transientness is registration metadata, not System state (§4.4): a
+    /// System neither revives nor releases anything. The Components under
+    /// it allocate and release their own roots in their own turns (§6.5), so
+    /// every System flavor and any custom type runs its children's turns
+    /// and nothing more.
+    bool transient_ = false;   ///< a Subsystem field (Components carry it too): set by add_subsystem from property::transient; read by the resolution pass
 
     ExecCtx ctx_;
     std::vector<std::unique_ptr<Subsystem>> children_;   ///< declared order = exec order
@@ -1945,15 +2039,14 @@ The default loop is per child:
 run_post_compute`; a child that submitted itself needs no owner action.
 
 ```
-revive();
 for (child : children_) {
-    child->run_pre_compute(ctx_);
+    child->run_pre_compute(ctx_);             // a Component allocates its roots here (§6.5)
     auto d = child->run_compute_forward();
     if (d) d->submit(ctx_.target());          // WE submit, routed on d->is_custom_op() / d->is_host()
     child->run_post_compute(ctx_);            // copies AFTER the work they depend on —
-                                              //   by the stream, not by an event
+                                              //   by the stream, not by an event; a Component
+                                              //   releases the roots it is the last user of here
 }
-release();
 return nullptr;                               // "I submitted"
 ```
 
@@ -1979,7 +2072,7 @@ namespace naga::cospan {
 namespace property {
     struct device        { sycl::device dev; };            // placement; inherited when absent
     struct parallel      {};                               // flavor
-    struct transient     {};   // the subtree's memory is released after each of its runs (§4.4); Systems only
+    struct transient     {};   // given by an OWNER at registration (a Component or a System): the subsystem and its descendants are transient registrations (§4.4)
     struct fused         { FusedSystem::Mode mode; std::optional<sycl::range<3>> wg; };
 }
 // Gating, counting and change detection are custom System TYPES (§10),
@@ -2019,6 +2112,12 @@ public:
     void tie_inputs (std::initializer_list<std::string_view> members, std::string name);
     void tie_outputs(std::initializer_list<std::string_view> members, std::string name,
                      TieOutputsPolicy policy = TieOutputsPolicy::require_atomic);
+    /// Declare the initial value of a free input root (§4.4): `path` is a
+    /// child input path, or one of this System's promoted or tied input
+    /// aliases. A System's declaration is at its own depth, so it wins over
+    /// any declaration below it and loses to any above it; two at one depth
+    /// on one root are an error at setup.
+    void init_input(std::string_view path, InitSpec init);
     void add_design_var(...);  void add_constraint(...);  void add_objective(...);   // §8
 };
 
@@ -2030,7 +2129,9 @@ has at most one source, enforced at the ROOT's flag after the first
 connection; connecting through any name of a set is the same connection;
 `promote` is kind-agnostic and always allowed; ties must precede
 connections ("tie before connecting, or connect from the alias");
-`tie_outputs` requires atomic member dtypes unless `allow_plain`.
+`tie_outputs` requires atomic member dtypes unless `allow_plain`;
+`init_input` names an input (an init on an output is an error at setup) and
+is ignored when the input's root ends up with a source.
 
 ### 7.5 ParallelSystem and FusedSystem — the two policy flavors
 
@@ -2048,8 +2149,9 @@ namespace naga::cospan {
 /// run_compute_forward: pre_compute ALL children → queue.submit_group {
 /// each child's description submitted with its own device (the Parallel's
 /// unless placed) through a SubmitTarget carrying the group } →
-/// post_compute ALL after the group returns. revive() first, release() last
-/// (§4.4). The group is ONE item of the
+/// post_compute ALL after the group returns (so a child's allocation is in
+/// its pre_compute and its release, as a last user, in its post_compute,
+/// both outside the group, §4.4). The group is ONE item of the
 /// stream (§7.3): its children are unordered among themselves and ordered
 /// both ways against everything outside. ctx.group is set for the extent
 /// of that submit_group and null otherwise. Data independence of children
@@ -2094,9 +2196,9 @@ public:
 /// access pattern between stages is the user's responsibility (§5.3) →
 /// pack streams + records, stamp group slices and local slices, check the
 /// wave's local memory against the device's limit, one staging, ONE
-/// submission with the sequence config → post-compute ALL.
-/// revive() first, release() last (§4.4). The framework inserts no
-/// barriers, in either mode.
+/// submission with the sequence config → post-compute ALL (allocation and
+/// release belong to the children's own pre- and post-compute, §4.4). The
+/// framework inserts no barriers, in either mode.
 /// Local memory (§5.6): sequential mode gives every scratch stage its own
 /// slice (`StageRecord::local_off`, the running sum, each stage's bytes
 /// rounded up to 16) and the launch needs the sum; parallel mode shares
@@ -2131,8 +2233,8 @@ public:
         connect("d2.y2", "d1.y2_in");            // the cycle: needs a solver
         tie_inputs({"d1.z", "d2.z"}, "z");
         promote("d1.y1", "y1");  promote("d2.y2", "y2");
+        init_input("z", init::fill(1.0));        // this level is above d1 and d2: it wins over their defaults
     }
-    void init(sk::queue&, const sycl::device&) override { fill_input("z", 1.0); }   // System pass: last word over d1/d2 inits
 };
 
 class Top : public System {
@@ -2217,7 +2319,8 @@ public:
     /// output's set, and the mark is gone with the old root: a consumed
     /// System's marks never bind the System that consumes it. Recorded
     /// on the root's IOEntry (§3.3 design_var()/…), enumerated by
-    /// Model. `region` restricts a mark to a subarray (root rank) via
+    /// Model. A mark on a transient root is an error at setup (§4.4): a
+    /// marked root must outlive a forward. `region` restricts a mark to a subarray (root rank) via
     /// the same view machinery. Why: §1 need
     /// 2.4 design variables, constraints, objectives.
 
@@ -2287,7 +2390,8 @@ namespace naga::cospan {
 /// The Model owns exactly four kinds of thing: one sk::context, one
 /// sk::queue, the per-device memory substrates ({arena, optional pool}),
 /// and the root System. It drives the setup chain (declare, exec info,
-/// substrates, prepare, compile, init, and collecting the marks of §8.4) and
+/// substrates, prepare, compile, applying the inits of durable free input
+/// roots, and collecting the marks of §8.4) and
 /// the forward; it
 /// never touches a Subsystem except through the Subsystem verbs and
 /// System::forward().
@@ -2337,20 +2441,21 @@ public:
     ///   0. at Model construction: the context is cfg.ctx; the queue is
     ///      queue_ = sk::queue{ctx_, default_device, cfg.async_handler} — ONE queue,
     ///      one in-order stream (§7.3), existing for everything below
-    ///   1. root.run_setup()                       — declare (§6/§7)
-    ///   2. bytes = root.get_exec_info(default_device)   — device -> bytes
+    ///   1. root.run_setup(); root.resolve()       — declare (§6/§7), ending with the resolution pass
+    ///      that records, per root, transient, init and last_user (§4.4)
+    ///   2. bytes = root.get_exec_info(default_device)   — device -> bytes (arena bytes: durable static device roots only)
     ///   3. substrates[d] = { DeviceArena{queue_, d, kind::device, bytes[d] + slack} iff bytes[d] > 0,
     ///      DevicePool iff configured for d } — every subsystem allocates
     ///      through its device's substrate. The arena's capacity is the static
 ///      bytes plus 4096*64 bytes of slack, the bytes measured exactly (the
 ///      sum over the device's distinct roots), so capacity = sum + 262144
-    ///   4. root.prepare_exec(queue_, substrates_) — allocate, point wrappers; ExecCtx complete
+    ///   4. root.prepare_exec(queue_, substrates_) — allocate DURABLE roots, point wrappers; ExecCtx complete
     ///   5. root.compile()                        — bodies
-    ///   6. root.init_tree()                      — Components, then Systems children-before-owners
+    ///   6. root.apply_inits()                    — each durable free input root's init, highest level wins (§4.4)
     ///   7. marks: walk children() depth-first in declaration order and read design_var()/constraint()/objective() off every root entry; cached (§8.4)
     /// Runs once: a second setup(), or forward() / host access before setup(), throws.
     /// After setup the model's STATE is not yet meaningful: it holds
-    /// initialization. State is defined after the first forward.
+    /// initial values. State is defined after the first forward.
     /// Why: §1 need 2.3 initialization.
     void setup();
 
@@ -2381,7 +2486,7 @@ public:
     /// Setters: root.from_host(span) into the root's primary storage,
     /// then `copy_d = root` per other placement, like any root write.
     /// Inputs: meaningful for free inputs (a connected one is overwritten
-    /// at the next forward — harmless, like init).
+    /// at the next forward — harmless). A released root throws (§4.4).
     template <DType DT, int Rank> void set_input (std::string_view path, std::span<const cpp_type_t<DT>>);
     template <DType DT, int Rank> void set_output(std::string_view path, std::span<const cpp_type_t<DT>>);
 
@@ -2436,7 +2541,7 @@ private:
 ```cpp
 auto model = create_model<Top>(ModelConfig{});          // default device, no pools
 model.setup();                                          // declare → exec-info → substrates
-                                                        //   → prepare → compile → init
+                                                        //   → prepare → compile → apply inits
 model.set_input<DType::f64, 1>("mda.z", {{1.0, 2.0}});  // drive a free input
 model.forward();  model.wait();                         // enqueue; wait when results are wanted
 
@@ -2489,10 +2594,11 @@ namespace naga::cospan {
 /// Run the subtree on the first n forwards, then never (n >= 1; n == 0
 /// throws std::invalid_argument). Do-once is n = 1: construction-time
 /// operators (LBVH, LRPIM, nonlocal-operator assembly). Users derive from it,
-/// pass n to its constructor and override setup() like any System. With
-/// property::transient it releases after each of its runs and revives on runs
-/// 2..n; after the n-th it stays released, because the early return reaches
-/// no revive(). Roots kept by a consumer outside persist.
+/// pass n to its constructor and override setup() like any System. An early
+/// return means its components neither allocate nor release (§4.4): when the
+/// subtree is transient, its roots are allocated and released in the runs,
+/// and after the n-th run its transient roots stay released. Roots kept by a
+/// consumer outside persist.
 class RunNSystem : public System {
     std::size_t remaining_;
 public:
@@ -2546,9 +2652,8 @@ nesting.
 ### 10.2 What the contract guarantees a custom System type
 
 - **Runners are virtual, hooks are for users.** A System type overrides
-  `run_compute_forward` (and, when it must, `prepare_exec`, `compile`,
-  `run_init`); its users override `setup`/`init` as with any
-  System.
+  `run_compute_forward` (and, when it must, `prepare_exec`, `compile`);
+  its users override `setup` as with any System.
 - **Returning `nullptr` means "I submitted (or chose not to)".** The owner
   carries on; there is nothing for it to refresh (§7.3). Returning a
   description means "submit this for me" — a System type may also do
@@ -2603,11 +2708,14 @@ auto model = create_model<Top>(ModelConfig{...}, top_args...);
 
 ### 11.2 `model.setup()` — the setup chain
 
-`run_setup → get_exec_info → substrates → prepare_exec → compile → init → marks`.
-Every step is a Subsystem verb driven from the root; Systems recurse in
+`run_setup + resolve → get_exec_info → substrates → prepare_exec → compile →
+apply_inits → marks`.
+Every step is a Subsystem verb driven from the root (the resolution pass and
+the inits are the root's own); Systems recurse in
 declared order (`children_` IS the exec order); nobody asks what kind a
-child is. The order is the one of §9.1: (0 construct) 1 run_setup ·
-2 get_exec_info · 3 substrates · 4 prepare_exec · 5 compile · 6 init_tree · 7 marks.
+child is. The order is the one of §9.1: (0 construct) 1 run_setup and the
+resolution pass · 2 get_exec_info · 3 substrates · 4 prepare_exec ·
+5 compile · 6 apply_inits · 7 marks.
 
 #### 11.2.1 Declare — `root.run_setup()`
 
@@ -2615,13 +2723,26 @@ child is. The order is the one of §9.1: (0 construct) 1 run_setup ·
 child, registers the name, sets its owner, **runs the child's `run_setup`
 before returning** (why: P6 — no deferred resolution pass);
 `connect` / `promote` / `tie_*` resolve paths in this
-namespace and apply the set operation (§4); marks record on roots.
+namespace and apply the set operation (§4); marks record on roots;
+`init_input` records an init declaration at its depth.
 
 `Component::run_setup` → `setup()` → `declare_*` creates entries (roots of
-singleton sets; flags by kind; DimRecords). Zero
+singleton sets; flags by kind; DimRecords); `init_input` records an init
+declaration on one of its own inputs. Zero
 allocation; no device anywhere in this step.
 
-**State:** final tree and exec order; final sets; marks. No storage.
+**The resolution pass.** Once the root System's `setup()` returns, the root
+runs `resolve()` over the final tree and sets (§4.4). Per root it records
+its `transient` flag (a root is transient iff EVERY registration in its
+alias set is), its `init` (highest declaring level wins; a tie at one depth
+is an error; an init on an output is an error; an init on a root with a
+source is ignored; none means zeros), and, for a transient root, its
+`last_user` (the last Component, in depth-first registration order, that
+touches it). A mark on a transient root is an error here. It replaces the
+transient marking of earlier drafts.
+
+**State:** final tree and exec order; final sets; marks; each root's
+transient flag, init and last user. No storage.
 
 #### 11.2.2 Exec info — `bytes = root.get_exec_info(default_device)`
 
@@ -2634,13 +2755,12 @@ maps (sum on key).
 (`parent_device`, the Component's default storage kind — host kind for a
 host body); per own entry `e`:
 - root → register this placement as `e`'s primary; count its static bytes
-  here (zero for a root inside a transient subtree, and for a host-kind
-  primary);
+  here (zero for a transient root, and for a host-kind primary);
 - input peer, `root(e)` already has storage registered at this placement →
   nothing;
 - input peer, it does not → register this placement on `root(e)` and count
-  the root's static bytes here when the placement is device kind (the
-  root will own a copy at this placement; §4.2);
+  the root's static bytes here when the placement is device kind and the
+  root is not transient (the root will own a copy at this placement; §4.2);
 - output peer (only a tied output is one) whose root's placement ≠ this
   placement → ERROR naming the tie: producers cannot write one storage
   from two placements.
@@ -2665,16 +2785,18 @@ allocation for a device goes through its substrate.
 
 `System`: complete `ctx` — `queue` = the Model's, `group` = null (only a
 Parallel owner sets one, for the extent of its `submit_group`),
-`substrate = &substrates[device]`; allocate own alias roots and point their
-wrappers; recurse.
+`substrate = &substrates[device]`; allocate own DURABLE alias roots and point
+their wrappers; recurse.
 
-`Component`: for every own ROOT entry allocatable now, build its
+`Component`: for every own DURABLE ROOT entry allocatable now, build its
 `usm_vector` per registered placement — a device placement from that
-device's substrate (static, device-kind and outside every transient
-subtree from the arena route; otherwise, with a known shape, via the pool
+device's substrate (static, device-kind and not transient from the arena
+route; otherwise, with a known shape, via the pool
 route with OS fallback), a host placement through the OS route on its
-device; roots whose shape is not yet known stay unallocated. Then point
-every member wrapper at
+device; roots whose shape is not yet known stay unallocated, and a
+transient root is never allocated here (its Components allocate it in a
+forward, §6.5). Then point
+every member wrapper of an allocated root at
 `root()->storage_on(own placement)` — guaranteed
 allocated by now (roots precede peers); shape and stride (+ view) set;
 static input peers validate against their roots here. An unconnected
@@ -2695,24 +2817,23 @@ rest of the Fused and Parallel legality is checked each forward on the
 descriptions the children return (cheap, host-side, and it is where the
 information is).
 
-#### 11.2.6 Init — `root.init_tree()`
+#### 11.2.6 Apply inits — `root.apply_inits()`
 
-`init_tree` is `run_init` (Component pass: every Component's
-`init(queue, device)`, depth-first in declaration order, with the Model's
-queue and the subsystem's device — signature: `init(sk::queue&, const
-sycl::device&)`; Systems forward) then `run_system_init` (System pass: every
-System's `init(queue, device)`, child Systems before owners, so an owner's
-`init` has the last word by path and the root System has the last word
-overall). Initializers write a root's
-primary storage and copy it to the root's other-placement storage.
-Unnecessary inits (connected inputs) are harmless. On a root that is
-unallocated and empty (a shape still to be resolved) an initializer is a
-no-op — a fresh allocation is zero-filled; on an unallocated non-empty
-root it throws.
+For every DURABLE free input root that has storage, the root applies the
+init the resolution pass recorded (§11.2.1): the declaration of the highest
+level, else zeros. There are no init hooks, no init passes and no
+initializer helpers; "the System has the last word" by ordering is gone —
+highest-level-wins, decided at resolve, replaces it. The init writes the
+root's primary storage and copies it to the root's other-placement storage.
+A root with a source has no init to apply (it was ignored at resolve). A
+durable root that is unallocated and empty (a shape still to be resolved)
+gets its init when it is first allocated, in a forward (§6.5). Transient
+free input roots are initialized at each allocation, in a forward, not here.
 
-**State:** storage for every static root, initialized; wrappers current;
-kernels compiled. The model can run. Its state is not yet meaningful —
-it holds initialization; state is defined after the first forward.
+**State:** storage for every static durable root, with its initial value;
+wrappers current; kernels compiled. The model can run. Its state is not yet
+meaningful — it holds initial values; state is defined after the first
+forward.
 
 #### 11.2.7 Marks
 
@@ -2730,15 +2851,13 @@ need not wait between them — the stream orders (§7.3).
 #### 11.3.1 A System's turn — the ordering contract (§7.3)
 
 ```
-revive()
 for child in children:
-    child.run_pre_compute(ctx)
+    child.run_pre_compute(ctx)                // a Component: shapes, then allocate its roots + apply inits
     d = child.run_compute_forward()
     if d:  d->submit(ctx.target())            // this System submits;
                                               //   routed on d->is_custom_op() / d->is_host()
-    child.run_post_compute(ctx)               // a child that submitted itself
-                                              //   needs no owner action
-release()
+    child.run_post_compute(ctx)               // a Component: other-placement sync, then release the
+                                              //   transient roots it is the last user of
 return null
 ```
 
@@ -2761,7 +2880,9 @@ connections between stages, and tied outputs only with
 stamp group and local slices, check the wave's local memory against the
 device's limit, one staging, ONE submission with the sequence config (the
 framework inserts no barriers) → post-compute ALL. **Custom System types** (§10): early-return from
-`run_compute_forward`.
+`run_compute_forward`; the components under an early return neither
+allocate nor release. No System flavor revives or releases anything: that
+is the Components' own, in their pre- and post-compute (§11.3.2).
 
 #### 11.3.2 A Component's turn (§6.5)
 
@@ -2769,16 +2890,21 @@ framework inserts no barriers) → post-compute ALL. **Custom System types** (§
    entry (input or output) whose shape a `FromInput` spec drives — read the driving input's value on the host (the one
    forced sync, so the launch geometry below is known), `root.resize(shape)`,
    `point_wrapper`; nothing submitted for the resize, no reallocation
-   inside a submitted task. Then `pre_forward()` → dynamic validation → wrapper sync.
+   inside a submitted task. Then `pre_forward()` → dynamic validation →
+   wrapper sync → ALLOCATE every root this Component touches that has no
+   storage, and apply its init when it is a free input root (§4.4).
 2. `run_compute_forward()` → `compute_forward()` → description (kernel,
    custom op or host body). The owner submits it.
 3. `run_post_compute(ctx)`: for each output root with storage at other
    placements, for each other placement `copy_d = root` — one assignment
    resizes to match and copies, routed by SlabKit — after the owner's
-   submission, ordered by the stream.
+   submission, ordered by the stream. Then RELEASE the transient roots for
+   which this Component is the last user: each waits on the stream and is
+   freed (D135), with one stream wait for the batch.
 
 **State:** every output root holds this forward's values; dynamic roots
-sized to this forward.
+sized to this forward; a transient root exists only between its first
+user's pre-compute and its last user's post-compute.
 
 ### 11.4 Host access
 
@@ -2788,8 +2914,8 @@ on the host and does `from_host` on destruction and on `commit()`),
 `set_*` (`root.from_host(span)`, then `copy_d = root` per other placement),
 `memory_report()`, `get_subsystem(path)` chaining and
 `get_inputs()/get_outputs()` enumeration (§10.3). Host access is §9.2. Host
-access to a released root of a transient subtree (§4.4) is an error naming
-the transient System.
+access to a released root (§4.4) is an error naming the root and the
+transient subsystem whose registration made it transient.
 
 ### 11.5 End of life
 
