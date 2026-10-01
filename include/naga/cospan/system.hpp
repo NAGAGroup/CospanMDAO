@@ -937,8 +937,13 @@ private:
                     if (sp.how == AliasDim::How::output_values && d == 0)
                         fail(what, dim + "output_values gives per-index extents, which are for dimensions >= 1");
                     detail::IOEntry& up = entry_at(sp.path);
-                    if (up.kind() != IOKind::output || !up.can_be_source() || !up.root()->can_be_source())
+                    if (sp.input) {
+                        if (up.kind() != IOKind::input)
+                            fail(what, dim + "'" + sp.path + "' is not an input (input_value / input_values / input_dim name an "
+                                           "input of the declaring system: a promoted input or a tie_inputs alias)");
+                    } else if (up.kind() != IOKind::output || !up.can_be_source() || !up.root()->can_be_source()) {
                         fail(what, dim + "'" + sp.path + "' is not an output that can be a source");
+                    }
                     if (sp.how != AliasDim::How::output_dim && !detail::is_integer_dtype(up.dtype()))
                         fail(what, dim + "'" + sp.path + "' is not of integer dtype");
                     if (sp.how == AliasDim::How::output_values && up.rank() > 2)
@@ -959,6 +964,15 @@ private:
                 if (!is_input)
                     fail(what, "an output alias defines the shape of its connections; alias::from_connection is for tie_inputs");
                 return nullptr;
+            case AliasShape::Kind::from_input_shape: {
+                detail::IOEntry& up = entry_at(s.path);
+                if (up.kind() != IOKind::input)
+                    fail(what, "alias::from_input_shape('" + s.path + "') names an entry that is not an input");
+                if (up.rank() != Rank)
+                    fail(what, "alias::from_input_shape('" + s.path + "') names an input of rank " +
+                                   std::to_string(up.rank()) + " but the alias is rank " + std::to_string(Rank));
+                return &up;
+            }
             case AliasShape::Kind::from_output_shape:
             case AliasShape::Kind::from_output_values: {
                 detail::IOEntry& up = entry_at(s.path);
@@ -1036,7 +1050,7 @@ private:
                                             "' takes its shape from a connection (alias::from_connection) but nothing is "
                                             "connected to it");
             if (s.kind != AliasShape::Kind::from_output_shape && s.kind != AliasShape::Kind::from_output_values &&
-                s.kind != AliasShape::Kind::dims)
+                s.kind != AliasShape::Kind::dims && s.kind != AliasShape::Kind::from_input_shape)
                 continue;
 
             // The tie's owner: the first member to run (members seen through their promotions).
@@ -1068,6 +1082,18 @@ private:
                 };
                 consider(root);
                 for (const detail::IOEntry* p : root->peers_) consider(p);
+                if (!found && up->kind() == IOKind::input) {
+                    // A FREE input root (no producer): it is allocated, and its init applied, by its owner (the
+                    // first Component to touch it); that owner must run no later than the alias's owner, which
+                    // reads it on the host. A root re-rooted by a ChunkedSystem exists before the first chunk.
+                    const auto oit = root->owner_ != nullptr ? index.find(root->owner_) : index.end();
+                    if (root->owner_ != nullptr && !root->chunk_rerooted_ && oit != index.end() && oit->second > first)
+                        throw std::invalid_argument("naga::cospan: tie alias '" + a->full_path() + "' takes its shape from the free input '" +
+                                                    std::string{src_path} + "', whose owner '" + root->owner_->path() +
+                                                    "' is registered after the tie's first member ('" + first_path +
+                                                    "'); the value is read before the members run (register the input's owner earlier)");
+                    continue;
+                }
                 if (!found)
                     throw std::invalid_argument("naga::cospan: tie alias '" + a->full_path() + "' takes its shape from '" +
                                                 std::string{src_path} + "', which no component produces");

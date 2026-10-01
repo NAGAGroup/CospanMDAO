@@ -250,6 +250,22 @@ private:
     T*             data_  = nullptr;
 };
 
+/// The block of an ATOMIC ragged output: the shape of a Block, with operator[] returning a relaxed, device-scope
+/// sycl::atomic_ref (as a dense atomic Output does); no bare reference is obtainable.
+template <class T, int R>
+struct AtomicBlock {
+    using atomic_type = sycl::atomic_ref<T, sycl::memory_order::relaxed, sycl::memory_scope::device>;
+    AtomicBlock() = default;
+    explicit AtomicBlock(Block<T, R> b) : b_{b} {}
+    atomic_type    operator[](sycl::id<R> idx) const { return atomic_type{b_[idx]}; }
+    atomic_type    operator[](std::size_t flat) const { return atomic_type{b_[flat]}; }
+    sycl::range<R> shape() const { return b_.shape(); }
+    std::size_t    size() const { return b_.size(); }
+
+private:
+    Block<T, R> b_{};
+};
+
 namespace detail {
 
 /// Shared block lookup of RaggedInput / RaggedOutput. Per dim d >= 1 either a scalar extent (ext[d-1])
@@ -299,9 +315,9 @@ private:
     friend class detail::IOEntry;
 };
 
-/// RaggedOutput<DT, Rank> — the writable twin. Non-atomic only.
+/// RaggedOutput<DT, Rank> — the writable twin. With an atomic DT, block(i) is an AtomicBlock (operator[] gives a
+/// sycl::atomic_ref, relaxed, device scope), mirroring a dense atomic Output.
 template <DType DT, int Rank>
-    requires(!is_atomic_v<DT>)
 struct RaggedOutput {
     static_assert(Rank >= 2 && Rank <= 3, "cospan: a ragged port has rank 2..3");
     using value_type = cpp_type_t<DT>;
@@ -310,8 +326,15 @@ struct RaggedOutput {
     static constexpr bool  ragged = true;
 
     std::size_t size() const { return n_; }
-    Block<value_type, Rank - 1> block(std::size_t i) const {
+    Block<value_type, Rank - 1> block(std::size_t i) const
+        requires(!is_atomic_v<DT>)
+    {
         return detail::RaggedAccess<value_type, Rank>::block(data_, offsets_, ext_, per_, i);
+    }
+    AtomicBlock<value_type, Rank - 1> block(std::size_t i) const
+        requires(is_atomic_v<DT>)
+    {
+        return AtomicBlock<value_type, Rank - 1>{detail::RaggedAccess<value_type, Rank>::block(data_, offsets_, ext_, per_, i)};
     }
 
 private:
@@ -326,6 +349,8 @@ private:
 static_assert(std::is_trivially_copyable_v<RaggedInput<DType::f32, 3>>);
 static_assert(std::is_trivially_copyable_v<RaggedOutput<DType::f32, 3>>);
 static_assert(std::is_trivially_copyable_v<Block<float, 2>>);
+static_assert(std::is_trivially_copyable_v<RaggedOutput<DType::atomic_f32, 3>>);
+static_assert(std::is_trivially_copyable_v<AtomicBlock<float, 2>>);
 
 static_assert(std::is_trivially_copyable_v<Input<DType::f32, 2>>);
 static_assert(std::is_trivially_copyable_v<Output<DType::atomic_f32, 1>>);

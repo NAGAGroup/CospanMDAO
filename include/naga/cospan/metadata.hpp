@@ -139,11 +139,23 @@ struct OutputDim { std::string path; std::size_t dim = 0; };
 inline OutputValue output_value(std::string_view path, std::size_t index = 0) { return {std::string{path}, index}; }
 inline OutputValues output_values(std::string_view path, std::size_t column = 0) { return {std::string{path}, column}; }
 inline OutputDim output_dim(std::string_view path, std::size_t d) { return {std::string{path}, d}; }
+
+/// The same three specs reading an INPUT of the declaring System instead (a promoted input or a tie_inputs
+/// alias, connected from upstream or free): values and shapes are read from the entry's ROOT on the host.
+struct InputValue { std::string path; std::size_t index = 0; };
+struct InputValues { std::string path; std::size_t column = 0; };
+struct InputDim { std::string path; std::size_t dim = 0; };
+
+inline InputValue input_value(std::string_view path, std::size_t index = 0) { return {std::string{path}, index}; }
+inline InputValues input_values(std::string_view path, std::size_t column = 0) { return {std::string{path}, column}; }
+inline InputDim input_dim(std::string_view path, std::size_t d) { return {std::string{path}, d}; }
 }  // namespace alias
 
 template <class T>
 concept AliasDimSpec = std::integral<T> || std::same_as<T, PerIndex> || std::same_as<T, alias::OutputValue> ||
-                       std::same_as<T, alias::OutputValues> || std::same_as<T, alias::OutputDim>;
+                       std::same_as<T, alias::OutputValues> || std::same_as<T, alias::OutputDim> ||
+                       std::same_as<T, alias::InputValue> || std::same_as<T, alias::InputValues> ||
+                       std::same_as<T, alias::InputDim>;
 
 /// One dimension of an alias::dims shape, type-erased.
 struct AliasDim {
@@ -151,8 +163,9 @@ struct AliasDim {
     How                      how    = How::fixed;
     std::size_t              extent = 1;   ///< fixed
     std::vector<std::size_t> values;       ///< per_index_host
-    std::string              path;         ///< output_*: the upstream output
+    std::string              path;         ///< output_*: the upstream output (input = true: the System's input)
     std::size_t              index  = 0;   ///< output_value: the element; output_values: the column; output_dim: the dim
+    bool                     input  = false;  ///< the path names an INPUT entry (input_value / input_values / input_dim)
     detail::IOEntry*         src    = nullptr;  ///< output_*: resolved by the System at setup
 };
 
@@ -168,29 +181,32 @@ AliasDim make_alias_dim(const S& s) {
     } else if constexpr (std::same_as<S, PerIndex>) {
         r.how    = AliasDim::How::per_index_host;
         r.values = s.values;
-    } else if constexpr (std::same_as<S, alias::OutputValue>) {
-        r.how = AliasDim::How::output_value;
-        r.path = s.path;
+    } else if constexpr (std::same_as<S, alias::OutputValue> || std::same_as<S, alias::InputValue>) {
+        r.how   = AliasDim::How::output_value;
+        r.path  = s.path;
         r.index = s.index;
-    } else if constexpr (std::same_as<S, alias::OutputValues>) {
-        r.how = AliasDim::How::output_values;
-        r.path = s.path;
+        r.input = std::same_as<S, alias::InputValue>;
+    } else if constexpr (std::same_as<S, alias::OutputValues> || std::same_as<S, alias::InputValues>) {
+        r.how   = AliasDim::How::output_values;
+        r.path  = s.path;
         r.index = s.column;
+        r.input = std::same_as<S, alias::InputValues>;
     } else {
-        r.how = AliasDim::How::output_dim;
-        r.path = s.path;
+        r.how   = AliasDim::How::output_dim;
+        r.path  = s.path;
         r.index = s.dim;
+        r.input = std::same_as<S, alias::InputDim>;
     }
     return r;
 }
 
 /// How a tie alias gets its shape (D139 part 2); build one with the cs::alias factories.
 struct AliasShape {
-    enum class Kind : uint8_t { fixed, from_connection, from_output_shape, from_output_values, dims };
+    enum class Kind : uint8_t { fixed, from_connection, from_output_shape, from_output_values, dims, from_input_shape };
     Kind                       kind = Kind::fixed;
     int                        rank = 0;            ///< fixed / dims: how many extents / specs were given
     std::array<std::size_t, 3> extents{1, 1, 1};    ///< fixed
-    std::string                path;                ///< from_output_*: an output, in the declaring System's namespace
+    std::string                path;                ///< from_output_* / from_input_shape: an entry, in the declaring System's namespace
     std::vector<AliasDim>      dim_specs;           ///< dims: one per dimension
 };
 
@@ -236,6 +252,14 @@ inline AliasShape from_connection() {
 inline AliasShape from_output_shape(std::string_view path) {
     AliasShape s;
     s.kind = AliasShape::Kind::from_output_shape;
+    s.path = std::string{path};
+    return s;
+}
+/// The shape (ragged-aware) of an INPUT of the declaring System: a promoted input or a tie_inputs alias, read
+/// from its root (it must have the alias's rank).
+inline AliasShape from_input_shape(std::string_view path) {
+    AliasShape s;
+    s.kind = AliasShape::Kind::from_input_shape;
     s.path = std::string{path};
     return s;
 }
@@ -1480,7 +1504,6 @@ private:
 
 /// RaggedOutputEntry holds RaggedOutput<DT,Rank>* (D140). Same flags as OutputEntry.
 template <DType DT, int Rank>
-    requires(!is_atomic_v<DT>)
 class RaggedOutputEntry final : public TypedEntry<DT, Rank> {
 public:
     RaggedOutputEntry(std::string name, const std::array<DimRecord, Rank>& dims, RaggedOutput<DT, Rank>* member)

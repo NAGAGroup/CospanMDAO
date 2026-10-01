@@ -530,14 +530,37 @@ private:
         std::array<std::vector<std::size_t>, 3> per_index;
     };
 
-    /// Slot `to` of `out` takes dimension `d` of the upstream output `up` (per-index too, if that dim is).
-    static void copy_alias_dim(AliasEval& out, std::size_t to, const detail::IOEntry& up, int d) {
+    /// Inside a ChunkedSystem an internal alias holds ONE chunk [start, start + len) of the leading dimension: a
+    /// per-index array that covers the whole run (a boundary root's) is cut to it; one that is already
+    /// chunk-sized (an inside entry's, resolved under the chunk) is kept as it is.
+    std::vector<std::size_t> chunk_slice(const detail::IOEntry& a, std::vector<std::size_t> v) const {
+        if (!a.dim0_override_ || v.size() == *a.dim0_override_) return v;
+        const std::size_t first = a.dim0_start_, len = *a.dim0_override_;
+        if (v.size() < first + len)
+            throw std::invalid_argument("naga::cospan: tie alias '" + a.full_path() + "': a per-index source has " +
+                                        std::to_string(v.size()) + " entries but the chunk reaches index " +
+                                        std::to_string(first + len));
+        return std::vector<std::size_t>(v.begin() + static_cast<std::ptrdiff_t>(first),
+                                        v.begin() + static_cast<std::ptrdiff_t>(first + len));
+    }
+
+    /// Slot `to` of `out` takes dimension `d` of `up` (per-index too, if that dim is). SHAPE inheritance only:
+    /// it never reads a value, so an internal entry of a ChunkedSystem is a fine source. `input`: `up` is an
+    /// INPUT source, whose ROOT is read (the input's own shape may not be resolved yet); a sliced input
+    /// contributes its view's extents.
+    void copy_alias_dim(AliasEval& out, std::size_t to, const detail::IOEntry& src, int d, const detail::IOEntry& a,
+                        bool input) const {
+        if (input && src.view()) {
+            out.ext[to] = src.view()->extents[static_cast<std::size_t>(d)];
+            return;
+        }
+        const detail::IOEntry& up = input ? *src.root() : src;
         if (up.dim_is_per(d)) {
             if (to == 0)
                 throw std::invalid_argument("naga::cospan: a per-index dimension of '" + up.full_path() +
                                             "' cannot become dimension 0 of a tie alias");
             out.per[to]       = true;
-            out.per_index[to] = up.per_index_extents(d);
+            out.per_index[to] = chunk_slice(a, up.per_index_extents(d));
             out.ext[to]       = 0;
         } else {
             out.ext[to] = up.extents()[static_cast<std::size_t>(d)];
@@ -554,7 +577,10 @@ private:
         switch (s.kind) {
             case AliasShape::Kind::fixed: out.ext = s.extents; break;
             case AliasShape::Kind::from_output_shape:
-                for (int d = 0; d < a.rank(); ++d) copy_alias_dim(out, static_cast<std::size_t>(d), *a.alias_src_, d);
+                for (int d = 0; d < a.rank(); ++d) copy_alias_dim(out, static_cast<std::size_t>(d), *a.alias_src_, d, a, false);
+                break;
+            case AliasShape::Kind::from_input_shape:
+                for (int d = 0; d < a.rank(); ++d) copy_alias_dim(out, static_cast<std::size_t>(d), *a.alias_src_, d, a, true);
                 break;
             case AliasShape::Kind::from_output_values:
                 for (int d = 0; d < a.rank(); ++d)
@@ -581,12 +607,17 @@ private:
                             out.per_index[u] = std::move(v);
                             break;
                         }
-                        case AliasDim::How::output_value: out.ext[u] = read_value(*sp.src, sp.index); break;
+                        // An input source is read through its ROOT (host snapshot), as an output is.
+                        case AliasDim::How::output_value:
+                            out.ext[u] = read_value(sp.input ? *sp.src->root() : *sp.src, sp.index);
+                            break;
                         case AliasDim::How::output_values:
                             out.per[u]       = true;
-                            out.per_index[u] = read_values(*sp.src, sp.index);
+                            out.per_index[u] = chunk_slice(a, read_values(sp.input ? *sp.src->root() : *sp.src, sp.index));
                             break;
-                        case AliasDim::How::output_dim: copy_alias_dim(out, u, *sp.src, static_cast<int>(sp.index)); break;
+                        case AliasDim::How::output_dim:
+                            copy_alias_dim(out, u, *sp.src, static_cast<int>(sp.index), a, sp.input);
+                            break;
                     }
                 }
                 break;

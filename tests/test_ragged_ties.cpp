@@ -3,8 +3,10 @@
 //   alias::dims(spec0, spec1, ...) with an integer, per_index, output_value, output_values, output_dim;
 //   from_output_shape and from_connection copy a ragged shape.
 //
-// Members are RaggedOutput / RaggedInput declared with cs::tied. The ragged wrappers are non-atomic, so the
-// tie_outputs here use TieOutputsPolicy::allow_plain (the producers run in order, they do not race).
+// Members are RaggedOutput / RaggedInput declared with cs::tied. Plain members use TieOutputsPolicy::allow_plain
+// (the producers run in order, they do not race); atomic ragged members take the require_atomic default.
+// Alias sources may also be INPUTS of the declaring System (input_value / input_values / input_dim /
+// from_input_shape), and a ChunkedSystem refuses only VALUE reads from its internal roots.
 //
 // Everything is checked against host references.
 
@@ -128,6 +130,35 @@ public:
         return this->create_launch_config(sycl::range<1>{t_.size()}, {}, {t_}, {});
     }
 };
+// ---- atomic ragged members: zero (store), accumulate (fetch_add) ------------------------------------------------
+template <int Op>
+struct TieBodyA {
+    struct Inputs {};
+    struct Outputs {
+        cs::RaggedOutput<DType::atomic_f32, 3> t;
+    };
+    void operator()(sycl::id<1> id, Inputs, Outputs o) const {
+        auto        b    = o.t.block(id[0]);
+        const float base = static_cast<float>(id[0] + 1);
+        for (std::size_t q = 0; q < b.size(); ++q) {
+            if constexpr (Op == 0) b[q].store(0.0f);
+            if constexpr (Op == 1) b[q].fetch_add(base * static_cast<float>(q + 1));
+        }
+    }
+};
+template <int Op>
+class TieMemberA : public cs::Component<TieBodyA<Op>> {
+    cs::RaggedOutput<DType::atomic_f32, 3> t_;
+
+public:
+    void setup() override { this->declare_output(t_, "t", cs::tied); }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+        return this->create_launch_config(sycl::range<1>{t_.size()}, {}, {t_}, {});
+    }
+};
+using ZeroA = TieMemberA<0>;
+using AccA  = TieMemberA<1>;
+
 using Zero   = TieMember<0>;
 using Acc    = TieMember<1>;
 using Build0 = TieMember<2>;
@@ -165,7 +196,7 @@ public:
 // ---- tie_outputs top: sz -> gen, then the tie (zero/acc or build/factor), then a sum ---------------------------------
 /// shape_mode 0: alias::dims(output_dim(sz.counts, 0), output_values(sz.counts), output_values(sz.counts)) -> [N, m, m]
 /// shape_mode 1: alias::from_output_shape(gen.pts) -> [N, m, 3]
-template <class P, class Q>
+template <class P, class Q, bool Atomic = false>
 class TieOutTop : public cs::System {
     Counts init_;
     int    shape_mode_;
@@ -179,14 +210,25 @@ public:
         add_subsystem<Q>("q");
         add_subsystem<SumT>("sum");
         connect("sz.counts", "gen.counts");
-        if (shape_mode_ == 0)
-            tie_outputs<DType::f32, 3>({"p.t", "q.t"}, "t",
-                                       cs::alias::dims(cs::alias::output_dim("sz.counts", 0), cs::alias::output_values("sz.counts"),
-                                                       cs::alias::output_values("sz.counts")),
-                                       cs::TieOutputsPolicy::allow_plain);
+        cs::AliasShape shape;
+        switch (shape_mode_) {
+            case 0:  // [N, m, m] from an upstream output
+                shape = cs::alias::dims(cs::alias::output_dim("sz.counts", 0), cs::alias::output_values("sz.counts"),
+                                        cs::alias::output_values("sz.counts"));
+                break;
+            case 1: shape = cs::alias::from_output_shape("gen.pts"); break;  // [N, m, 3], ragged upstream shape
+            case 2:  // [N, m, m] from a FREE input (its owner, sz, is registered first)
+                shape = cs::alias::dims(cs::alias::input_dim("sz.raw", 0), cs::alias::input_values("sz.raw"),
+                                        cs::alias::input_values("sz.raw"));
+                break;
+            default:  // [N, m, m] from a CONNECTED input (gen.counts, connected from sz.counts)
+                shape = cs::alias::dims(cs::alias::input_dim("gen.counts", 0), cs::alias::input_values("gen.counts"),
+                                        cs::alias::input_values("gen.counts"));
+        }
+        if constexpr (Atomic)
+            tie_outputs<DType::atomic_f32, 3>({"p.t", "q.t"}, "t", std::move(shape));  // require_atomic (the default)
         else
-            tie_outputs<DType::f32, 3>({"p.t", "q.t"}, "t", cs::alias::from_output_shape("gen.pts"),
-                                       cs::TieOutputsPolicy::allow_plain);
+            tie_outputs<DType::f32, 3>({"p.t", "q.t"}, "t", std::move(shape), cs::TieOutputsPolicy::allow_plain);
         connect("t", "sum.pts");
     }
 };
@@ -199,7 +241,7 @@ struct TieRef {
 TieRef tie_ref(const Counts& counts, int shape_mode, bool factor) {
     TieRef r;
     for (std::size_t i = 0; i < counts.size(); ++i) {
-        const std::size_t size = counts[i] * (shape_mode == 0 ? counts[i] : 3u);
+        const std::size_t size = counts[i] * (shape_mode == 1 ? 3u : counts[i]);
         float             s    = 0.0f;
         for (std::size_t q = 0; q < size; ++q) {
             const float base = static_cast<float>((i + 1) * (q + 1));
@@ -226,7 +268,7 @@ void run_tie_out(cs::Model& m, const Counts& counts, int shape_mode, bool factor
     CHECK(pts.data == ref.data);
     CHECK(pts.size() == counts.size());
     CHECK(pts.is_per_index(1));
-    if (shape_mode == 0)
+    if (shape_mode != 1)
         CHECK(pts.is_per_index(2));
     else
         CHECK_FALSE(pts.is_per_index(2));
@@ -415,6 +457,240 @@ std::vector<float> chunk_ref(const Sizes& sizes) {
     return out;
 }
 
+// ---- alias shapes from INPUTS, and shape inheritance from internal entries, inside a ChunkedSystem ------------------------
+/// BuildS: t = in (q + 1); also has the u32 input `sizes` (promoted by G; the alias reads its values).
+struct BuildSBody {
+    struct Inputs {
+        cs::Input<DType::f32, 1> in;
+        cs::Input<DType::u32, 1> sizes;
+    };
+    struct Outputs {
+        cs::RaggedOutput<DType::f32, 3> t;
+    };
+    void operator()(sycl::id<1> id, Inputs a, Outputs o) const {
+        auto b = o.t.block(id[0]);
+        for (std::size_t q = 0; q < b.size(); ++q) b[q] = a.in[id] * static_cast<float>(q + 1);
+    }
+};
+class BuildS : public cs::Component<BuildSBody> {
+    cs::Input<DType::f32, 1>        in_;
+    cs::Input<DType::u32, 1>        sizes_;
+    cs::RaggedOutput<DType::f32, 3> t_;
+
+public:
+    void setup() override {
+        declare_input(in_, "in", cs::FromSourceDim{0});
+        declare_input(sizes_, "sizes", cs::FromSourceDim{0});
+        declare_output(t_, "t", cs::tied);
+    }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+        return create_launch_config(sycl::range<1>{t_.size()}, {in_, sizes_}, {t_}, {});
+    }
+};
+
+/// BuildP: t = in (q + 1); also has a RAGGED input `pts` (promoted by G; the alias inherits its shape).
+struct BuildPBody {
+    struct Inputs {
+        cs::Input<DType::f32, 1>       in;
+        cs::RaggedInput<DType::f32, 3> pts;
+    };
+    struct Outputs {
+        cs::RaggedOutput<DType::f32, 3> t;
+    };
+    void operator()(sycl::id<1> id, Inputs a, Outputs o) const {
+        auto b = o.t.block(id[0]);
+        for (std::size_t q = 0; q < b.size(); ++q) b[q] = a.in[id] * static_cast<float>(q + 1);
+    }
+};
+class BuildP : public cs::Component<BuildPBody> {
+    cs::Input<DType::f32, 1>        in_;
+    cs::RaggedInput<DType::f32, 3>  pts_;
+    cs::RaggedOutput<DType::f32, 3> t_;
+
+public:
+    void setup() override {
+        declare_input(in_, "in", cs::FromSourceDim{0});
+        declare_input(pts_, "pts", cs::FromSourceDim{0}, cs::FromSourceDim{1}, cs::FromSourceDim{2});
+        declare_output(t_, "t", cs::tied);
+    }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+        return create_launch_config(sycl::range<1>{t_.size()}, {in_, pts_}, {t_}, {});
+    }
+};
+
+/// Mk: an INTERNAL ragged output r [N, sizes[i], 3] (shape from the values of a boundary input), r = sizes[i].
+struct MkBody {
+    struct Inputs {
+        cs::Input<DType::u32, 1> sizes;
+    };
+    struct Outputs {
+        cs::RaggedOutput<DType::f32, 3> r;
+    };
+    void operator()(sycl::id<1> id, Inputs a, Outputs o) const {
+        auto b = o.r.block(id[0]);
+        for (std::size_t q = 0; q < b.size(); ++q) b[q] = static_cast<float>(a.sizes[id]);
+    }
+};
+class Mk : public cs::Component<MkBody> {
+    cs::Input<DType::u32, 1>        sizes_;
+    cs::RaggedOutput<DType::f32, 3> r_;
+
+public:
+    void setup() override {
+        declare_input(sizes_, "sizes", cs::FromSourceDim{0});
+        declare_output(r_, "r", cs::FromInputDim{"sizes", 0}, cs::FromInputValues{"sizes"}, 3);
+    }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+        return create_launch_config(sizes_.shape(), {sizes_}, {r_}, {});
+    }
+};
+
+/// AccX: an ATOMIC ragged tie member: t += in (q + 1).
+struct AccXBody {
+    struct Inputs {
+        cs::Input<DType::f32, 1> in;
+    };
+    struct Outputs {
+        cs::RaggedOutput<DType::atomic_f32, 3> t;
+    };
+    void operator()(sycl::id<1> id, Inputs a, Outputs o) const {
+        auto b = o.t.block(id[0]);
+        for (std::size_t q = 0; q < b.size(); ++q) b[q].fetch_add(a.in[id] * static_cast<float>(q + 1));
+    }
+};
+class AccX : public cs::Component<AccXBody> {
+    cs::Input<DType::f32, 1>               in_;
+    cs::RaggedOutput<DType::atomic_f32, 3> t_;
+
+public:
+    void setup() override {
+        declare_input(in_, "in", cs::FromSourceDim{0});
+        declare_output(t_, "t", cs::tied);
+    }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+        return create_launch_config(sycl::range<1>{t_.size()}, {in_}, {t_}, {});
+    }
+};
+
+/// The system of one variant (v):
+///   0  alias [N, m, m] from alias::input_dim / input_values of the promoted input `sizes` (u32 [N])
+///   1  alias [N, m, 3] from alias::from_input_shape of the promoted RAGGED input `pts`
+///   2  alias [N, m, m] from alias::input_dim of `pts`
+///   3  alias [N, m, m] from alias::output_dim of the INTERNAL ragged output mk.r (shape inheritance)
+///   4  ATOMIC members (zero, then AccX), alias from per_index; require_atomic (the default)
+class GV : public cs::System {
+    int         v_;
+    std::size_t n_;
+    Sizes       sizes_;
+
+public:
+    GV(int v, std::size_t n, Sizes sizes) : v_{v}, n_{n}, sizes_{std::move(sizes)} {}
+    void setup() override {
+        const auto policy = cs::TieOutputsPolicy::allow_plain;
+        if (v_ == 0) {
+            add_subsystem<BuildS>("p");
+            promote<DType::u32, 1>("p.sizes", "sizes");
+        } else if (v_ == 1 || v_ == 2) {
+            add_subsystem<BuildP>("p");
+            promote<DType::f32, 3>("p.pts", "pts");
+        } else if (v_ == 3) {
+            add_subsystem<Mk>("mk");
+            add_subsystem<BuildX>("p");
+        } else {
+            add_subsystem<ZeroA>("p");
+        }
+        if (v_ == 4)
+            add_subsystem<AccX>("q");
+        else
+            add_subsystem<Factor>("q");
+        add_subsystem<SumT>("s");
+        switch (v_) {
+            case 0:
+                tie_outputs<DType::f32, 3>({"p.t", "q.t"}, "t",
+                                           cs::alias::dims(cs::alias::input_dim("sizes", 0), cs::alias::input_values("sizes"),
+                                                           cs::alias::input_values("sizes")),
+                                           policy);
+                break;
+            case 1: tie_outputs<DType::f32, 3>({"p.t", "q.t"}, "t", cs::alias::from_input_shape("pts"), policy); break;
+            case 2:
+                tie_outputs<DType::f32, 3>({"p.t", "q.t"}, "t",
+                                           cs::alias::dims(cs::alias::input_dim("pts", 0), cs::alias::input_dim("pts", 1),
+                                                           cs::alias::input_dim("pts", 1)),
+                                           policy);
+                break;
+            case 3:
+                tie_outputs<DType::f32, 3>({"p.t", "q.t"}, "t",
+                                           cs::alias::dims(cs::alias::output_dim("mk.r", 0), cs::alias::output_dim("mk.r", 1),
+                                                           cs::alias::output_dim("mk.r", 1)),
+                                           policy);
+                break;
+            default:
+                tie_outputs<DType::atomic_f32, 3>({"p.t", "q.t"}, "t",
+                                                  cs::alias::dims(n_, cs::per_index(sizes_), cs::per_index(sizes_)));
+        }
+        connect("t", "s.pts");
+    }
+};
+class InnerPlainV : public cs::System {
+    int         v_;
+    std::size_t n_;
+    Sizes       sizes_;
+
+public:
+    InnerPlainV(std::size_t, int v, std::size_t n, Sizes sizes) : v_{v}, n_{n}, sizes_{std::move(sizes)} {}
+    void setup() override { add_subsystem<GV>("g", v_, n_, sizes_); }
+};
+class InnerChunkV : public cs::ChunkedSystem {
+    int         v_;
+    std::size_t n_;
+    Sizes       sizes_;
+
+public:
+    InnerChunkV(std::size_t budget, int v, std::size_t n, Sizes sizes)
+        : cs::ChunkedSystem(budget), v_{v}, n_{n}, sizes_{std::move(sizes)} {}
+    void setup() override { add_subsystem<GV>("g", v_, n_, sizes_); }
+};
+template <class Inner>
+class VTop : public cs::System {
+    Counts      counts_;
+    std::size_t budget_;
+    int         v_;
+
+public:
+    VTop(Counts counts, std::size_t budget, int v) : counts_{std::move(counts)}, budget_{budget}, v_{v} {}
+    void setup() override {
+        const std::size_t n = counts_.size();
+        Sizes             sizes(counts_.begin(), counts_.end());
+        add_subsystem<CProd>("sz", counts_);
+        add_subsystem<Gen>("gen");
+        add_subsystem<Src>("src", n);
+        add_subsystem<Inner>("inner", budget_, v_, n, sizes);
+        add_subsystem<Cons>("cons");
+        connect("sz.counts", "gen.counts");
+        connect("src.x", v_ == 4 ? "inner.g.q.in" : "inner.g.p.in");
+        if (v_ == 0) connect("sz.counts", "inner.g.sizes");
+        if (v_ == 1 || v_ == 2) connect("gen.pts", "inner.g.pts");
+        if (v_ == 3) connect("sz.counts", "inner.g.mk.sizes");
+        connect("inner.g.s.sums", "cons.in");
+    }
+};
+
+/// forward -> cons.out of the variant: block i holds x_i (q + 1), then (variants 0-3) 2 t + 1, summed; cons: 2 s + 1.
+std::vector<float> variant_ref(const Sizes& sizes, int v) {
+    std::vector<float> out;
+    for (std::size_t i = 0; i < sizes.size(); ++i) {
+        const float       x    = 0.5f * static_cast<float>(i) + 1.0f;
+        const std::size_t size = sizes[i] * (v == 1 ? 3u : sizes[i]);
+        float             s    = 0.0f;
+        for (std::size_t q = 0; q < size; ++q) {
+            const float base = x * static_cast<float>(q + 1);
+            s += v == 4 ? base : 2.0f * base + 1.0f;
+        }
+        out.push_back(2.0f * s + 1.0f);
+    }
+    return out;
+}
+
 // ---- errors ----------------------------------------------------------------------------------------------------------------
 class ErrTop : public cs::System {
     int variant_;
@@ -430,9 +706,15 @@ public:
             tie_outputs<DType::f32, 3>({"p.t", "q.t"}, "t", cs::alias::dims(cs::per_index(Sizes{1, 2}), 2, 2), policy);
         else if (variant_ == 1)  // a fixed dim 0 of 4 and a per-index array of 2
             tie_outputs<DType::f32, 3>({"p.t", "q.t"}, "t", cs::alias::dims(4, cs::per_index(Sizes{1, 2}), 2), policy);
-        else  // dim 0 is 4 (from sz.counts) at run time; the per-index array has 2
+        else if (variant_ == 2)  // dim 0 is 4 (from sz.counts) at run time; the per-index array has 2
             tie_outputs<DType::f32, 3>({"p.t", "q.t"}, "t",
                                        cs::alias::dims(cs::alias::output_dim("sz.counts", 0), cs::per_index(Sizes{1, 2}), 2), policy);
+        else if (variant_ == 3)  // input_values names an OUTPUT
+            tie_outputs<DType::f32, 3>({"p.t", "q.t"}, "t", cs::alias::dims(4, cs::alias::input_values("sz.counts"), 2), policy);
+        else {  // a FREE input whose owner (late) is registered after the tie's first member
+            add_subsystem<CProd>("late", Counts{1, 2, 3, 4});
+            tie_outputs<DType::f32, 3>({"p.t", "q.t"}, "t", cs::alias::dims(4, cs::alias::input_values("late.raw"), 2), policy);
+        }
     }
 };
 
@@ -501,9 +783,9 @@ public:
 
 }  // namespace trt
 
-TEST_CASE("Ragged ties: tie_outputs of two ragged members (zero, then accumulate), sizes from an upstream output",
+TEST_CASE("Ragged ties: tie_outputs of two ragged members (zero, then accumulate), sizes from an upstream output or an input",
           "[ragged][tie]") {
-    for (const int shape_mode : {0, 1}) {
+    for (const int shape_mode : {0, 1, 2, 3}) {
         INFO("shape_mode " << shape_mode);
         cs::Model m = cs::create_model<trt::TieOutTop<trt::Zero, trt::Acc>>(default_config(), trt::Counts{3, 0, 2, 4}, shape_mode);
         m.setup();
@@ -572,6 +854,47 @@ TEST_CASE("Ragged ties: a tie inside a ChunkedSystem, bitwise equal to unchunked
     }
 }
 
+TEST_CASE("Ragged ties: ATOMIC ragged members, zero then accumulate (require_atomic), several forwards", "[ragged][tie][atomic]") {
+    for (const int shape_mode : {0, 1}) {
+        INFO("shape_mode " << shape_mode);
+        cs::Model m = cs::create_model<trt::TieOutTop<trt::ZeroA, trt::AccA, true>>(default_config(), trt::Counts{3, 0, 2, 4}, shape_mode);
+        m.setup();
+        trt::run_tie_out(m, {3, 0, 2, 4}, shape_mode, false);
+        trt::run_tie_out(m, {0, 5, 1, 2}, shape_mode, false);
+        trt::run_tie_out(m, {2, 2, 2, 1}, shape_mode, false);
+    }
+}
+
+TEST_CASE("Ragged ties: alias shapes from inputs and from internal entries inside a ChunkedSystem", "[ragged][tie][chunked]") {
+    const trt::Counts counts{1, 3, 2, 3, 0, 3, 1, 2};
+    const trt::Sizes  sizes(counts.begin(), counts.end());
+    for (int v = 0; v <= 4; ++v) {
+        INFO("variant " << v);
+        const auto want = trt::variant_ref(sizes, v);
+        cs::Model  plain = cs::create_model<trt::VTop<trt::InnerPlainV>>(default_config(), counts, std::size_t{0}, v);
+        plain.setup();
+        const auto pout = trt::forward_out(plain);
+        REQUIRE(pout.size() == counts.size());
+        for (std::size_t i = 0; i < pout.size(); ++i) CHECK(pout[i] == want[i]);
+        for (const std::size_t budget : {std::size_t{72}, std::size_t{100}, std::size_t{150}, std::size_t{100000}}) {
+            INFO("budget " << budget);
+            cs::Model m = cs::create_model<trt::VTop<trt::InnerChunkV>>(default_config(), counts, budget, v);
+            m.setup();
+            cs::detail::IOEntry& t = m.root().entry_at("inner.g.t");  // the internal ragged tie alias root
+            for (int rep = 0; rep < 2; ++rep) {
+                const std::size_t before = t.allocation_count();
+                const auto        out    = trt::forward_out(m);
+                CHECK(out == pout);
+                CHECK(t.allocation_count() - before == 1);
+                if (v == 3) {  // the internal ragged OUTPUT the alias inherits its shape from
+                    cs::detail::IOEntry& r = m.root().entry_at("inner.g.mk.r");
+                    CHECK(r.allocation_count() == static_cast<std::size_t>(rep + 1));
+                }
+            }
+        }
+    }
+}
+
 TEST_CASE("Ragged ties: errors", "[ragged][tie]") {
     SECTION("a per-index spec on dimension 0") {
         cs::Model m = cs::create_model<trt::ErrTop>(default_config(), 0);
@@ -586,6 +909,14 @@ TEST_CASE("Ragged ties: errors", "[ragged][tie]") {
         m.setup();
         trt::expect_throws([&] { m.forward(); }, {"has 2 extents", "dimension 0 has 4"});
         m.wait();  // earlier components of the failed forward were submitted: wait before the Model is destroyed (D135)
+    }
+    SECTION("input_values naming an output") {
+        cs::Model m = cs::create_model<trt::ErrTop>(default_config(), 3);
+        trt::expect_throws([&] { m.setup(); }, {"alias::dims, dimension 1", "is not an input"});
+    }
+    SECTION("a free input whose owner is registered after the alias's first member") {
+        cs::Model m = cs::create_model<trt::ErrTop>(default_config(), 4);
+        trt::expect_throws([&] { m.setup(); }, {"free input", "late.raw", "registered after"});
     }
     SECTION("a per-index source computed inside a chunked system") {
         cs::Model m = cs::create_model<trt::BadTop>(default_config());
