@@ -157,6 +157,8 @@ void fill_dense(cs::System& s, bool promote_t) {
     s.add_subsystem<A>("a");
     s.add_subsystem<B>("b");
     s.connect("a.t", "b.in");
+    s.promote<DType::f32, 2>("a.in", "in");  // the interface of an opaque chunked system: its promotions
+    s.promote<DType::f32, 1>("b.y", "y");
     if (promote_t) s.promote<DType::f32, 2>("a.t", "t");  // boundary AND used inside by b
 }
 class InnerPlain : public cs::System {
@@ -185,8 +187,8 @@ public:
         add_subsystem<Prod>("prod", n_);
         add_subsystem<Inner>("inner", budget_, promote_t_);
         add_subsystem<Cons>("cons");
-        connect("prod.x", "inner.a.in");
-        connect("inner.b.y", "cons.in");
+        connect("prod.x", "inner.in");
+        connect("inner.y", "cons.in");
     }
 };
 
@@ -354,6 +356,8 @@ void fill_ragged(cs::System& s) {
     s.add_subsystem<S>("s");
     s.add_subsystem<R>("r");
     s.connect("s.gram", "r.gram");
+    s.promote<DType::f32, 3>("s.pts", "pts");  // the interface of an opaque chunked system
+    s.promote<DType::f32, 1>("r.out", "out");
 }
 class RInnerPlain : public cs::System {
 public:
@@ -378,8 +382,8 @@ public:
         add_subsystem<Inner>("inner", budget_);
         add_subsystem<Cons>("cons");
         connect("prod.counts", "gen.counts");
-        connect("gen.pts", "inner.s.pts");
-        connect("inner.r.out", "cons.in");
+        connect("gen.pts", "inner.pts");
+        connect("inner.out", "cons.in");
     }
 };
 
@@ -410,6 +414,12 @@ std::vector<float> forward_out(cs::Model& m, const char* path = "cons.out") {
     return std::vector<float>(v.span().begin(), v.span().end());
 }
 
+/// An entry INSIDE the chunked system 'inner', resolved by the chunked system itself (its own subtree is visible to it;
+/// from outside only its promotions are: the Model's root.entry_at("inner.a.t") is refused).
+cs::detail::IOEntry& inner_entry(cs::Model& m, const char* path) {
+    return dynamic_cast<cs::ChunkedSystem&>(m.get_subsystem("inner")).entry_at(path);
+}
+
 std::size_t chunks_of(cs::Model& m) { return dynamic_cast<cs::ChunkedSystem&>(m.get_subsystem("inner")).last_chunk_count(); }
 
 }  // namespace tch
@@ -437,7 +447,7 @@ TEST_CASE("Chunked: dense, 1 / 2 / uneven / many chunks, bitwise equal to the pl
         CHECK(tch::chunks_of(m) == c.chunks);
         CHECK(tch::expected_chunks(tch::Sizes(n, 16), c.budget) == c.chunks);
         // views from the host see whole roots after the run
-        CHECK(m.view_output<DType::f32, 1>("inner.b.y").size() == n);
+        CHECK(m.view_output<DType::f32, 1>("inner.y").size() == n);
         CHECK(out == want);
     }
 }
@@ -614,6 +624,8 @@ public:
         add_subsystem<B>("b");
         add_subsystem<GenFixed>("g", std::size_t{13});
         connect("a.t", "b.in");
+        promote<DType::f32, 2>("a.in", "in");
+        promote<DType::f32, 1>("b.y", "y");
     }
 };
 class OddTop : public cs::System {
@@ -622,8 +634,8 @@ public:
         add_subsystem<Prod>("prod", std::size_t{8});
         add_subsystem<OddInner>("inner", std::size_t{1000});
         add_subsystem<Cons>("cons");
-        connect("prod.x", "inner.a.in");
-        connect("inner.b.y", "cons.in");
+        connect("prod.x", "inner.in");
+        connect("inner.y", "cons.in");
     }
 };
 
@@ -634,6 +646,8 @@ public:
     void setup() override {
         add_subsystem<A>("a");
         add_subsystem<A>("a2");
+        promote<DType::f32, 2>("a.in", "in1");
+        promote<DType::f32, 2>("a2.in", "in2");
     }
 };
 class TwoNTop : public cs::System {
@@ -642,8 +656,60 @@ public:
         add_subsystem<Prod>("p1", std::size_t{8});
         add_subsystem<Prod>("p2", std::size_t{6});
         add_subsystem<TwoNInner>("inner", std::size_t{1000});
-        connect("p1.x", "inner.a.in");
-        connect("p2.x", "inner.a2.in");
+        connect("p1.x", "inner.in1");
+        connect("p2.x", "inner.in2");
+    }
+};
+
+/// A promoted FREE input declared with 6 rows next to a promoted connected input fed by an 8-row source.
+class WrongLenInner : public cs::ChunkedSystem {
+public:
+    explicit WrongLenInner(std::size_t budget) : cs::ChunkedSystem(budget) {}
+    void setup() override {
+        add_subsystem<A>("a", std::size_t{6});
+        add_subsystem<A>("a2");
+        promote<DType::f32, 2>("a.in", "w");
+        promote<DType::f32, 2>("a2.in", "in2");
+    }
+};
+class WrongLenTop : public cs::System {
+public:
+    void setup() override {
+        add_subsystem<Prod>("p", std::size_t{8});
+        add_subsystem<WrongLenInner>("inner", std::size_t{1000});
+        connect("p.x", "inner.in2");
+    }
+};
+
+/// An outside producer with a derived dimension 1 (the value of its free input k), registered AFTER the chunked system
+/// it feeds: its root is not resolved when the chunked system runs.
+struct ProdKBody {
+    struct Inputs {
+        cs::Input<DType::u32, 1> k;
+    };
+    struct Outputs {
+        cs::Output<DType::f32, 2> x;
+    };
+    void operator()(sycl::id<2> i, Inputs, Outputs o) const { o.x[i] = 1.0f; }
+};
+class ProdK : public cs::Component<ProdKBody> {
+    cs::Input<DType::u32, 1>  k_;
+    cs::Output<DType::f32, 2> x_;
+
+public:
+    void setup() override {
+        declare_input(k_, "k", 1);
+        init_input("k", cs::init::from_host(std::vector<std::uint32_t>{3}));
+        declare_output(x_, "x", std::size_t{10}, cs::FromInput{"k", 0});
+    }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(x_.shape(), {k_}, {x_}, {}); }
+};
+class UnresolvedTop : public cs::System {
+public:
+    void setup() override {
+        add_subsystem<InnerChunk>("inner", std::size_t{1000}, false);
+        add_subsystem<ProdK>("late");
+        connect("late.x", "inner.in");
     }
 };
 
@@ -677,6 +743,7 @@ public:
         add_subsystem<CopyU32>("c");
         add_subsystem<CoordGen>("gen");
         connect("c.cnt", "gen.counts");
+        promote<DType::u32, 1>("c.in", "in");
     }
 };
 class ValueTop : public cs::System {
@@ -684,7 +751,7 @@ public:
     void setup() override {
         add_subsystem<CProd>("prod", std::vector<std::uint32_t>{1, 2, 3});
         add_subsystem<ValueInner>("inner", std::size_t{1000});
-        connect("prod.counts", "inner.c.in");
+        connect("prod.counts", "inner.in");
     }
 };
 
@@ -697,9 +764,7 @@ public:
 class NestTop : public cs::System {
 public:
     void setup() override {
-        add_subsystem<Prod>("prod", std::size_t{8});
-        add_subsystem<NestOuter>("outer", std::size_t{1000});
-        connect("prod.x", "outer.sub.a.in");
+        add_subsystem<NestOuter>("outer", std::size_t{1000});  // nothing can be wired into sub: it is not promoted
     }
 };
 
@@ -717,6 +782,27 @@ TEST_CASE("Chunked: errors", "[chunked][errors]") {
         m.setup();
         tch::expect_throws([&] { m.forward(); }, {"disagree", "leading length 8", "leading length 6"});
         m.wait();
+    }
+    SECTION("a promoted input with the wrong leading length") {
+        cs::Model m = cs::create_model<tch::WrongLenTop>(default_config());
+        m.setup();
+        tch::expect_throws([&] { m.forward(); }, {"disagree", "leading length 6", "leading length 8"});
+        m.wait();
+    }
+    SECTION("a promoted input whose dimension 1 is unresolved") {
+        cs::Model m = cs::create_model<tch::UnresolvedTop>(default_config());
+        std::string what = "<no exception>";
+        try {
+            m.setup();
+            m.forward();
+            m.wait();
+        } catch (const std::exception& e) {
+            what = e.what();
+        }
+        INFO("thrown: " << what);
+        CHECK(what != "<no exception>");
+        CHECK(what.find("unresolved dimension 1") != std::string::npos);
+        CHECK(what.find("late.x") != std::string::npos);
     }
     SECTION("one index over budget") {
         cs::Model m = cs::create_model<tch::DenseTop<tch::InnerChunk>>(default_config(), std::size_t{10}, std::size_t{8});
@@ -795,7 +881,11 @@ class BiasInner : public cs::ChunkedSystem {
 
 public:
     BiasInner(std::size_t budget, std::shared_ptr<int> calls) : cs::ChunkedSystem(budget), calls_{std::move(calls)} {}
-    void setup() override { add_subsystem<AddBias>("ab", calls_); }
+    void setup() override {
+        add_subsystem<AddBias>("ab", calls_);
+        promote<DType::f32, 1>("ab.in", "in");
+        promote<DType::f32, 1>("ab.out", "out");
+    }
 };
 class BiasTop : public cs::System {
     std::size_t          n_, budget_;
@@ -807,8 +897,8 @@ public:
         add_subsystem<Src1>("src", n_);
         add_subsystem<BiasInner>("inner", budget_, calls_);
         add_subsystem<Cons>("cons");
-        connect("src.x", "inner.ab.in");
-        connect("inner.ab.out", "cons.in");
+        connect("src.x", "inner.in");
+        connect("inner.out", "cons.in");
     }
 };
 
@@ -822,7 +912,7 @@ TEST_CASE("Chunked: internal roots are allocated once per forward and kept acros
         const auto pout = tch::forward_out(plain);
         cs::Model  m    = cs::create_model<tch::DenseTop<tch::InnerChunk>>(default_config(), n, std::size_t{16});
         m.setup();
-        cs::detail::IOEntry& t = m.root().entry_at("inner.a.t");  // the internal [N,4] root
+        cs::detail::IOEntry& t = tch::inner_entry(m, "a.t");  // the internal [N,4] root
         for (int rep = 0; rep < 3; ++rep) {
             const std::size_t before = t.allocation_count();
             const auto        out    = tch::forward_out(m);
@@ -842,7 +932,7 @@ TEST_CASE("Chunked: internal roots are allocated once per forward and kept acros
         const auto pout = tch::forward_out(plain);
         cs::Model  m    = cs::create_model<tch::RaggedTop<tch::RInnerChunk>>(default_config(), counts, std::size_t{64});
         m.setup();
-        cs::detail::IOEntry& g = m.root().entry_at("inner.s.gram");  // the internal ragged root
+        cs::detail::IOEntry& g = tch::inner_entry(m, "s.gram");  // the internal ragged root
         for (int rep = 0; rep < 2; ++rep) {
             const std::size_t before = g.allocation_count();
             const auto        out    = tch::forward_out(m);
@@ -871,7 +961,7 @@ TEST_CASE("Chunked: an internal free input takes its init again in every chunk",
             const float bias = static_cast<float>(i / 3 + 1);  // the call number of its chunk
             CHECK(out[i] == 2.0f * (0.5f * static_cast<float>(i) + bias) + 1.0f);
         }
-        CHECK(m.root().entry_at("inner.ab.bias").allocation_count() == static_cast<std::size_t>(rep + 1));  // once per forward
+        CHECK(tch::inner_entry(m, "ab.bias").allocation_count() == static_cast<std::size_t>(rep + 1));  // once per forward
     }
 }
 
@@ -967,6 +1057,9 @@ void fill_mix(cs::System& s, int mode, std::size_t rows) {
         s.add_subsystem<MixFromInput>("m");
     s.add_subsystem<Sum3>("s");
     s.connect("m.t", "s.in");
+    s.promote<DType::f32, 1>("m.in", "in");  // the interface of an opaque chunked system
+    s.promote<DType::f32, 1>("s.y", "y");
+    if (mode == 1) s.promote<DType::u32, 1>("m.n", "n");
 }
 class MixPlain : public cs::System {
     int         mode_;
@@ -996,9 +1089,9 @@ public:
         if (mode_ == 1) add_subsystem<CProd>("ns", std::vector<std::uint32_t>(n_, static_cast<std::uint32_t>(n_)));  // n[0] = N
         add_subsystem<Inner>("inner", budget_, mode_, rows_);
         add_subsystem<Cons>("cons");
-        connect("src.x", "inner.m.in");
-        if (mode_ == 1) connect("ns.counts", "inner.m.n");
-        connect("inner.s.y", "cons.in");
+        connect("src.x", "inner.in");
+        if (mode_ == 1) connect("ns.counts", "inner.n");
+        connect("inner.y", "cons.in");
     }
 };
 

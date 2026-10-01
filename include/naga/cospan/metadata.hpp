@@ -1055,6 +1055,7 @@ private:
     bool                      init_pending_ = false;  ///< roots: the init is to be applied at the owner's next run
     const Subsystem*          last_user_ = nullptr;  ///< roots, set by System::resolve
     const Subsystem*          owner_     = nullptr;  ///< roots, set by System::resolve: the first toucher
+    bool                      chunk_outside_tie_ = false;  ///< a tie alias declared outside a ChunkedSystem whose inside members make it a boundary root: the chunked system resolves its shape
     bool                      chunk_rerooted_ = false;  ///< D140 B2: a root made at a ChunkedSystem's level (its owner allocates it)
     std::string               chunk_internal_by_;       ///< D140 B2: roots internal to the named ChunkedSystem (forced transient)
     Substrates*               substrates_ = nullptr; ///< roots, bound at prepare_exec

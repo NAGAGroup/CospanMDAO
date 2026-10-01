@@ -127,6 +127,8 @@ public:
         add_subsystem<A>("a");
         add_subsystem<B>("b");
         connect("a.t", "b.in");
+        promote<DType::f32, 2>("a.in", "in");  // the interface of an opaque chunked system
+        promote<DType::f32, 1>("b.y", "y");
     }
 };
 class DenseTop : public cs::System {
@@ -138,8 +140,8 @@ public:
         add_subsystem<Prod>("prod", n_);
         add_subsystem<DenseInner>("inner", budget_);
         add_subsystem<Cons>("cons");
-        connect("prod.x", "inner.a.in");
-        connect("inner.b.y", "cons.in");
+        connect("prod.x", "inner.in");
+        connect("inner.y", "cons.in");
     }
 };
 
@@ -284,7 +286,12 @@ public:
 class RaggedInner : public cs::ChunkedSystem {
 public:
     explicit RaggedInner(std::size_t budget) : cs::ChunkedSystem(budget) {}
-    void setup() override { add_subsystem<TieG>("g"); }
+    void setup() override {
+        add_subsystem<TieG>("g");
+        promote<DType::u32, 1>("g.sizes", "sizes");
+        promote<DType::f32, 1>("g.p.in", "in");
+        promote<DType::f32, 1>("g.s.sums", "sums");
+    }
 };
 class RaggedTop : public cs::System {
     Counts      counts_;
@@ -297,9 +304,9 @@ public:
         add_subsystem<Src>("src", counts_.size());
         add_subsystem<RaggedInner>("inner", budget_);
         add_subsystem<Cons>("cons");
-        connect("sz.counts", "inner.g.sizes");
-        connect("src.x", "inner.g.p.in");
-        connect("inner.g.s.sums", "cons.in");
+        connect("sz.counts", "inner.sizes");
+        connect("src.x", "inner.in");
+        connect("inner.sums", "cons.in");
     }
 };
 

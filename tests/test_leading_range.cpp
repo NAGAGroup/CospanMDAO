@@ -381,6 +381,16 @@ public:
         }
         add_subsystem<Copy>("cp");
         connect("cons.sums", "cp.in");
+        // the interface of an opaque chunked system: its promotions
+        if (local_ || kind_ == Kind::ragged_ragged) {
+            if (local_)
+                promote<DType::f32, 2>("ds.in", "in");
+            else
+                promote<DType::f32, 3>("cons.in", "in");
+        } else {
+            promote<DType::f32, 2>("cons.in", "in");
+        }
+        promote<DType::f32, 1>("cp.out", "out");
     }
 };
 class LRChunkTop : public cs::System {
@@ -403,8 +413,8 @@ public:
         }
         add_subsystem<LRInner>("inner", budget_, kind_, local_, sizes_);
         add_subsystem<Copy>("fin");
-        connect("src.out", local_ ? "inner.ds.in" : "inner.cons.in");
-        connect("inner.cp.out", "fin.in");
+        connect("src.out", "inner.in");
+        connect("inner.out", "fin.in");
     }
 };
 }  // namespace tlr

@@ -572,12 +572,12 @@ private:
     void copy_alias_dim(AliasEval& out, std::size_t to, const detail::IOEntry& src, int d, const detail::IOEntry& a,
                         bool input) const {
         if (input && src.view()) {
-            if (shape_recorder_ != nullptr) shape_recorder_->push_back(src.root());
+            note_shape_dep(src.root());
             out.ext[to] = src.view()->extents[static_cast<std::size_t>(d)];
             return;
         }
         const detail::IOEntry& up = input ? *src.root() : src;
-        if (shape_recorder_ != nullptr) shape_recorder_->push_back(up.root());  // a SHAPE dependency of the topology cache
+        note_shape_dep(up.root());  // a SHAPE dependency of the topology cache
         if (up.dim_is_per(d)) {
             if (to == 0)
                 throw std::invalid_argument("naga::cospan: a per-index dimension of '" + up.full_path() +
@@ -663,6 +663,44 @@ private:
         return out;
     }
 
+    /// A ROOT tie alias takes the shape its rule gives now. Per-index dims are resolved on the host and applied like
+    /// any ragged root's: update_shape computes the block offsets and resizes the storage; the owner uploads the
+    /// device copies (run_pre_compute) once the root is allocated.
+    void apply_alias_root(detail::IOEntry& a) {
+        const AliasEval ev = alias_eval(a);
+        for (int d = 0; d < a.rank(); ++d) {
+            const auto         u = static_cast<std::size_t>(d);
+            detail::DimRecord& r = a.dims_[u];
+            r.extent             = ev.ext[u];
+            if (d >= 1) {
+                r.per       = ev.per[u];
+                r.per_index = ev.per_index[u];
+            }
+        }
+        a.update_shape();
+    }
+
+    /// ChunkedSystem: resolve the shape of an OUTSIDE tie alias (a boundary root) from its rule alone, through this
+    /// Component's alias resolution. Its value / shape reads go to `deps` / `shapes` (the topology cache) when given,
+    /// and a source computed inside the chunked system is refused as in the full pass.
+    void resolve_alias_root(detail::IOEntry& a, std::vector<detail::IOEntry*>* deps, std::vector<const detail::IOEntry*>* shapes) {
+        dep_recorder_   = deps;
+        shape_recorder_ = shapes;
+        chunk_pass_     = true;
+        const auto reset = [&] {
+            dep_recorder_   = nullptr;
+            shape_recorder_ = nullptr;
+            chunk_pass_     = false;
+        };
+        try {
+            apply_alias_root(a);
+        } catch (...) {
+            reset();
+            throw;
+        }
+        reset();
+    }
+
     /// For each tie alias one of this Component's entries belongs to: an alias that is a ROOT
     /// this Component owns gets its shape resolved (and its storage resized); a connected
     /// tie_inputs alias is checked once against the output it joined.
@@ -676,20 +714,10 @@ private:
             if (a->is_root()) {
                 if (a->owner() != this) continue;
                 if (s.kind == AliasShape::Kind::fixed && !a->dim0_override_) continue;
-                // Per-index dims are resolved on the host and applied like any ragged root's: update_shape
-                // computes the block offsets and resizes the storage; the owner uploads the device copies
-                // (run_pre_compute) once the root is allocated.
-                const AliasEval ev = alias_eval(*a);
-                for (int d = 0; d < a->rank(); ++d) {
-                    const auto         u = static_cast<std::size_t>(d);
-                    detail::DimRecord& r = a->dims_[u];
-                    r.extent             = ev.ext[u];
-                    if (d >= 1) {
-                        r.per       = ev.per[u];
-                        r.per_index = ev.per_index[u];
-                    }
-                }
-                a->update_shape();
+                // An OUTSIDE tie alias that is a boundary root of a chunked system is resolved ONCE by that system,
+                // before its pass, from its own rule (not by an inside owner, once per chunk).
+                if (chunk_inside_ && a->chunk_outside_tie_) continue;
+                apply_alias_root(*a);
             } else if (!a->alias_checked_) {
                 if (s.kind != AliasShape::Kind::from_connection) {
                     const AliasEval        want = alias_eval(*a);
@@ -761,7 +789,7 @@ private:
     /// on the host: one per row (D140, FromInputValues). Negative values are an error.
     std::vector<std::size_t> read_values(detail::IOEntry& src, std::size_t column) {
         check_not_chunk_internal(src);
-        if (dep_recorder_ != nullptr) dep_recorder_->push_back(src.root());  // a VALUE dependency of the topology cache
+        note_value_dep(src.root());  // a VALUE dependency of the topology cache
         if (!detail::is_integer_dtype(src.dtype()))
             throw std::invalid_argument("naga::cospan: '" + std::string{src.name()} +
                                         "' drives per-index extents by value and must have an integer dtype");
@@ -824,7 +852,7 @@ private:
     /// The VALUE of element `index` of an integer-dtype input, on the host.
     std::size_t read_value(detail::IOEntry& src, std::size_t index) {
         check_not_chunk_internal(src);
-        if (dep_recorder_ != nullptr) dep_recorder_->push_back(src.root());  // a VALUE dependency of the topology cache
+        note_value_dep(src.root());  // a VALUE dependency of the topology cache
         if (!detail::is_integer_dtype(src.dtype()))
             throw std::invalid_argument("naga::cospan: '" + std::string{src.name()} +
                                         "' drives a shape by value and must have an integer dtype");
@@ -861,10 +889,28 @@ private:
     bool declaring_       = false;
     bool in_pre_forward_  = false;
     bool chunk_pass_      = false;                       ///< a ChunkedSystem's full-range pass is running (D140 B2)
+    bool chunk_inside_    = false;                       ///< this Component is inside a ChunkedSystem (set at its classification)
     bool replay_          = false;                       ///< a ChunkedSystem replays its cached topology: run_pre_compute applies, never resolves
     /// Set by the ChunkedSystem around resolve_shapes in its full pass: every value read (read_value / read_values,
     /// which every alias and port value read goes through) pushes the root it read; copy_alias_dim pushes the roots
     /// whose SHAPE it copied. Single-threaded, like all submission.
+    /// One recorded read: the root read, the entry being resolved when it was read, and which kind of dependency.
+    struct DepRead {
+        const detail::IOEntry* root;
+        const detail::IOEntry* by;
+        bool                   shape;
+    };
+    mutable std::vector<DepRead> read_log_;  ///< the same reads with their readers (the ChunkedSystem's dependency self-check)
+    void note_value_dep(detail::IOEntry* root) const {
+        if (dep_recorder_ == nullptr) return;
+        dep_recorder_->push_back(root);
+        read_log_.push_back(DepRead{root, resolving_, false});
+    }
+    void note_shape_dep(const detail::IOEntry* root) const {
+        if (shape_recorder_ == nullptr) return;
+        shape_recorder_->push_back(root);
+        read_log_.push_back(DepRead{root, resolving_, true});
+    }
     std::vector<detail::IOEntry*>*       dep_recorder_   = nullptr;
     std::vector<const detail::IOEntry*>* shape_recorder_ = nullptr;
     const detail::IOEntry* resolving_ = nullptr;         ///< the entry resolve() is working on

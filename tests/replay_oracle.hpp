@@ -113,6 +113,8 @@ void oracle(const char* chunked_path, Make&& make, const std::function<std::vect
         CHECK(r.window.frees == 0);
         CHECK(r.window.queue_waits == 0);
         CHECK(dynamic_cast<cs::ChunkedSystem&>(replay.get_subsystem(chunked_path)).topology_cached());
+        // the opacity self-check (every recorded dependency is an internal or a boundary root) ran, and passed, on this model
+        CHECK(dynamic_cast<cs::ChunkedSystem&>(replay.get_subsystem(chunked_path)).dependency_checks() >= 1);
         CHECK_FALSE(dynamic_cast<cs::ChunkedSystem&>(legacy.get_subsystem(chunked_path)).topology_cached());
     }
 }

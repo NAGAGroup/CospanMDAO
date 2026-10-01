@@ -176,7 +176,7 @@ public:
     /// source) the init is stored, a warning is printed to std::cerr, and it is never applied.
     void init_input(std::string_view path, InitSpec init) {
         Impl&            s = ready("init_input");
-        detail::IOEntry& e = s.root->entry_at(path);
+        detail::IOEntry& e = s.root->entry_at_from_outside(path);
         if (e.kind() != IOKind::input)
             throw std::invalid_argument("naga::cospan: Model::init_input: '" + std::string{path} +
                                         "' is an output; outputs are never initialized");
@@ -189,14 +189,18 @@ public:
     // ---- retrieval & observation ------------------------------------------------
     template <DType DT, int Rank>
     Input<DT, Rank>& get_input(std::string_view path) {
-        return ready("get_input").root->template get_input<DT, Rank>(path);
+        System& root = *ready("get_input").root;
+        (void)root.entry_at_from_outside(path);  // the opacity check, as an OUTSIDE caller
+        return root.template get_input<DT, Rank>(path);
     }
     template <DType DT, int Rank>
     Output<DT, Rank>& get_output(std::string_view path) {
-        return ready("get_output").root->template get_output<DT, Rank>(path);
+        System& root = *ready("get_output").root;
+        (void)root.entry_at_from_outside(path);  // the opacity check, as an OUTSIDE caller
+        return root.template get_output<DT, Rank>(path);
     }
     System&    root() { return *impl("root").root; }
-    Subsystem& get_subsystem(std::string_view path) { return ready("get_subsystem").root->get_subsystem(path); }
+    Subsystem& get_subsystem(std::string_view path) { return ready("get_subsystem").root->get_subsystem(path, /*outside=*/true); }
 
     struct MemoryReport {
         /// A snapshot at the time of the call, between runs.
@@ -288,7 +292,7 @@ private:
     }
 
     static detail::IOEntry& entry_of(Impl& s, std::string_view path, IOKind want, const char* verb) {
-        detail::IOEntry& e = s.root->entry_at(path);
+        detail::IOEntry& e = s.root->entry_at_from_outside(path);
         if (e.kind() != want)
             throw std::invalid_argument(std::string{"naga::cospan: Model::"} + verb + ": '" + std::string{path} +
                                         "' is " + (want == IOKind::input ? "an output" : "an input"));

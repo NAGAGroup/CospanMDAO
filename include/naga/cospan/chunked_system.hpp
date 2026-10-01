@@ -77,6 +77,7 @@ class ChunkedSystem : public System {
     std::vector<Boundary>           boundary_;
     std::vector<detail::IOEntry*>   internal_;
     std::vector<ComponentBase*>     comps_;
+    std::vector<detail::IOEntry*>   outside_ties_;  ///< outside tie aliases that are boundary roots: resolved here, before the pass
 
     // ---- the topology cache ----
     using Chunks = std::vector<std::pair<std::size_t, std::size_t>>;
@@ -107,6 +108,8 @@ class ChunkedSystem : public System {
     bool                                 recording_ = false;
     std::vector<detail::IOEntry*>        dep_roots_;
     std::vector<const detail::IOEntry*>  shape_roots_;
+    mutable std::size_t                 dep_checks_ = 0;  ///< how many times the dependency self-check ran (a test hook)
+    std::vector<ComponentBase::DepRead> reads_;  ///< the reads of the recording pass with their readers (self-check)
     std::function<void(std::size_t)>     chunk_hook_, chunk_post_hook_;
 
     /// The process-wide default of set_replay: true, unless the environment has COSPAN_CHUNK_LEGACY=1 (the
@@ -126,6 +129,8 @@ public:
     }
 
     std::size_t budget() const noexcept { return budget_; }
+    /// OPAQUE (D140 amendment): from outside, only this system's own promotions are visible.
+    bool is_opaque() const noexcept override { return true; }
     /// true (the default): cache the topology and replay it per chunk; false: the legacy per-chunk resolution.
     void set_replay(bool on) {
         replay_      = on;
@@ -153,6 +158,8 @@ public:
             if (seen.insert(r).second) out.push_back(r);
         return out;
     }
+    /// How many times the dependency self-check (every recorded dependency is internal or a boundary root) ran.
+    std::size_t dependency_checks() const noexcept { return dep_checks_; }
     /// Whether the cached topology is currently held (a test hook).
     bool topology_cached() const noexcept { return topo_.valid; }
     /// The number of chunks the last forward ran (0 before the first, and for N = 0).
@@ -162,6 +169,7 @@ public:
         Chunks                     chunks;
         std::optional<std::size_t> known_n;
         try {
+            resolve_outside_ties(false);  // their shapes are known before the chunk length is
             const std::size_t n = leading_length();
             known_n             = n;
             const bool replay   = replay_;
@@ -179,7 +187,7 @@ public:
                 if (replay) build_topology(n, chunks);
             }
             for (Boundary& b : boundary_)
-                if (b.member != nullptr) allocate_rerooted(*b.root);
+                if (b.member != nullptr || b.root->chunk_outside_tie_) allocate_rerooted(*b.root);
             hold_internal(chunks);
             // Replay: the internal roots' device metadata is uploaded ONCE, at the full range, before the window
             // (version-gated: unchanged metadata is not sent again). Per chunk only meta_shift_ moves.
@@ -236,6 +244,9 @@ protected:
         if (has_nested_chunked(*this))
             throw std::invalid_argument("naga::cospan: " + describe() + ": nested chunked systems are not supported");
         collect_components(comps_);
+        for (detail::IOEntry* a : outside_ties_) a->chunk_outside_tie_ = false;
+        outside_ties_.clear();
+        for (ComponentBase* c : comps_) c->chunk_inside_ = true;
 
         std::vector<detail::IOEntry*>                    roots;
         std::unordered_set<const detail::IOEntry*>       seen;
@@ -259,6 +270,10 @@ protected:
                 Boundary b;
                 b.root = r;
                 boundary_.push_back(std::move(b));
+                if (r->alias_shape_ && r->is_root()) {  // a tie declared above this system, with inside members
+                    r->chunk_outside_tie_ = true;
+                    outside_ties_.push_back(r);
+                }
             }
         }
         for (Boundary& b : boundary_) {
@@ -269,10 +284,12 @@ protected:
     }
 
 private:
-    /// Declared in a strict descendant (an alias declared by this system itself is at its level: outside).
+    /// Inside = DECLARED by this system or a descendant: a Component entry, a tie alias of a descendant, and a tie alias of
+    /// this system itself (its own ties are internal and transient). This system's own PROMOTIONS (no alias_shape_) are its
+    /// interface: they stay boundary ports, as does anything declared above it.
     bool inside(const detail::IOEntry& e) const {
         for (const Subsystem* s = e.declarer(); s != nullptr; s = s->owner())
-            if (s == this) return e.declarer() != this;
+            if (s == this) return e.declarer() != this || e.alias_shape_.has_value();
         return false;
     }
 
@@ -328,12 +345,30 @@ private:
             }
         dep_roots_.clear();
         shape_roots_.clear();
+        reads_.clear();
+        for (ComponentBase* c : comps_) c->read_log_.clear();
+        resolve_outside_ties(recording_);  // again, recording what their rules read (value / shape dependencies)
         full_pass();
         for (Boundary& b : boundary_)  // an input root whose shape the pass changed takes its init again
             if (b.member != nullptr && b.root->kind() == IOKind::input && b.root->flat_size() != b.prev_flat)
                 b.root->init_pending_ = true;  // applied with the allocation step
         chunks       = plan_chunks(n);
         last_chunks_ = chunks.size();
+    }
+
+    /// Each outside tie alias that is a boundary root takes the shape its OWN rule gives (its sources are outside by
+    /// construction: a path into this system is refused at setup, a value computed inside is refused here), through
+    /// the alias resolution of its owner, independent of which Component owns it.
+    void resolve_outside_ties(bool record) {
+        for (detail::IOEntry* a : outside_ties_) {
+            ComponentBase* owner = dynamic_cast<ComponentBase*>(const_cast<Subsystem*>(a->owner()));
+            if (owner == nullptr) owner = comps_.front();
+            owner->read_log_.clear();
+            owner->resolve_alias_root(*a, record ? &dep_roots_ : nullptr, record ? &shape_roots_ : nullptr);
+            // The reads of an outside tie's OWN rule are on its outside sources (opacity guarantees they are not inside):
+            // dependencies of the cache, but not crossings of this system's boundary. They are not self-checked.
+            owner->read_log_.clear();
+        }
     }
 
     static std::vector<std::uint64_t> snapshot_values(detail::IOEntry& root, sk::queue& q) {
@@ -370,8 +405,24 @@ private:
         return s;
     }
 
+    /// OPACITY self-check: every dependency the full pass recorded is an INTERNAL root or a boundary root (one reached
+    /// through a promotion, or an outside tie of this system). Anything else means something read across the boundary.
+    void check_dependencies() const {
+        ++dep_checks_;
+        for (const ComponentBase::DepRead& r : reads_) {
+            const detail::IOEntry* root = r.root->root();
+            bool                   ok   = std::find(internal_.begin(), internal_.end(), root) != internal_.end();
+            for (const Boundary& b : boundary_) ok = ok || b.root == root;
+            if (ok) continue;
+            throw std::logic_error(std::string{"naga::cospan: internal error: "} + (r.shape ? "shape" : "value") +
+                                   " dependency crosses chunked system '" + path() + "' outside its promotions (root '" +
+                                   root->full_path() + "', read by '" + (r.by != nullptr ? r.by->full_path() : std::string{"?"}) + "')");
+        }
+    }
+
     /// After the full pass and the plan: record what the pass depended on and capture the states.
     void build_topology(std::size_t n, const Chunks& chunks) {
+        check_dependencies();
         Topology t;
         t.n      = n;
         t.chunks = chunks;
@@ -539,6 +590,8 @@ private:
             c->chunk_pass_     = false;
             c->dep_recorder_   = nullptr;
             c->shape_recorder_ = nullptr;
+            reads_.insert(reads_.end(), c->read_log_.begin(), c->read_log_.end());
+            c->read_log_.clear();
             for (Boundary& b : boundary_)
                 if (b.member != nullptr && b.member->declarer() == c) b.root->adopt_shape(*b.member);
         }
@@ -554,6 +607,13 @@ private:
             std::size_t l = 0;
             if (b.member == nullptr) {
                 l = b.root->extents()[0];
+                // a derived scalar dimension >= 1 that no producer has resolved yet (extent 0 = unknown): a setup error
+                for (int d = 1; d < b.root->rank(); ++d)
+                    if (!b.root->dim_is_per(d) && b.root->extents()[static_cast<std::size_t>(d)] == 0 &&
+                        b.root->dim(d).how != detail::DimRecord::How::fixed)
+                        throw std::invalid_argument("naga::cospan: " + describe() + ": the boundary root '" + b.root->full_path() +
+                                                    "' has an unresolved dimension " + std::to_string(d) +
+                                                    " (its producer must run before this chunked system and resolve it)");
             } else if (b.root->kind() == IOKind::input && b.member->dim(0).how == detail::DimRecord::How::fixed) {
                 l = b.member->dim(0).extent;
             } else {

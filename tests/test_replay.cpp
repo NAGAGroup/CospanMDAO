@@ -110,6 +110,8 @@ public:
         add_subsystem<A>("a");
         add_subsystem<B>("b");
         connect("a.t", "b.in");
+        promote<DType::f32, 2>("a.in", "in");  // the interface of an opaque chunked system
+        promote<DType::f32, 1>("b.y", "y");
     }
 };
 class Top : public cs::System {
@@ -121,8 +123,8 @@ public:
         add_subsystem<Prod>("prod", n_);
         add_subsystem<Inner>("inner", budget_);
         add_subsystem<Cons>("cons");
-        connect("prod.x", "inner.a.in");
-        connect("inner.b.y", "cons.in");  // y crosses the boundary: only t (16 B per index) is internal
+        connect("prod.x", "inner.in");
+        connect("inner.y", "cons.in");  // y crosses the boundary: only t (16 B per index) is internal
     }
 };
 
@@ -174,11 +176,11 @@ TEST_CASE("Replay: the before-launch hook sees every chunk's cached shape and le
     std::vector<std::pair<std::size_t, std::size_t>> ranges;
     sys.set_chunk_hooks(
         [&](std::size_t) {
-            t_rows.push_back(m.root().entry_at("inner.a.t").extents()[0]);  // the internal root: this chunk's rows
-            const auto lr = m.root().entry_at("inner.a.in").leading_range();
+            t_rows.push_back(sys.entry_at("a.t").extents()[0]);  // the internal root: this chunk's rows
+            const auto lr = sys.entry_at("a.in").leading_range();
             REQUIRE(lr.has_value());
             ranges.push_back(*lr);
-            in_a.push_back(m.root().entry_at("inner.a.in").extents()[0]);
+            in_a.push_back(sys.entry_at("a.in").extents()[0]);
         },
         nullptr);
     m.forward();
@@ -187,10 +189,10 @@ TEST_CASE("Replay: the before-launch hook sees every chunk's cached shape and le
     CHECK(in_a == std::vector<std::size_t>{3, 3, 3, 1});
     CHECK(ranges == std::vector<std::pair<std::size_t, std::size_t>>{{0, 3}, {3, 6}, {6, 9}, {9, 10}});
     // after the forward the whole run is back: no range, the full shape
-    CHECK_FALSE(m.root().entry_at("inner.a.in").leading_range().has_value());
-    CHECK(m.root().entry_at("inner.a.in").extents()[0] == n);
-    CHECK(m.root().entry_at("inner.b.y").extents()[0] == n);
-    CHECK(m.root().entry_at("inner.a.t").extents()[0] == n);
+    CHECK_FALSE(sys.entry_at("a.in").leading_range().has_value());
+    CHECK(sys.entry_at("a.in").extents()[0] == n);
+    CHECK(sys.entry_at("b.y").extents()[0] == n);
+    CHECK(sys.entry_at("a.t").extents()[0] == n);
     CHECK(sys.last_chunk_count() == 4);
 }
 

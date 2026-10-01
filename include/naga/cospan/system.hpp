@@ -381,12 +381,19 @@ public:
     EntryRefs get_inputs() const { return aliases_of(IOKind::input); }
     EntryRefs get_outputs() const { return aliases_of(IOKind::output); }
 
-    /// Chains through children by dotted path.
-    Subsystem& get_subsystem(std::string_view path) {
+    /// OPACITY (D140 amendment): a chunked system's only interface is its own promotions. A path that descends
+    /// THROUGH an opaque system into its children is refused, unless the opaque system is the CALLER resolving its own
+    /// subtree. Overridden by ChunkedSystem.
+    virtual bool is_opaque() const noexcept { return false; }
+
+    /// Chains through children by dotted path. `outside`: the caller is a Model (an OUTSIDE caller of this root, even
+    /// when this root is opaque itself).
+    Subsystem& get_subsystem(std::string_view path, bool outside = false) {
         const auto seg = split_path(path);
         System*    s   = this;
         Subsystem* c   = nullptr;
         for (std::size_t i = 0; i < seg.size(); ++i) {
+            check_opaque_descent(*s, path, outside);
             c = s->find_child(seg[i]);
             if (c == nullptr)
                 throw std::out_of_range("naga::cospan: " + s->describe() + " has no subsystem '" +
@@ -406,15 +413,10 @@ public:
 
     /// The entry a path names (Component I/O or alias), for the Model's host
     /// access and for tests; never for wiring.
-    detail::IOEntry& entry_at(std::string_view path) {
-        const Located l = locate(path);
-        detail::IOEntry* e = l.comp != nullptr ? l.comp->lookup_entry(l.leaf) : l.sys->find_alias(l.leaf);
-        if (e == nullptr)
-            throw std::out_of_range("naga::cospan: " + l.sys->describe() + " has no " +
-                                    (l.comp != nullptr ? "entry '" : "alias '") + std::string{l.leaf} +
-                                    "' (resolving '" + std::string{path} + "')");
-        return *e;
-    }
+    detail::IOEntry& entry_at(std::string_view path) { return entry_at_impl(path, false); }
+    /// The MODEL-facing resolver: the caller is outside this system even when it is itself a chunked system, so a Model
+    /// whose root is chunked sees its promotions only. (Everything else is entry_at.)
+    detail::IOEntry& entry_at_from_outside(std::string_view path) { return entry_at_impl(path, true); }
 
     // ---- initial values (legal inside setup() only; r01 §4.4, D138) -------------------------
     /// Declare the initial value of a free input root: `path` is a child input path, or one of
@@ -673,6 +675,25 @@ private:
         return e;
     }
 private:
+    detail::IOEntry& entry_at_impl(std::string_view path, bool outside) {
+        const Located l = locate(path, outside);
+        detail::IOEntry* e = l.comp != nullptr ? l.comp->lookup_entry(l.leaf) : l.sys->find_alias(l.leaf);
+        if (e == nullptr)
+            throw std::out_of_range("naga::cospan: " + l.sys->describe() + " has no " +
+                                    (l.comp != nullptr ? "entry '" : "alias '") + std::string{l.leaf} +
+                                    "' (resolving '" + std::string{path} + "')");
+        return *e;
+    }
+
+    /// About to look up a child of `s` while resolving `path` from this System: refuse it when `s` is an opaque
+    /// system other than the caller (or the caller itself, for an outside caller).
+    void check_opaque_descent(const System& s, std::string_view path, bool outside) const {
+        if (!s.is_opaque() || (&s == this && !outside)) return;
+        const std::string full = this->path().empty() || outside ? std::string{path} : this->path() + "." + std::string{path};
+        throw std::invalid_argument("naga::cospan: '" + full + "' lives inside chunked system '" + s.Subsystem::path() +
+                                    "'; only its promotions are visible outside it; promote it to use it here");
+    }
+
     /// What a path resolves to: the System reached and either one of its
     /// Components' (comp != null) or its own alias (comp == null) named `leaf`.
     struct Located {
@@ -698,10 +719,11 @@ private:
 
     /// Dotted, descending children from THIS namespace; the last segment is an
     /// alias of the System reached or a Component's declared entry (§10.3).
-    Located locate(std::string_view path) {
+    Located locate(std::string_view path, bool outside = false) {
         const auto seg = split_path(path);
         System*    s   = this;
         for (std::size_t i = 0; i + 1 < seg.size(); ++i) {
+            check_opaque_descent(*s, path, outside);
             Subsystem* c = s->find_child(seg[i]);
             if (c == nullptr)
                 throw std::out_of_range("naga::cospan: " + s->describe() + " has no subsystem '" +

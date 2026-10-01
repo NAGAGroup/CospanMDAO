@@ -490,7 +490,11 @@ class InnerPlain : public cs::System {
 
 public:
     InnerPlain(std::size_t, std::size_t n, Sizes sizes) : n_{n}, sizes_{std::move(sizes)} {}
-    void setup() override { add_subsystem<G>("g", n_, sizes_); }
+    void setup() override {
+        add_subsystem<G>("g", n_, sizes_);
+        promote<DType::f32, 1>("g.p.in", "in");  // the interface of an opaque chunked system: its promotions
+        promote<DType::f32, 1>("g.s.sums", "sums");
+    }
 };
 class InnerChunk : public cs::ChunkedSystem {
     std::size_t n_;
@@ -498,7 +502,11 @@ class InnerChunk : public cs::ChunkedSystem {
 
 public:
     InnerChunk(std::size_t budget, std::size_t n, Sizes sizes) : cs::ChunkedSystem(budget), n_{n}, sizes_{std::move(sizes)} {}
-    void setup() override { add_subsystem<G>("g", n_, sizes_); }
+    void setup() override {
+        add_subsystem<G>("g", n_, sizes_);
+        promote<DType::f32, 1>("g.p.in", "in");
+        promote<DType::f32, 1>("g.s.sums", "sums");
+    }
 };
 template <class Inner>
 class ChunkTop : public cs::System {
@@ -511,10 +519,16 @@ public:
         add_subsystem<Src>("src", n_);
         add_subsystem<Inner>("inner", budget_, n_, sizes_);
         add_subsystem<Cons>("cons");
-        connect("src.x", "inner.g.p.in");
-        connect("inner.g.s.sums", "cons.in");
+        connect("src.x", "inner.in");
+        connect("inner.sums", "cons.in");
     }
 };
+
+/// An entry INSIDE the chunked system 'inner', resolved by the chunked system itself (from outside only its promotions
+/// are visible).
+cs::detail::IOEntry& inner_entry(cs::Model& m, const char* path) {
+    return dynamic_cast<cs::ChunkedSystem&>(m.get_subsystem("inner")).entry_at(path);
+}
 
 std::vector<float> forward_out(cs::Model& m) {
     m.forward();
@@ -576,12 +590,22 @@ public:
 class TieChunkPlain : public cs::System {
 public:
     explicit TieChunkPlain(std::size_t) {}
-    void setup() override { add_subsystem<TieChunkG>("g"); }
+    void setup() override {
+        add_subsystem<TieChunkG>("g");
+        promote<DType::f32, 3>("g.pts", "pts");  // the tie alias, the interface of an opaque chunked system
+        promote<DType::f32, 1>("g.sa.sums", "sa_sums");
+        promote<DType::f32, 1>("g.st.sums", "st_sums");
+    }
 };
 class TieChunkChunked : public cs::ChunkedSystem {
 public:
     explicit TieChunkChunked(std::size_t budget) : cs::ChunkedSystem(budget) {}
-    void setup() override { add_subsystem<TieChunkG>("g"); }
+    void setup() override {
+        add_subsystem<TieChunkG>("g");
+        promote<DType::f32, 3>("g.pts", "pts");
+        promote<DType::f32, 1>("g.sa.sums", "sa_sums");
+        promote<DType::f32, 1>("g.st.sums", "st_sums");
+    }
 };
 template <class Inner>
 class TieChunkTop : public cs::System {
@@ -597,9 +621,9 @@ public:
         add_subsystem<Cons>("c1");
         add_subsystem<Cons>("c2");
         connect("sz.counts", "gen.counts");
-        connect("gen.pts", "inner.g.pts");
-        connect("inner.g.sa.sums", "c1.in");
-        connect("inner.g.st.sums", "c2.in");
+        connect("gen.pts", "inner.pts");
+        connect("inner.sa_sums", "c1.in");
+        connect("inner.st_sums", "c2.in");
     }
 };
 
@@ -777,6 +801,14 @@ public:
         connect("t", "s.pts");
     }
 };
+/// The interface of an opaque chunked system (and of its plain twin): the promotions the variant's wiring needs.
+void promote_v(cs::System& s, int v) {
+    s.promote<DType::f32, 1>(v == 4 ? "g.q.in" : "g.p.in", "in");
+    if (v == 0) s.promote<DType::u32, 1>("g.sizes", "sizes");
+    if (v == 1 || v == 2) s.promote<DType::f32, 3>("g.pts", "pts");
+    if (v == 3) s.promote<DType::u32, 1>("g.mk.sizes", "mk_sizes");
+    s.promote<DType::f32, 1>("g.s.sums", "sums");
+}
 class InnerPlainV : public cs::System {
     int         v_;
     std::size_t n_;
@@ -784,7 +816,10 @@ class InnerPlainV : public cs::System {
 
 public:
     InnerPlainV(std::size_t, int v, std::size_t n, Sizes sizes) : v_{v}, n_{n}, sizes_{std::move(sizes)} {}
-    void setup() override { add_subsystem<GV>("g", v_, n_, sizes_); }
+    void setup() override {
+        add_subsystem<GV>("g", v_, n_, sizes_);
+        promote_v(*this, v_);
+    }
 };
 class InnerChunkV : public cs::ChunkedSystem {
     int         v_;
@@ -794,7 +829,10 @@ class InnerChunkV : public cs::ChunkedSystem {
 public:
     InnerChunkV(std::size_t budget, int v, std::size_t n, Sizes sizes)
         : cs::ChunkedSystem(budget), v_{v}, n_{n}, sizes_{std::move(sizes)} {}
-    void setup() override { add_subsystem<GV>("g", v_, n_, sizes_); }
+    void setup() override {
+        add_subsystem<GV>("g", v_, n_, sizes_);
+        promote_v(*this, v_);
+    }
 };
 template <class Inner>
 class VTop : public cs::System {
@@ -813,11 +851,11 @@ public:
         add_subsystem<Inner>("inner", budget_, v_, n, sizes);
         add_subsystem<Cons>("cons");
         connect("sz.counts", "gen.counts");
-        connect("src.x", v_ == 4 ? "inner.g.q.in" : "inner.g.p.in");
-        if (v_ == 0) connect("sz.counts", "inner.g.sizes");
-        if (v_ == 1 || v_ == 2) connect("gen.pts", "inner.g.pts");
-        if (v_ == 3) connect("sz.counts", "inner.g.mk.sizes");
-        connect("inner.g.s.sums", "cons.in");
+        connect("src.x", "inner.in");
+        if (v_ == 0) connect("sz.counts", "inner.sizes");
+        if (v_ == 1 || v_ == 2) connect("gen.pts", "inner.pts");
+        if (v_ == 3) connect("sz.counts", "inner.mk_sizes");
+        connect("inner.sums", "cons.in");
     }
 };
 
@@ -844,7 +882,7 @@ class ErrTop : public cs::System {
 public:
     explicit ErrTop(int variant) : variant_{variant} {}
     void setup() override {
-        add_subsystem<CProd>("sz", Counts{1, 2, 3, 4});
+        add_subsystem<trt::CProd>("sz", trt::Counts{1, 2, 3, 4});
         add_subsystem<Zero>("p");
         add_subsystem<Acc>("q");
         const auto policy = cs::TieOutputsPolicy::allow_plain;
@@ -916,14 +954,17 @@ public:
 class BadInner : public cs::ChunkedSystem {
 public:
     BadInner() : cs::ChunkedSystem(1000) {}
-    void setup() override { add_subsystem<GBad>("g"); }
+    void setup() override {
+        add_subsystem<GBad>("g");
+        promote<DType::u32, 1>("g.cc.in", "in");
+    }
 };
 class BadTop : public cs::System {
 public:
     void setup() override {
         add_subsystem<SrcU>("src");
         add_subsystem<BadInner>("inner");
-        connect("src.x", "inner.g.cc.in");
+        connect("src.x", "inner.in");
     }
 };
 
@@ -1023,7 +1064,7 @@ TEST_CASE("Ragged ties: a tie inside a ChunkedSystem, bitwise equal to unchunked
         INFO("budget " << budget);
         cs::Model m = cs::create_model<trt::ChunkTop<trt::InnerChunk>>(default_config(), n, budget, sizes);
         m.setup();
-        cs::detail::IOEntry& t = m.root().entry_at("inner.g.t");  // the internal ragged tie alias root
+        cs::detail::IOEntry& t = trt::inner_entry(m, "g.t");  // the internal ragged tie alias root
         for (int rep = 0; rep < 2; ++rep) {
             const std::size_t before = t.allocation_count();
             const auto        out    = trt::forward_out(m);
@@ -1060,14 +1101,14 @@ TEST_CASE("Ragged ties: alias shapes from inputs and from internal entries insid
             INFO("budget " << budget);
             cs::Model m = cs::create_model<trt::VTop<trt::InnerChunkV>>(default_config(), counts, budget, v);
             m.setup();
-            cs::detail::IOEntry& t = m.root().entry_at("inner.g.t");  // the internal ragged tie alias root
+            cs::detail::IOEntry& t = trt::inner_entry(m, "g.t");  // the internal ragged tie alias root
             for (int rep = 0; rep < 2; ++rep) {
                 const std::size_t before = t.allocation_count();
                 const auto        out    = trt::forward_out(m);
                 CHECK(out == pout);
                 CHECK(t.allocation_count() - before == 1);
                 if (v == 3) {  // the internal ragged OUTPUT the alias inherits its shape from
-                    cs::detail::IOEntry& r = m.root().entry_at("inner.g.mk.r");
+                    cs::detail::IOEntry& r = trt::inner_entry(m, "g.mk.r");
                     CHECK(r.allocation_count() == static_cast<std::size_t>(rep + 1));
                 }
             }
@@ -1242,6 +1283,8 @@ public:
                                                    cs::alias::input_values("sizes")),
                                    cs::TieOutputsPolicy::allow_plain);
         connect("t", "s.pts");
+        promote<DType::f32, 1>("p.in", "in");
+        promote<DType::f32, 1>("s.sums", "sums");
     }
 };
 class DirectPlain : public cs::System {
@@ -1257,6 +1300,8 @@ public:
                                                    cs::alias::input_values("sizes")),
                                    cs::TieOutputsPolicy::allow_plain);
         connect("t", "s.pts");
+        promote<DType::f32, 1>("p.in", "in");
+        promote<DType::f32, 1>("s.sums", "sums");
     }
 };
 template <class Inner>
@@ -1271,14 +1316,15 @@ public:
         add_subsystem<Src>("src", counts_.size());
         add_subsystem<Inner>("inner", budget_);
         add_subsystem<Cons>("cons");
-        connect("src.x", "inner.p.in");
+        connect("src.x", "inner.in");
         connect("sz.counts", "inner.sizes");
-        connect("inner.s.sums", "cons.in");
+        connect("inner.sums", "cons.in");
     }
 };
 }  // namespace trt
 
-TEST_CASE("Chunked: promote + tie_outputs with input_values declared in the chunked system's own setup", "[.segv][ragged][tie][chunked]") {
+TEST_CASE("Chunked: a tie declared in the chunked system's own setup is internal (input_values on a promoted input)",
+          "[chunked-level-tie][ragged][tie][chunked]") {
     const trt::Counts counts{3, 1, 4, 0, 2, 5, 1, 3, 2, 4};
     cs::Model         plain = cs::create_model<trt::DirectTop<trt::DirectPlain>>(default_config(), counts, std::size_t{0});
     plain.setup();
@@ -1286,43 +1332,300 @@ TEST_CASE("Chunked: promote + tie_outputs with input_values declared in the chun
     cs::Model  m    = cs::create_model<trt::DirectTop<trt::DirectChunk>>(default_config(), counts, std::size_t{200});
     m.setup();
     CHECK(trt::forward_out(m) == want);
+    // internal and transient: nothing of the tie is left allocated after the forward
+    CHECK_FALSE(trt::inner_entry(m, "t").has_storage());
+    CHECK(trt::inner_entry(m, "t").held() == false);
 }
 
+TEST_CASE("Replay oracle: a tie declared in the chunked system's own setup", "[chunked-level-tie][ragged][tie][chunked][replay]") {
+    const trt::Counts first{3, 1, 4, 0, 2, 5, 1, 3, 2, 4};
+    const trt::Counts second{2, 0, 5, 5, 1, 1, 3, 4, 0, 2};
+    for (const std::size_t budget : {std::size_t{1000}, std::size_t{200}, std::size_t{100}}) {
+        INFO("budget " << budget);
+        tor::oracle("inner", [&] { return cs::create_model<trt::DirectTop<trt::DirectChunk>>(default_config(), first, budget); },
+                    [](cs::Model& m) {
+                        auto o = m.view_output<DType::f32, 1>("cons.out");
+                        return std::vector<float>(o.span().begin(), o.span().end());
+                    },
+                    3, [&](cs::Model& m, int f) { m.init_input("sz.raw", cs::init::from_host(f == 1 ? second : first)); });
+    }
+}
 
 // =============================================================================================================================
-// Named replay oracle cases (C2c): the mechanisms that were only covered in combination.
+// OPACITY (C2e): a chunked system's only interface is its own promotions.
 // =============================================================================================================================
 namespace trt {
 
-/// output_values from an OUTSIDE output, the tie declared by the TOP system with its members inside the chunked system.
-class OvInner : public cs::ChunkedSystem {
+/// A top with ONE route into the chunked system 'inner' (ChunkTop's InnerChunk: g.p.in, g.t, g.s.sums inside; `in` and
+/// `sums` promoted). Every route names something inside.
+class RouteTop : public cs::System {
+    int route_;
+
 public:
-    explicit OvInner(std::size_t budget) : cs::ChunkedSystem(budget) {}
+    explicit RouteTop(int route) : route_{route} {}
     void setup() override {
-        add_subsystem<Zero>("p");
-        add_subsystem<Acc>("q");
-        add_subsystem<SumT>("sum");
+        const Sizes sizes{1, 2, 3, 1};
+        add_subsystem<Src>("src", 4);
+        add_subsystem<InnerChunk>("inner", std::size_t{1000}, std::size_t{4}, sizes);
+        add_subsystem<Zero>("z1");
+        add_subsystem<Acc>("z2");
+        switch (route_) {
+            case 0: connect("src.x", "inner.g.p.in"); break;
+            case 1:
+                tie_outputs<DType::f32, 3>({"inner.g.p.t", "z2.t"}, "tt", cs::alias::dims(4, 2, 2), cs::TieOutputsPolicy::allow_plain);
+                break;
+            case 2:
+                tie_outputs<DType::f32, 3>({"z1.t", "z2.t"}, "tt",
+                                           cs::alias::dims(cs::alias::input_dim("inner.g.p.in", 0), 2, 2),
+                                           cs::TieOutputsPolicy::allow_plain);
+                break;
+            case 3: promote<DType::f32, 1>("inner.g.p.in", "pp"); break;
+            case 4: init_input("inner.g.p.in", cs::init::fill(1.0f)); break;
+            case 5: add_design_var("inner.g.p.in"); break;
+            default: break;
+        }
     }
 };
-class OvTop : public cs::System {
+
+}  // namespace trt
+
+TEST_CASE("Opaque chunked system: every route into it from outside is refused at setup", "[chunked][opaque]") {
+    const std::vector<std::pair<int, const char*>> routes{
+        {0, "connect"}, {1, "tie member path"}, {2, "alias source path"}, {3, "promote from above"}, {4, "init_input"}, {5, "mark"}};
+    for (const auto& [route, what] : routes) {
+        INFO("route: " << what);
+        cs::Model m = cs::create_model<trt::RouteTop>(default_config(), route);
+        trt::expect_throws([&] { m.setup(); }, {"lives inside chunked system 'inner'", "only its promotions are visible outside it",
+                                                 "promote it to use it here"});
+    }
+}
+
+TEST_CASE("Opaque chunked system: a Model reaches its promotions only; the chunked system reaches its own subtree",
+          "[chunked][opaque]") {
+    const trt::Sizes sizes{1, 3, 2, 3, 0, 3, 1, 2};
+    cs::Model        m = cs::create_model<trt::ChunkTop<trt::InnerChunk>>(default_config(), sizes.size(), std::size_t{100}, sizes);
+    m.setup();
+    auto exp_open = [&](auto&& f) { trt::expect_throws(f, {"lives inside chunked system 'inner'", "promote it to use it here"}); };
+    exp_open([&] { (void)m.root().entry_at("inner.g.p.in"); });
+    exp_open([&] { (void)m.root().entry_at("inner.g.t"); });
+    exp_open([&] { m.init_input("inner.g.p.in", cs::init::fill(1.0f)); });
+    exp_open([&] { (void)m.view_input<DType::f32, 1>("inner.g.p.in"); });
+    exp_open([&] { (void)m.view_output<DType::f32, 1>("inner.g.s.sums"); });
+    exp_open([&] { (void)m.get_subsystem("inner.g"); });
+    exp_open([&] { (void)m.get_output<DType::f32, 1>("inner.g.s.sums"); });
+    // a path ending AT its promotion is legal
+    CHECK_NOTHROW((void)m.root().entry_at("inner.sums"));
+    CHECK_NOTHROW((void)m.root().entry_at("inner.in"));
+    // the chunked system itself, and the systems inside it, reach their own subtrees
+    auto& x = dynamic_cast<cs::ChunkedSystem&>(m.get_subsystem("inner"));
+    CHECK_NOTHROW((void)x.entry_at("g.p.in"));
+    CHECK_NOTHROW((void)x.entry_at("g.t"));
+    CHECK_NOTHROW((void)x.get_subsystem("g"));
+    auto& g = dynamic_cast<cs::System&>(x.get_subsystem("g"));
+    CHECK_NOTHROW((void)g.entry_at("s.sums"));
+    CHECK_NOTHROW((void)g.entry_at("t"));
+    // and the model still runs
+    CHECK(trt::forward_out(m) == trt::chunk_ref(sizes));
+}
+
+TEST_CASE("Opaque chunked system: a Model whose ROOT is a chunked system sees its promotions only", "[chunked][opaque]") {
+    const trt::Sizes sizes{1, 3, 2, 3, 0, 3, 1, 2};
+    cs::Model        m = cs::create_model<trt::InnerChunk>(default_config(), std::size_t{100}, sizes.size(), sizes);
+    m.setup();
+    auto exp_open = [&](auto&& f) { trt::expect_throws(f, {"lives inside chunked system", "promote it to use it here"}); };
+    exp_open([&] { m.init_input("g.p.in", cs::init::fill(1.0f)); });
+    exp_open([&] { (void)m.view_output<DType::f32, 1>("g.s.sums"); });
+    exp_open([&] { (void)m.get_subsystem("g"); });
+    CHECK_NOTHROW(m.init_input("in", cs::init::fill(1.0f)));  // its own promotion
+    // the chunked root itself still reaches its subtree
+    CHECK_NOTHROW((void)m.root().entry_at("g.p.in"));
+}
+
+TEST_CASE("Opaque chunked system: a tie declared above, with members inside, fails with the opacity error",
+          "[outside-tie-inside-members][ragged][tie][chunked][opaque]") {
+    class OvInnerBad : public cs::ChunkedSystem {
+    public:
+        explicit OvInnerBad(std::size_t budget) : cs::ChunkedSystem(budget) {}
+        void setup() override {
+            add_subsystem<trt::Zero>("p");
+            add_subsystem<trt::Acc>("q");
+        }
+    };
+    class OvTopBad : public cs::System {
+    public:
+        void setup() override {
+            add_subsystem<trt::CProd>("sz", trt::Counts{1, 2, 3, 4});
+            add_subsystem<OvInnerBad>("inner", std::size_t{1000});
+            tie_outputs<DType::f32, 3>({"inner.p.t", "inner.q.t"}, "t",
+                                       cs::alias::dims(cs::alias::output_dim("sz.counts", 0), cs::alias::output_values("sz.counts"),
+                                                       cs::alias::output_values("sz.counts")),
+                                       cs::TieOutputsPolicy::allow_plain);
+        }
+    };
+    cs::Model m = cs::create_model<OvTopBad>(default_config());
+    trt::expect_throws([&] { m.setup(); }, {"lives inside chunked system 'inner'", "promote it to use it here"});
+}
+
+// ---- an outside tie over PROMOTIONS of inside cs::tied ports ----------------------------------------------------------------
+namespace trt {
+
+/// AccIn: t += in[i] (q + 1); `t` is a tied ragged output, `in` a plain input.
+struct AccInBody {
+    struct Inputs {
+        cs::Input<DType::f32, 1> in;
+    };
+    struct Outputs {
+        cs::RaggedOutput<DType::f32, 3> t;
+    };
+    void operator()(sycl::id<1> id, Inputs a, Outputs o) const {
+        auto b = o.t.block(id[0]);
+        for (std::size_t q = 0; q < b.size(); ++q) b[q] += a.in[id] * static_cast<float>(q + 1);
+    }
+};
+class AccIn : public cs::Component<AccInBody> {
+    cs::Input<DType::f32, 1>        in_;
+    cs::RaggedOutput<DType::f32, 3> t_;
+
+public:
+    void setup() override {
+        declare_input(in_, "in", cs::FromSourceDim{0});
+        declare_output(t_, "t", cs::tied);
+    }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+        return create_launch_config(sycl::range<1>{t_.size()}, {in_}, {t_}, {});
+    }
+};
+
+void fill_ot(cs::System& s) {
+    s.add_subsystem<AccIn>("q");
+    s.promote<DType::f32, 1>("q.in", "in");
+    s.promote<DType::f32, 3>("q.t", "qt");  // a promotion of an inside cs::tied output: the outside tie's member
+}
+class OtPlain : public cs::System {
+public:
+    explicit OtPlain(std::size_t) {}
+    void setup() override { fill_ot(*this); }
+};
+class OtChunk : public cs::ChunkedSystem {
+public:
+    explicit OtChunk(std::size_t budget) : cs::ChunkedSystem(budget) {}
+    void setup() override { fill_ot(*this); }
+};
+/// tie_outputs over {outside writer w.t (zeroes), inner.qt (the chunks accumulate their slices)}, sized from sz.counts.
+template <class Inner>
+class OtTop : public cs::System {
     Counts      init_;
     std::size_t budget_;
 
 public:
-    OvTop(Counts init, std::size_t budget) : init_{std::move(init)}, budget_{budget} {}
+    OtTop(Counts init, std::size_t budget) : init_{std::move(init)}, budget_{budget} {}
     void setup() override {
         add_subsystem<CProd>("sz", init_);
-        add_subsystem<OvInner>("inner", budget_);
+        add_subsystem<Src>("src", init_.size());
+        add_subsystem<Zero>("w");
+        add_subsystem<Inner>("inner", budget_);
+        add_subsystem<SumT>("sum");
         add_subsystem<Cons>("cons");
-        tie_outputs<DType::f32, 3>({"inner.p.t", "inner.q.t"}, "t",
+        tie_outputs<DType::f32, 3>({"w.t", "inner.qt"}, "t",
                                    cs::alias::dims(cs::alias::output_dim("sz.counts", 0), cs::alias::output_values("sz.counts"),
                                                    cs::alias::output_values("sz.counts")),
                                    cs::TieOutputsPolicy::allow_plain);
-        connect("t", "inner.sum.pts");
-        connect("inner.sum.sums", "cons.in");
+        connect("src.x", "inner.in");
+        connect("t", "sum.pts");
+        connect("sum.sums", "cons.in");
+    }
+};
+
+/// tie_inputs over {inner.pts (a promotion of the inside tied input sa.pts), sb.pts}, connected from gen.pts.
+void fill_ti(cs::System& s) {
+    s.add_subsystem<SumK<1>>("sa");
+    s.promote<DType::f32, 3>("sa.pts", "pts");
+    s.promote<DType::f32, 1>("sa.sums", "sums");
+}
+class TiPlain : public cs::System {
+public:
+    explicit TiPlain(std::size_t) {}
+    void setup() override { fill_ti(*this); }
+};
+class TiChunk : public cs::ChunkedSystem {
+public:
+    explicit TiChunk(std::size_t budget) : cs::ChunkedSystem(budget) {}
+    void setup() override { fill_ti(*this); }
+};
+template <class Inner>
+class TiTop : public cs::System {
+    Counts      init_;
+    std::size_t budget_;
+
+public:
+    TiTop(Counts init, std::size_t budget) : init_{std::move(init)}, budget_{budget} {}
+    void setup() override {
+        add_subsystem<CProd>("sz", init_);
+        add_subsystem<Gen>("gen");
+        add_subsystem<Inner>("inner", budget_);
+        add_subsystem<SumK<1>>("sb");
+        add_subsystem<Cons>("c1");
+        add_subsystem<Cons>("c2");
+        connect("sz.counts", "gen.counts");
+        tie_inputs<DType::f32, 3>({"inner.pts", "sb.pts"}, "tp", cs::alias::from_connection());
+        connect("gen.pts", "tp");
+        connect("inner.sums", "c1.in");
+        connect("sb.sums", "c2.in");
     }
 };
 }  // namespace trt
+
+TEST_CASE("Replay oracle: an outside tie_outputs over a promotion of an inside tied output plus an outside writer",
+          "[outside-tie-inside-members][ragged][tie][chunked][replay]") {
+    const trt::Counts first{3, 1, 4, 0, 2, 5, 1, 3, 2, 4};
+    const trt::Counts second{2, 0, 5, 5, 1, 1, 3, 4, 0, 2};
+    const auto        read = [](cs::Model& m) {
+        auto o = m.view_output<DType::f32, 1>("cons.out");
+        std::vector<float> out(o.span().begin(), o.span().end());
+        auto               t = m.view_ragged_input<DType::f32, 3>("sum.pts");  // the tie alias: the FULL root
+        out.insert(out.end(), t.data.begin(), t.data.end());
+        return out;
+    };
+    cs::Model plain = cs::create_model<trt::OtTop<trt::OtPlain>>(default_config(), first, std::size_t{0});
+    plain.setup();
+    const auto pout = (plain.forward(), plain.wait(), read(plain));
+    for (const std::size_t budget : {std::size_t{1000}, std::size_t{150}, std::size_t{70}}) {
+        INFO("budget " << budget);
+        cs::Model m = cs::create_model<trt::OtTop<trt::OtChunk>>(default_config(), first, budget);
+        m.setup();
+        m.forward();
+        m.wait();
+        CHECK(read(m) == pout);  // matches the unchunked run (the alias is the full root, the chunks wrote their slices)
+        tor::oracle("inner", [&] { return cs::create_model<trt::OtTop<trt::OtChunk>>(default_config(), first, budget); }, read, 3,
+                    [&](cs::Model& mm, int f) { mm.init_input("sz.raw", cs::init::from_host(f == 1 ? second : first)); });
+    }
+}
+
+TEST_CASE("Replay oracle: an outside tie_inputs over a promotion of an inside tied input", "[outside-tie-inside-members][ragged][tie][chunked][replay]") {
+    const trt::Counts first{3, 1, 4, 0, 2, 5, 1, 3, 2, 4};
+    const trt::Counts second{2, 0, 5, 5, 1, 1, 3, 4, 0, 2};
+    const auto        read = [](cs::Model& m) {
+        std::vector<float> out;
+        for (const char* p : {"c1.out", "c2.out"}) {
+            auto o = m.view_output<DType::f32, 1>(p);
+            out.insert(out.end(), o.span().begin(), o.span().end());
+        }
+        return out;
+    };
+    cs::Model plain = cs::create_model<trt::TiTop<trt::TiPlain>>(default_config(), first, std::size_t{0});
+    plain.setup();
+    const auto pout = (plain.forward(), plain.wait(), read(plain));
+    for (const std::size_t budget : {std::size_t{1000}, std::size_t{100}}) {
+        INFO("budget " << budget);
+        cs::Model m = cs::create_model<trt::TiTop<trt::TiChunk>>(default_config(), first, budget);
+        m.setup();
+        m.forward();
+        m.wait();
+        CHECK(read(m) == pout);
+        tor::oracle("inner", [&] { return cs::create_model<trt::TiTop<trt::TiChunk>>(default_config(), first, budget); }, read, 3,
+                    [&](cs::Model& mm, int f) { mm.init_input("sz.raw", cs::init::from_host(f == 1 ? second : first)); });
+    }
+}
 
 TEST_CASE("Replay oracle: cs::per_index host arrays on a tie alias, several budgets", "[ragged][tie][chunked][replay]") {
     const trt::Sizes sizes{3, 1, 4, 0, 2, 5, 1, 3, 2, 4};
@@ -1333,20 +1636,5 @@ TEST_CASE("Replay oracle: cs::per_index host arrays on a tie alias, several budg
                         auto o = m.view_output<DType::f32, 1>("cons.out");
                         return std::vector<float>(o.span().begin(), o.span().end());
                     });
-    }
-}
-
-TEST_CASE("Replay oracle: output_values / output_dim of an OUTSIDE output sizing a tie whose members are inside",
-          "[.no_legal_form][ragged][tie][chunked][replay]") {
-    const trt::Counts first{3, 1, 4, 0, 2, 5, 1, 3, 2, 4};
-    const trt::Counts second{2, 0, 5, 5, 1, 1, 3, 4, 0, 2};
-    for (const std::size_t budget : {std::size_t{1000}, std::size_t{200}}) {
-        INFO("budget " << budget);
-        tor::oracle("inner", [&] { return cs::create_model<trt::OvTop>(default_config(), first, budget); },
-                    [](cs::Model& m) {
-                        auto o = m.view_output<DType::f32, 1>("cons.out");
-                        return std::vector<float>(o.span().begin(), o.span().end());
-                    },
-                    3, [&](cs::Model& m, int f) { m.init_input("sz.raw", cs::init::from_host(f == 1 ? second : first)); });
     }
 }
