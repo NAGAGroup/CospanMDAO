@@ -126,16 +126,87 @@ constexpr FromInputArray from_input_array(std::string_view input) { return {inpu
 struct Tied {};
 inline constexpr Tied tied{};
 
+/// The per-dimension specs of cs::alias::dims (D140: tie aliases take the shape rules of ports). An integer
+/// or cs::per_index(...) is also a spec; these name an upstream OUTPUT, in the declaring System's namespace.
+namespace alias {
+/// The extent is the VALUE of element `index` (flat) of an upstream integer output.
+struct OutputValue { std::string path; std::size_t index = 0; };
+/// Per-index extents (dims >= 1): the VALUES of an upstream integer output of rank 1 [N] (column 0) or rank 2 [N, k].
+struct OutputValues { std::string path; std::size_t column = 0; };
+/// Dim `dim` of an upstream output's shape (per-index too, if that dim is per-index).
+struct OutputDim { std::string path; std::size_t dim = 0; };
+
+inline OutputValue output_value(std::string_view path, std::size_t index = 0) { return {std::string{path}, index}; }
+inline OutputValues output_values(std::string_view path, std::size_t column = 0) { return {std::string{path}, column}; }
+inline OutputDim output_dim(std::string_view path, std::size_t d) { return {std::string{path}, d}; }
+}  // namespace alias
+
+template <class T>
+concept AliasDimSpec = std::integral<T> || std::same_as<T, PerIndex> || std::same_as<T, alias::OutputValue> ||
+                       std::same_as<T, alias::OutputValues> || std::same_as<T, alias::OutputDim>;
+
+/// One dimension of an alias::dims shape, type-erased.
+struct AliasDim {
+    enum class How : uint8_t { fixed, per_index_host, output_value, output_values, output_dim };
+    How                      how    = How::fixed;
+    std::size_t              extent = 1;   ///< fixed
+    std::vector<std::size_t> values;       ///< per_index_host
+    std::string              path;         ///< output_*: the upstream output
+    std::size_t              index  = 0;   ///< output_value: the element; output_values: the column; output_dim: the dim
+    detail::IOEntry*         src    = nullptr;  ///< output_*: resolved by the System at setup
+};
+
+template <AliasDimSpec S>
+AliasDim make_alias_dim(const S& s) {
+    AliasDim r;
+    if constexpr (std::integral<S>) {
+        if constexpr (std::is_signed_v<S>) {
+            if (s < 0) throw std::invalid_argument("naga::cospan: a fixed extent is negative");
+        }
+        r.how    = AliasDim::How::fixed;
+        r.extent = static_cast<std::size_t>(s);
+    } else if constexpr (std::same_as<S, PerIndex>) {
+        r.how    = AliasDim::How::per_index_host;
+        r.values = s.values;
+    } else if constexpr (std::same_as<S, alias::OutputValue>) {
+        r.how = AliasDim::How::output_value;
+        r.path = s.path;
+        r.index = s.index;
+    } else if constexpr (std::same_as<S, alias::OutputValues>) {
+        r.how = AliasDim::How::output_values;
+        r.path = s.path;
+        r.index = s.column;
+    } else {
+        r.how = AliasDim::How::output_dim;
+        r.path = s.path;
+        r.index = s.dim;
+    }
+    return r;
+}
+
 /// How a tie alias gets its shape (D139 part 2); build one with the cs::alias factories.
 struct AliasShape {
-    enum class Kind : uint8_t { fixed, from_connection, from_output_shape, from_output_values };
+    enum class Kind : uint8_t { fixed, from_connection, from_output_shape, from_output_values, dims };
     Kind                       kind = Kind::fixed;
-    int                        rank = 0;            ///< fixed: how many extents were given
+    int                        rank = 0;            ///< fixed / dims: how many extents / specs were given
     std::array<std::size_t, 3> extents{1, 1, 1};    ///< fixed
     std::string                path;                ///< from_output_*: an output, in the declaring System's namespace
+    std::vector<AliasDim>      dim_specs;           ///< dims: one per dimension
 };
 
 namespace alias {
+/// The per-dimension form (D140): one spec per dim, count = the alias's Rank. A spec is an integer (fixed),
+/// cs::per_index(values) (dims >= 1), alias::output_value(path, index), alias::output_values(path, column)
+/// (dims >= 1) or alias::output_dim(path, d).
+template <AliasDimSpec... S>
+AliasShape dims(const S&... specs) {
+    static_assert(sizeof...(S) >= 1 && sizeof...(S) <= 3, "cospan: rank is 1..3");
+    AliasShape s;
+    s.kind = AliasShape::Kind::dims;
+    s.rank = static_cast<int>(sizeof...(S));
+    (s.dim_specs.push_back(make_alias_dim(specs)), ...);
+    return s;
+}
 /// The alias has this shape (its rank is the number of extents).
 inline AliasShape fixed(std::size_t e0) {
     AliasShape s;
@@ -438,6 +509,21 @@ public:
     /// A tie alias: how its shape is made, and the upstream output a from_output_* shape reads.
     const std::optional<AliasShape>& alias_shape() const noexcept { return alias_shape_; }
     const IOEntry*                   alias_source() const noexcept { return alias_src_; }
+    /// Every upstream output a tie alias's shape reads (path, entry): one for from_output_*, one per
+    /// output-reading dim of an alias::dims shape.
+    std::vector<std::pair<std::string_view, const IOEntry*>> alias_sources() const {
+        std::vector<std::pair<std::string_view, const IOEntry*>> out;
+        if (!alias_shape_) return out;
+        if (alias_src_ != nullptr) out.emplace_back(alias_shape_->path, alias_src_);
+        for (const AliasDim& d : alias_shape_->dim_specs)
+            if (d.src != nullptr) out.emplace_back(d.path, d.src);
+        return out;
+    }
+    /// Dimension d >= 1 is per-index and resolved (a promoted alias asks its member).
+    bool dim_is_per(int d) const noexcept {
+        if (mirror_of_ != nullptr) return mirror_of_->dim_is_per(d);
+        return ragged_ && d >= 1 && d < rank_ && dims_[static_cast<std::size_t>(d)].per;
+    }
 
     /// The wrapper geometry of this entry: whole-root contiguous, or, for a
     /// peer with a view, the view's extents over the root's strides.
@@ -713,6 +799,7 @@ protected:
     /// Inside a ChunkedSystem the framework sets dim 0 of every port of every inside component to the
     /// current chunk length (N in the full-range pass, b - a per chunk), whatever rule declared it.
     std::optional<std::size_t> dim0_override_;
+    std::size_t                dim0_start_ = 0;  ///< with dim0_override_: the first index of the chunk (host per-index slices)
     std::vector<DimRecord>     dims_;
     std::vector<Placement>     placements_;        ///< roots; primary first
     std::optional<sycl::device> device_;

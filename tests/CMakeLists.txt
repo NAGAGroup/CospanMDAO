@@ -25,6 +25,7 @@ set(COSPAN_TEST_SOURCES
     test_leading_range.cpp
     test_model.cpp
     test_ragged.cpp
+    test_ragged_ties.cpp
     test_system.cpp
 )
 

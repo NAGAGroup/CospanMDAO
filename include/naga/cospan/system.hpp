@@ -877,8 +877,16 @@ private:
             if (s.kind == AliasShape::Kind::fixed) {
                 r.how    = detail::DimRecord::How::fixed;
                 r.extent = s.extents[static_cast<std::size_t>(d)];
+            } else if (s.kind == AliasShape::Kind::dims &&
+                       s.dim_specs[static_cast<std::size_t>(d)].how == AliasDim::How::fixed) {
+                r.how    = detail::DimRecord::How::fixed;
+                r.extent = s.dim_specs[static_cast<std::size_t>(d)].extent;
             } else {
                 r.how = detail::DimRecord::How::from_input;
+                if (s.kind == AliasShape::Kind::dims) {  // D140: statically per-index dims (resolved by the owner)
+                    const AliasDim& sp = s.dim_specs[static_cast<std::size_t>(d)];
+                    if (sp.how == AliasDim::How::per_index_host || sp.how == AliasDim::How::output_values) r.per = true;
+                }
             }
         }
         return out;
@@ -908,8 +916,40 @@ private:
     /// Validates an AliasShape against the alias's Rank; returns the upstream output a
     /// from_output_* shape reads (null for the others).
     template <int Rank>
-    detail::IOEntry* check_alias_shape(const AliasShape& s, const char* what, bool is_input) {
+    detail::IOEntry* check_alias_shape(AliasShape& s, const char* what, bool is_input) {
         switch (s.kind) {
+            case AliasShape::Kind::dims: {
+                if (s.rank != Rank || static_cast<int>(s.dim_specs.size()) != Rank)
+                    fail(what, "alias::dims gives " + std::to_string(s.dim_specs.size()) + " specs but the alias is rank " +
+                                   std::to_string(Rank));
+                for (int d = 0; d < Rank; ++d) {
+                    AliasDim&         sp  = s.dim_specs[static_cast<std::size_t>(d)];
+                    const std::string dim = "alias::dims, dimension " + std::to_string(d) + ": ";
+                    if (sp.how == AliasDim::How::fixed) continue;
+                    if (sp.how == AliasDim::How::per_index_host) {
+                        if (d == 0) fail(what, dim + "a per-index spec is for dimensions >= 1 (dimension 0 is the number of indices)");
+                        const AliasDim& d0 = s.dim_specs[0];
+                        if (d0.how == AliasDim::How::fixed && sp.values.size() != d0.extent)
+                            fail(what, dim + "per_index has " + std::to_string(sp.values.size()) +
+                                           " extents but dimension 0 is " + std::to_string(d0.extent));
+                        continue;
+                    }
+                    if (sp.how == AliasDim::How::output_values && d == 0)
+                        fail(what, dim + "output_values gives per-index extents, which are for dimensions >= 1");
+                    detail::IOEntry& up = entry_at(sp.path);
+                    if (up.kind() != IOKind::output || !up.can_be_source() || !up.root()->can_be_source())
+                        fail(what, dim + "'" + sp.path + "' is not an output that can be a source");
+                    if (sp.how != AliasDim::How::output_dim && !detail::is_integer_dtype(up.dtype()))
+                        fail(what, dim + "'" + sp.path + "' is not of integer dtype");
+                    if (sp.how == AliasDim::How::output_values && up.rank() > 2)
+                        fail(what, dim + "'" + sp.path + "' drives per-index extents by value and must be rank 1 [N] or rank 2 [N,k]");
+                    if (sp.how == AliasDim::How::output_dim && static_cast<int>(sp.index) >= up.rank())
+                        fail(what, dim + "'" + sp.path + "' has rank " + std::to_string(up.rank()) + ", no dimension " +
+                                       std::to_string(sp.index));
+                    sp.src = &up;
+                }
+                return nullptr;
+            }
             case AliasShape::Kind::fixed:
                 if (s.rank != Rank)
                     fail(what, "alias::fixed gives " + std::to_string(s.rank) + " extents but the alias is rank " +
@@ -995,7 +1035,9 @@ private:
                 throw std::invalid_argument("naga::cospan: tie alias '" + a->full_path() +
                                             "' takes its shape from a connection (alias::from_connection) but nothing is "
                                             "connected to it");
-            if (s.kind != AliasShape::Kind::from_output_shape && s.kind != AliasShape::Kind::from_output_values) continue;
+            if (s.kind != AliasShape::Kind::from_output_shape && s.kind != AliasShape::Kind::from_output_values &&
+                s.kind != AliasShape::Kind::dims)
+                continue;
 
             // The tie's owner: the first member to run (members seen through their promotions).
             std::size_t      first = comps.size();
@@ -1008,32 +1050,33 @@ private:
                     first_path = m->declarer()->path();
                 }
             }
-            // The producer: the LAST component writing the upstream output's root.
-            const detail::IOEntry* up       = a->alias_src_;
-            const detail::IOEntry* root     = up->root();
-            bool                   found    = false;
-            std::size_t            producer = 0;
-            std::string            producer_path;
-            const auto             consider = [&](const detail::IOEntry* x) {
-                if (x->kind() != IOKind::output) return;
-                const auto it = index.find(x->declarer());
-                if (it == index.end()) return;
-                if (!found || it->second > producer) {
-                    producer      = it->second;
-                    producer_path = x->declarer()->path();
-                }
-                found = true;
-            };
-            consider(root);
-            for (const detail::IOEntry* p : root->peers_) consider(p);
-            if (!found)
-                throw std::invalid_argument("naga::cospan: tie alias '" + a->full_path() + "' takes its shape from '" +
-                                            s.path + "', which no component produces");
-            if (producer >= first)
-                throw std::invalid_argument("naga::cospan: tie alias '" + a->full_path() + "' takes its shape from '" +
-                                            s.path + "', produced by '" + producer_path +
-                                            "', which is not registered before the tie's first member ('" + first_path +
-                                            "'); the shape is read before the members run");
+            // The producer of EACH upstream output the shape reads: the LAST component writing its root.
+            for (const auto& [src_path, up] : a->alias_sources()) {
+                const detail::IOEntry* root     = up->root();
+                bool                   found    = false;
+                std::size_t            producer = 0;
+                std::string            producer_path;
+                const auto             consider = [&](const detail::IOEntry* x) {
+                    if (x->kind() != IOKind::output) return;
+                    const auto it = index.find(x->declarer());
+                    if (it == index.end()) return;
+                    if (!found || it->second > producer) {
+                        producer      = it->second;
+                        producer_path = x->declarer()->path();
+                    }
+                    found = true;
+                };
+                consider(root);
+                for (const detail::IOEntry* p : root->peers_) consider(p);
+                if (!found)
+                    throw std::invalid_argument("naga::cospan: tie alias '" + a->full_path() + "' takes its shape from '" +
+                                                std::string{src_path} + "', which no component produces");
+                if (producer >= first)
+                    throw std::invalid_argument("naga::cospan: tie alias '" + a->full_path() + "' takes its shape from '" +
+                                                std::string{src_path} + "', produced by '" + producer_path +
+                                                "', which is not registered before the tie's first member ('" + first_path +
+                                                "'); the shape is read before the members run");
+            }
         }
     }
 

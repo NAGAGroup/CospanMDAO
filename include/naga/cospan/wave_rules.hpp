@@ -140,14 +140,15 @@ inline void check_value_driven_sizes(const std::string& owner, std::span<Subsyst
                         // A tied entry's shape comes from its tie alias; a from_output_* alias reads an
                         // upstream output on the host, which must not belong to a stage of the same wave.
                         const IOEntry* alias = e.tie_alias();
-                        if (alias == nullptr || !alias->alias_shape() || alias->alias_source() == nullptr) continue;
-                        if (const IOEntry* o = output_of_other_stage(*alias->alias_source(), s, stages))
-                            throw std::invalid_argument(
-                                "naga::cospan: " + owner + ": '" + std::string{e.name()} + "' of '" + s->path() +
-                                "' takes its shape from tie alias '" + alias->full_path() + "', which reads the output '" +
-                                alias->alias_shape()->path + "' (an output of '" + o->declarer()->path() +
-                                "' in the same fuse); the shape is read on the host before the wave launches, so it "
-                                "cannot come from a stage of the same wave (feed it from outside the fuse)");
+                        if (alias == nullptr || !alias->alias_shape()) continue;
+                        for (const auto& [src_path, src] : alias->alias_sources())  // every output the shape reads
+                            if (const IOEntry* o = output_of_other_stage(*src, s, stages))
+                                throw std::invalid_argument(
+                                    "naga::cospan: " + owner + ": '" + std::string{e.name()} + "' of '" + s->path() +
+                                    "' takes its shape from tie alias '" + alias->full_path() + "', which reads the output '" +
+                                    std::string{src_path} + "' (an output of '" + o->declarer()->path() +
+                                    "' in the same fuse); the shape is read on the host before the wave launches, so it "
+                                    "cannot come from a stage of the same wave (feed it from outside the fuse)");
                         break;
                     }
                     if (r.how != DimRecord::How::from_input) continue;

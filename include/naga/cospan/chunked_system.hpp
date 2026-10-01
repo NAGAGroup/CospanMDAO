@@ -96,7 +96,7 @@ public:
                 if (b.member != nullptr) allocate_rerooted(*b.root);
             hold_internal(chunks);
             for (const auto& [a, b] : chunks) {
-                set_dim0(b - a);
+                set_dim0(b - a, a);
                 for (Boundary& bd : boundary_)
                     for (detail::IOEntry* p : bd.peers) detail::LeadingRangeAccess::set(*p, a, b);
                 // Each chunk is a fresh computation: an internal free input takes its init again.
@@ -312,13 +312,26 @@ private:
     }
 
     /// Dim 0 of every port of every inside component is the current chunk length (D140 B3).
-    void set_dim0(std::size_t n) {
+    /// `start` is the first index of the chunk (0 for the whole run). An INTERNAL tie alias root (declared by a
+    /// descendant, owning no port) has no Component entry to carry the override: it gets it too, and slices
+    /// a host per-index array by [start, start + n).
+    void set_dim0(std::size_t n, std::size_t start = 0) {
         for (ComponentBase* c : comps_)
             for (detail::IOEntry* e : c->order_) e->dim0_override_ = n;
+        for (detail::IOEntry* r : internal_)
+            if (r->alias_shape_) {
+                r->dim0_override_ = n;
+                r->dim0_start_    = start;
+            }
     }
     void clear_dim0() {
         for (ComponentBase* c : comps_)
             for (detail::IOEntry* e : c->order_) e->dim0_override_.reset();
+        for (detail::IOEntry* r : internal_)
+            if (r->alias_shape_) {
+                r->dim0_override_.reset();
+                r->dim0_start_ = 0;
+            }
     }
 
     /// Pricing from the declared shape rules (resolved over the full range) and the greedy scan.

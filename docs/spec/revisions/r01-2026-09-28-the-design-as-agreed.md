@@ -704,6 +704,8 @@ declare_input(grid, "grid", from_input_array("dims"));
 
 A ragged port has rank 2 or 3 and, for every index i of dimension 0 (N indices), its own extent on each trailing dimension. Dimension 0 is always scalar.
 
+**Ragged tie aliases.** A tie alias (section 4.3) takes the same per-index rules: `cs::alias::dims` with `per_index`, `output_values`, `output_dim`; `from_output_shape` and `from_connection` copy ragged shapes.
+
 **Spec forms.** `cs::PerIndex{values}` / `cs::per_index(vec)` (a host array, one extent per index, fixed at declaration) and `cs::FromInputValues{input, column}` (the extents are the values of an integer sibling input of rank 1 [N] or rank 2 [N, k]; negative values are an error). They are `DimSpec`s on dimensions >= 1 only, mixed freely with scalar specs. `FromSourceDim`, `FromInputDim` and `cs::tied` on a per-index dimension copy its array.
 
 ```cpp
@@ -832,6 +834,8 @@ private:
 ```
 
 ### 4.3 The structural operations, as set operations
+
+**Ragged aliases (D140).** A tie alias takes the same per-index shape rules as a port. `cs::alias::dims(spec0, spec1, ...)` gives one spec per dimension (count = Rank): an integer (fixed), `cs::per_index(vec)` (dims >= 1), `cs::alias::output_value(path, index)` (a scalar from an upstream output's value), `cs::alias::output_values(path, column = 0)` (per-index extents from the values of an upstream integer output of rank 1 [N] or rank 2 [N,k]; dims >= 1) and `cs::alias::output_dim(path, d)` (dim d of an upstream output's shape, per-index if that dim is). `from_output_shape` copies the upstream shape including per-index dims, and `from_connection` inherits a ragged source wholesale. The same ordering rules and Fused/Parallel refusal apply to every upstream output a shape reads. The root's owner resolves per-index dims on the host, computes the block offsets, resizes and uploads the device copies like any ragged root; members (cs::tied, from_root) copy the arrays from the root and must be declared RaggedInput / RaggedOutput (`declare_*(w, name, cs::tied)` overloads exist for them; a dense wrapper is the existing error). Ragged wrappers are non-atomic, so a ragged tie_outputs takes `TieOutputsPolicy::allow_plain`. Inside a ChunkedSystem an internal ragged alias root is priced like any internal root, dim 0 is set by the framework, a `per_index` host array is sliced per chunk, and a per-index source computed inside is the "computed inside" error.
 
 `merge(into, from)`: append `from`'s peers and `from` itself to `into`'s
 peer list; set every moved entry's root to `into`. O(|set|); models are

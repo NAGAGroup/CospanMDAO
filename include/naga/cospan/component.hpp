@@ -118,6 +118,20 @@ public:
         add_output<DT, Rank>(m, std::move(name), detail::tied_dims<Rank>());
     }
 
+    /// The rank-only form of a ragged port (D140): a member of a tie whose alias gives per-index dims
+    /// (cs::alias::dims with per_index / output_values / output_dim, or a ragged from_output_shape /
+    /// from_connection) must be declared with RaggedInput / RaggedOutput.
+    template <DType DT, int Rank>
+    void declare_input(RaggedInput<DT, Rank>& m, std::string name, Tied) {
+        register_entry(std::make_unique<detail::RaggedInputEntry<DT, Rank>>(name, detail::tied_dims<Rank>(), &m), &m,
+                       "declare_input");
+    }
+    template <DType DT, int Rank>
+    void declare_output(RaggedOutput<DT, Rank>& m, std::string name, Tied) {
+        register_entry(std::make_unique<detail::RaggedOutputEntry<DT, Rank>>(name, detail::tied_dims<Rank>(), &m), &m,
+                       "declare_output");
+    }
+
     /// Ragged ports (D140): RaggedInput / RaggedOutput members, Rank 2..3, with the same DimSpec
     /// arguments (scalar and per-index mixed: PerIndex, FromInputValues on dims >= 1).
     template <DType DT, int Rank, DimSpec... Specs>
@@ -508,20 +522,86 @@ private:
     }
 
     // ---- tie aliases (D139 part 2) ------------------------------------------------
-    /// The extents a tie alias's AliasShape gives right now (1-padded). from_output_* read a
-    /// producer that has already run (checked at setup: it is earlier in registration order).
-    std::array<std::size_t, 3> alias_extents(const detail::IOEntry& a) {
-        const AliasShape&          s = *a.alias_shape_;
-        std::array<std::size_t, 3> out{1, 1, 1};
+    /// A tie alias's shape as its AliasShape gives it right now (D140: scalar extents, and per-index arrays
+    /// for dims >= 1 that are per-index; the extent of a per-index dim is 0).
+    struct AliasEval {
+        std::array<std::size_t, 3>              ext{1, 1, 1};
+        std::array<bool, 3>                     per{false, false, false};
+        std::array<std::vector<std::size_t>, 3> per_index;
+    };
+
+    /// Slot `to` of `out` takes dimension `d` of the upstream output `up` (per-index too, if that dim is).
+    static void copy_alias_dim(AliasEval& out, std::size_t to, const detail::IOEntry& up, int d) {
+        if (up.dim_is_per(d)) {
+            if (to == 0)
+                throw std::invalid_argument("naga::cospan: a per-index dimension of '" + up.full_path() +
+                                            "' cannot become dimension 0 of a tie alias");
+            out.per[to]       = true;
+            out.per_index[to] = up.per_index_extents(d);
+            out.ext[to]       = 0;
+        } else {
+            out.ext[to] = up.extents()[static_cast<std::size_t>(d)];
+        }
+    }
+
+    /// What the alias's AliasShape gives right now. Every upstream output it reads is a producer that has
+    /// already run (checked at setup: it is earlier in registration order); the value reads happen on the
+    /// host from a snapshot, as FromInputValues does.
+    AliasEval alias_eval(const detail::IOEntry& a) {
+        const AliasShape& s = *a.alias_shape_;
+        AliasEval         out;
+        resolving_ = &a;  // names the alias in a "computed inside a chunked system" error
         switch (s.kind) {
-            case AliasShape::Kind::fixed: out = s.extents; break;
-            case AliasShape::Kind::from_output_shape: out = a.alias_src_->geometry().shape; break;
+            case AliasShape::Kind::fixed: out.ext = s.extents; break;
+            case AliasShape::Kind::from_output_shape:
+                for (int d = 0; d < a.rank(); ++d) copy_alias_dim(out, static_cast<std::size_t>(d), *a.alias_src_, d);
+                break;
             case AliasShape::Kind::from_output_values:
                 for (int d = 0; d < a.rank(); ++d)
-                    out[static_cast<std::size_t>(d)] = read_value(*a.alias_src_, static_cast<std::size_t>(d));
+                    out.ext[static_cast<std::size_t>(d)] = read_value(*a.alias_src_, static_cast<std::size_t>(d));
+                break;
+            case AliasShape::Kind::dims:
+                for (int d = 0; d < a.rank(); ++d) {
+                    const auto      u  = static_cast<std::size_t>(d);
+                    const AliasDim& sp = s.dim_specs[u];
+                    switch (sp.how) {
+                        case AliasDim::How::fixed: out.ext[u] = sp.extent; break;
+                        case AliasDim::How::per_index_host: {
+                            std::vector<std::size_t> v = sp.values;
+                            if (a.dim0_override_) {  // inside a ChunkedSystem: this chunk's slice of the host array
+                                const std::size_t first = a.dim0_start_, len = *a.dim0_override_;
+                                if (v.size() < first + len)
+                                    throw std::invalid_argument("naga::cospan: tie alias '" + a.full_path() + "': per-index dimension " +
+                                                                std::to_string(d) + " has " + std::to_string(v.size()) +
+                                                                " extents but the chunk reaches index " + std::to_string(first + len));
+                                v = std::vector<std::size_t>(v.begin() + static_cast<std::ptrdiff_t>(first),
+                                                             v.begin() + static_cast<std::ptrdiff_t>(first + len));
+                            }
+                            out.per[u]       = true;
+                            out.per_index[u] = std::move(v);
+                            break;
+                        }
+                        case AliasDim::How::output_value: out.ext[u] = read_value(*sp.src, sp.index); break;
+                        case AliasDim::How::output_values:
+                            out.per[u]       = true;
+                            out.per_index[u] = read_values(*sp.src, sp.index);
+                            break;
+                        case AliasDim::How::output_dim: copy_alias_dim(out, u, *sp.src, static_cast<int>(sp.index)); break;
+                    }
+                }
                 break;
             case AliasShape::Kind::from_connection:
                 throw std::logic_error("naga::cospan: '" + a.full_path() + "' takes its shape from a connection, which it does not have");
+        }
+        resolving_ = nullptr;
+        return out;
+    }
+
+    static std::string alias_shape_str(const std::array<std::size_t, 3>& ext, const std::array<bool, 3>& per, int rank) {
+        std::string out;
+        for (int d = 0; d < rank; ++d) {
+            if (d > 0) out += "x";
+            out += per[static_cast<std::size_t>(d)] ? std::string{"(per-index)"} : std::to_string(ext[static_cast<std::size_t>(d)]);
         }
         return out;
     }
@@ -537,22 +617,51 @@ private:
             seen.push_back(a);
             const AliasShape& s = *a->alias_shape_;
             if (a->is_root()) {
-                if (a->owner() != this || s.kind == AliasShape::Kind::fixed) continue;
-                const auto ext = alias_extents(*a);
-                for (int d = 0; d < a->rank(); ++d)
-                    a->dims_[static_cast<std::size_t>(d)].extent = ext[static_cast<std::size_t>(d)];
-                if (ext != a->extents_) a->reshape(sycl::range<3>{ext[0], ext[1], ext[2]});
+                if (a->owner() != this) continue;
+                if (s.kind == AliasShape::Kind::fixed && !a->dim0_override_) continue;
+                // Per-index dims are resolved on the host and applied like any ragged root's: update_shape
+                // computes the block offsets and resizes the storage; the owner uploads the device copies
+                // (run_pre_compute) once the root is allocated.
+                const AliasEval ev = alias_eval(*a);
+                for (int d = 0; d < a->rank(); ++d) {
+                    const auto         u = static_cast<std::size_t>(d);
+                    detail::DimRecord& r = a->dims_[u];
+                    r.extent             = ev.ext[u];
+                    if (d >= 1) {
+                        r.per       = ev.per[u];
+                        r.per_index = ev.per_index[u];
+                    }
+                }
+                a->update_shape();
             } else if (!a->alias_checked_) {
                 if (s.kind != AliasShape::Kind::from_connection) {
-                    const auto want = alias_extents(*a);
-                    const auto v    = a->view();
-                    const auto got  = v ? v->extents : a->root()->geometry().shape;
-                    if (want != got)
+                    const AliasEval        want = alias_eval(*a);
+                    const detail::IOEntry& root = *a->root();
+                    bool                   same = true;
+                    std::string            got_str;
+                    if (root.is_ragged() || want.per[1] || want.per[2]) {
+                        std::array<std::size_t, 3> got{1, 1, 1};
+                        std::array<bool, 3>        got_per{false, false, false};
+                        for (int d = 0; d < a->rank(); ++d) {
+                            const auto u = static_cast<std::size_t>(d);
+                            got[u]       = root.extents()[u];
+                            got_per[u]   = root.dim_is_per(d);
+                            if (got_per[u]) got[u] = 0;
+                            if (want.per[u] != got_per[u] || want.ext[u] != got[u]) same = false;
+                            if (d >= 1 && want.per[u] && got_per[u] && want.per_index[u] != root.per_index_extents(d)) same = false;
+                        }
+                        got_str = alias_shape_str(got, got_per, a->rank());
+                    } else {
+                        const auto v   = a->view();
+                        const auto got = v ? v->extents : root.geometry().shape;
+                        same           = want.ext == got;
+                        got_str        = alias_shape_str(got, {false, false, false}, 3);
+                    }
+                    if (!same)
                         throw std::invalid_argument(
                             "naga::cospan: tie alias '" + a->full_path() + "' declares the shape " +
-                            std::to_string(want[0]) + "x" + std::to_string(want[1]) + "x" + std::to_string(want[2]) +
-                            " but is connected to '" + std::string{a->root()->name()} + "', whose shape is " +
-                            std::to_string(got[0]) + "x" + std::to_string(got[1]) + "x" + std::to_string(got[2]));
+                            alias_shape_str(want.ext, want.per, root.is_ragged() || want.per[1] || want.per[2] ? a->rank() : 3) +
+                            " but is connected to '" + std::string{root.name()} + "', whose shape is " + got_str);
                 }
                 a->alias_checked_ = true;
             }
