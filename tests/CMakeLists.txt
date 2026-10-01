@@ -27,6 +27,7 @@ set(COSPAN_TEST_SOURCES
     test_ragged.cpp
     test_ragged_ties.cpp
     test_diagnostics.cpp
+    test_epochs.cpp
     test_system.cpp
 )
 

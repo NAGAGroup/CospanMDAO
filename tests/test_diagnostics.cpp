@@ -322,16 +322,17 @@ Row measure(cs::Model& m) {
 
 void print_header(const char* title, std::size_t budget) {
     std::printf("[diag] %s, budget %zu\n", title, budget);
-    std::printf("[diag] %-34s %6s | %-8s %5s %5s %5s %5s %5s %5s %5s %5s\n", "forward", "chunks", "scope", "wait", "free", "alloc",
-                "hread", "htask", "rupl", "fpass", "resol");
+    std::printf("[diag] %-34s %6s | %-8s %5s %5s %5s %5s %5s %5s %5s %5s %5s\n", "forward", "chunks", "scope", "wait", "free", "alloc",
+                "hread", "hhit", "htask", "rupl", "fpass", "resol");
 }
 
 void print_row(const char* what, const Row& r) {
     const auto line = [&](const char* scope, const cs::diag::EventCounts& c, bool first) {
-        std::printf("[diag] %-34s %6s | %-8s %5llu %5llu %5llu %5llu %5llu %5llu %5llu %5llu\n", first ? what : "",
+        std::printf("[diag] %-34s %6s | %-8s %5llu %5llu %5llu %5llu %5llu %5llu %5llu %5llu %5llu\n", first ? what : "",
                     first ? std::to_string(r.chunks).c_str() : "", scope, static_cast<unsigned long long>(c.queue_waits),
                     static_cast<unsigned long long>(c.frees), static_cast<unsigned long long>(c.allocations),
-                    static_cast<unsigned long long>(c.host_reads), static_cast<unsigned long long>(c.host_tasks),
+                    static_cast<unsigned long long>(c.host_reads), static_cast<unsigned long long>(c.host_read_hits),
+                    static_cast<unsigned long long>(c.host_tasks),
                     static_cast<unsigned long long>(c.ragged_uploads), static_cast<unsigned long long>(c.full_passes),
                     static_cast<unsigned long long>(c.resolve_shapes));
     };

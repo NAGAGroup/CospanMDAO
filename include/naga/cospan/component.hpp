@@ -289,6 +289,18 @@ public:
     /// launch by the stream; then RELEASE the transient roots this Component is
     /// the last user of: one stream wait for the batch (synchronous frees, D135).
     void run_post_compute(ExecCtx& owner_ctx) override {
+        // Write epochs: every launch path ends here, with this Component's kernels submitted. Each OUTPUT's
+        // root advances once per call (tied members of one root are separate Components, so N writers give +N).
+        {
+            std::vector<detail::IOEntry*> bumped;
+            for (detail::IOEntry* e : order_) {
+                if (e->kind() != IOKind::output) continue;
+                detail::IOEntry* r = e->root();
+                if (std::find(bumped.begin(), bumped.end(), r) != bumped.end()) continue;
+                bumped.push_back(r);
+                r->bump_write();
+            }
+        }
         for (detail::IOEntry* e : order_)
             if (e->kind() == IOKind::output && e->is_root() && e->storage_placements().size() > 1 &&
                 e->has_storage())
@@ -756,10 +768,21 @@ private:
                                    "' drives per-index extents by value but has no storage yet");
         std::vector<std::size_t> out(src.extents()[0]);
         detail::dispatch_dtype(src.dtype(), [&](auto tag) {
-            using T   = typename decltype(tag)::type;
-            auto snap = detail::take_snapshot<T>(src, queue_ref());
+            using T = typename decltype(tag)::type;
+            // Read through the root's cached host copy and its geometry (as take_snapshot does), building only
+            // the small output: no whole-root temporary.
+            const detail::IOEntry::Geometry g     = src.geometry();
+            const std::vector<T>&           whole = detail::storage_of<T>(src).read_primary(queue_ref());
+            const std::size_t               count = detail::element_count(g);
             for (std::size_t i = 0; i < out.size(); ++i) {
-                const T v = snap.data[i * k + column];
+                if (i * k + column >= count)
+                    throw std::out_of_range("naga::cospan: '" + std::string{src.name()} + "' has no element " +
+                                            std::to_string(i * k + column));
+                const std::size_t off = detail::element_offset(i * k + column, g);
+                if (off >= whole.size())
+                    throw std::out_of_range("naga::cospan: '" + src.full_path() +
+                                            "' presents elements past its root's storage");
+                const T v = whole[off];
                 if constexpr (std::is_signed_v<T>)
                     if (v < 0)
                         throw std::invalid_argument("naga::cospan: '" + std::string{src.name()} +
@@ -800,12 +823,17 @@ private:
                                    "' drives a shape by value but has no storage yet");
         std::size_t out = 0;
         detail::dispatch_dtype(src.dtype(), [&](auto tag) {
-            using T   = typename decltype(tag)::type;
-            auto snap = detail::take_snapshot<T>(src, queue_ref());
-            if (index >= snap.data.size())
+            using T = typename decltype(tag)::type;
+            // The root's cached host copy through the entry's geometry: one element, no whole-root temporary.
+            const detail::IOEntry::Geometry g = src.geometry();
+            if (index >= detail::element_count(g))
                 throw std::out_of_range("naga::cospan: '" + std::string{src.name()} + "' has no element " +
                                         std::to_string(index));
-            const T v = snap.data[index];
+            const std::vector<T>& whole = detail::storage_of<T>(src).read_primary(queue_ref());
+            const std::size_t     off   = detail::element_offset(index, g);
+            if (off >= whole.size())
+                throw std::out_of_range("naga::cospan: '" + src.full_path() + "' presents elements past its root's storage");
+            const T v = whole[off];
             if constexpr (std::is_signed_v<T>)
                 if (v < 0)
                     throw std::invalid_argument("naga::cospan: '" + std::string{src.name()} +

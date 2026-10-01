@@ -656,6 +656,14 @@ public:
     bool held() const noexcept { return root_->held_; }
     /// How many times the root's storage was allocated or grew past its capacity (a test hook).
     std::size_t allocation_count() const noexcept { return root_->allocations_; }
+    /// The ROOT's write epoch: a counter that advances whenever the root's data may have changed (a
+    /// component that writes it has been submitted, an init was applied, a host write, an allocation, a
+    /// release or a size change). It is what a host-copy cache compares against; it never decreases.
+    /// Not bumped by sync_other_placements (same logical content) nor by ragged-metadata uploads (shape,
+    /// not data). Single-threaded submission is assumed, as everywhere in CoSpan.
+    std::uint64_t write_epoch() const noexcept { return root_->write_epoch_; }
+    /// Advance the root's write epoch (always the canonical root, never a peer, view or alias member).
+    void bump_write() noexcept { ++root_->write_epoch_; }
     /// D140 B2: the path of the ChunkedSystem this root is internal to; empty otherwise.
     std::string_view chunk_internal_by() const noexcept { return root_->chunk_internal_by_; }
     /// The Subsystem that registered this entry (a Component for I/O, a System for aliases).
@@ -821,6 +829,7 @@ protected:
     bool                       held_          = false;   ///< set by the ChunkedSystem: no release by a last user
     std::size_t                reserve_elems_ = 0;       ///< held: the capacity (elements) allocate() takes
     std::size_t                allocations_   = 0;       ///< storage allocations of this root (allocate, growth past capacity)
+    std::uint64_t              write_epoch_   = 0;       ///< roots: see write_epoch()
     /// Inside a ChunkedSystem the framework sets dim 0 of every port of every inside component to the
     /// current chunk length (N in the full-range pass, b - a per chunk), whatever rule declared it.
     std::optional<std::size_t> dim0_override_;
@@ -1145,6 +1154,7 @@ public:
             slots_.push_back(std::make_unique<Slot>(p, sk::usm_vector<T>(n, route(q, subs, p, n))));
             ++allocations_;
             diag::count_allocations();
+            bump_write();  // a new slot: whatever a cache held is gone
         }
         released_ = false;
         present_  = true;
@@ -1200,6 +1210,9 @@ public:
         // only for its own tasks, so the CALLER has waited the stream (once per releasing Component's
         // batch); the vectors free here.
         diag::count_frees(slots_.size());
+        if (!slots_.empty()) bump_write();
+        host_cache_  = std::vector<T>{};  // free the cached copy with the storage
+        cache_epoch_ = ~std::uint64_t{0};
         slots_.clear();
         released_ = true;
         present_  = false;
@@ -1216,17 +1229,32 @@ public:
     /// A host copy of the WHOLE root, from the primary storage. Device kind:
     /// usm_vector::host_view (an owned copy, ordered after the stream's prior
     /// work). Host kind: queue.wait() then get_access().
-    std::vector<T> read_primary(sk::queue& q) const {
-        diag::count_host_reads();
+    ///
+    /// CACHED: the copy is kept on the root and served again while the root's write epoch is unchanged
+    /// (no device access, no wait). primary_slot() runs FIRST, so a released or not-yet-present root throws
+    /// exactly as before and a hit never bypasses that. The epoch is recorded BEFORE the ordered read, so a
+    /// write submitted afterwards is never missed. The reference is valid until the next read_primary of this
+    /// root that refreshes, or its release; copy it if you need to keep it. Single-threaded use is assumed
+    /// (as everywhere in CoSpan today: submission and host reads come from one thread).
+    const std::vector<T>& read_primary(sk::queue& q) const {
         Slot& s = primary_slot();
+        const std::uint64_t e = write_epoch();
+        if (cache_epoch_ == e) {
+            diag::count_host_read_hits();
+            return host_cache_;
+        }
+        diag::count_host_reads();
         if (s.data.get_kind() == sk::kind::device) {
             auto hv = s.data.host_view();
-            return std::vector<T>(hv.begin(), hv.end());
+            host_cache_.assign(hv.begin(), hv.end());
+        } else {
+            diag::count_queue_waits();
+            q.wait();
+            auto acc = s.data.get_access();
+            host_cache_.assign(acc.begin(), acc.end());
         }
-        diag::count_queue_waits();
-        q.wait();
-        auto acc = s.data.get_access();
-        return std::vector<T>(acc.begin(), acc.end());
+        cache_epoch_ = e;
+        return host_cache_;
     }
 
     /// Replace the primary storage's contents from the host, then refresh the
@@ -1234,6 +1262,7 @@ public:
     void write_primary(sk::queue& q, std::span<const T> src) {
         diag::count_host_tasks();
         primary_slot().data.from_host(src);
+        bump_write();
         sync_other_placements(q);
     }
 
@@ -1281,7 +1310,9 @@ private:
             ++allocations_;  // a usm_vector resize within its capacity never reallocates; this one does
             diag::count_allocations();
         }
+        const bool size_changes = !slots_.empty() && slots_.front()->data.size() != flat_size();
         for (auto& s : slots_) s->data.resize(flat_size());
+        if (size_changes) bump_write();
     }
 
     /// A per-index array of the SOURCE's dimension d (empty: scalar), for FromSourceDim.
@@ -1395,6 +1426,8 @@ private:
     }
 
     std::vector<std::unique_ptr<Slot>> slots_;  // parallel to placements_ once allocated
+    mutable std::vector<T>             host_cache_;                      // the primary's host copy, valid at cache_epoch_
+    mutable std::uint64_t              cache_epoch_ = ~std::uint64_t{0};  // the write epoch host_cache_ was read at
     Substrates*                        subs_ = nullptr;  // bound at allocate (the ragged arrays route through it)
 };
 

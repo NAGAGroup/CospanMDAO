@@ -86,7 +86,7 @@ struct Snapshot {
 template <class T>
 Snapshot<T> take_snapshot(IOEntry& entry, sk::queue& q) {
     const IOEntry::Geometry g     = entry.geometry();
-    const std::vector<T>    whole = storage_of<T>(entry).read_primary(q);
+    const std::vector<T>&   whole = storage_of<T>(entry).read_primary(q);  // the root's cached copy; read from, not kept
     std::vector<T>          out(element_count(g));
     for (std::size_t f = 0; f < out.size(); ++f) {
         const std::size_t off = element_offset(f, g);
@@ -115,7 +115,7 @@ void write_back(IOEntry& entry, sk::queue& q, std::span<const T> host) {
         root.write_primary(q, host);
         return;
     }
-    std::vector<T> whole = root.read_primary(q);
+    std::vector<T> whole = root.read_primary(q);  // a COPY of the cache: it is modified below
     for (std::size_t f = 0; f < host.size(); ++f) {
         const std::size_t off = element_offset(f, g);
         if (off >= whole.size())
@@ -225,7 +225,7 @@ private:
         if (entry.is_ragged()) {
             // Under a runtime leading range [a, b) (D140 B1) the view is that range: its offsets start at 0
             // and its data starts at the root's block a.
-            std::vector<value_type> whole = detail::storage_of<value_type>(entry).read_primary(q);
+            const std::vector<value_type>& whole = detail::storage_of<value_type>(entry).read_primary(q);
             offsets                       = entry.block_offsets();
             const std::size_t start =
                 entry.leading_range() ? static_cast<std::size_t>(entry.root()->block_offset_at(entry.leading_range()->first)) : 0;

@@ -1137,3 +1137,73 @@ TEST_CASE("transient: ParallelSystem and FusedSystem children release after the 
     CHECK(cst::pool_in_use(model) == base);  // every later forward returns what it allocated
     tfl::expect_throws([&] { (void)model.view_output<DType::f32, 1>("grp.a.y"); }, {"grp"});
 }
+
+TEST_CASE("write epochs: Fused and Parallel systems give the same deltas as the plain System (+1 per written root per forward)",
+          "[flavors][epoch]") {
+    const auto delta_of = [](cs::Model& m, const char* path) {
+        const auto before = m.root().entry_at(path).write_epoch();
+        m.forward();
+        m.wait();
+        return m.root().entry_at(path).write_epoch() - before;
+    };
+    // plain: src -> a -> b at the top level
+    cs::Model plain = tfl::make([](cs::System& s) {
+        s.add_subsystem<tfl::Src1>("src", std::array<int, 1>{1000});
+        s.add_subsystem<tfl::Elem<0>>("a");
+        s.add_subsystem<tfl::Elem<1>>("b");
+        s.connect("src.y", "a.x");
+        s.connect("a.y", "b.x");
+    });
+    plain.setup();
+    // fused sequential: the same two stages in a wave
+    cs::Model fused = tfl::make([](cs::System& s) {
+        s.add_subsystem<tfl::Src1>("src", std::array<int, 1>{1000});
+        s.add_subsystem<tfl::Wave>("f", cs::FusedSystem::Mode::sequential, std::optional<sycl::range<3>>{},
+                                   std::function<void(cs::FusedSystem&)>{[](cs::FusedSystem& w) {
+                                       w.add_subsystem<tfl::Elem<0>>("a");
+                                       w.add_subsystem<tfl::Elem<1>>("b");
+                                   }});
+        s.connect("src.y", "f.a.x");
+        s.connect("f.a.y", "f.b.x");
+    });
+    fused.setup();
+    // fused parallel: independent stages
+    cs::Model fpar = tfl::make([](cs::System& s) {
+        s.add_subsystem<tfl::Src1>("src", std::array<int, 1>{1000});
+        s.add_subsystem<tfl::Wave>("f", cs::FusedSystem::Mode::parallel, std::optional<sycl::range<3>>{},
+                                   std::function<void(cs::FusedSystem&)>{[](cs::FusedSystem& w) {
+                                       w.add_subsystem<tfl::Elem<0>>("a");
+                                       w.add_subsystem<tfl::Elem<2>>("b");
+                                   }});
+        s.connect("src.y", "f.a.x");
+        s.connect("src.y", "f.b.x");
+    });
+    fpar.setup();
+    // typed ParallelSystem: independent children
+    cs::Model par = tfl::make([](cs::System& s) {
+        s.add_subsystem<tfl::Src1>("src", std::array<int, 1>{1000});
+        s.add_subsystem<tfl::Par>("f", std::function<void(cs::ParallelSystem&)>{[](cs::ParallelSystem& p) {
+            p.add_subsystem<tfl::Elem<0>>("a");
+            p.add_subsystem<tfl::Elem<2>>("b");
+        }});
+        s.connect("src.y", "f.a.x");
+        s.connect("src.y", "f.b.x");
+    });
+    par.setup();
+    for (cs::Model* m : {&plain, &fused, &fpar, &par}) {
+        m->forward();  // the first forward allocates
+        m->wait();
+    }
+    for (int r = 0; r < 3; ++r) {
+        CHECK(delta_of(plain, "src.y") == 1);
+        CHECK(delta_of(plain, "a.y") == 1);
+        CHECK(delta_of(plain, "b.y") == 1);
+        CHECK(delta_of(fused, "src.y") == 1);
+        CHECK(delta_of(fused, "f.a.y") == 1);
+        CHECK(delta_of(fused, "f.b.y") == 1);
+        CHECK(delta_of(fpar, "f.a.y") == 1);
+        CHECK(delta_of(fpar, "f.b.y") == 1);
+        CHECK(delta_of(par, "f.a.y") == 1);
+        CHECK(delta_of(par, "f.b.y") == 1);
+    }
+}

@@ -73,6 +73,7 @@ inline void zero_primary(IOEntry& root, sk::queue& q) {
 /// then the other placements follow the primary.
 inline void apply_root_init(IOEntry& root, sk::queue& q) {
     if (root.flat_size() == 0) return;
+    root.bump_write();  // the init (fill, zero, from_host, custom) rewrites the whole root
     if (const auto& s = root.init_spec())
         s->apply(root, q);
     else
