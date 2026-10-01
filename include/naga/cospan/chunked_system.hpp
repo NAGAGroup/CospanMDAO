@@ -580,7 +580,10 @@ private:
     /// a host per-index array by [start, start + n).
     void set_dim0(std::size_t n, std::size_t start = 0) {
         for (ComponentBase* c : comps_)
-            for (detail::IOEntry* e : c->order_) e->dim0_override_ = n;
+            for (detail::IOEntry* e : c->order_) {
+                e->dim0_override_ = n;
+                e->dim0_start_    = start;  // a host per-index array on a port is cut to [start, start + n)
+            }
         for (detail::IOEntry* r : internal_)
             if (r->alias_shape_) {
                 r->dim0_override_ = n;
@@ -589,7 +592,10 @@ private:
     }
     void clear_dim0() {
         for (ComponentBase* c : comps_)
-            for (detail::IOEntry* e : c->order_) e->dim0_override_.reset();
+            for (detail::IOEntry* e : c->order_) {
+                e->dim0_override_.reset();
+                e->dim0_start_ = 0;
+            }
         for (detail::IOEntry* r : internal_)
             if (r->alias_shape_) {
                 r->dim0_override_.reset();

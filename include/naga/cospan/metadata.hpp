@@ -357,6 +357,9 @@ struct DimRecord {
     /// owning Component resolves it, and copied from the source dimension by from_source_dim /
     /// from_input_dim / from_root when that dimension is per-index.
     std::vector<std::size_t> per_index;
+    /// per_index_host: the declared full-length array. Inside a ChunkedSystem `per_index` is the chunk's slice of it
+    /// ([dim0_start_, dim0_start_ + dim0), D140 B3); outside, `per_index` is this array itself.
+    std::vector<std::size_t> host_full;
     /// The dimension is per-index (even when `per_index` is empty because N is 0): true from
     /// declaration for per_index_host / per_index_from_input, copied with the array by the derived hows.
     bool per = false;
@@ -381,6 +384,7 @@ DimRecord make_dim_record(const S& s) {
     } else if constexpr (std::same_as<S, PerIndex>) {
         r.how       = DimRecord::How::per_index_host;
         r.per_index = s.values;
+        r.host_full = s.values;
         r.per       = true;
     } else if constexpr (std::same_as<S, FromInputValues>) {
         r.how         = DimRecord::How::per_index_from_input;
@@ -1089,7 +1093,26 @@ public:
                     break;
                 case DimRecord::How::from_input_dim:    // resolved by the Component (which also copies a
                 case DimRecord::How::from_input:        // per-index source dimension's array)
-                case DimRecord::How::per_index_host:    // fixed at declaration
+                    break;
+                case DimRecord::How::per_index_host:
+                    // Declared at full length; inside a ChunkedSystem dim 0 is the chunk length and the array is cut to the
+                    // chunk, as for a tie alias. Outside, it is the declared array again.
+                    if (d >= 1) {
+                        if (!dim0_override_) {
+                            if (r.per_index != r.host_full) r.per_index = r.host_full;
+                        } else if (r.host_full.size() != *dim0_override_) {
+                            const std::size_t first = dim0_start_, len = *dim0_override_;
+                            if (r.host_full.size() < first + len)
+                                throw std::invalid_argument("naga::cospan: '" + full_path() + "': per-index dimension " +
+                                                            std::to_string(d) + " has " + std::to_string(r.host_full.size()) +
+                                                            " extents but the chunk reaches index " + std::to_string(first + len));
+                            r.per_index.assign(r.host_full.begin() + static_cast<std::ptrdiff_t>(first),
+                                               r.host_full.begin() + static_cast<std::ptrdiff_t>(first + len));
+                        } else if (r.per_index != r.host_full) {
+                            r.per_index = r.host_full;
+                        }
+                    }
+                    break;
                 case DimRecord::How::per_index_from_input: break;  // resolved by the Component
             }
             next[static_cast<std::size_t>(d)] = (d >= 1 && r.per) ? 0 : r.extent;

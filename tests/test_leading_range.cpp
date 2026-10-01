@@ -85,7 +85,7 @@ public:
     explicit RaggedSrc(Sizes s) : sizes_{std::move(s)} {}
     void setup() override { declare_output(out_, "out", sizes_.size(), cs::per_index(sizes_), 3); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(sycl::range<1>{sizes_.size()}, {}, {out_}, {});
+        return create_launch_config(sycl::range<1>{out_.size()}, {}, {out_}, {});  // the chunk's blocks inside a ChunkedSystem
     }
 };
 
@@ -428,9 +428,8 @@ TEST_CASE("Replay oracle: leading-range models in a ChunkedSystem (dense / ragge
 }
 
 TEST_CASE("Replay oracle: an internal ragged port with host per-index arrays (cs::per_index on a component port)",
-          "[.port_per_index][leading_range][chunked][replay]") {
-    // HIDDEN: a host per-index array on a COMPONENT port inside a chunked system is not sliced per chunk (only a tie alias
-    // slices it); the LEGACY path already fails with "per-index dimension 1 has N extents but dimension 0 has M".
+          "[port_per_index][leading_range][chunked][replay]") {
+    // The full-length host array of rs.out is cut to each chunk [start, start + dim0) (C2d), as a tie alias''s is.
     const auto read = [](cs::Model& m) {
         auto v = m.view_output<DType::f32, 1>("fin.out");
         return std::vector<float>(v.span().begin(), v.span().end());
