@@ -321,6 +321,81 @@ public:
     }
 };
 
+// ---- a CONNECTED tie_inputs alias with per-index dims read from input values -----------------------------------------------
+/// Sz2: sizes [N, 2] (u32), a free input (init from the host), copied.
+struct Sz2Body {
+    struct Inputs {
+        cs::Input<DType::u32, 2> raw;
+    };
+    struct Outputs {
+        cs::Output<DType::u32, 2> out;
+    };
+    void operator()(sycl::id<2> i, Inputs a, Outputs o) const { o.out[i] = a.raw[i]; }
+};
+class Sz2 : public cs::Component<Sz2Body> {
+    Counts                    init_;
+    cs::Input<DType::u32, 2>  raw_;
+    cs::Output<DType::u32, 2> out_;
+
+public:
+    explicit Sz2(Counts init) : init_{std::move(init)} {}
+    void setup() override {
+        declare_input(raw_, "raw", init_.size() / 2, 2);
+        init_input("raw", cs::init::from_host(init_));
+        declare_output(out_, "out", cs::FromInputDim{"raw", 0}, 2);
+    }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+        return create_launch_config(out_.shape(), {raw_}, {out_}, {});
+    }
+};
+
+/// GenCols: pts [N, sizes[i, 1], 3], pts.block(i)[q] = i * 1000 + q.
+struct GenColsBody {
+    struct Inputs {
+        cs::Input<DType::u32, 2> sizes;
+    };
+    struct Outputs {
+        cs::RaggedOutput<DType::f32, 3> pts;
+    };
+    void operator()(sycl::id<1> id, Inputs, Outputs o) const {
+        auto b = o.pts.block(id[0]);
+        for (std::size_t q = 0; q < b.size(); ++q) b[q] = static_cast<float>(id[0] * 1000 + q);
+    }
+};
+class GenCols : public cs::Component<GenColsBody> {
+    cs::Input<DType::u32, 2>        sizes_;
+    cs::RaggedOutput<DType::f32, 3> pts_;
+
+public:
+    void setup() override {
+        declare_input(sizes_, "sizes", cs::FromSourceDim{0}, cs::FromSourceDim{1});
+        declare_output(pts_, "pts", cs::FromInputDim{"sizes", 0}, cs::FromInputValues{"sizes", 1}, 3);
+    }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+        return create_launch_config(sycl::range<1>{sizes_.shape()[0]}, {sizes_}, {pts_}, {});
+    }
+};
+
+/// sz -> gen (ragged [N, sizes[i,1], 3]) -> two RaggedInputs tied, whose alias is
+/// dims(input_dim(gen.sizes, 0), input_values(gen.sizes, `col`), 3), connected from gen.pts.
+class TieInColTop : public cs::System {
+    Counts      init_;
+    std::size_t col_;
+
+public:
+    TieInColTop(Counts init, std::size_t col) : init_{std::move(init)}, col_{col} {}
+    void setup() override {
+        add_subsystem<Sz2>("sz", init_);
+        add_subsystem<GenCols>("gen");
+        add_subsystem<SumK<1>>("sa");
+        add_subsystem<SumK<2>>("sb");
+        connect("sz.out", "gen.sizes");
+        tie_inputs<DType::f32, 3>({"sa.pts", "sb.pts"}, "pts",
+                                  cs::alias::dims(cs::alias::input_dim("gen.sizes", 0), cs::alias::input_values("gen.sizes", col_), 3));
+        connect("gen.pts", "pts");
+    }
+};
+
 // ---- a plain tie inside (and outside) a ChunkedSystem ----------------------------------------------------------------------
 struct SrcBody {
     struct Inputs {};
@@ -803,6 +878,40 @@ TEST_CASE("Ragged ties: a plain tie whose second member transforms the first one
         m.setup();
         trt::run_tie_out(m, {1, 3, 0, 2}, shape_mode, true);
         trt::run_tie_out(m, {4, 0, 2, 2}, shape_mode, true);
+    }
+}
+
+TEST_CASE("Ragged ties: a connected tie_inputs alias with dims(input_dim, input_values, 3) checks the per-index arrays",
+          "[ragged][tie]") {
+    SECTION("matching per-index extents, two forwards with changing sizes") {
+        cs::Model m = cs::create_model<trt::TieInColTop>(default_config(), trt::Counts{2, 2, 0, 0, 3, 3, 1, 1}, std::size_t{1});
+        m.setup();
+        for (const trt::Counts& sizes : {trt::Counts{2, 2, 0, 0, 3, 3, 1, 1}, trt::Counts{1, 4, 0, 5, 2, 2, 3, 0}}) {
+            m.init_input("sz.raw", cs::init::from_host(sizes));
+            m.forward();
+            m.wait();
+            auto sa = m.view_output<DType::f32, 1>("sa.sums");
+            auto sb = m.view_output<DType::f32, 1>("sb.sums");
+            REQUIRE(sa.size() == 4);
+            for (std::size_t i = 0; i < 4; ++i) {
+                float want = 0.0f;
+                for (std::size_t q = 0; q < sizes[2 * i + 1] * 3u; ++q) want += static_cast<float>(i * 1000 + q);
+                CHECK(sa.span()[i] == want);
+                CHECK(sb.span()[i] == 2.0f * want);
+            }
+            auto pa = m.view_ragged_input<DType::f32, 3>("sa.pts");
+            trt::Sizes col1;
+            for (std::size_t i = 0; i < 4; ++i) col1.push_back(sizes[2 * i + 1]);
+            CHECK(pa.extents(1) == col1);
+        }
+    }
+    SECTION("a mismatching per-index array names the index") {
+        // the alias reads column 0 ([2,0,3,1]); gen.pts has column 1 ([2,0,1,1]): they differ first at index 2
+        cs::Model m = cs::create_model<trt::TieInColTop>(default_config(), trt::Counts{2, 2, 0, 0, 3, 1, 1, 1}, std::size_t{0});
+        m.setup();
+        trt::expect_throws([&] { m.forward(); }, {"tie alias 'pts'", "per-index dimension 1 differs at index 2",
+                                                  "the alias declares 3", "the connection has 1"});
+        m.wait();
     }
 }
 

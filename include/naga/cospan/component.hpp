@@ -624,6 +624,9 @@ private:
             case AliasShape::Kind::from_connection:
                 throw std::logic_error("naga::cospan: '" + a.full_path() + "' takes its shape from a connection, which it does not have");
         }
+        // A per-index dim has no scalar extent, whichever spec made it (copy_alias_dim sets 0 as well).
+        for (std::size_t u = 0; u < 3; ++u)
+            if (out.per[u]) out.ext[u] = 0;
         resolving_ = nullptr;
         return out;
     }
@@ -669,8 +672,10 @@ private:
                     const AliasEval        want = alias_eval(*a);
                     const detail::IOEntry& root = *a->root();
                     bool                   same = true;
-                    std::string            got_str;
+                    std::string            got_str, why;
                     if (root.is_ragged() || want.per[1] || want.per[2]) {
+                        // Scalar dims compare by extent; per-index dims by their ARRAYS (length = dim 0, then element
+                        // by element), never by extent.
                         std::array<std::size_t, 3> got{1, 1, 1};
                         std::array<bool, 3>        got_per{false, false, false};
                         for (int d = 0; d < a->rank(); ++d) {
@@ -678,8 +683,35 @@ private:
                             got[u]       = root.extents()[u];
                             got_per[u]   = root.dim_is_per(d);
                             if (got_per[u]) got[u] = 0;
-                            if (want.per[u] != got_per[u] || want.ext[u] != got[u]) same = false;
-                            if (d >= 1 && want.per[u] && got_per[u] && want.per_index[u] != root.per_index_extents(d)) same = false;
+                            if (!same) continue;  // report the first difference only
+                            if (want.per[u] != got_per[u]) {
+                                same = false;
+                                why  = "dimension " + std::to_string(d) + " is per-index on the " +
+                                       (want.per[u] ? "alias" : "connection") + " only";
+                            } else if (!want.per[u]) {
+                                if (want.ext[u] != got[u]) {
+                                    same = false;
+                                    why  = "dimension " + std::to_string(d) + ": the alias declares " + std::to_string(want.ext[u]) +
+                                          ", the connection has " + std::to_string(got[u]);
+                                }
+                            } else {
+                                const std::vector<std::size_t> have = root.per_index_extents(d);
+                                const std::vector<std::size_t>& mine = want.per_index[u];
+                                if (mine.size() != have.size()) {
+                                    same = false;
+                                    why  = "per-index dimension " + std::to_string(d) + ": the alias has " + std::to_string(mine.size()) +
+                                          " entries, the connection " + std::to_string(have.size());
+                                } else {
+                                    for (std::size_t k = 0; k < mine.size(); ++k)
+                                        if (mine[k] != have[k]) {
+                                            same = false;
+                                            why  = "per-index dimension " + std::to_string(d) + " differs at index " +
+                                                  std::to_string(k) + ": the alias declares " + std::to_string(mine[k]) +
+                                                  ", the connection has " + std::to_string(have[k]);
+                                            break;
+                                        }
+                                }
+                            }
                         }
                         got_str = alias_shape_str(got, got_per, a->rank());
                     } else {
@@ -692,9 +724,12 @@ private:
                         throw std::invalid_argument(
                             "naga::cospan: tie alias '" + a->full_path() + "' declares the shape " +
                             alias_shape_str(want.ext, want.per, root.is_ragged() || want.per[1] || want.per[2] ? a->rank() : 3) +
-                            " but is connected to '" + std::string{root.name()} + "', whose shape is " + got_str);
+                            " but is connected to '" + std::string{root.name()} + "', whose shape is " + got_str +
+                            (why.empty() ? std::string{} : " (" + why + ")"));
                 }
-                a->alias_checked_ = true;
+                // A shape that reads other entries (values or dims) can change between forwards: check it again
+                // every forward. A static one (fixed, per_index host arrays) is checked once.
+                if (a->alias_sources().empty()) a->alias_checked_ = true;
             }
         }
     }
