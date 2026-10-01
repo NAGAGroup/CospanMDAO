@@ -62,3 +62,20 @@ Topics learned while building the light-transport forcing case (2026-09-30). Eac
 - [ ] README.md rewrite (it still describes the first-pass framework).
 - [ ] Tests from the first code commit.
 - [ ] Clean up tests/smoke and tests/spike: standalone, unbuilt, and stale after D138 (they use init() hooks, initializers, EntryAccess/RootDriver). Fold anything still worth checking into the Catch2 suite, then remove them (Jack decides at cleanup time).
+
+## After the 2026-10-01 checkpoint (D140 rework)
+
+Found while porting LRPIM onto opaque chunked systems (C2b to C2e) and measuring it. Notes dated 2026-10-01.
+
+- [ ] Hold internal roots across forwards when the topology is unchanged. Why: removes the one release wait per chunked forward.
+- [ ] D135's one stream wait per releasing component in plain systems. Why: pipeline stalls outside chunked systems.
+- [ ] Registration-order diagnostics that name the offending registration. Why: today's errors say what is wrong, not which registration caused it.
+- [ ] Audit of alias kinds and declaration forms for overlap. Why: several forms now express nearly the same sharing; one should be canonical.
+- [ ] Ragged ports in FusedSystem and ParallelSystem. Why: ragged data is limited to plain systems and chunked systems.
+- [ ] Device-side scan for extents known only on the device. Why: value-driven sizes currently need a host read.
+- [ ] SlabKit `from_host` without the `async_host` keep-alive task (a general fix). Why: host tasks fence the stream.
+- [ ] Per-backend launch configuration (e.g. work-group size). Why: group bodies with many barriers are fast on CUDA but about 5x slower than a one-item-per-group body on the omp backend (LRPIM measurement).
+- [ ] Sparse bundles over ragged ports (CSR, block CSR, SELL); memoryless functional ports; restrict_ptr (see Phase 1 follow-ups). Why: sparse data is what the ragged ports are used for, and each bundle would carry its own invariants.
+- [ ] Investigate: wave kernels JIT only in the translation unit that defines the stages. Why: a FusedSystem of kernels defined in another TU aborts with "Could not find function call specialization target".
+- [ ] Housekeeping: tests/smoke is stale against the D139/D140 APIs (HostViewMut semantics changed in C2c). Why: it is unbuilt and no longer matches the API.
+- [ ] Housekeeping: a clean gemver timing rerun, not concurrent with other GPU work. Why: earlier timings may have been disturbed by other GPU jobs.
