@@ -442,8 +442,8 @@ std::atomic<int>         g_host_calls{0};
 std::atomic<int>         g_custom_calls{0};
 std::atomic<std::size_t> g_custom_size{0};
 
-// y = 10 x + w + v + d. x fill, w from_host, u zero, v custom_host, m custom (device side; only
-// records its call), d declares nothing (zeros by default).
+// y = 10 x + w + v + d. x fill, w from_host, u zero, v custom_host, m custom (a device kernel
+// writes 10 + i; the body ignores it), d declares nothing (zeros by default).
 struct InitDemoBody {
     struct Inputs {
         cs::Input<DType::f32, 1> x, w, u, v, d, m;
@@ -480,9 +480,17 @@ public:
                             }}));
         init_input("m", cs::init::custom<DType::f32, 1>(
                             std::function<void(sk::queue&, cs::Initializer<DType::f32, 1>)>{
-                                [](sk::queue&, cs::Initializer<DType::f32, 1> out) {
+                                [](sk::queue& q, cs::Initializer<DType::f32, 1> out) {
                                     ++g_custom_calls;
                                     g_custom_size = out.size();
+                                    // A device kernel on the given queue writes m[i] = 10 + i through
+                                    // the Initializer's public operator[] (the submit form CoSpan's own
+                                    // launches use: queue.submit(device, command-group)).
+                                    q.submit(q.get_device(), [=](sycl::handler& h) {
+                                        h.parallel_for(sycl::range<1>{out.size()}, [=](sycl::id<1> i) {
+                                            out[i] = 10.0f + static_cast<float>(i[0]);
+                                        });
+                                    });
                                 }}));
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
@@ -659,9 +667,10 @@ TEST_CASE("initial values: fill / zero / from_host / custom / custom_host, and z
               std::vector<float>({100.0f, 200.0f, 300.0f, 400.0f}));  // custom_host
         CHECK(to_vector(model.view_input<DType::f32, 1>("ini.d")) == std::vector<float>(4, 0.0f));  // default
     }
-    SECTION("custom ran once, with the root's shape") {
+    SECTION("custom ran once, with the root's shape, and its device kernel wrote the values") {
         CHECK(tc::g_custom_calls.load() == 1);
         CHECK(tc::g_custom_size.load() == 4);
+        CHECK(to_vector(model.view_input<DType::f32, 1>("ini.m")) == std::vector<float>({10.0f, 11.0f, 12.0f, 13.0f}));
         CHECK(tc::g_host_calls.load() == 1);  // a durable root is initialized at setup, not per forward
     }
     SECTION("the kernel sees the initialized inputs") {

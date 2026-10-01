@@ -842,7 +842,9 @@ an input root with `can_be_target == true` — a member whose set is
 already connected fails here ("tie before connecting"). A member may
 itself be a tie alias: ties compose up the hierarchy, as promotions do.
 Merge every member's set into the alias (a tie alias member contributes
-its whole set). THE EXCEPTION: mark each member
+its whole set). The alias takes its dtype and shape from the first member
+(or that member's root) with a fixed shape; with no such member the call
+throws. THE EXCEPTION: mark each member
 `can_be_target = false`, so a later connect *through a member name*
 fails at the direct check. Data-wise it would be identical to connecting
 through the alias; the mark exists so a tie is visible at every use
@@ -856,7 +858,17 @@ is the user's assertion. Each member's root must be an output root whose
 set contains NO input-kind peer — a downstream connection already exists
 otherwise ("tie before connecting, or connect from the alias"); output-
 kind peers (promotions) ride along. Merge. THE EXCEPTION, mirrored: mark
-each member `can_be_source = false`.
+each member `can_be_source = false`. SHAPE: the alias takes its dtype and
+shape from the first member (or that member's root) with a fixed shape. A
+`tie_outputs` whose members are ALL value-driven (§3, `FromInput`) is
+allowed: the alias root is then dynamic, with the first member's rank and
+inert dims, and a member's resolved extents propagate to it when the
+member's shape resolves (its `reshape`), so the root is sized and
+(re)allocated by its owner (§4.4) from the extents the members resolved.
+Tied members are one root, so they must resolve to one size. This is what
+the zeroing producer plus accumulator of §6.7 (ZeroBins + Histogram)
+needs. `tie_inputs` is unchanged: its alias is a free input root and needs
+a fixed-shape member.
 
 Path resolution for every operation is from the caller's namespace,
 dot-separated, descending children; the last segment resolves an alias
@@ -2146,8 +2158,9 @@ has at most one source, enforced at the ROOT's flag after the first
 connection; connecting through any name of a set is the same connection;
 `promote` is kind-agnostic and always allowed; ties must precede
 connections ("tie before connecting, or connect from the alias");
-`tie_outputs` requires atomic member dtypes unless `allow_plain`;
-`init_input` names an input (an init on an output is an error at setup) and
+`tie_outputs` requires atomic member dtypes unless `allow_plain`, and
+accepts members that are all value-driven (§4.3 SHAPE); `tie_inputs`
+needs a fixed-shape member; `init_input` names an input (an init on an output is an error at setup) and
 is ignored when the input's root ends up with a source.
 
 ### 7.5 ParallelSystem and FusedSystem — the two policy flavors

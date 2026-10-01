@@ -132,17 +132,20 @@ cs::Model make_model(Variant v, const Options& o, std::size_t groups) {
         case Variant::fused: return cs::create_model<gc::Chain>(cs::ModelConfig{}, gc::Style::fused, o.n, o.R);
         case Variant::onepass: return cs::create_model<gc::Chain>(cs::ModelConfig{}, gc::Style::onepass, o.n, o.R);
         case Variant::barrier:
-            return cs::create_model<gc::BarrierChain>(cs::ModelConfig{}, o.n, o.R, groups, o.spin_limit);
+            return cs::create_model<gc::BarrierTop>(cs::ModelConfig{}, o.n, o.R, groups, o.spin_limit);
     }
     throw std::logic_error("unknown variant");
 }
 
 /// The value of every barrier's timeout flag; nonzero = some group gave up waiting.
 /// A view of an atomic output is read through its value dtype.
+/// The timeout flags are PER FORWARD: a zeroing launch before the fused wave resets every counter
+/// at the start of each forward (D138: outputs are never initialized), so what is read here is the
+/// flag of the LAST forward only; a timeout in an earlier forward of a batch is not remembered.
 std::uint32_t barrier_timeouts(cs::Model& m) {
     std::uint32_t any = 0;
     for (int i = 1; i <= gc::BarrierChain::kBarriers; ++i) {
-        const std::string path = "bar" + std::to_string(i) + ".timeout";
+        const std::string path = "bar" + std::to_string(i) + "_timeout";  // the tie alias at the root
         const auto        view = m.view_output<DType::u32, 1>(path);  // the view owns the snapshot
         any |= view.span()[0];
     }

@@ -361,9 +361,9 @@ public:
 // GridBarrier: a software grid barrier. Only valid when EVERY group of the launch is
 // co-resident, which is why the whole chain runs on a capped, resident number of groups.
 // =============================================================================
-// A ZeroPair stage (below), first in the chain, zeroes `count` and `timeout` at the start of every
-// forward (outputs are never initialized, D138). `count` then grows by G at the one crossing of the
-// forward, which waits for count >= G.
+// A ZeroPair (below), submitted as its OWN launch before the fused wave (never a stage inside it),
+// zeroes `count` and `timeout` at the start of every forward (outputs are never initialized, D138).
+// `count` then grows by G at the one crossing of the forward, which waits for count >= G.
 // A group that waits `spin_limit` polls without seeing the target gives up and sets `timeout`.
 struct GridBarrierBody {
     struct Inputs {};
@@ -409,7 +409,7 @@ public:
 
 // =============================================================================
 // ZeroPair: the zeroing producer of one barrier's counters (outputs are never initialized).
-// Registered before the chain's stages; its outputs are tied to the barrier's by tie_outputs.
+// Registered before the chain, in a plain System; its outputs are tied to the barrier's by tie_outputs.
 // =============================================================================
 struct ZeroPairBody {
     struct Inputs {};

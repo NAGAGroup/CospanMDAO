@@ -205,10 +205,6 @@ public:
         const float       ab  = 1.0f / std::sqrt(static_cast<float>(n_));
         const std::size_t res = groups_ * kWg;  // resident_items of every stage
 
-        // The barrier counters are zeroed at the start of every forward by one ZeroPair stage
-        // per barrier (outputs are never initialized); each is tied to its barrier's outputs.
-        for (int i = 1; i <= kBarriers; ++i) add_subsystem<ZeroPair>("zbar" + std::to_string(i));
-
         add_subsystem<Rank2Update>("r2u1", n_, R_, res);
         add_subsystem<GemvTPartial>("gtp1", n_, R_, res);
         add_subsystem<GridBarrier>("bar1", groups_, spin_limit_);
@@ -227,14 +223,6 @@ public:
         add_subsystem<ColReduce<true>>("cred2", n_, R_, ab, res);
         add_subsystem<GridBarrier>("bar7", groups_, spin_limit_);
         add_subsystem<Gemv>("gemv2", n_, ab, res);
-
-        for (int i = 1; i <= kBarriers; ++i) {
-            const std::string z = "zbar" + std::to_string(i), b = "bar" + std::to_string(i);
-            const std::string zc = z + ".count", zt = z + ".timeout", bc = b + ".count", bt = b + ".timeout";
-            const std::string nc = b + "_count", nt = b + "_timeout";
-            tie_outputs({zc, bc}, nc);
-            tie_outputs({zt, bt}, nt);
-        }
 
         // G1
         connect("r2u1.B", "gtp1.B");
@@ -275,6 +263,45 @@ public:
         promote("r2u2.B", "B2");
         promote("cred2.x", "x2");
         promote("gemv2.y", "w2");
+    }
+};
+
+// The barrier counters are zeroed by their OWN launches, before the fused kernel: one ZeroPair
+// per barrier (outputs are never initialized, D138), each a separate submission in registration
+// order. Inside the wave a late group could zero a counter after another group had incremented
+// it, so the zeroing must never be a stage of the FusedSystem.
+class ZeroBarriers : public cs::System {
+public:
+    void setup() override {
+        for (int i = 1; i <= BarrierChain::kBarriers; ++i) add_subsystem<ZeroPair>("zbar" + std::to_string(i));
+    }
+};
+
+// The barrier variant's root: the zeroing System first, then the chain, each barrier's zero
+// output tied to its counters (tie_outputs across the fuse boundary). The chain's promoted names
+// are promoted again so the root presents the same names as the other variants; the tie aliases
+// "bar<i>_count" / "bar<i>_timeout" are the barriers' counters.
+class BarrierTop : public cs::System {
+    int           n_, R_;
+    std::size_t   groups_;
+    std::uint32_t spin_limit_;
+
+public:
+    BarrierTop(int n, int R, std::size_t groups, std::uint32_t spin_limit)
+        : n_{n}, R_{R}, groups_{groups}, spin_limit_{spin_limit} {}
+
+    void setup() override {
+        add_subsystem<ZeroBarriers>("zero");  // BEFORE the chain: registration order is execution order
+        add_subsystem<BarrierChain>("chain", n_, R_, groups_, spin_limit_);
+        for (int i = 1; i <= BarrierChain::kBarriers; ++i) {
+            const std::string z = "zero.zbar" + std::to_string(i), b = "chain.bar" + std::to_string(i);
+            const std::string name = "bar" + std::to_string(i);
+            tie_outputs({z + ".count", b + ".count"}, name + "_count");
+            tie_outputs({z + ".timeout", b + ".timeout"}, name + "_timeout");
+        }
+        for (const char* n : {"A",  "u1a", "v1a", "u2a", "v2a", "ya", "za", "u1b", "v1b", "u2b",
+                              "v2b", "B1", "x1",  "w1",  "q",   "s",  "B2", "x2",  "w2"})
+            promote(std::string{"chain."} + n, n);
     }
 };
 
