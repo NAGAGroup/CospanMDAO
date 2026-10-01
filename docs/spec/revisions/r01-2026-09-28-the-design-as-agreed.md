@@ -700,6 +700,30 @@ declare_input(grid, "grid", from_input_array("dims"));
 
 ---
 
+### 3.5 Ragged dimensions (D140)
+
+A ragged port has rank 2 or 3 and, for every index i of dimension 0 (N indices), its own extent on each trailing dimension. Dimension 0 is always scalar.
+
+**Spec forms.** `cs::PerIndex{values}` / `cs::per_index(vec)` (a host array, one extent per index, fixed at declaration) and `cs::FromInputValues{input, column}` (the extents are the values of an integer sibling input of rank 1 [N] or rank 2 [N, k]; negative values are an error). They are `DimSpec`s on dimensions >= 1 only, mixed freely with scalar specs. `FromSourceDim`, `FromInputDim` and `cs::tied` on a per-index dimension copy its array.
+
+```cpp
+cs::Input<DType::u32, 1>        counts_;
+cs::RaggedOutput<DType::f32, 3> pts_;
+declare_input(counts_, "counts", cs::FromSourceDim{0});
+declare_output(pts_, "pts", cs::FromInputDim{"counts", 0}, cs::FromInputValues{"counts"}, 3);
+// kernel: auto b = out.pts.block(i); b[sycl::id<2>{j, k}] = ...;
+```
+
+**Layout.** Blocks are stored contiguously in index order in one allocation; block i has the dense row-major shape (extent_1(i)[, extent_2(i)]) and starts at `offsets[i]`; `offsets` has N + 1 entries, the last is the total. The device holds copies of the offsets and of every per-index array (u64), kept per placement with the root and refreshed whenever N or an array changes. `flat_size()` is the total; `extents()` reports N on dim 0 and 0 on per-index dims; `geometry()` and a Slice are errors.
+
+**Wrappers.** `RaggedInput<DT,R>` / `RaggedOutput<DT,R>`: `size()` is N, `block(i)` a dense `Block<T,R-1>` (`shape()`, `size()`, `[]` by id or flat). Non-atomic, trivially copyable, so they travel in Inputs/Outputs like any wrapper. They also read or write a dense port (block i = row i).
+
+**Host views.** `model.view_ragged_input<DT,R>(path)` / `view_ragged_output<DT,R>(path)`: `data`, `offsets`, `size()`, `extents(d)`, `is_per_index(d)`, `block(i)`; also on dense entries. `view_input`/`view_output` on a ragged entry throw and point to them.
+
+**Errors.** A per-index spec on dim 0; a dense wrapper declared with a per-index spec (setup); a dense wrapper whose entry inherits a per-index dim, a per-index length different from N, a negative extent, mismatching per-index extents or totals on a connection (forward); a Slice onto a ragged port (setup).
+
+**Not supported yet.** Ragged ports in a FusedSystem or ParallelSystem (a setup error).
+
 ## 4. Aliasing
 
 Binding contract; declarations only. Completes §3's IOEntry and gives §7's

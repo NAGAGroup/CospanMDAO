@@ -12,6 +12,7 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <type_traits>
 
 #include <sycl/sycl.hpp>
@@ -25,6 +26,8 @@ struct CustomOp;  // the one place a raw device pointer is obtainable (r01 §5.1
 namespace detail {
 
 class IOEntry;
+template <class T, int Rank>
+struct RaggedAccess;
 struct ScratchLayout;
 struct ItemFixup;
 
@@ -223,6 +226,104 @@ private:
     value_type*       ptr_    = nullptr;  // null until device-side fixup
     friend struct detail::ScratchLayout;
 };
+
+// ---- ragged wrappers (D140) -------------------------------------------------------------
+
+/// A dense row-major view of one block of a ragged port: rank R (= the port's rank - 1), shape per
+/// block. `T` is const-qualified for an input. Trivially copyable; made by RaggedInput/RaggedOutput::block.
+template <class T, int R>
+struct Block {
+    static_assert(R >= 1 && R <= 2, "cospan: a ragged block has rank 1..2");
+    T& operator[](sycl::id<R> idx) const {
+        std::size_t flat = 0;
+        for (int d = 0; d < R; ++d) flat = flat * shape_[d] + idx[d];
+        return data_[flat];
+    }
+    T&                operator[](std::size_t flat) const { return data_[flat]; }
+    sycl::range<R>    shape() const { return shape_; }
+    std::size_t       size() const { return detail::range_size<R>(shape_); }
+
+private:
+    template <class, int>
+    friend struct detail::RaggedAccess;
+    sycl::range<R> shape_ = detail::filled_range<R>(0);
+    T*             data_  = nullptr;
+};
+
+namespace detail {
+
+/// Shared block lookup of RaggedInput / RaggedOutput. Per dim d >= 1 either a scalar extent (ext[d-1])
+/// or a per-index array (per[d-1] non-null). offsets == nullptr: a dense port, block i is row i.
+template <class T, int Rank>
+struct RaggedAccess {
+    static Block<T, Rank - 1> block(T* data, const std::uint64_t* offsets, const std::array<std::size_t, 2>& ext,
+                                    const std::array<const std::uint64_t*, 2>& per, std::size_t i) {
+        Block<T, Rank - 1> b;
+        std::size_t        size = 1;
+        for (int d = 1; d < Rank; ++d) {
+            const std::size_t e = per[d - 1] != nullptr ? static_cast<std::size_t>(per[d - 1][i]) : ext[d - 1];
+            b.shape_[d - 1]     = e;
+            size *= e;
+        }
+        b.data_ = data + (offsets != nullptr ? static_cast<std::size_t>(offsets[i]) : i * size);
+        return b;
+    }
+};
+
+}  // namespace detail
+
+/// RaggedInput<DT, Rank> — read-only ragged port, Rank 2..3: N blocks, block i of shape (extent_1(i)[, extent_2(i)]).
+/// Also accepts a DENSE port (block i = row i). Non-atomic only.
+template <DType DT, int Rank>
+    requires(!is_atomic_v<DT>)
+struct RaggedInput {
+    static_assert(Rank >= 2 && Rank <= 3, "cospan: a ragged port has rank 2..3");
+    using value_type = cpp_type_t<DT>;
+    static constexpr DType dtype  = DT;
+    static constexpr int   rank   = Rank;
+    static constexpr bool  ragged = true;
+
+    std::size_t size() const { return n_; }
+    Block<const value_type, Rank - 1> block(std::size_t i) const {
+        return detail::RaggedAccess<const value_type, Rank>::block(data_, offsets_, ext_, per_, i);
+    }
+
+private:
+    std::size_t                         n_       = 0;
+    const value_type*                   data_    = nullptr;
+    const std::uint64_t*                offsets_ = nullptr;
+    std::array<std::size_t, 2>          ext_{1, 1};
+    std::array<const std::uint64_t*, 2> per_{nullptr, nullptr};
+    friend class detail::IOEntry;
+};
+
+/// RaggedOutput<DT, Rank> — the writable twin. Non-atomic only.
+template <DType DT, int Rank>
+    requires(!is_atomic_v<DT>)
+struct RaggedOutput {
+    static_assert(Rank >= 2 && Rank <= 3, "cospan: a ragged port has rank 2..3");
+    using value_type = cpp_type_t<DT>;
+    static constexpr DType dtype  = DT;
+    static constexpr int   rank   = Rank;
+    static constexpr bool  ragged = true;
+
+    std::size_t size() const { return n_; }
+    Block<value_type, Rank - 1> block(std::size_t i) const {
+        return detail::RaggedAccess<value_type, Rank>::block(data_, offsets_, ext_, per_, i);
+    }
+
+private:
+    std::size_t                         n_       = 0;
+    value_type*                         data_    = nullptr;
+    const std::uint64_t*                offsets_ = nullptr;
+    std::array<std::size_t, 2>          ext_{1, 1};
+    std::array<const std::uint64_t*, 2> per_{nullptr, nullptr};
+    friend class detail::IOEntry;
+};
+
+static_assert(std::is_trivially_copyable_v<RaggedInput<DType::f32, 3>>);
+static_assert(std::is_trivially_copyable_v<RaggedOutput<DType::f32, 3>>);
+static_assert(std::is_trivially_copyable_v<Block<float, 2>>);
 
 static_assert(std::is_trivially_copyable_v<Input<DType::f32, 2>>);
 static_assert(std::is_trivially_copyable_v<Output<DType::atomic_f32, 1>>);

@@ -76,6 +76,12 @@ public:
     /// A ParallelSystem has no untyped children to add.
     System& add_subsystem(std::string, const property_list& = {}) = delete;
 
+    /// D140: ragged ports are not supported in a ParallelSystem yet (a setup error).
+    void compile() override {
+        System::compile();  // the children compile first
+        detail::check_no_ragged_ports(describe(), children());
+    }
+
     // ---- the runner (r01 §7.5, §11.3.1) ---------------------------------------------------------
     std::unique_ptr<LaunchDescription> run_compute_forward() override {
         const std::size_t n = children_.size();

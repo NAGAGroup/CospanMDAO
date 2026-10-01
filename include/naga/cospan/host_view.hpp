@@ -17,6 +17,7 @@
 // initializing, hands it to the user's function and commits it on return.
 
 #include <array>
+#include <cstdint>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -60,10 +61,19 @@ inline std::size_t element_count(const IOEntry::Geometry& g) {
     return g.shape[0] * g.shape[1] * g.shape[2];
 }
 
-inline void check_entry(const IOEntry& e, DType dt, int rank) {
+inline void check_entry_type(const IOEntry& e, DType dt, int rank) {
     if (!dtype_compatible(e.dtype(), dt) || e.rank() != rank)
         throw std::invalid_argument("naga::cospan: host view of '" + e.full_path() +
                                     "' asked for the wrong dtype or rank");
+}
+
+/// The dense views: a ragged entry has no rectangular shape (D140), view_ragged_* is for it.
+inline void check_entry(const IOEntry& e, DType dt, int rank) {
+    check_entry_type(e, dt, rank);
+    if (e.is_ragged())
+        throw std::invalid_argument("naga::cospan: '" + e.full_path() +
+                                    "' is ragged and has no rectangular host view; use view_ragged_input / "
+                                    "view_ragged_output");
 }
 
 template <class T>
@@ -158,6 +168,86 @@ private:
     friend class System;
 };
 
+/// One block of a HostRagged: a dense row-major host view of rank R = Rank - 1.
+template <class T, int R>
+class HostBlock {
+public:
+    const T& operator[](sycl::id<R> idx) const { return data_[detail::flat_of<R>(idx, shape_)]; }
+    const T& operator[](std::size_t flat) const { return data_[flat]; }
+    sycl::range<R>     shape() const { return shape_; }
+    std::size_t        size() const { return data_.size(); }
+    std::span<const T> span() const { return data_; }
+
+private:
+    friend struct detail::HostViewAccess;
+    template <DType, int>
+    friend class HostRagged;
+    std::span<const T> data_;
+    sycl::range<R>     shape_ = detail::filled_range<R>(0);
+};
+
+/// HostRagged<DT, Rank> — a read-only host copy of a ragged entry (D140), Rank 2..3: the flat data
+/// (`data`, the total size), the block offsets (`offsets`, N + 1 entries, u64) and the per-dimension
+/// extents. Also taken of a DENSE entry (offsets are the row starts, extents the constants).
+template <DType DT, int Rank>
+class HostRagged {
+public:
+    static_assert(Rank >= 2 && Rank <= 3, "cospan: a ragged host view has rank 2..3");
+    using value_type = cpp_type_t<DT>;
+    static constexpr DType dtype = DT;
+    static constexpr int   rank  = Rank;
+
+    std::vector<value_type>    data;     ///< flat, the total size
+    std::vector<std::uint64_t> offsets;  ///< N + 1 entries; block i is data[offsets[i], offsets[i+1])
+
+    /// N, the number of blocks.
+    std::size_t size() const { return offsets.empty() ? 0 : offsets.size() - 1; }
+    /// The extent of dimension d (1..Rank-1) of every block: N entries (a scalar dimension repeats its
+    /// constant).
+    const std::vector<std::size_t>& extents(int d) const {
+        if (d < 1 || d >= Rank) throw std::out_of_range("naga::cospan: HostRagged::extents is for dimensions 1..rank-1");
+        return extents_[static_cast<std::size_t>(d - 1)];
+    }
+    /// Whether dimension d (1..Rank-1) is per-index (false: scalar, `extents(d)` is constant).
+    bool is_per_index(int d) const { return per_[static_cast<std::size_t>(d - 1)]; }
+    /// A dense host view of block i.
+    HostBlock<value_type, Rank - 1> block(std::size_t i) const {
+        if (i >= size()) throw std::out_of_range("naga::cospan: HostRagged::block past the last block");
+        HostBlock<value_type, Rank - 1> b;
+        b.data_ = std::span<const value_type>{data.data() + offsets[i], static_cast<std::size_t>(offsets[i + 1] - offsets[i])};
+        for (int d = 1; d < Rank; ++d) b.shape_[d - 1] = extents_[static_cast<std::size_t>(d - 1)][i];
+        return b;
+    }
+
+private:
+    HostRagged(detail::IOEntry& entry, sk::queue& q) {
+        detail::check_entry_type(entry, DT, Rank);
+        if (entry.is_ragged()) {
+            data    = detail::storage_of<value_type>(entry).read_primary(q);
+            offsets = entry.block_offsets();
+            data.resize(static_cast<std::size_t>(offsets.back()));
+            for (int d = 1; d < Rank; ++d) {
+                per_[static_cast<std::size_t>(d - 1)]     = entry.dim(d).per;
+                extents_[static_cast<std::size_t>(d - 1)] = entry.per_index_extents(d);
+            }
+        } else {
+            auto snap = detail::take_snapshot<value_type>(entry, q);
+            data      = std::move(snap.data);
+            const std::size_t n     = snap.shape[0];
+            const std::size_t block = snap.shape[1] * snap.shape[2];
+            offsets.assign(n + 1, 0);
+            for (std::size_t i = 0; i < n; ++i) offsets[i + 1] = offsets[i] + block;
+            for (int d = 1; d < Rank; ++d)
+                extents_[static_cast<std::size_t>(d - 1)] = std::vector<std::size_t>(n, snap.shape[static_cast<std::size_t>(d)]);
+        }
+    }
+
+    std::array<std::vector<std::size_t>, 2> extents_;
+    std::array<bool, 2>                     per_{false, false};
+    friend struct detail::HostViewAccess;
+    friend class Model;
+};
+
 /// HostViewMut<DT, Rank> — the writable host copy handed to a cs::init::custom_host function.
 /// Built by the framework only (the constructor is private); the framework commits it when the
 /// function returns. It is NOT a host write API: there is none (D139).
@@ -210,6 +300,10 @@ struct HostViewAccess {
     template <DType DT, int Rank>
     static HostViewMut<DT, Rank> view_mut(IOEntry& e, sk::queue& q) {
         return HostViewMut<DT, Rank>{e, q};
+    }
+    template <DType DT, int Rank>
+    static HostRagged<DT, Rank> ragged(IOEntry& e, sk::queue& q) {
+        return HostRagged<DT, Rank>{e, q};
     }
 };
 

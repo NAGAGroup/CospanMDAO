@@ -67,6 +67,25 @@ inline const ComponentBase* stage_component(const Subsystem* s) {
     return c;
 }
 
+/// (D140) FusedSystem and ParallelSystem: a child with any ragged port (declared with RaggedInput /
+/// RaggedOutput, or with a per-index dimension spec) is a setup error for now.
+inline void check_no_ragged_ports(const std::string& owner, std::span<Subsystem* const> stages) {
+    for (const Subsystem* s : stages) {
+        const ComponentBase* c = stage_component(s);
+        const auto scan = [&](const auto& entries) {
+            for (const auto& ref : entries) {
+                const IOEntry& e = ref.get();
+                if (e.is_ragged_port() || e.declared_ragged())
+                    throw std::invalid_argument("naga::cospan: " + owner + ": '" + std::string{e.name()} + "' of '" +
+                                                s->path() +
+                                                "' is a ragged port: ragged ports are not supported in fused/parallel systems yet");
+            }
+        };
+        scan(c->get_inputs());
+        scan(c->get_outputs());
+    }
+}
+
 /// (c) PARALLEL only. `what` names the owner kind in the message, e.g.
 /// "parallel-mode wave" or "ParallelSystem".
 inline void check_no_stage_connections(const std::string& owner, const char* what,

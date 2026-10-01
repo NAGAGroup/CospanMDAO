@@ -121,6 +121,9 @@ public:
                                             "; the stages of a wave share one rank");
         }
 
+        // (D140) no ragged ports in a fuse yet.
+        detail::check_no_ragged_ports(describe(), children());
+
         // (h) a value-driven size may not be driven by a stage of this fuse (both modes).
         detail::check_value_driven_sizes(describe(), children());
 

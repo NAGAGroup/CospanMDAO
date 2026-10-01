@@ -154,6 +154,17 @@ public:
         Impl& s = ready("view_output");
         return HostView<DT, Rank>{entry_of(s, path, IOKind::output, "view_output"), s.queue};
     }
+    /// D140: host copies of a ragged entry (also of a dense one: offsets are the row starts).
+    template <DType DT, int Rank>
+    HostRagged<DT, Rank> view_ragged_input(std::string_view path) const {
+        Impl& s = ready("view_ragged_input");
+        return detail::HostViewAccess::ragged<DT, Rank>(entry_of(s, path, IOKind::input, "view_ragged_input"), s.queue);
+    }
+    template <DType DT, int Rank>
+    HostRagged<DT, Rank> view_ragged_output(std::string_view path) const {
+        Impl& s = ready("view_ragged_output");
+        return detail::HostViewAccess::ragged<DT, Rank>(entry_of(s, path, IOKind::output, "view_ragged_output"), s.queue);
+    }
     // ---- initial values (D139): the only way to give an input data from the host -----------
     /// Set the initial value of the root of the input at `path`, any time after setup(). It wins
     /// over the Component's and the Systems' declarations, and the root's OWNER applies it at its

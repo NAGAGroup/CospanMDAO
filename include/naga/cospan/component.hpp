@@ -118,6 +118,23 @@ public:
         add_output<DT, Rank>(m, std::move(name), detail::tied_dims<Rank>());
     }
 
+    /// Ragged ports (D140): RaggedInput / RaggedOutput members, Rank 2..3, with the same DimSpec
+    /// arguments (scalar and per-index mixed: PerIndex, FromInputValues on dims >= 1).
+    template <DType DT, int Rank, DimSpec... Specs>
+        requires(sizeof...(Specs) == Rank)
+    void declare_input(RaggedInput<DT, Rank>& m, std::string name, Specs... specs) {
+        register_entry(std::make_unique<detail::RaggedInputEntry<DT, Rank>>(
+                           name, std::array<detail::DimRecord, Rank>{detail::make_dim_record(specs)...}, &m),
+                       &m, "declare_input");
+    }
+    template <DType DT, int Rank, DimSpec... Specs>
+        requires(sizeof...(Specs) == Rank)
+    void declare_output(RaggedOutput<DT, Rank>& m, std::string name, Specs... specs) {
+        register_entry(std::make_unique<detail::RaggedOutputEntry<DT, Rank>>(
+                           name, std::array<detail::DimRecord, Rank>{detail::make_dim_record(specs)...}, &m),
+                       &m, "declare_output");
+    }
+
     /// The pre_forward-only resize (same setter as automatic derivation).
     template <DType DT, int Rank>
     void reshape(Input<DT, Rank>& m, sycl::range<Rank> shape) {
@@ -232,6 +249,9 @@ public:
         // apply a free input root's init at the allocation (r01 §4.4, D138 amendment). A root it
         // does not own is only pointed at, below.
         for (detail::IOEntry* e : order_) allocate_owned(*e->root());
+        // D140: a ragged root's device index arrays follow its (possibly changed) description.
+        for (detail::IOEntry* e : order_)
+            if (e->root()->owner() == this && e->root()->has_storage()) e->root()->upload_ragged(queue_ref());
         for (detail::IOEntry* e : order_) {
             if (e->kind() == IOKind::input && !e->is_root() &&
                 (e->is_dynamic() || e->root()->is_dynamic()))
@@ -320,12 +340,23 @@ private:
     template <DType DT, int Rank>
     void add_input(Input<DT, Rank>& m, std::string name,
                    const std::array<detail::DimRecord, Rank>& dims) {
+        reject_per_index(name, dims);
         register_entry(std::make_unique<detail::InputEntry<DT, Rank>>(name, dims, &m), &m, "declare_input");
     }
     template <DType DT, int Rank>
     void add_output(Output<DT, Rank>& m, std::string name,
                     const std::array<detail::DimRecord, Rank>& dims) {
+        reject_per_index(name, dims);
         register_entry(std::make_unique<detail::OutputEntry<DT, Rank>>(name, dims, &m), &m, "declare_output");
+    }
+
+    /// D140: a DENSE wrapper cannot hold per-index dims (PerIndex, FromInputValues).
+    template <std::size_t N>
+    void reject_per_index(const std::string& name, const std::array<detail::DimRecord, N>& dims) const {
+        for (const detail::DimRecord& r : dims)
+            if (r.how == detail::DimRecord::How::per_index_host || r.how == detail::DimRecord::How::per_index_from_input)
+                throw std::invalid_argument("naga::cospan: " + describe() + ": '" + name +
+                                            "': per-index dims need RaggedInput/RaggedOutput");
     }
 
     void register_entry(std::unique_ptr<detail::IOEntry> e, const void* member, const char* what) {
@@ -436,6 +467,17 @@ private:
                     throw std::out_of_range("naga::cospan: '" + std::string{e.name()} +
                                             "' derives from a dimension past the rank of '" + r.input + "'");
                 r.extent = src.extents()[r.dim];
+                // D140: a per-index source dimension passes its array on (dim 0 is never per-index).
+                if (d >= 1) {
+                    r.per_index = src.per_index_raw(r.dim);
+                    r.per       = src.dim(r.dim).per;
+                }
+            } else if (r.how == detail::DimRecord::How::per_index_from_input) {
+                detail::IOEntry& src = sibling_input(e, r.input);
+                resolve(src, done, active);
+                r.per_index = read_values(src, r.value_index);
+                r.per       = true;
+                r.extent    = 0;
             } else if (r.how == detail::DimRecord::How::from_input) {
                 detail::IOEntry& src = sibling_input(e, r.input);
                 resolve(src, done, active);
@@ -443,6 +485,9 @@ private:
             }
         }
         e.update_shape();
+        if (e.is_ragged() && !e.is_ragged_port())
+            throw std::invalid_argument("naga::cospan: " + describe() + ": '" + std::string{e.name()} +
+                                        "' is ragged; declare it with RaggedInput/RaggedOutput");
         active.erase(&e);
         done.insert(&e);
     }
@@ -497,6 +542,39 @@ private:
                 a->alias_checked_ = true;
             }
         }
+    }
+
+    /// The VALUES of an integer-dtype input of rank 1 [N] (column 0) or rank 2 [N, k] (column < k),
+    /// on the host: one per row (D140, FromInputValues). Negative values are an error.
+    std::vector<std::size_t> read_values(detail::IOEntry& src, std::size_t column) {
+        if (!detail::is_integer_dtype(src.dtype()))
+            throw std::invalid_argument("naga::cospan: '" + std::string{src.name()} +
+                                        "' drives per-index extents by value and must have an integer dtype");
+        if (src.rank() > 2)
+            throw std::invalid_argument("naga::cospan: '" + std::string{src.name()} +
+                                        "' drives per-index extents by value and must be rank 1 [N] or rank 2 [N,k]");
+        const std::size_t k = src.rank() == 2 ? src.extents()[1] : 1;
+        if (column >= k)
+            throw std::out_of_range("naga::cospan: '" + std::string{src.name()} + "' has no column " +
+                                    std::to_string(column));
+        allocate_owned(*src.root());
+        if (!src.root()->has_storage())
+            throw std::logic_error("naga::cospan: '" + std::string{src.name()} +
+                                   "' drives per-index extents by value but has no storage yet");
+        std::vector<std::size_t> out(src.extents()[0]);
+        detail::dispatch_dtype(src.dtype(), [&](auto tag) {
+            using T   = typename decltype(tag)::type;
+            auto snap = detail::take_snapshot<T>(src, queue_ref());
+            for (std::size_t i = 0; i < out.size(); ++i) {
+                const T v = snap.data[i * k + column];
+                if constexpr (std::is_signed_v<T>)
+                    if (v < 0)
+                        throw std::invalid_argument("naga::cospan: '" + std::string{src.name()} +
+                                                    "' holds a negative extent (row " + std::to_string(i) + ")");
+                out[i] = static_cast<std::size_t>(v);
+            }
+        });
+        return out;
     }
 
     /// The VALUE of element `index` of an integer-dtype input, on the host.

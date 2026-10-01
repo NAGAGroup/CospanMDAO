@@ -1038,6 +1038,11 @@ private:
         if (!dtype_compatible(s.dtype(), d.dtype()) || !dtype_compatible(sr.dtype(), dr.dtype()))
             fail(what.c_str(), "the value dtypes differ");
 
+        // D140: a Slice cannot select a region of a ragged root (no rectangular geometry).
+        if (slice && (sr.declared_ragged() || sr.is_ragged_port() || s.is_ragged_port() || d.is_ragged_port() ||
+                      dr.is_ragged_port()))
+            fail(what.c_str(), "'" + std::string{sr.name()} + "' is ragged; a Slice view onto a ragged root is not supported");
+
         // View: what `src` sees (B), composed with the Slice (A).
         std::optional<SubarrayRef> view = s.view();
         if (slice) {

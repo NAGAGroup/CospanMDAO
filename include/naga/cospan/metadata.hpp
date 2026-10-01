@@ -80,9 +80,20 @@ struct FromInputDim { std::string_view input; uint8_t dim; };
 /// input `input`, which SHALL have an integer value dtype.
 struct FromInput { std::string_view input; std::size_t index; };
 
+/// RAGGED DIMENSIONS (D140). A dimension d >= 1 of a ragged port may have a different extent for every
+/// index of dimension 0: PerIndex gives the extents as a host array at declaration (its length must equal
+/// dimension 0's extent), FromInputValues takes them from the VALUES of an integer sibling input of rank 1
+/// [N] (column 0) or rank 2 [N, k] (column < k). Negative values are an error. Neither is allowed on dim 0.
+struct PerIndex { std::vector<std::size_t> values; };
+
+inline PerIndex per_index(std::vector<std::size_t> values) { return PerIndex{std::move(values)}; }
+
+struct FromInputValues { std::string_view input; std::size_t column = 0; };
+
 template <class T>
 concept DimSpec = std::integral<T> || std::same_as<T, FromSourceDim> ||
-                  std::same_as<T, FromInputDim> || std::same_as<T, FromInput>;
+                  std::same_as<T, FromInputDim> || std::same_as<T, FromInput> ||
+                  std::same_as<T, PerIndex> || std::same_as<T, FromInputValues>;
 
 /// The whole-shape value-driven marker: on a rank-R declaration it expands to
 /// FromInput{input,0}..{input,R-1}. Accepted alone by the declaration
@@ -236,12 +247,22 @@ namespace detail {
 /// Per-dimension storage form of a declared DimSpec.
 struct DimRecord {
     /// from_root: the entry's shape is its root's shape (cs::tied, D139 part 2).
-    enum class How : uint8_t { fixed, from_source_dim, from_input_dim, from_input, from_root };
+    /// per_index_host / per_index_from_input (D140): dimension d >= 1 has one extent per index of dim 0.
+    enum class How : uint8_t { fixed, from_source_dim, from_input_dim, from_input, from_root, per_index_host,
+                               per_index_from_input };
     How         how = How::fixed;
     std::size_t extent = 0;  ///< fixed: declared; derived: last resolved (0 = unknown)
     std::string input;       ///< from_input_*: sibling input name (owned)
     uint8_t     dim = 0;     ///< from_source_dim / from_input_dim
-    std::size_t value_index = 0;  ///< from_input
+    std::size_t value_index = 0;  ///< from_input; per_index_from_input: the column
+    /// The resolved per-index extents of a dimension d >= 1 (D140); EMPTY means the dimension is scalar
+    /// (its extent is `extent`). Filled by per_index_host at declaration, by per_index_from_input when the
+    /// owning Component resolves it, and copied from the source dimension by from_source_dim /
+    /// from_input_dim / from_root when that dimension is per-index.
+    std::vector<std::size_t> per_index;
+    /// The dimension is per-index (even when `per_index` is empty because N is 0): true from
+    /// declaration for per_index_host / per_index_from_input, copied with the array by the derived hows.
+    bool per = false;
 };
 
 template <DimSpec S>
@@ -260,6 +281,15 @@ DimRecord make_dim_record(const S& s) {
         r.how   = DimRecord::How::from_input_dim;
         r.input = std::string{s.input};
         r.dim   = s.dim;
+    } else if constexpr (std::same_as<S, PerIndex>) {
+        r.how       = DimRecord::How::per_index_host;
+        r.per_index = s.values;
+        r.per       = true;
+    } else if constexpr (std::same_as<S, FromInputValues>) {
+        r.how         = DimRecord::How::per_index_from_input;
+        r.input       = std::string{s.input};
+        r.value_index = s.column;
+        r.per         = true;
     } else {
         r.how         = DimRecord::How::from_input;
         r.input       = std::string{s.input};
@@ -333,10 +363,48 @@ public:
         const Geometry g = geometry();
         return sycl::range<3>{g.stride[0], g.stride[1], g.stride[2]};
     }
+    /// A ragged entry (D140): the TOTAL number of elements (block_offsets().back()). A promoted alias
+    /// mirrors its member.
     std::size_t flat_size() const noexcept {
-        const auto& e = shape_ref();
-        return e[0] * e[1] * e[2];
+        if (mirror_of_ != nullptr) return mirror_of_->flat_size();
+        if (ragged_) return static_cast<std::size_t>(offsets_.back());
+        return extents_[0] * extents_[1] * extents_[2];
     }
+
+    // ---- ragged dimensions (D140) ------------------------------------------
+    /// Any dimension d >= 1 is resolved per-index. extents() reports N on dim 0 and 0 on every per-index
+    /// dim; geometry() throws (a ragged entry has no rectangular geometry).
+    bool is_ragged() const noexcept { return mirror_of_ != nullptr ? mirror_of_->is_ragged() : ragged_; }
+    /// Declared with RaggedInput / RaggedOutput (whatever it resolves to).
+    bool is_ragged_port() const noexcept { return ragged_port_; }
+    /// Declared with a per-index dimension spec (statically known raggedness).
+    bool declared_ragged() const noexcept {
+        for (const DimRecord& r : dims_)
+            if (r.per) return true;
+        return false;
+    }
+    /// The extent of dimension d >= 1 for every index of dimension 0 (host copy): the per-index array, or,
+    /// for a scalar dimension, its constant. Dimension 0 throws.
+    std::vector<std::size_t> per_index_extents(int d) const {
+        if (mirror_of_ != nullptr) return mirror_of_->per_index_extents(d);
+        if (d < 1 || d >= rank_) throw std::out_of_range("naga::cospan: per_index_extents is for dimensions 1..rank-1");
+        const DimRecord& r = dims_[static_cast<std::size_t>(d)];
+        if (r.per) return r.per_index;
+        return std::vector<std::size_t>(extents_[0], r.extent);
+    }
+    /// N + 1 entries: the exclusive scan of the block sizes (block i = the product of its extents over
+    /// dims >= 1). The last entry is the total. Dense entries get the constant-block offsets.
+    std::vector<std::uint64_t> block_offsets() const {
+        if (mirror_of_ != nullptr) return mirror_of_->block_offsets();
+        if (ragged_) return offsets_;
+        std::uint64_t block = 1;
+        for (int d = 1; d < rank_; ++d) block *= extents_[static_cast<std::size_t>(d)];
+        std::vector<std::uint64_t> out(extents_[0] + 1, 0);
+        for (std::size_t i = 0; i < extents_[0]; ++i) out[i + 1] = out[i] + block;
+        return out;
+    }
+    /// The raw per-index array of dimension d (empty: scalar). Internal.
+    const std::vector<std::size_t>& per_index_raw(int d) const { return dims_[static_cast<std::size_t>(d)].per_index; }
     const DimRecord& dim(int d) const {
         if (d < 0 || d >= rank_) throw std::out_of_range("naga::cospan: dim index >= rank");
         return dims_[static_cast<std::size_t>(d)];
@@ -363,6 +431,8 @@ public:
     /// peer with a view, the view's extents over the root's strides.
     Geometry geometry() const {
         if (mirror_of_ != nullptr) return mirror_of_->geometry();  // a promotion shows its member's geometry, live
+        if (ragged_)
+            throw std::logic_error("naga::cospan: '" + name_ + "' is ragged: ragged entries have no rectangular geometry");
         Geometry g;
         if (view_) {
             const IOEntry* r = root_;
@@ -510,6 +580,15 @@ public:
     /// Write {data pointer, shape, stride} into the registered member wrapper.
     virtual void point_wrapper() = 0;
 
+    /// ROOTS ONLY (D140): bring every placement's device copies of the ragged index arrays (the offsets and
+    /// one array per per-index dimension) up to date with the host description; drops them when the root
+    /// is not ragged. A no-op when nothing changed or the root is not present.
+    virtual void upload_ragged(sk::queue& q) = 0;
+
+    /// ROOTS ONLY (D140): the device copy of the offsets (which == 0) or of the per-index array of
+    /// dimension `which` (1..2) on placement `p`; null when there is none.
+    virtual const std::uint64_t* ragged_ptr_on(const Placement& p, int which) const = 0;
+
     /// The root's producer copies primary -> every other placement's storage
     /// (a routed copy; the ordinary copy rule).
     virtual void sync_other_placements(sk::queue& q) = 0;
@@ -537,6 +616,9 @@ protected:
                                         "': the number of dimension specs must equal the rank");
         for (int d = 0; d < rank_; ++d) {
             const DimRecord& r = dims_[static_cast<std::size_t>(d)];
+            if (d == 0 && (r.how == DimRecord::How::per_index_host || r.how == DimRecord::How::per_index_from_input))
+                throw std::invalid_argument("naga::cospan: '" + name_ +
+                                            "': a per-index extent (PerIndex / FromInputValues) is not allowed on dimension 0");
             if (r.how == DimRecord::How::from_source_dim && k == IOKind::output)
                 throw std::invalid_argument("naga::cospan: '" + name_ +
                                             "': FromSourceDim is ill-formed for an output");
@@ -558,6 +640,20 @@ protected:
         w.stride_ = make_range<W::rank>(g.stride);
         w.data_   = data;
     }
+
+    /// The only writer of ragged wrapper fields (D140).
+    template <class W, class P>
+    static void write_ragged(W& w, std::size_t n, P* data, const std::uint64_t* offsets,
+                             const std::array<std::size_t, 2>& ext, const std::array<const std::uint64_t*, 2>& per) {
+        w.n_       = n;
+        w.data_    = data;
+        w.offsets_ = offsets;
+        w.ext_     = ext;
+        w.per_     = per;
+    }
+
+    /// Mark this entry as declared with a ragged wrapper.
+    void mark_ragged_port() noexcept { ragged_port_ = true; }
 
     /// Registered in get_exec_info (System/Component); appends if absent, so
     /// the first registration is the primary.
@@ -585,7 +681,13 @@ protected:
         return mirror_of_ != nullptr ? mirror_of_->shape_ref() : extents_;
     }
 
-    std::array<std::size_t, 3> extents_{1, 1, 1};  ///< 1-padded
+    std::array<std::size_t, 3> extents_{1, 1, 1};  ///< 1-padded; a per-index dim reports 0 (D140)
+    // ---- D140: the applied ragged description of THIS entry (host) ----
+    bool                       ragged_ = false;          ///< any dim >= 1 is per-index
+    std::vector<std::uint64_t> offsets_;                 ///< ragged: N + 1 block offsets
+    std::array<std::vector<std::size_t>, 3> applied_per_;  ///< the per-index arrays last applied
+    std::uint64_t              ragged_version_ = 0;      ///< bumped whenever the ragged description changes
+    bool                       ragged_port_ = false;     ///< declared with RaggedInput / RaggedOutput
     std::vector<DimRecord>     dims_;
     std::vector<Placement>     placements_;        ///< roots; primary first
     std::optional<sycl::device> device_;
@@ -669,33 +771,108 @@ public:
             DimRecord& r = dims_[static_cast<std::size_t>(d)];
             switch (r.how) {
                 case DimRecord::How::fixed: break;
-                case DimRecord::How::from_source_dim: r.extent = source_extent(r.dim); break;
-                case DimRecord::How::from_root: r.extent = root_extent(static_cast<uint8_t>(d)); break;
-                case DimRecord::How::from_input_dim:
-                case DimRecord::How::from_input: break;  // resolved by the Component
+                case DimRecord::How::from_source_dim:
+                    r.extent = source_extent(r.dim);
+                    if (d >= 1) {
+                        r.per_index = source_per_index(r.dim);
+                        r.per       = source_per_flag(r.dim);
+                    }
+                    break;
+                case DimRecord::How::from_root:
+                    r.extent = root_extent(static_cast<uint8_t>(d));
+                    if (d >= 1) {
+                        r.per_index = root_per_index(static_cast<uint8_t>(d));
+                        r.per       = root_per_flag(static_cast<uint8_t>(d));
+                    }
+                    break;
+                case DimRecord::How::from_input_dim:    // resolved by the Component (which also copies a
+                case DimRecord::How::from_input:        // per-index source dimension's array)
+                case DimRecord::How::per_index_host:    // fixed at declaration
+                case DimRecord::How::per_index_from_input: break;  // resolved by the Component
             }
-            next[static_cast<std::size_t>(d)] = r.extent;
+            next[static_cast<std::size_t>(d)] = (d >= 1 && r.per) ? 0 : r.extent;
         }
-        if (next != extents_) reshape(sycl::range<3>{next[0], next[1], next[2]});
+
+        // ---- D140: the ragged description. Every per-index array must have one entry per index of dim 0.
+        bool ragged = false;
+        for (int d = 1; d < rank(); ++d)
+            if (dims_[static_cast<std::size_t>(d)].per) ragged = true;
+        std::vector<std::uint64_t> offs;
+        if (ragged) {
+            const std::size_t n = dims_[0].extent;
+            for (int d = 1; d < rank(); ++d) {
+                const DimRecord& r = dims_[static_cast<std::size_t>(d)];
+                if (r.per && r.per_index.size() != n)
+                    throw std::invalid_argument("naga::cospan: '" + full_path() + "': per-index dimension " +
+                                                std::to_string(d) + " has " + std::to_string(r.per_index.size()) +
+                                                " extents but dimension 0 has " + std::to_string(n));
+            }
+            offs.assign(n + 1, 0);
+            for (std::size_t i = 0; i < n; ++i) {
+                std::uint64_t block = 1;
+                for (int d = 1; d < rank(); ++d) {
+                    const DimRecord& r = dims_[static_cast<std::size_t>(d)];
+                    block *= r.per ? r.per_index[i] : r.extent;
+                }
+                offs[i + 1] = offs[i] + block;
+            }
+        }
+        bool per_changed = ragged != ragged_;
+        for (int d = 1; d < rank(); ++d)
+            if (dims_[static_cast<std::size_t>(d)].per_index != applied_per_[static_cast<std::size_t>(d)]) per_changed = true;
+        if (ragged && offs != offsets_) per_changed = true;
+
+        if (next == extents_ && !per_changed) return;
+        if (!ragged && next != extents_ && !ragged_) {
+            reshape(sycl::range<3>{next[0], next[1], next[2]});  // the dense path, as before
+            return;
+        }
+        extents_ = next;
+        ragged_  = ragged;
+        offsets_ = std::move(offs);
+        for (int d = 0; d < 3; ++d)
+            applied_per_[static_cast<std::size_t>(d)] =
+                (d >= 1 && d < rank()) ? dims_[static_cast<std::size_t>(d)].per_index : std::vector<std::size_t>{};
+        ++ragged_version_;
+        resize_storage();
     }
 
     void reshape(sycl::range<3> r) override {
+        if (ragged_)
+            throw std::logic_error("naga::cospan: '" + full_path() + "' is ragged: its shape follows its per-index dimensions and cannot be reshaped");
         for (int d = rank(); d < 3; ++d)
             if (r[d] != 1)
                 throw std::invalid_argument("naga::cospan: '" + std::string{name()} +
                                             "': extents past the rank must be 1");
         extents_ = {r[0], r[1], r[2]};
-        if (is_root()) {
-            // Growing reallocates and frees the old storage synchronously (D135): wait the stream's kernels first.
-            if (!slots_.empty() && flat_size() > slots_.front()->data.capacity())
-                slots_.front()->data.get_queue().wait();
-            for (auto& s : slots_) s->data.resize(flat_size());
-        }
+        resize_storage();
     }
 
     void validate_connection() const override {
         if (kind() != IOKind::input || is_root()) return;
         const IOEntry& r        = *root();
+        if (r.is_ragged() || is_ragged()) {  // D140: the per-index extents must match dim by dim, and the totals
+            if (r.is_ragged() != is_ragged())
+                throw std::invalid_argument("naga::cospan: input '" + std::string{name()} + "' is " +
+                                            (is_ragged() ? "ragged" : "dense") + " but is connected to '" +
+                                            std::string{r.name()} + "', which is " + (r.is_ragged() ? "ragged" : "dense"));
+            if (view())
+                throw std::invalid_argument("naga::cospan: '" + std::string{name()} + "' sees a subarray of the ragged '" +
+                                            std::string{r.name()} + "'; ragged roots cannot be sliced");
+            if (extents()[0] != r.extents()[0])
+                throw std::invalid_argument("naga::cospan: ragged input '" + std::string{name()} + "' has " +
+                                            std::to_string(extents()[0]) + " blocks but '" + std::string{r.name()} +
+                                            "' has " + std::to_string(r.extents()[0]));
+            for (int d = 1; d < rank(); ++d)
+                if (per_index_extents(d) != r.per_index_extents(d))
+                    throw std::invalid_argument("naga::cospan: ragged input '" + std::string{name()} + "': the per-index extents of dimension " +
+                                                std::to_string(d) + " differ from those of '" + std::string{r.name()} + "'");
+            if (flat_size() != r.flat_size())
+                throw std::invalid_argument("naga::cospan: ragged input '" + std::string{name()} + "' holds " +
+                                            std::to_string(flat_size()) + " elements but '" + std::string{r.name()} +
+                                            "' holds " + std::to_string(r.flat_size()));
+            return;
+        }
         const Geometry g        = geometry();  // throws on a rank mismatch under a view
         std::size_t    expected = r.flat_size();
         if (const auto v = view()) {
@@ -718,6 +895,7 @@ public:
         if (!is_root()) return;
         if (placements_.empty())
             register_placement(Placement{device_ ? *device_ : q.get_device(), storage_kind_});
+        subs_ = &subs;
         for (const Placement& p : placements_) {
             if (find_slot(p) != nullptr) continue;
             // A size-0 root gets an empty vector (usm_vector(0, ...) allocates nothing).
@@ -725,6 +903,39 @@ public:
         }
         released_ = false;
         present_  = true;
+        upload_ragged(q);
+    }
+
+    void upload_ragged(sk::queue& q) override {
+        if (!is_root() || !present_ || subs_ == nullptr) return;
+        for (auto& s : slots_) {
+            if (s->version == ragged_version_) continue;
+            if (s->version != 0) q.wait();  // replacing arrays a previous forward's kernels may still read
+            s->offs.reset();
+            for (auto& a : s->per) a.reset();
+            if (ragged_) {
+                s->offs.emplace(offsets_.size(), route_as<std::uint64_t>(q, *subs_, s->pl));
+                s->offs->from_host(std::span<const std::uint64_t>{offsets_});
+                for (int d = 1; d < rank(); ++d) {
+                    if (!dims_[static_cast<std::size_t>(d)].per) continue;
+                    const auto& src = dims_[static_cast<std::size_t>(d)].per_index;
+                    std::vector<std::uint64_t> conv(src.begin(), src.end());
+                    auto& dst = s->per[static_cast<std::size_t>(d - 1)];
+                    dst.emplace(conv.size(), route_as<std::uint64_t>(q, *subs_, s->pl));
+                    dst->from_host(std::span<const std::uint64_t>{conv});
+                }
+            }
+            s->version = ragged_version_;
+        }
+    }
+
+    const std::uint64_t* ragged_ptr_on(const Placement& p, int which) const override {
+        Slot* s = find_slot(p);
+        if (s == nullptr) return nullptr;
+        if (which == 0) return s->offs ? s->offs->data() : nullptr;
+        if (which < 1 || which > 2) return nullptr;
+        const auto& a = s->per[static_cast<std::size_t>(which - 1)];
+        return a ? a->data() : nullptr;
     }
 
     void release_storage() override {
@@ -794,7 +1005,44 @@ private:
         Slot(Placement p, sk::usm_vector<T> v) : pl{std::move(p)}, data{std::move(v)} {}
         Placement         pl;
         sk::usm_vector<T> data;
+        // D140: the device copies of the ragged index arrays, allocated with this slot's placement and
+        // released with it. `version` is the ragged_version_ they were built for (0 = none).
+        std::optional<sk::usm_vector<std::uint64_t>>               offs;
+        std::array<std::optional<sk::usm_vector<std::uint64_t>>, 2> per;  // dims 1 and 2
+        std::uint64_t                                              version = 0;
     };
+
+    /// Resize the root's storage to flat_size(); growing waits the stream first (synchronous frees, D135).
+    void resize_storage() {
+        if (!is_root()) return;
+        if (!slots_.empty() && flat_size() > slots_.front()->data.capacity())
+            slots_.front()->data.get_queue().wait();
+        for (auto& s : slots_) s->data.resize(flat_size());
+    }
+
+    /// A per-index array of the SOURCE's dimension d (empty: scalar), for FromSourceDim.
+    std::vector<std::size_t> source_per_index(uint8_t d) const {
+        if (is_root()) return {};  // source_extent throws for it before this is reached
+        if (view()) return {};
+        return root()->per_index_raw(d);
+    }
+
+    /// Whether the root's dimension d is per-index AND already resolved (its array has one entry per
+    /// index of dim 0): before its owner resolves a FromInputValues dim the array is empty, and a peer
+    /// updating its shape at setup must not read that as a length mismatch.
+    bool source_per_flag(uint8_t d) const {
+        if (is_root() || view()) return false;
+        const DimRecord& rd = root()->dim(d);
+        return rd.per && rd.per_index.size() == root()->extents()[0];
+    }
+    bool root_per_flag(uint8_t d) const { return source_per_flag(d); }
+
+    /// A tied entry's per-index array of dimension d: its root's.
+    std::vector<std::size_t> root_per_index(uint8_t d) const {
+        if (is_root()) return {};
+        if (view()) return {};
+        return root()->per_index_raw(d);
+    }
 
     Slot* find_slot(const Placement& p) const {
         for (const auto& s : slots_)
@@ -857,7 +1105,17 @@ private:
         return sk::allocator<T>{q, sk::kind::device, d};
     }
 
+    /// The route of a ragged index array (never the arena: a ragged root is dynamic).
+    template <class U>
+    sk::allocator<U> route_as(sk::queue& q, Substrates& subs, const Placement& p) const {
+        if (p.kind != sk::kind::device) return sk::allocator<U>{q, p.kind, p.device};
+        const auto it = subs.find(p.device);
+        if (it != subs.end() && it->second.pool) return sk::allocator<U>{q, *it->second.pool};
+        return sk::allocator<U>{q, sk::kind::device, p.device};
+    }
+
     std::vector<std::unique_ptr<Slot>> slots_;  // parallel to placements_ once allocated
+    Substrates*                        subs_ = nullptr;  // bound at allocate (the ragged arrays route through it)
 };
 
 /// The rank/dtype-typed layer: the wrapper pointer helpers.
@@ -883,9 +1141,39 @@ protected:
 
     template <class W>
     void point(W& w) const {
+        if (this->is_ragged())
+            throw std::logic_error("naga::cospan: '" + std::string{this->name()} + "' is ragged; declare it with "
+                                   "RaggedInput / RaggedOutput (a dense Input / Output cannot see per-index extents)");
         const IOEntry::Geometry g = this->geometry();
         auto* base = static_cast<value_type*>(this->root()->storage_on(this->placement()));
         IOEntry::write_wrapper(w, g, base != nullptr ? base + g.offset : nullptr);
+    }
+
+    /// A ragged wrapper (D140): the root's data, the block count, and the device copies of the index
+    /// arrays; a DENSE entry is accepted too (offsets null: block i is row i of the rectangle).
+    template <class W>
+    void point_ragged(W& w) const {
+        const IOEntry* r    = this->root();
+        auto*          base = static_cast<value_type*>(this->root()->storage_on(this->placement()));
+        std::array<std::size_t, 2>           ext{1, 1};
+        std::array<const std::uint64_t*, 2> per{nullptr, nullptr};
+        if (this->is_ragged()) {
+            const Placement pl = this->placement();
+            for (int d = 1; d < Rank; ++d) {
+                if (!this->dim(d).per)
+                    ext[static_cast<std::size_t>(d - 1)] = this->dim(d).extent;
+                else
+                    per[static_cast<std::size_t>(d - 1)] = r->ragged_ptr_on(pl, d);
+            }
+            IOEntry::write_ragged(w, this->extents()[0], base, r->ragged_ptr_on(pl, 0), ext, per);
+        } else {
+            const IOEntry::Geometry g = this->geometry();
+            if (g.stride != contiguous_strides(g.shape))
+                throw std::logic_error("naga::cospan: '" + std::string{this->name()} +
+                                       "': a ragged wrapper on a dense port needs contiguous storage (no sliced view)");
+            for (int d = 1; d < Rank; ++d) ext[static_cast<std::size_t>(d - 1)] = g.shape[static_cast<std::size_t>(d)];
+            IOEntry::write_ragged(w, g.shape[0], base != nullptr ? base + g.offset : nullptr, nullptr, ext, per);
+        }
     }
 };
 
@@ -928,6 +1216,40 @@ public:
 
 private:
     Output<DT, Rank>* member_;
+};
+
+/// RaggedInputEntry holds RaggedInput<DT,Rank>* (D140). Same flags as InputEntry.
+template <DType DT, int Rank>
+    requires(!is_atomic_v<DT>)
+class RaggedInputEntry final : public TypedEntry<DT, Rank> {
+public:
+    RaggedInputEntry(std::string name, const std::array<DimRecord, Rank>& dims, RaggedInput<DT, Rank>* member)
+        : TypedEntry<DT, Rank>{std::move(name), IOKind::input, dims, false, true}, member_{member} {
+        this->mark_ragged_port();
+    }
+    void point_wrapper() override {
+        if (member_ != nullptr) this->point_ragged(*member_);
+    }
+
+private:
+    RaggedInput<DT, Rank>* member_;
+};
+
+/// RaggedOutputEntry holds RaggedOutput<DT,Rank>* (D140). Same flags as OutputEntry.
+template <DType DT, int Rank>
+    requires(!is_atomic_v<DT>)
+class RaggedOutputEntry final : public TypedEntry<DT, Rank> {
+public:
+    RaggedOutputEntry(std::string name, const std::array<DimRecord, Rank>& dims, RaggedOutput<DT, Rank>* member)
+        : TypedEntry<DT, Rank>{std::move(name), IOKind::output, dims, true, false}, member_{member} {
+        this->mark_ragged_port();
+    }
+    void point_wrapper() override {
+        if (member_ != nullptr) this->point_ragged(*member_);
+    }
+
+private:
+    RaggedOutput<DT, Rank>* member_;
 };
 
 /// A System-level alias (promotion or tie alias): no member wrapper. Its

@@ -22,6 +22,7 @@ set(COSPAN_TEST_SOURCES
     test_component.cpp
     test_flavors.cpp
     test_model.cpp
+    test_ragged.cpp
     test_system.cpp
 )
 
