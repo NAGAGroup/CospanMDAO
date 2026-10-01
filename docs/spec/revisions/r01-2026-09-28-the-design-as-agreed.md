@@ -824,7 +824,10 @@ resolved entry's set as a PEER (never a root), with its flags a SNAPSHOT
 of the root's flags at creation. The snapshot is what keeps a promoted
 input from becoming sourceable after its set is later connected. The
 alias enumerates under `get_inputs()`/`get_outputs()` by the flags it
-snapshotted.
+snapshotted. (D139 part 2: `promote<DT, Rank>(path, name)` names the dtype and rank,
+which must be the entry's, else a setup error; the alias MIRRORS the entry: its
+shape is read live from it, so a view through the promoted name shows the member's
+current shape. There are no inert alias extents.)
 
 **connect(src, dst)** — check `src.can_be_source ∧ root(src).can_be_source
 ∧ dst.can_be_target ∧ root(dst).can_be_target`, else throw naming the
@@ -841,12 +844,31 @@ is what a tie already is. A `Slice` therefore reads an output root.
 **tie_inputs({m...}, name)** — the alias is a NEW ROOT with
 `can_be_target = true, can_be_source = false`. Each member's root must be
 an input root with `can_be_target == true` — a member whose set is
-already connected fails here ("tie before connecting"). A member may
-itself be a tie alias: ties compose up the hierarchy, as promotions do.
-Merge every member's set into the alias (a tie alias member contributes
-its whole set). The alias takes its dtype and shape from the first member
-(or that member's root) with a fixed shape; with no such member the call
-throws. THE EXCEPTION: mark each member
+already connected fails here ("tie before connecting"). (D139 part 2: the
+call is `tie_inputs<DT, Rank>({m...}, name, AliasShape)`. Fewer than two
+members is an error ("a tie needs two or more members; use promote for
+one"). Every member is a RANK-ONLY entry (declared `cs::tied`, or a
+promotion of one) of dtype DT and rank Rank; a member that declares any
+shape is an error naming it. A tie alias carries a shape, so it cannot be a
+member of another tie: pass members up by promotion.) Merge every member's
+set into the alias. THE ALIAS OWNS THE SHAPE, given by its AliasShape:
+`cs::alias::fixed(e0[, e1, e2])`; `cs::alias::from_connection()` (tie_inputs
+only: the shape of the output connected into the alias; an error at setup
+if nothing is); `cs::alias::from_output_shape(path)` (the shape of an
+upstream output of the alias's rank); `cs::alias::from_output_values(path)`
+(the extents are the VALUES of elements 0..Rank-1 of an upstream output of
+integer dtype, read on the host as FromInput reads a value). The paths are in
+the declaring System's namespace and name an output whose producing
+component is registered BEFORE the tie's first member (checked in resolve();
+FusedSystem and ParallelSystem refuse a source from the same wave, as for
+value-driven sizes). The unconnected alias is the root; its owner resolves
+the shape in `run_pre_compute` before allocation. Once an output is
+connected into the alias it joins that output's root (the producer owns and
+allocates it) and the members take that output's shape; a fixed or
+from_output_* AliasShape is checked against it on the first run
+(`invalid_argument` on a mismatch). Members' shapes are "from the root"
+(`DimRecord::How::from_root`, resolved in update_shape). After resolve() every
+rank-only entry must belong to a tie's set. THE EXCEPTION: mark each member
 `can_be_target = false`, so a later connect *through a member name*
 fails at the direct check. Data-wise it would be identical to connecting
 through the alias; the mark exists so a tie is visible at every use
@@ -860,17 +882,17 @@ is the user's assertion. Each member's root must be an output root whose
 set contains NO input-kind peer — a downstream connection already exists
 otherwise ("tie before connecting, or connect from the alias"); output-
 kind peers (promotions) ride along. Merge. THE EXCEPTION, mirrored: mark
-each member `can_be_source = false`. SHAPE: the alias takes its dtype and
-shape from the first member (or that member's root) with a fixed shape. A
-`tie_outputs` whose members are ALL value-driven (§3, `FromInput`) is
-allowed: the alias root is then dynamic, with the first member's rank and
-inert dims, and a member's resolved extents propagate to it when the
-member's shape resolves (its `reshape`), so the root is sized and
-(re)allocated by its owner (§4.4) from the extents the members resolved.
-Tied members are one root, so they must resolve to one size. This is what
-the zeroing producer plus accumulator of §6.7 (ZeroBins + Histogram)
-needs. `tie_inputs` is unchanged: its alias is a free input root and needs
-a fixed-shape member.
+each member `can_be_source = false`. SHAPE (D139 part 2): the call is
+`tie_outputs<DT, Rank>({m...}, name, AliasShape, policy)`; the members are
+rank-only outputs, and the alias is ALWAYS the root and owns the shape by
+its AliasShape (fixed, from_output_shape, from_output_values;
+`from_connection` is an error, "an output alias defines the shape of its
+connections"). The root's owner resolves the shape before allocation, so
+the root is sized and (re)allocated from it each run. This is what the
+zeroing producer plus accumulator of §6.7 (ZeroBins + Histogram) uses: the
+bin count is the value of an upstream output. (Removed: shape_source, the
+"first fixed member" rule, inert alias dims and the D138 member-to-root
+reshape propagation.)
 
 Path resolution for every operation is from the caller's namespace,
 dot-separated, descending children; the last segment resolves an alias
@@ -1017,11 +1039,11 @@ placement is known), error naming the tie.
 
 ```cpp
 // declared: d1.out (root O1), d2.out (root O2), c.in (root I1)
-promote("d1.out", "y");       // y joins O1's set as a peer; flags = O1's
+promote<DType::f32, 1>("d1.out", "y");   // y joins O1's set as a peer; flags = O1's
 connect("y", "c.in");         // O1 absorbs I1's set: {y, c.in} peers of O1
 connect("d2.out", "c.in");    // FAILS at the root check: root(c.in) = O1,
                               //   an output root, can_be_target == false
-tie_outputs({"d1.out","d2.out"}, "sum");   // FAILS: O1's set has an
+tie_outputs<DType::f32, 1>({"d1.out","d2.out"}, "sum", alias::fixed(8));   // FAILS: O1's set has an
                               //   input-kind peer (c.in) — connected already
 ```
 
@@ -1842,8 +1864,8 @@ public:
     void setup() override {
         declare_input (values_, "values",  FromSourceDim{0});
         declare_input (weights_,"weights", from_input_shape<1>("values"));
-        declare_input (n_bins_, "n_bins",  1);
-        declare_output(bins_,   "bins",    FromInput{"n_bins", 0});
+        declare_input (n_bins_, "n_bins",  from_source_shape<1>());   // connected from NBins
+        declare_output(bins_,   "bins",    tied);                      // a tie_outputs member (D139 part 2)
     }
     std::unique_ptr<LaunchDescription> compute_forward() override {
         return create_launch_config(values_.shape(),
@@ -1854,28 +1876,31 @@ public:
 // (a') The zeroing producer. Outputs are never initialized (§6.0), so what a
 // histogram accumulates onto is the output of a component that computes zero.
 struct ZeroBody {
-    struct Inputs  { Input<DType::u32,1> n_bins; };
+    struct Inputs  {};
     struct Outputs { Output<DType::atomic_f32,1> bins; };
     void operator()(sycl::id<1> i, Inputs, Outputs out) const { out.bins[i].store(0.0f); }
 };
 class ZeroBins : public Component<ZeroBody> {
-    Input<DType::u32,1> n_bins_;  Output<DType::atomic_f32,1> bins_;
+    Output<DType::atomic_f32,1> bins_;
 public:
-    void setup() override {
-        declare_input (n_bins_, "n_bins", 1);
-        declare_output(bins_,   "bins",   FromInput{"n_bins", 0});   // sized like the histogram's bins
-    }
+    void setup() override { declare_output(bins_, "bins", tied); }   // the tie alias owns its shape
     std::unique_ptr<LaunchDescription> compute_forward() override
-        { return create_launch_config(bins_.shape(), {n_bins_}, {bins_}); }
+        { return create_launch_config(bins_.shape(), {}, {bins_}); }
 };
+
+// NBins: the bin count as an OUTPUT, n[0] = v[0] (v is the free input a user drives).
+class NBins : public Component<NBinsBody> { /* declare_input(v_, "v", 1); declare_output(n_, "n", 1); */ };
 
 class Histogram : public System {
 public:
     void setup() override {
+        add_subsystem<NBins>("nb");                                // BEFORE the tie's members
         add_subsystem<ZeroBins>("zero");                           // BEFORE hist: registration order is execution order
         add_subsystem<WeightedHistogram>("hist", 0.0f, 1.0f);
-        tie_inputs({"zero.n_bins", "hist.n_bins"}, "n_bins");
-        tie_outputs({"zero.bins", "hist.bins"}, "bins");           // atomic by default
+        connect("nb.n", "hist.n_bins");
+        // bins' shape is the VALUE of nb.n[0], read by the root's owner (zero) each run; atomic by default
+        tie_outputs<DType::atomic_f32, 1>({"zero.bins", "hist.bins"}, "bins", alias::from_output_values("nb.n"));
+        promote<DType::u32, 1>("nb.v", "n_bins");
     }
 };
 ```
@@ -2149,9 +2174,11 @@ public:
 
     void connect(std::string_view src, std::string_view dst);                 // identity
     void connect(std::string_view src, std::string_view dst, Slice view);   // §8.1: dst sees a rectangular region of src's root
-    void promote(std::string_view child_path, std::string promoted_name);
-    void tie_inputs (std::initializer_list<std::string_view> members, std::string name);
-    void tie_outputs(std::initializer_list<std::string_view> members, std::string name,
+    template <DType DT, int Rank> void promote(std::string_view child_path, std::string promoted_name);   // D139 part 2
+    template <DType DT, int Rank>
+    void tie_inputs (std::initializer_list<std::string_view> members, std::string name, AliasShape shape);
+    template <DType DT, int Rank>
+    void tie_outputs(std::initializer_list<std::string_view> members, std::string name, AliasShape shape,
                      TieOutputsPolicy policy = TieOutputsPolicy::require_atomic);
     /// Declare the initial value of a free input root (§4.4): `path` is a
     /// child input path, or one of this System's promoted or tied input
@@ -2170,9 +2197,9 @@ has at most one source, enforced at the ROOT's flag after the first
 connection; connecting through any name of a set is the same connection;
 `promote` is kind-agnostic and always allowed; ties must precede
 connections ("tie before connecting, or connect from the alias");
-`tie_outputs` requires atomic member dtypes unless `allow_plain`, and
-accepts members that are all value-driven (§4.3 SHAPE); `tie_inputs`
-needs a fixed-shape member; `init_input` names an input (an init on an output is an error at setup) and
+`tie_outputs` requires atomic member dtypes unless `allow_plain`; both
+ties take rank-only (`cs::tied`) members and an AliasShape that owns the
+shape (§4.3); `init_input` names an input (an init on an output is an error at setup) and
 is ignored when the input's root ends up with a source.
 
 ### 7.5 ParallelSystem and FusedSystem — the two policy flavors
@@ -2273,8 +2300,8 @@ public:
         auto& d2 = add_subsystem<Discipline2>("d2");
         connect("d1.y1", "d2.y1_in");
         connect("d2.y2", "d1.y2_in");            // the cycle: needs a solver
-        tie_inputs({"d1.z", "d2.z"}, "z");
-        promote("d1.y1", "y1");  promote("d2.y2", "y2");
+        tie_inputs<DType::f64, 1>({"d1.z", "d2.z"}, "z", alias::fixed(2));   // d1.z, d2.z are declared `tied`
+        promote<DType::f64, 1>("d1.y1", "y1");  promote<DType::f64, 1>("d2.y2", "y2");
         init_input("z", init::fill(1.0));        // this level is above d1 and d2: it wins over their defaults
     }
 };

@@ -353,11 +353,10 @@ struct AdderBody {
 class Adder : public cs::Component<AdderBody> {
     cs::Output<DType::atomic_f32, 1> acc_;
     float                            v_;
-    int                              n_;
 
 public:
-    explicit Adder(float v, int n = 12) : v_{v}, n_{n} {}
-    void setup() override { declare_output(acc_, "acc", n_); }
+    explicit Adder(float v) : v_{v} {}
+    void setup() override { declare_output(acc_, "acc", cs::tied); }  // a tie_outputs member: the alias owns the shape
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return create_launch_config(acc_.shape(), {}, {acc_}, {v_});
     }
@@ -374,11 +373,9 @@ struct ZeroAccBody {
 };
 class ZeroAcc : public cs::Component<ZeroAccBody> {
     cs::Output<DType::atomic_f32, 1> acc_;
-    int                              n_;
 
 public:
-    explicit ZeroAcc(int n = 12) : n_{n} {}
-    void setup() override { declare_output(acc_, "acc", n_); }
+    void setup() override { declare_output(acc_, "acc", cs::tied); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return create_launch_config(acc_.shape(), {}, {acc_}, {});
     }
@@ -624,7 +621,8 @@ TEST_CASE("parallel: tied outputs throw at forward, naming both, unless allow_ti
                 p.add_subsystem<tfl::Adder>("a", 1.0f);
                 p.add_subsystem<tfl::Adder>("b", 2.0f);
             }});
-            s.tie_outputs({"zero.acc", "par.a.acc", "par.b.acc"}, "sum");  // atomic writers, one root
+            s.tie_outputs<DType::atomic_f32, 1>({"zero.acc", "par.a.acc", "par.b.acc"}, "sum",
+                                                cs::alias::fixed(12));  // atomic writers, one root
         });
     };
     SECTION("refused") {
@@ -895,7 +893,8 @@ TEST_CASE("fused: tied outputs throw in parallel mode unless allow_tied_outputs(
                     w.add_subsystem<tfl::Adder>("a", 1.0f);
                     w.add_subsystem<tfl::Adder>("b", 2.0f);
                 }});
-            s.tie_outputs({"zero.acc", "f.a.acc", "f.b.acc"}, "sum");  // atomic writers, one root
+            s.tie_outputs<DType::atomic_f32, 1>({"zero.acc", "f.a.acc", "f.b.acc"}, "sum",
+                                                cs::alias::fixed(12));  // atomic writers, one root
         });
     };
     SECTION("parallel, refused") {

@@ -183,8 +183,8 @@ public:
     void setup() override {
         declare_input(values_, "values", cs::FromSourceDim{0});
         declare_input(weights_, "weights", cs::from_input_shape<1>("values"));
-        declare_input(n_bins_, "n_bins", 1);  // a free input: the test drives it with init_input
-        declare_output(bins_, "bins", cs::FromInput{"n_bins", 0});
+        declare_input(n_bins_, "n_bins", cs::from_source_shape<1>());  // connected from the NBins producer
+        declare_output(bins_, "bins", cs::tied);  // a tie_outputs member: the alias takes its shape from NBins' value
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return create_launch_config(values_.shape(), {values_, weights_, n_bins_}, {bins_}, {lo_, hi_});
@@ -194,9 +194,7 @@ public:
 // The zeroing producer (r01 §6.7): outputs are never initialized, so what the histogram accumulates
 // onto is the output of a component that computes zero.
 struct ZeroBody {
-    struct Inputs {
-        cs::Input<DType::u32, 1> n_bins;
-    };
+    struct Inputs {};
     struct Outputs {
         cs::Output<DType::atomic_f32, 1> bins;
     };
@@ -204,16 +202,38 @@ struct ZeroBody {
 };
 
 class ZeroBins : public cs::Component<ZeroBody> {
-    cs::Input<DType::u32, 1>         n_bins_;
     cs::Output<DType::atomic_f32, 1> bins_;
 
 public:
+    void setup() override { declare_output(bins_, "bins", cs::tied); }  // shape: the tie alias's
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+        return create_launch_config(bins_.shape(), {}, {bins_}, {});
+    }
+};
+
+// The bin count as an OUTPUT (an alias shape reads an upstream output): n[0] = v[0], where v is
+// the free input the test drives (promoted as "n_bins").
+struct NBinsBody {
+    struct Inputs {
+        cs::Input<DType::u32, 1> v;
+    };
+    struct Outputs {
+        cs::Output<DType::u32, 1> n;
+    };
+    void operator()(sycl::id<1> i, Inputs in, Outputs out) const { out.n[i] = in.v[i]; }
+};
+
+class NBins : public cs::Component<NBinsBody> {
+    cs::Input<DType::u32, 1>  v_;
+    cs::Output<DType::u32, 1> n_;
+
+public:
     void setup() override {
-        declare_input(n_bins_, "n_bins", 1);
-        declare_output(bins_, "bins", cs::FromInput{"n_bins", 0});
+        declare_input(v_, "v", 1);
+        declare_output(n_, "n", 1);
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(bins_.shape(), {n_bins_}, {bins_}, {});
+        return create_launch_config(n_.shape(), {v_}, {n_}, {});
     }
 };
 
@@ -221,10 +241,13 @@ class TopHist : public cs::System {
 public:
     void setup() override {
         add_subsystem<HistProducer>("prod");
+        add_subsystem<NBins>("nb");        // produces the bin count; registered before the tie's members
         add_subsystem<ZeroBins>("zero");  // BEFORE hist: registration order is execution order
         add_subsystem<WeightedHistogram>("hist", 0.0f, 1.0f);
-        tie_inputs({"zero.n_bins", "hist.n_bins"}, "n_bins");
-        tie_outputs({"zero.bins", "hist.bins"}, "bins");
+        connect("nb.n", "hist.n_bins");
+        // The bins root's shape is the VALUE of nb.n[0], read by the root's owner (zero) each run.
+        tie_outputs<DType::atomic_f32, 1>({"zero.bins", "hist.bins"}, "bins", cs::alias::from_output_values("nb.n"));
+        promote<DType::u32, 1>("nb.v", "n_bins");  // the test drives the bin count by this name
         connect("prod.values", "hist.values");
         connect("prod.weights", "hist.weights");
     }
@@ -514,12 +537,16 @@ class InitAffine : public cs::Component<AffineBody<1>> {
     cs::Output<DType::f32, 1> y_;
     std::optional<cs::InitSpec> init_;
     int                         mode_;
+    bool                        tied_x_;
 
 public:
-    explicit InitAffine(std::optional<cs::InitSpec> init = std::nullopt, int mode = 0)
-        : init_{std::move(init)}, mode_{mode} {}
+    explicit InitAffine(std::optional<cs::InitSpec> init = std::nullopt, int mode = 0, bool tied_x = false)
+        : init_{std::move(init)}, mode_{mode}, tied_x_{tied_x} {}
     void setup() override {
-        declare_input(x_, "x", 4);
+        if (tied_x_)
+            declare_input(x_, "x", cs::tied);  // a tie_inputs member: the tie alias owns the shape
+        else
+            declare_input(x_, "x", 4);
         declare_output(y_, "y", cs::from_input_shape<1>("x"));
         if (init_) init_input("x", *init_);
         if (mode_ == 1) init_input("y", cs::init::zero());
@@ -707,9 +734,9 @@ TEST_CASE("initial values: metadata rules (connected, output, duplicates, highes
         tc::expect_throws(
             [&] {
                 auto model = top([](cs::System& s) {
-                    s.add_subsystem<tc::InitAffine>("a", std::optional<cs::InitSpec>{cs::init::fill(1.0f)});
-                    s.add_subsystem<tc::InitAffine>("b", std::optional<cs::InitSpec>{cs::init::fill(2.0f)});
-                    s.tie_inputs({"a.x", "b.x"}, "x");
+                    s.add_subsystem<tc::InitAffine>("a", std::optional<cs::InitSpec>{cs::init::fill(1.0f)}, 0, true);
+                    s.add_subsystem<tc::InitAffine>("b", std::optional<cs::InitSpec>{cs::init::fill(2.0f)}, 0, true);
+                    s.tie_inputs<DType::f32, 1>({"a.x", "b.x"}, "x", cs::alias::fixed(4));
                 });
                 model.setup();
             },
@@ -717,9 +744,9 @@ TEST_CASE("initial values: metadata rules (connected, output, duplicates, highes
     }
     SECTION("a System-level init beats the components' on a tied alias") {
         auto model = top([](cs::System& s) {
-            s.add_subsystem<tc::InitAffine>("a", std::optional<cs::InitSpec>{cs::init::fill(1.0f)});
-            s.add_subsystem<tc::InitAffine>("b", std::optional<cs::InitSpec>{cs::init::fill(2.0f)});
-            s.tie_inputs({"a.x", "b.x"}, "x");
+            s.add_subsystem<tc::InitAffine>("a", std::optional<cs::InitSpec>{cs::init::fill(1.0f)}, 0, true);
+            s.add_subsystem<tc::InitAffine>("b", std::optional<cs::InitSpec>{cs::init::fill(2.0f)}, 0, true);
+            s.tie_inputs<DType::f32, 1>({"a.x", "b.x"}, "x", cs::alias::fixed(4));
             s.init_input("x", cs::init::fill(9.0f));
         });
         model.setup();

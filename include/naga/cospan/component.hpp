@@ -106,6 +106,18 @@ public:
         add_output<DT, Rank>(m, std::move(name), detail::expand_from_input_array<Rank>(marker));
     }
 
+    /// The rank-only form (D139 part 2): the entry has a dtype and a rank (the wrapper's) and no
+    /// shape; its shape is its root's, and its root must be a tie alias (System::tie_inputs /
+    /// tie_outputs). An untied rank-only entry is a setup error.
+    template <DType DT, int Rank>
+    void declare_input(Input<DT, Rank>& m, std::string name, Tied) {
+        add_input<DT, Rank>(m, std::move(name), detail::tied_dims<Rank>());
+    }
+    template <DType DT, int Rank>
+    void declare_output(Output<DT, Rank>& m, std::string name, Tied) {
+        add_output<DT, Rank>(m, std::move(name), detail::tied_dims<Rank>());
+    }
+
     /// The pre_forward-only resize (same setter as automatic derivation).
     template <DType DT, int Rank>
     void reshape(Input<DT, Rank>& m, sycl::range<Rank> shape) {
@@ -203,6 +215,9 @@ public:
 
     void run_pre_compute(ExecCtx& owner_ctx) override {
         (void)owner_ctx;
+        // Tie aliases first (D139 part 2): the root's owner resolves an alias root's shape BEFORE
+        // the entries below read it (and before allocation); a connected alias is checked once.
+        resolve_alias_shapes();
         std::unordered_set<const detail::IOEntry*> done, active;
         // Inputs first: derivation sources are inputs only.
         for (detail::IOEntry* e : order_)
@@ -430,6 +445,58 @@ private:
         e.update_shape();
         active.erase(&e);
         done.insert(&e);
+    }
+
+    // ---- tie aliases (D139 part 2) ------------------------------------------------
+    /// The extents a tie alias's AliasShape gives right now (1-padded). from_output_* read a
+    /// producer that has already run (checked at setup: it is earlier in registration order).
+    std::array<std::size_t, 3> alias_extents(const detail::IOEntry& a) {
+        const AliasShape&          s = *a.alias_shape_;
+        std::array<std::size_t, 3> out{1, 1, 1};
+        switch (s.kind) {
+            case AliasShape::Kind::fixed: out = s.extents; break;
+            case AliasShape::Kind::from_output_shape: out = a.alias_src_->geometry().shape; break;
+            case AliasShape::Kind::from_output_values:
+                for (int d = 0; d < a.rank(); ++d)
+                    out[static_cast<std::size_t>(d)] = read_value(*a.alias_src_, static_cast<std::size_t>(d));
+                break;
+            case AliasShape::Kind::from_connection:
+                throw std::logic_error("naga::cospan: '" + a.full_path() + "' takes its shape from a connection, which it does not have");
+        }
+        return out;
+    }
+
+    /// For each tie alias one of this Component's entries belongs to: an alias that is a ROOT
+    /// this Component owns gets its shape resolved (and its storage resized); a connected
+    /// tie_inputs alias is checked once against the output it joined.
+    void resolve_alias_shapes() {
+        std::vector<detail::IOEntry*> seen;
+        for (detail::IOEntry* e : order_) {
+            detail::IOEntry* a = e->tie_alias_;
+            if (a == nullptr || !a->alias_shape_ || std::find(seen.begin(), seen.end(), a) != seen.end()) continue;
+            seen.push_back(a);
+            const AliasShape& s = *a->alias_shape_;
+            if (a->is_root()) {
+                if (a->owner() != this || s.kind == AliasShape::Kind::fixed) continue;
+                const auto ext = alias_extents(*a);
+                for (int d = 0; d < a->rank(); ++d)
+                    a->dims_[static_cast<std::size_t>(d)].extent = ext[static_cast<std::size_t>(d)];
+                if (ext != a->extents_) a->reshape(sycl::range<3>{ext[0], ext[1], ext[2]});
+            } else if (!a->alias_checked_) {
+                if (s.kind != AliasShape::Kind::from_connection) {
+                    const auto want = alias_extents(*a);
+                    const auto v    = a->view();
+                    const auto got  = v ? v->extents : a->root()->geometry().shape;
+                    if (want != got)
+                        throw std::invalid_argument(
+                            "naga::cospan: tie alias '" + a->full_path() + "' declares the shape " +
+                            std::to_string(want[0]) + "x" + std::to_string(want[1]) + "x" + std::to_string(want[2]) +
+                            " but is connected to '" + std::string{a->root()->name()} + "', whose shape is " +
+                            std::to_string(got[0]) + "x" + std::to_string(got[1]) + "x" + std::to_string(got[2]));
+                }
+                a->alias_checked_ = true;
+            }
+        }
     }
 
     /// The VALUE of element `index` of an integer-dtype input, on the host.

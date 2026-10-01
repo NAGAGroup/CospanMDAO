@@ -73,16 +73,16 @@ public:
         connect(pre + "r2u.B", "gemv.B");
         connect("cred.x", "gemv.x");
 
-        promote(pre + "r2u.A", "A");
-        promote(pre + "r2u.u1", "u1");
-        promote(pre + "r2u.v1", "v1");
-        promote(pre + "r2u.u2", "u2");
-        promote(pre + "r2u.v2", "v2");
-        promote(pre + "gtp.y", "y");
-        promote("cred.z", "z");
-        promote(pre + "r2u.B", "B");
-        promote("cred.x", "x");
-        promote("gemv.y", "w");
+        promote<DType::f32, 2>(pre + "r2u.A", "A");
+        promote<DType::f32, 1>(pre + "r2u.u1", "u1");
+        promote<DType::f32, 1>(pre + "r2u.v1", "v1");
+        promote<DType::f32, 1>(pre + "r2u.u2", "u2");
+        promote<DType::f32, 1>(pre + "r2u.v2", "v2");
+        promote<DType::f32, 1>(pre + "gtp.y", "y");
+        promote<DType::f32, 1>("cred.z", "z");
+        promote<DType::f32, 2>(pre + "r2u.B", "B");
+        promote<DType::f32, 1>("cred.x", "x");
+        promote<DType::f32, 1>("gemv.y", "w");
     }
 };
 
@@ -104,37 +104,40 @@ public:
             add_subsystem<ColReduce<false>>("cred_s", n_, R_, 1.0f);
             connect("onepass.Pq", "rowred.Pq");
             connect("onepass.Ps", "cred_s.P");
-            promote("onepass.B", "B");
-            promote("onepass.p", "p");
-            promote("onepass.r", "r");
-            promote("rowred.q", "q");
-            promote("cred_s.x", "s");
+            promote<DType::f32, 2>("onepass.B", "B");
+            promote<DType::f32, 1>("onepass.p", "p");
+            promote<DType::f32, 1>("onepass.r", "r");
+            promote<DType::f32, 1>("rowred.q", "q");
+            promote<DType::f32, 1>("cred_s.x", "s");
             return;
         }
         std::string pre;  // the path prefix of gemv_q and gtp_s
         if (style_ == Style::parallel) {
-            add_subsystem("par", cs::property_list{cs::property::parallel{}}, child<Gemv>("gemv_q", n_, 1.0f),
-                          child<GemvTPartial>("gtp_s", n_, R_));
+            add_subsystem("par", cs::property_list{cs::property::parallel{}},
+                          child<Gemv>("gemv_q", n_, 1.0f, std::size_t{0}, true),
+                          child<GemvTPartial>("gtp_s", n_, R_, std::size_t{0}, true));
             pre = "par.";
         } else if (style_ == Style::fused) {
             // Independent stages: each gets its own slice of groups.
             add_subsystem("fw",
                           cs::property_list{cs::property::fused{cs::property::fused::Mode::parallel, wg256()}},
-                          child<Gemv>("gemv_q", n_, 1.0f), child<GemvTPartial>("gtp_s", n_, R_));
+                          child<Gemv>("gemv_q", n_, 1.0f, std::size_t{0}, true),
+                          child<GemvTPartial>("gtp_s", n_, R_, std::size_t{0}, true));
             pre = "fw.";
         } else {
-            add_subsystem<Gemv>("gemv_q", n_, 1.0f);
-            add_subsystem<GemvTPartial>("gtp_s", n_, R_);
+            add_subsystem<Gemv>("gemv_q", n_, 1.0f, std::size_t{0}, true);
+            add_subsystem<GemvTPartial>("gtp_s", n_, R_, std::size_t{0}, true);
         }
         add_subsystem<ColReduce<false>>("cred_s", n_, R_, 1.0f);
 
         connect(pre + "gtp_s.P", "cred_s.P");
-        tie_inputs({pre + "gemv_q.B", pre + "gtp_s.B"}, "B");  // one B feeds both kernels
+        // One B feeds both kernels; both declare B rank-only and the tie alias owns its shape.
+        tie_inputs<DType::f32, 2>({pre + "gemv_q.B", pre + "gtp_s.B"}, "B", cs::alias::fixed(n_, n_));
 
-        promote(pre + "gemv_q.x", "p");
-        promote(pre + "gtp_s.y", "r");
-        promote(pre + "gemv_q.y", "q");
-        promote("cred_s.x", "s");
+        promote<DType::f32, 1>(pre + "gemv_q.x", "p");
+        promote<DType::f32, 1>(pre + "gtp_s.y", "r");
+        promote<DType::f32, 1>(pre + "gemv_q.y", "q");
+        promote<DType::f32, 1>("cred_s.x", "s");
     }
 };
 
@@ -160,25 +163,25 @@ public:
         connect("bicgk.q", "g2.y");  // y = q
         connect("bicgk.s", "g2.z");  // z = s
 
-        promote("g1.A", "A");
-        promote("g1.u1", "u1a");
-        promote("g1.v1", "v1a");
-        promote("g1.u2", "u2a");
-        promote("g1.v2", "v2a");
-        promote("g1.y", "ya");
-        promote("g1.z", "za");
-        promote("g2.u1", "u1b");
-        promote("g2.v1", "v1b");
-        promote("g2.u2", "u2b");
-        promote("g2.v2", "v2b");
-        promote("g1.B", "B1");
-        promote("g1.x", "x1");
-        promote("g1.w", "w1");
-        promote("bicgk.q", "q");
-        promote("bicgk.s", "s");
-        promote("g2.B", "B2");
-        promote("g2.x", "x2");
-        promote("g2.w", "w2");
+        promote<DType::f32, 2>("g1.A", "A");
+        promote<DType::f32, 1>("g1.u1", "u1a");
+        promote<DType::f32, 1>("g1.v1", "v1a");
+        promote<DType::f32, 1>("g1.u2", "u2a");
+        promote<DType::f32, 1>("g1.v2", "v2a");
+        promote<DType::f32, 1>("g1.y", "ya");
+        promote<DType::f32, 1>("g1.z", "za");
+        promote<DType::f32, 1>("g2.u1", "u1b");
+        promote<DType::f32, 1>("g2.v1", "v1b");
+        promote<DType::f32, 1>("g2.u2", "u2b");
+        promote<DType::f32, 1>("g2.v2", "v2b");
+        promote<DType::f32, 2>("g1.B", "B1");
+        promote<DType::f32, 1>("g1.x", "x1");
+        promote<DType::f32, 1>("g1.w", "w1");
+        promote<DType::f32, 1>("bicgk.q", "q");
+        promote<DType::f32, 1>("bicgk.s", "s");
+        promote<DType::f32, 2>("g2.B", "B2");
+        promote<DType::f32, 1>("g2.x", "x2");
+        promote<DType::f32, 1>("g2.w", "w2");
     }
 };
 
@@ -244,25 +247,25 @@ public:
         connect("r2u2.B", "gemv2.B");
         connect("cred2.x", "gemv2.x");
 
-        promote("r2u1.A", "A");
-        promote("r2u1.u1", "u1a");
-        promote("r2u1.v1", "v1a");
-        promote("r2u1.u2", "u2a");
-        promote("r2u1.v2", "v2a");
-        promote("gtp1.y", "ya");
-        promote("cred1.z", "za");
-        promote("r2u2.u1", "u1b");
-        promote("r2u2.v1", "v1b");
-        promote("r2u2.u2", "u2b");
-        promote("r2u2.v2", "v2b");
-        promote("r2u1.B", "B1");
-        promote("cred1.x", "x1");
-        promote("gemv1.y", "w1");
-        promote("gemv_q.y", "q");
-        promote("cred_s.x", "s");
-        promote("r2u2.B", "B2");
-        promote("cred2.x", "x2");
-        promote("gemv2.y", "w2");
+        promote<DType::f32, 2>("r2u1.A", "A");
+        promote<DType::f32, 1>("r2u1.u1", "u1a");
+        promote<DType::f32, 1>("r2u1.v1", "v1a");
+        promote<DType::f32, 1>("r2u1.u2", "u2a");
+        promote<DType::f32, 1>("r2u1.v2", "v2a");
+        promote<DType::f32, 1>("gtp1.y", "ya");
+        promote<DType::f32, 1>("cred1.z", "za");
+        promote<DType::f32, 1>("r2u2.u1", "u1b");
+        promote<DType::f32, 1>("r2u2.v1", "v1b");
+        promote<DType::f32, 1>("r2u2.u2", "u2b");
+        promote<DType::f32, 1>("r2u2.v2", "v2b");
+        promote<DType::f32, 2>("r2u1.B", "B1");
+        promote<DType::f32, 1>("cred1.x", "x1");
+        promote<DType::f32, 1>("gemv1.y", "w1");
+        promote<DType::f32, 1>("gemv_q.y", "q");
+        promote<DType::f32, 1>("cred_s.x", "s");
+        promote<DType::f32, 2>("r2u2.B", "B2");
+        promote<DType::f32, 1>("cred2.x", "x2");
+        promote<DType::f32, 1>("gemv2.y", "w2");
     }
 };
 
@@ -289,12 +292,14 @@ public:
         add_subsystem<BarrierChain>("chain", n_, R_, groups_, spin_limit_);
         for (int i = 1; i <= BarrierChain::kBarriers; ++i) {
             const std::string k = std::to_string(i), b = "chain.bar" + k;
-            tie_outputs({"zero.count" + k, b + ".count"}, "bar" + k + "_count");
-            tie_outputs({"zero.timeout" + k, b + ".timeout"}, "bar" + k + "_timeout");
+            tie_outputs<DType::atomic_u32, 1>({"zero.count" + k, b + ".count"}, "bar" + k + "_count", cs::alias::fixed(1));
+            tie_outputs<DType::atomic_u32, 1>({"zero.timeout" + k, b + ".timeout"}, "bar" + k + "_timeout",
+                                              cs::alias::fixed(1));
         }
-        for (const char* n : {"A",  "u1a", "v1a", "u2a", "v2a", "ya", "za", "u1b", "v1b", "u2b",
-                              "v2b", "B1", "x1",  "w1",  "q",   "s",  "B2", "x2",  "w2"})
-            promote(std::string{"chain."} + n, n);
+        for (const char* n : {"A", "B1", "B2"}) promote<DType::f32, 2>(std::string{"chain."} + n, n);
+        for (const char* n : {"u1a", "v1a", "u2a", "v2a", "ya", "za", "u1b", "v1b", "u2b", "v2b",
+                              "x1",  "w1",  "q",   "s",   "x2",  "w2"})
+            promote<DType::f32, 1>(std::string{"chain."} + n, n);
     }
 };
 

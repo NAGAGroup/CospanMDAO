@@ -37,7 +37,10 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <cstdint>
+#include <iostream>
 #include <span>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -125,9 +128,17 @@ struct SrcBody {
 
 class Src : public cs::Component<SrcBody> {
     cs::Output<DType::f32, 1> y_;
+    bool                      tied_;
 
 public:
-    void setup() override { declare_output(y_, "y", static_cast<int>(kLen)); }
+    /// `tied`: y is rank-only (a tie_outputs member; the tie alias owns the shape).
+    explicit Src(bool tied = false) : tied_{tied} {}
+    void setup() override {
+        if (tied_)
+            declare_output(y_, "y", cs::tied);
+        else
+            declare_output(y_, "y", static_cast<int>(kLen));
+    }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return create_launch_config(y_.shape(), {}, {y_}, {});
     }
@@ -145,18 +156,27 @@ struct AxpbBody {
     void operator()(sycl::id<1> i, Inputs in, Outputs out) const { out.y[i] = a * in.x[i] + b; }
 };
 
+/// Selects the Axpb whose input x is rank-only (a tie_inputs member).
+struct TiedX {};
+inline constexpr TiedX tied_x{};
+
 class Axpb : public cs::Component<AxpbBody> {
     cs::Input<DType::f32, 1>  x_;
     cs::Output<DType::f32, 1> y_;
     float                     a_, b_;
     std::optional<float>      x0_;
     std::string               log_;
+    bool                      tied_ = false;
 
 public:
     Axpb(float a, float b, std::optional<float> x0 = std::nullopt, std::string log = {})
         : a_{a}, b_{b}, x0_{x0}, log_{std::move(log)} {}
+    Axpb(TiedX, float a, float b) : a_{a}, b_{b}, tied_{true} {}
     void setup() override {
-        declare_input(x_, "x", static_cast<int>(kLen));
+        if (tied_)
+            declare_input(x_, "x", cs::tied);
+        else
+            declare_input(x_, "x", static_cast<int>(kLen));
         declare_output(y_, "y", static_cast<int>(kLen));
         if (!log_.empty())
             init_input("x", logging_fill(log_, x0_.value_or(0.0f)));
@@ -254,7 +274,7 @@ class Adder : public cs::Component<AdderBody> {
 
 public:
     explicit Adder(float v) : v_{v} {}
-    void setup() override { declare_output(acc_, "acc", static_cast<int>(kLen)); }
+    void setup() override { declare_output(acc_, "acc", cs::tied); }  // a tie_outputs member
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return create_launch_config(acc_.shape(), {}, {acc_}, {v_});
     }
@@ -273,7 +293,7 @@ class ZeroAcc : public cs::Component<ZeroAccBody> {
     cs::Output<DType::atomic_f32, 1> acc_;
 
 public:
-    void setup() override { declare_output(acc_, "acc", static_cast<int>(kLen)); }
+    void setup() override { declare_output(acc_, "acc", cs::tied); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return create_launch_config(acc_.shape(), {}, {acc_}, {});
     }
@@ -339,7 +359,7 @@ public:
         add_subsystem<Src>("p");
         add_subsystem<Copy1>("c");
         connect("p.y", "c.x", cs::Slice{cs::subarray<1>({2}, {4})});  // elements 2..5
-        promote("c.x", "cx");
+        promote<DType::f32, 1>("c.x", "cx");
     }
 };
 
@@ -357,7 +377,7 @@ class PromoteMid : public cs::System {
 public:
     void setup() override {
         add_subsystem<Src>("child");
-        promote("child.y", "y");
+        promote<DType::f32, 1>("child.y", "y");
     }
 };
 
@@ -366,7 +386,7 @@ public:
     void setup() override {
         add_subsystem<PromoteMid>("mid");
         add_subsystem<Axpb>("c", 3.0f, 0.0f);
-        promote("mid.y", "y");
+        promote<DType::f32, 1>("mid.y", "y");
         connect("y", "c.x");  // from the promoted alias
     }
 };
@@ -375,18 +395,20 @@ public:
 class TieInSys : public cs::System {
 public:
     void setup() override {
-        add_subsystem<Axpb>("a", 2.0f, 0.0f);
-        add_subsystem<Axpb>("b", 3.0f, 0.0f);
-        tie_inputs({"a.x", "b.x"}, "x");
+        add_subsystem<Axpb>("a", tied_x, 2.0f, 0.0f);
+        add_subsystem<Axpb>("b", tied_x, 3.0f, 0.0f);
+        tie_inputs<DType::f32, 1>({"a.x", "b.x"}, "x", cs::alias::fixed(kLen));
     }
 };
 
 class TieInInner : public cs::System {
 public:
     void setup() override {
-        add_subsystem<Axpb>("a", 2.0f, 0.0f);
-        add_subsystem<Axpb>("b", 3.0f, 0.0f);
-        tie_inputs({"a.x", "b.x"}, "t");
+        add_subsystem<Axpb>("a", tied_x, 2.0f, 0.0f);
+        add_subsystem<Axpb>("b", tied_x, 3.0f, 0.0f);
+        // An alias carries a shape, so it cannot itself be a tie member: pass the members up by promotion.
+        promote<DType::f32, 1>("a.x", "ax");
+        promote<DType::f32, 1>("b.x", "bx");
     }
 };
 
@@ -394,8 +416,9 @@ class TieInTop : public cs::System {
 public:
     void setup() override {
         add_subsystem<TieInInner>("in");
-        add_subsystem<Axpb>("c", 4.0f, 0.0f);
-        tie_inputs({"in.t", "c.x"}, "tt");  // a tie of a tie alias: three members, one root
+        add_subsystem<Axpb>("c", tied_x, 4.0f, 0.0f);
+        // Three members, two of them promotions from the level below: one root.
+        tie_inputs<DType::f32, 1>({"in.ax", "in.bx", "c.x"}, "tt", cs::alias::fixed(kLen));
     }
 };
 
@@ -406,7 +429,8 @@ public:
         add_subsystem<Adder>("a", 1.0f);
         add_subsystem<Adder>("b", 2.0f);
         add_subsystem<Copy1>("c");
-        tie_outputs({"z.acc", "a.acc", "b.acc"}, "sum");  // require_atomic (the default): both are atomic
+        tie_outputs<DType::atomic_f32, 1>({"z.acc", "a.acc", "b.acc"}, "sum",
+                                          cs::alias::fixed(kLen));  // require_atomic (the default): all are atomic
         connect("sum", "c.x");                    // a tie alias is a source
     }
 };
@@ -417,12 +441,12 @@ class TieOutPlain : public cs::System {
 public:
     explicit TieOutPlain(bool allow = false) : allow_{allow} {}
     void setup() override {
-        add_subsystem<Src>("a");
-        add_subsystem<Src>("b");
+        add_subsystem<Src>("a", true);
+        add_subsystem<Src>("b", true);
         if (allow_) {
-            tie_outputs({"a.y", "b.y"}, "t", cs::TieOutputsPolicy::allow_plain);
+            tie_outputs<DType::f32, 1>({"a.y", "b.y"}, "t", cs::alias::fixed(kLen), cs::TieOutputsPolicy::allow_plain);
         } else {
-            tie_outputs({"a.y", "b.y"}, "t");
+            tie_outputs<DType::f32, 1>({"a.y", "b.y"}, "t", cs::alias::fixed(kLen));
         }
     }
 };
@@ -580,7 +604,7 @@ class TransPromo : public cs::System {
 public:
     void setup() override {
         add_subsystem<Src>("p");
-        promote("p.y", "y");
+        promote<DType::f32, 1>("p.y", "y");
     }
 };
 
@@ -592,7 +616,7 @@ public:
     explicit PromoInTrans(bool repromote) : repromote_{repromote} {}
     void setup() override {
         add_subsystem<TransPromo>("tr", kTransient);
-        if (repromote_) promote("tr.y", "out");
+        if (repromote_) promote<DType::f32, 1>("tr.y", "out");
     }
 };
 
@@ -695,7 +719,7 @@ public:
     void setup() override {
         ThreeAxpb::setup();
         connect("a.y", "c.x");
-        tie_inputs({"c.x", "b.x"}, "t");  // c.x is already connected
+        tie_inputs<DType::f32, 1>({"c.x", "b.x"}, "t", cs::alias::fixed(kLen));  // c.x is already connected
     }
 };
 
@@ -769,8 +793,8 @@ class D1 : public cs::Component<D1Body> {
 
 public:
     void setup() override {
-        declare_input(z_, "z", 2);
-        declare_input(x_, "x", 1);
+        declare_input(z_, "z", cs::tied);  // z and x are tie members: the tie alias owns their shape
+        declare_input(x_, "x", cs::tied);
         declare_input(y2_, "y2", 1);
         declare_output(y1_, "y1", 1);
         init_input("y2", cs::init::fill(kSellarD1Y2));
@@ -804,7 +828,7 @@ class D2 : public cs::Component<D2Body> {
 
 public:
     void setup() override {
-        declare_input(z_, "z", 2);
+        declare_input(z_, "z", cs::tied);
         declare_input(y1_in_, "y1_in", cs::from_source_shape<1>());
         declare_output(y2_, "y2", 1);
         declare_output(yy_, "yy", 2);
@@ -836,8 +860,8 @@ class Obj : public cs::Component<ObjBody> {
 
 public:
     void setup() override {
-        declare_input(x_, "x", 1);
-        declare_input(z_, "z", 2);
+        declare_input(x_, "x", cs::tied);
+        declare_input(z_, "z", cs::tied);
         declare_input(y1_, "y1", cs::from_source_shape<1>());
         declare_input(y2_, "y2", cs::from_source_shape<1>());
         declare_output(f_, "f", 1);
@@ -901,11 +925,12 @@ public:
         add_subsystem<D1>("d1");
         add_subsystem<D2>("d2");
         connect("d1.y1", "d2.y1_in");
-        tie_inputs({"d1.z", "d2.z"}, "z");
-        promote("d1.x", "x");
-        promote("d1.y1", "y1");
-        promote("d2.y2", "y2");
-        promote("d2.yy", "yy");
+        promote<DType::f32, 1>("d1.z", "z1");  // z and x are tied at the top (tie members are never aliases with a shape)
+        promote<DType::f32, 1>("d2.z", "z2");
+        promote<DType::f32, 1>("d1.x", "x");
+        promote<DType::f32, 1>("d1.y1", "y1");
+        promote<DType::f32, 1>("d2.y2", "y2");
+        promote<DType::f32, 1>("d2.yy", "yy");
         init_input("d1.y2", cs::init::fill(kSellarY2));  // beats d1's own (depth 2)
     }
 };
@@ -918,8 +943,8 @@ public:
         add_subsystem<G1>("g1");
         add_subsystem<G2>("g2");
 
-        tie_inputs({"mda.x", "obj.x"}, "x");
-        tie_inputs({"mda.z", "obj.z"}, "z");  // a tie of a tie alias
+        tie_inputs<DType::f32, 1>({"mda.x", "obj.x"}, "x", cs::alias::fixed(1));
+        tie_inputs<DType::f32, 1>({"mda.z1", "mda.z2", "obj.z"}, "z", cs::alias::fixed(2));  // members through promotions
         connect("mda.y1", "obj.y1");
         connect("mda.yy", "obj.y2", cs::Slice{cs::subarray<1>({1}, {1})});  // element 1 of yy = y2
         connect("mda.y1", "g1.y1");
@@ -1054,11 +1079,12 @@ TEST_CASE("ties: tie_inputs gives one root; a tie of a tie gives three members a
         CHECK(sys.entry_at("in.a.x").root() == root);
         CHECK(sys.entry_at("in.b.x").root() == root);
         CHECK(sys.entry_at("c.x").root() == root);
-        CHECK(sys.entry_at("in.t").root() == root);
+        CHECK(sys.entry_at("in.ax").root() == root);
+        CHECK(sys.entry_at("in.bx").root() == root);
         model.init_input("tt", cs::init::from_host(x));
         model.forward();
         model.wait();
-        for (const char* path : {"in.a.x", "in.b.x", "c.x", "in.t"})
+        for (const char* path : {"in.a.x", "in.b.x", "c.x", "in.ax", "in.bx"})
             CHECK(to_vector(model.view_input<DType::f32, 1>(path)) == x);
         std::vector<float> want4(x);
         for (auto& v : want4) v *= 4.0f;
@@ -1482,8 +1508,8 @@ TEST_CASE("structural errors", "[system][errors]") {
         model.setup();
         auto& sys = model.root();
         tsys::expect_throws([&] { sys.connect("a.y", "b.x"); }, "setup() only");
-        tsys::expect_throws([&] { sys.promote("a.y", "y"); }, "setup() only");
-        tsys::expect_throws([&] { sys.tie_inputs({"a.x", "b.x"}, "t"); }, "setup() only");
+        tsys::expect_throws([&] { sys.promote<DType::f32, 1>("a.y", "y"); }, "setup() only");
+        tsys::expect_throws([&] { sys.tie_inputs<DType::f32, 1>({"a.x", "b.x"}, "t", cs::alias::fixed(1)); }, "setup() only");
         tsys::expect_throws([&] { sys.add_design_var("a.x"); }, "setup() only");
         model.wait();  // setup() submitted initializer work (D135)
     }
@@ -1568,4 +1594,446 @@ TEST_CASE("Sellar-shaped forward: ties of ties, promotions, a Slice, marks, init
     CHECK(model.constraints().size() == 2);
     CHECK(tsys::mark_on(model.constraints(), sys.entry_at("g1.g").root()) != nullptr);
     CHECK(tsys::mark_on(model.constraints(), sys.entry_at("g2.g").root()) != nullptr);
+}
+
+
+// =============================================================================================
+// 7. D139 part 2: ties own the shape; promotions mirror live; rank-templated aliases
+// =============================================================================================
+namespace tsys2 {
+
+// bins (VBins): a free u32 input n and an output b of n floats (b[i] = i + 1); a VALUE-driven output.
+struct VBinsBody {
+    struct Inputs {
+        cs::Input<DType::u32, 1> n;
+    };
+    struct Outputs {
+        cs::Output<DType::f32, 1> b;
+    };
+    void operator()(sycl::id<1> i, Inputs, Outputs out) const { out.b[i] = static_cast<float>(i[0]) + 1.0f; }
+};
+class VBins : public cs::Component<VBinsBody> {
+    cs::Input<DType::u32, 1>  n_;
+    cs::Output<DType::f32, 1> b_;
+
+public:
+    void setup() override {
+        declare_input(n_, "n", 1);
+        declare_output(b_, "b", cs::FromInput{"n", 0});
+    }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+        return create_launch_config(b_.shape(), {n_}, {b_}, {});
+    }
+};
+
+// NCopy: n[0] = v[0], the bin count as an OUTPUT (an alias shape reads an upstream output).
+struct NCopyBody {
+    struct Inputs {
+        cs::Input<DType::u32, 1> v;
+    };
+    struct Outputs {
+        cs::Output<DType::u32, 1> n;
+    };
+    void operator()(sycl::id<1> i, Inputs in, Outputs out) const { out.n[i] = in.v[i]; }
+};
+class NCopy : public cs::Component<NCopyBody> {
+    cs::Input<DType::u32, 1>  v_;
+    cs::Output<DType::u32, 1> n_;
+
+public:
+    void setup() override {
+        declare_input(v_, "v", 1);
+        declare_output(n_, "n", 1);
+    }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+        return create_launch_config(n_.shape(), {v_}, {n_}, {});
+    }
+};
+
+// TScale: y = 2 x; x is rank-only (a tie member), y follows x's shape.
+struct TScaleBody {
+    struct Inputs {
+        cs::Input<DType::f32, 1> x;
+    };
+    struct Outputs {
+        cs::Output<DType::f32, 1> y;
+    };
+    void operator()(sycl::id<1> i, Inputs in, Outputs out) const { out.y[i] = 2.0f * in.x[i]; }
+};
+class TScale : public cs::Component<TScaleBody> {
+    cs::Input<DType::f32, 1>  x_;
+    cs::Output<DType::f32, 1> y_;
+
+public:
+    void setup() override {
+        declare_input(x_, "x", cs::tied);
+        declare_output(y_, "y", cs::from_input_shape<1>("x"));
+    }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+        return create_launch_config(y_.shape(), {x_}, {y_}, {});
+    }
+};
+
+// TIota: o[i] = i + 1; o is rank-only (a tie_outputs member).
+struct TIotaBody {
+    struct Inputs {};
+    struct Outputs {
+        cs::Output<DType::f32, 1> o;
+    };
+    void operator()(sycl::id<1> i, Inputs, Outputs out) const { out.o[i] = static_cast<float>(i[0]) + 1.0f; }
+};
+class TIota : public cs::Component<TIotaBody> {
+    cs::Output<DType::f32, 1> o_;
+
+public:
+    void setup() override { declare_output(o_, "o", cs::tied); }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+        return create_launch_config(o_.shape(), {}, {o_}, {});
+    }
+};
+
+/// A root System whose setup() runs a callable.
+class FnSys : public cs::System {
+    std::function<void(cs::System&)> build_;
+
+public:
+    explicit FnSys(std::function<void(cs::System&)> b) : build_{std::move(b)} {}
+    void setup() override { build_(*this); }
+};
+
+inline cs::Model make(std::function<void(cs::System&)> build, cs::ModelConfig cfg = default_config()) {
+    return cs::create_model<FnSys>(std::move(cfg), std::move(build));
+}
+
+std::vector<float> one_to(std::size_t n) {
+    std::vector<float> v(n);
+    for (std::size_t i = 0; i < n; ++i) v[i] = static_cast<float>(i) + 1.0f;
+    return v;
+}
+std::vector<float> doubled(std::vector<float> v) {
+    for (auto& e : v) e *= 2.0f;
+    return v;
+}
+std::vector<std::uint32_t> one_u32(std::uint32_t n) { return std::vector<std::uint32_t>{n}; }
+
+/// Two TScale members tied into "x", and the transient version of the same.
+class TieTwoScales : public cs::System {
+public:
+    void setup() override {
+        add_subsystem<TScale>("a");
+        add_subsystem<TScale>("b");
+        tie_inputs<DType::f32, 1>({"a.x", "b.x"}, "x", cs::alias::fixed(tsys::kLen));
+    }
+};
+class TransTieTop : public cs::System {
+public:
+    void setup() override { add_subsystem<TieTwoScales>("tr", tsys::kTransient); }
+};
+
+}  // namespace tsys2
+
+TEST_CASE("D139-2: a promoted value-driven output shows its member's current shape", "[system][alias][promote]") {
+    auto model = tsys2::make([](cs::System& s) {
+        s.add_subsystem<tsys2::VBins>("v");
+        s.promote<DType::f32, 1>("v.b", "b");
+        s.promote<DType::u32, 1>("v.n", "n");
+    });
+    model.setup();
+    tsys::expect_throws([&] { (void)model.view_output<DType::f32, 1>("b"); }, "no data until its owner");
+    for (const std::uint32_t n : {3u, 7u, 2u}) {  // the size changes between runs
+        INFO("n = " << n);
+        model.init_input("n", cs::init::from_host(tsys2::one_u32(n)));
+        model.forward();
+        model.wait();
+        auto v = model.view_output<DType::f32, 1>("b");
+        CHECK(v.shape()[0] == n);
+        CHECK(v.size() == n);
+        CHECK(to_vector(v) == tsys2::one_to(n));
+    }
+}
+
+TEST_CASE("D139-2: views of an alias before its root's owner has run throw", "[system][alias]") {
+    cs::Model model = cs::create_model<tsys2::TieTwoScales>(default_config());
+    model.setup();
+    tsys::expect_throws([&] { (void)model.view_input<DType::f32, 1>("x"); }, "no data until its owner");
+    tsys::expect_throws([&] { (void)model.view_input<DType::f32, 1>("a.x"); }, "no data until its owner");
+    model.forward();
+    model.wait();
+    CHECK(model.view_input<DType::f32, 1>("x").shape()[0] == tsys::kLen);
+    CHECK(model.view_input<DType::f32, 1>("a.x").shape()[0] == tsys::kLen);
+}
+
+TEST_CASE("D139-2: tie errors", "[system][alias][errors]") {
+    const auto setup_throws = [](std::function<void(cs::System&)> build, const std::string& needle) {
+        tsys::expect_throws(
+            [&] {
+                auto model = tsys2::make(build);
+                model.setup();
+            },
+            needle);
+    };
+    const auto two_scales = [](cs::System& s) {
+        s.add_subsystem<tsys2::TScale>("a");
+        s.add_subsystem<tsys2::TScale>("b");
+    };
+    SECTION("a tie of one member") {
+        setup_throws(
+            [&](cs::System& s) {
+                two_scales(s);
+                s.tie_inputs<DType::f32, 1>({"a.x"}, "t", cs::alias::fixed(4));
+            },
+            "a tie needs two or more members; use promote for one");
+    }
+    SECTION("dtype mismatch") {
+        setup_throws(
+            [&](cs::System& s) {
+                two_scales(s);
+                s.tie_inputs<DType::f64, 1>({"a.x", "b.x"}, "t", cs::alias::fixed(4));
+            },
+            "dtype");
+    }
+    SECTION("rank mismatch") {
+        setup_throws(
+            [&](cs::System& s) {
+                two_scales(s);
+                s.tie_inputs<DType::f32, 2>({"a.x", "b.x"}, "t", cs::alias::fixed(4, 4));
+            },
+            "rank");
+        setup_throws(
+            [&](cs::System& s) {
+                s.add_subsystem<tsys::Axpb>("a", 1.0f, 0.0f);
+                s.promote<DType::f32, 2>("a.x", "ax");
+            },
+            "rank");
+    }
+    SECTION("a tied member that declares a shape") {
+        setup_throws(
+            [&](cs::System& s) {
+                s.add_subsystem<tsys::Axpb>("a", 1.0f, 0.0f);  // x is fixed
+                s.add_subsystem<tsys::Axpb>("b", tsys::tied_x, 1.0f, 0.0f);
+                s.tie_inputs<DType::f32, 1>({"a.x", "b.x"}, "t", cs::alias::fixed(tsys::kLen));
+            },
+            "'a.x' declares a shape");
+    }
+    SECTION("a rank-only entry that no tie owns") {
+        setup_throws([&](cs::System& s) { s.add_subsystem<tsys2::TScale>("a"); }, "'a.x' is rank-only");
+    }
+    SECTION("an output alias cannot take its shape from a connection") {
+        setup_throws(
+            [&](cs::System& s) {
+                s.add_subsystem<tsys2::TIota>("w1");
+                s.add_subsystem<tsys2::TIota>("w2");
+                s.tie_outputs<DType::f32, 1>({"w1.o", "w2.o"}, "t", cs::alias::from_connection(),
+                                             cs::TieOutputsPolicy::allow_plain);
+            },
+            "an output alias defines the shape of its connections");
+    }
+    SECTION("from_connection on an alias nothing is connected to") {
+        setup_throws(
+            [&](cs::System& s) {
+                two_scales(s);
+                s.tie_inputs<DType::f32, 1>({"a.x", "b.x"}, "t", cs::alias::from_connection());
+            },
+            "nothing is connected");
+    }
+    SECTION("from_output_values names a later-registered producer") {
+        setup_throws(
+            [&](cs::System& s) {
+                two_scales(s);
+                s.add_subsystem<tsys2::NCopy>("nb");  // registered AFTER the tie's members
+                s.tie_inputs<DType::f32, 1>({"a.x", "b.x"}, "t", cs::alias::from_output_values("nb.n"));
+            },
+            "not registered before");
+    }
+    SECTION("from_output_shape names a later-registered producer") {
+        setup_throws(
+            [&](cs::System& s) {
+                two_scales(s);
+                s.add_subsystem<tsys2::VBins>("v");
+                s.tie_inputs<DType::f32, 1>({"a.x", "b.x"}, "t", cs::alias::from_output_shape("v.b"));
+            },
+            "not registered before");
+    }
+    SECTION("an alias shape source that is not an output") {
+        setup_throws(
+            [&](cs::System& s) {
+                s.add_subsystem<tsys2::VBins>("v");
+                two_scales(s);
+                s.tie_inputs<DType::f32, 1>({"a.x", "b.x"}, "t", cs::alias::from_output_shape("v.n"));
+            },
+            "not an output");
+    }
+}
+
+TEST_CASE("D139-2: tie_inputs shapes: fixed, from_output_shape, from_output_values", "[system][alias][tie]") {
+    SECTION("fixed") {
+        auto model = tsys2::make([](cs::System& s) {
+            s.add_subsystem<tsys2::TScale>("a");
+            s.add_subsystem<tsys2::TScale>("b");
+            s.tie_inputs<DType::f32, 1>({"a.x", "b.x"}, "x", cs::alias::fixed(5));
+        });
+        model.setup();
+        model.init_input("x", cs::init::from_host(tsys2::one_to(5)));
+        model.forward();
+        model.wait();
+        CHECK(to_vector(model.view_output<DType::f32, 1>("a.y")) == tsys2::doubled(tsys2::one_to(5)));
+        CHECK(to_vector(model.view_output<DType::f32, 1>("b.y")) == tsys2::doubled(tsys2::one_to(5)));
+    }
+    SECTION("from_output_shape: the shape follows the upstream output between runs") {
+        auto model = tsys2::make([](cs::System& s) {
+            s.add_subsystem<tsys2::VBins>("v");
+            s.add_subsystem<tsys2::TScale>("a");
+            s.add_subsystem<tsys2::TScale>("b");
+            s.tie_inputs<DType::f32, 1>({"a.x", "b.x"}, "x", cs::alias::from_output_shape("v.b"));
+        });
+        model.setup();
+        for (const std::uint32_t n : {3u, 6u, 4u}) {
+            INFO("n = " << n);
+            model.init_input("v.n", cs::init::from_host(tsys2::one_u32(n)));
+            model.forward();
+            model.wait();
+            CHECK(model.view_input<DType::f32, 1>("x").shape()[0] == n);
+            CHECK(model.view_input<DType::f32, 1>("a.x").shape()[0] == n);
+            CHECK(to_vector(model.view_output<DType::f32, 1>("b.y")) == std::vector<float>(n, 0.0f));
+        }
+    }
+    SECTION("from_output_values: the extents are the values of an upstream output") {
+        auto model = tsys2::make([](cs::System& s) {
+            s.add_subsystem<tsys2::NCopy>("nb");
+            s.add_subsystem<tsys2::TScale>("a");
+            s.add_subsystem<tsys2::TScale>("b");
+            s.tie_inputs<DType::f32, 1>({"a.x", "b.x"}, "x", cs::alias::from_output_values("nb.n"));
+        });
+        model.setup();
+        for (const std::uint32_t n : {4u, 9u, 1u}) {
+            INFO("n = " << n);
+            model.init_input("nb.v", cs::init::from_host(tsys2::one_u32(n)));
+            model.init_input("x", cs::init::fill(1.5f));
+            model.forward();
+            model.wait();
+            CHECK(model.view_input<DType::f32, 1>("a.x").shape()[0] == n);
+            CHECK(to_vector(model.view_output<DType::f32, 1>("a.y")) == std::vector<float>(n, 3.0f));
+            CHECK(to_vector(model.view_output<DType::f32, 1>("b.y")) == std::vector<float>(n, 3.0f));
+        }
+    }
+}
+
+TEST_CASE("D139-2: tie_outputs shapes: fixed and from_output_values", "[system][alias][tie]") {
+    SECTION("fixed") {
+        auto model = tsys2::make([](cs::System& s) {
+            s.add_subsystem<tsys2::TIota>("w1");
+            s.add_subsystem<tsys2::TIota>("w2");
+            s.add_subsystem<tsys::Copy1>("c");
+            s.tie_outputs<DType::f32, 1>({"w1.o", "w2.o"}, "t", cs::alias::fixed(6), cs::TieOutputsPolicy::allow_plain);
+            s.connect("t", "c.x");
+        });
+        model.setup();
+        model.forward();
+        model.wait();
+        CHECK(to_vector(model.view_output<DType::f32, 1>("t")) == tsys2::one_to(6));
+        CHECK(to_vector(model.view_output<DType::f32, 1>("c.y")) == tsys2::one_to(6));
+    }
+    SECTION("from_output_values: the size changes between runs") {
+        auto model = tsys2::make([](cs::System& s) {
+            s.add_subsystem<tsys2::NCopy>("nb");
+            s.add_subsystem<tsys2::TIota>("w1");
+            s.add_subsystem<tsys2::TIota>("w2");
+            s.add_subsystem<tsys::Copy1>("c");
+            s.tie_outputs<DType::f32, 1>({"w1.o", "w2.o"}, "t", cs::alias::from_output_values("nb.n"),
+                                         cs::TieOutputsPolicy::allow_plain);
+            s.connect("t", "c.x");
+        });
+        model.setup();
+        for (const std::uint32_t n : {3u, 8u, 5u}) {
+            INFO("n = " << n);
+            model.init_input("nb.v", cs::init::from_host(tsys2::one_u32(n)));
+            model.forward();
+            model.wait();
+            CHECK(to_vector(model.view_output<DType::f32, 1>("t")) == tsys2::one_to(n));
+            CHECK(to_vector(model.view_output<DType::f32, 1>("c.y")) == tsys2::one_to(n));
+        }
+    }
+}
+
+TEST_CASE("D139-2: a connected tie_inputs alias joins the producer's root", "[system][alias][tie]") {
+    const auto build = [](cs::AliasShape shape) {
+        return [shape](cs::System& s) {
+            s.add_subsystem<tsys2::VBins>("v");
+            s.add_subsystem<tsys2::TScale>("a");
+            s.add_subsystem<tsys2::TScale>("b");
+            s.tie_inputs<DType::f32, 1>({"a.x", "b.x"}, "x", shape);
+            s.connect("v.b", "x");
+        };
+    };
+    SECTION("members take the connected output's shape; the producer owns the root") {
+        auto model = tsys2::make(build(cs::alias::from_connection()));
+        model.setup();
+        CHECK(model.root().entry_at("a.x").root() == model.root().entry_at("v.b").root());
+        for (const std::uint32_t n : {4u, 2u}) {
+            INFO("n = " << n);
+            model.init_input("v.n", cs::init::from_host(tsys2::one_u32(n)));
+            model.forward();
+            model.wait();
+            CHECK(model.view_input<DType::f32, 1>("a.x").shape()[0] == n);
+            CHECK(to_vector(model.view_output<DType::f32, 1>("a.y")) == tsys2::doubled(tsys2::one_to(n)));
+            CHECK(to_vector(model.view_output<DType::f32, 1>("b.y")) == tsys2::doubled(tsys2::one_to(n)));
+        }
+    }
+    SECTION("a mismatching fixed AliasShape errors on the first run") {
+        auto model = tsys2::make(build(cs::alias::fixed(5)));
+        model.setup();
+        model.init_input("v.n", cs::init::from_host(tsys2::one_u32(4)));
+        tsys::expect_throws(
+            [&] {
+                model.forward();
+                model.wait();
+            },
+            "declares the shape");
+        model.wait();
+    }
+    SECTION("a matching fixed AliasShape runs") {
+        auto model = tsys2::make(build(cs::alias::fixed(4)));
+        model.setup();
+        model.init_input("v.n", cs::init::from_host(tsys2::one_u32(4)));
+        model.forward();
+        model.wait();
+        CHECK(to_vector(model.view_output<DType::f32, 1>("a.y")) == tsys2::doubled(tsys2::one_to(4)));
+    }
+    SECTION("a model init on the alias warns and is skipped") {
+        auto model = tsys2::make(build(cs::alias::from_connection()));
+        model.setup();
+        std::ostringstream captured;
+        std::streambuf*    old = std::cerr.rdbuf(captured.rdbuf());
+        try {
+            model.init_input("x", cs::init::fill(9.0f));
+        } catch (...) {
+            std::cerr.rdbuf(old);
+            throw;
+        }
+        std::cerr.rdbuf(old);
+        CHECK(captured.str() ==
+              "naga::cospan: warning: input 'x' is connected to an output; your initializer may not run\n");
+        model.init_input("v.n", cs::init::from_host(tsys2::one_u32(3)));
+        model.forward();
+        model.wait();
+        CHECK(to_vector(model.view_output<DType::f32, 1>("a.y")) == tsys2::doubled(tsys2::one_to(3)));  // not 9
+    }
+}
+
+TEST_CASE("D139-2: a tie alias inside a transient subsystem is released and the pool returns to its baseline",
+          "[system][alias][transient]") {
+    cs::Model model = cs::create_model<tsys2::TransTieTop>(cst::pooled_config());
+    model.setup();
+    const std::size_t base = tsys::pool_in_use_of(model);
+    for (int round = 0; round < 2; ++round) {
+        INFO("forward " << round + 1);
+        model.forward();
+        model.wait();
+        auto& sys = model.root();
+        CHECK(sys.entry_at("tr.x").root()->transient());
+        CHECK(sys.entry_at("tr.x").root()->released());
+        CHECK(!sys.entry_at("tr.x").root()->has_storage());
+        CHECK(tsys::pool_in_use_of(model) == base);
+        tsys::expect_throws([&] { (void)model.view_input<DType::f32, 1>("tr.x"); }, "transient subsystem 'tr'");
+    }
 }

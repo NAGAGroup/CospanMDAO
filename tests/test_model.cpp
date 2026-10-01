@@ -91,8 +91,8 @@ class D1 : public cs::Component<D1Body<DT>> {
 
 public:
     void setup() override {
-        this->declare_input(z_, "z", 2);
-        this->declare_input(x_, "x", 1);
+        this->declare_input(z_, "z", cs::tied);  // z and x are tie members: the tie alias owns their shape
+        this->declare_input(x_, "x", cs::tied);
         this->declare_input(y2_, "y2", 1);
         this->declare_output(y1_, "y1", 1);
     }
@@ -121,7 +121,7 @@ class D2 : public cs::Component<D2Body<DT>> {
 
 public:
     void setup() override {
-        this->declare_input(z_, "z", 2);
+        this->declare_input(z_, "z", cs::tied);
         this->declare_input(y1_, "y1", cs::from_source_shape<1>());
         this->declare_output(y2_, "y2", 1);
     }
@@ -153,8 +153,8 @@ class Obj : public cs::Component<ObjBody<DT>> {
 
 public:
     void setup() override {
-        this->declare_input(x_, "x", 1);
-        this->declare_input(z_, "z", 2);
+        this->declare_input(x_, "x", cs::tied);
+        this->declare_input(z_, "z", cs::tied);
         this->declare_input(y1_, "y1", cs::from_source_shape<1>());
         this->declare_input(y2_, "y2", cs::from_source_shape<1>());
         this->declare_output(f_, "f", 1);
@@ -229,8 +229,8 @@ public:
         add_subsystem<G1<DT>>("g1");
         add_subsystem<G2<DT>>("g2");
 
-        tie_inputs({"d1.z", "d2.z", "obj.z"}, "z");
-        tie_inputs({"d1.x", "obj.x"}, "x");
+        tie_inputs<DT, 1>({"d1.z", "d2.z", "obj.z"}, "z", cs::alias::fixed(2));
+        tie_inputs<DT, 1>({"d1.x", "obj.x"}, "x", cs::alias::fixed(1));
         connect("d1.y1", "d2.y1");
         connect("d1.y1", "obj.y1");
         connect("d2.y2", "obj.y2");
@@ -402,8 +402,8 @@ class Comb : public cs::Component<CombBody> {
 
 public:
     void setup() override {
-        declare_input(b_, "b", 8);
-        declare_input(c_, "c", 8);
+        declare_input(b_, "b", cs::tied);  // tied into the top alias "bc" (fixed 8)
+        declare_input(c_, "c", cs::tied);
         declare_input(e_, "e", cs::from_source_shape<1>());
         declare_output(o_, "o", 16);
     }
@@ -418,10 +418,10 @@ public:
         add_subsystem<Gen>("gen");
         add_subsystem<Cvt>("cvt");
         add_subsystem<Comb>("comb");
-        tie_inputs({"comb.b", "comb.c"}, "bc");
+        tie_inputs<DType::f32, 1>({"comb.b", "comb.c"}, "bc", cs::alias::fixed(8));
         connect("gen.y", "cvt.a");
         connect("cvt.d", "comb.e");
-        promote("comb.o", "out");
+        promote<DType::f32, 1>("comb.o", "out");
     }
 };
 

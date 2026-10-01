@@ -107,6 +107,64 @@ constexpr std::array<FromInputDim, Rank> from_input_shape(std::string_view input
 
 constexpr FromInputArray from_input_array(std::string_view input) { return {input}; }
 
+/// The rank-only declaration marker (D139 part 2): `declare_input(w, "x", cs::tied)`. The entry
+/// names a dtype and a rank (from its wrapper type) and no shape: its shape is whatever its ROOT's
+/// shape is, and the root of a tied entry is a tie alias (System::tie_inputs / tie_outputs), which
+/// owns the shape.
+struct Tied {};
+inline constexpr Tied tied{};
+
+/// How a tie alias gets its shape (D139 part 2); build one with the cs::alias factories.
+struct AliasShape {
+    enum class Kind : uint8_t { fixed, from_connection, from_output_shape, from_output_values };
+    Kind                       kind = Kind::fixed;
+    int                        rank = 0;            ///< fixed: how many extents were given
+    std::array<std::size_t, 3> extents{1, 1, 1};    ///< fixed
+    std::string                path;                ///< from_output_*: an output, in the declaring System's namespace
+};
+
+namespace alias {
+/// The alias has this shape (its rank is the number of extents).
+inline AliasShape fixed(std::size_t e0) {
+    AliasShape s;
+    s.rank = 1;
+    s.extents = {e0, 1, 1};
+    return s;
+}
+inline AliasShape fixed(std::size_t e0, std::size_t e1) {
+    AliasShape s;
+    s.rank = 2;
+    s.extents = {e0, e1, 1};
+    return s;
+}
+inline AliasShape fixed(std::size_t e0, std::size_t e1, std::size_t e2) {
+    AliasShape s;
+    s.rank = 3;
+    s.extents = {e0, e1, e2};
+    return s;
+}
+/// tie_inputs only: the shape of whatever output is connected into the alias.
+inline AliasShape from_connection() {
+    AliasShape s;
+    s.kind = AliasShape::Kind::from_connection;
+    return s;
+}
+/// The shape of an upstream output (it must have the alias's rank).
+inline AliasShape from_output_shape(std::string_view path) {
+    AliasShape s;
+    s.kind = AliasShape::Kind::from_output_shape;
+    s.path = std::string{path};
+    return s;
+}
+/// The extents are the VALUES of elements 0..Rank-1 of an upstream output of integer dtype.
+inline AliasShape from_output_values(std::string_view path) {
+    AliasShape s;
+    s.kind = AliasShape::Kind::from_output_values;
+    s.path = std::string{path};
+    return s;
+}
+}  // namespace alias
+
 // -----------------------------------------------------------------------------
 // Views, slices and marks
 // -----------------------------------------------------------------------------
@@ -177,7 +235,8 @@ namespace detail {
 
 /// Per-dimension storage form of a declared DimSpec.
 struct DimRecord {
-    enum class How : uint8_t { fixed, from_source_dim, from_input_dim, from_input };
+    /// from_root: the entry's shape is its root's shape (cs::tied, D139 part 2).
+    enum class How : uint8_t { fixed, from_source_dim, from_input_dim, from_input, from_root };
     How         how = How::fixed;
     std::size_t extent = 0;  ///< fixed: declared; derived: last resolved (0 = unknown)
     std::string input;       ///< from_input_*: sibling input name (owned)
@@ -221,6 +280,14 @@ std::array<DimRecord, Rank> expand_from_input_array(const FromInputArray& m) {
     return a;
 }
 
+/// cs::tied against a member's Rank.
+template <int Rank>
+std::array<DimRecord, Rank> tied_dims() {
+    std::array<DimRecord, Rank> a{};
+    for (int d = 0; d < Rank; ++d) a[d].how = DimRecord::How::from_root;
+    return a;
+}
+
 /// Row-major strides of a 1-padded extents triple. For a rank-R entry the
 /// first R strides are exactly rank-R row-major strides.
 constexpr std::array<std::size_t, 3> contiguous_strides(const std::array<std::size_t, 3>& e) {
@@ -256,13 +323,20 @@ public:
     int              rank() const noexcept { return rank_; }    ///< AUTHORITATIVE (§3.1)
 
     // ---- shape -------------------------------------------------------------
-    sycl::range<3> extents() const { return sycl::range<3>{extents_[0], extents_[1], extents_[2]}; }
+    /// A promoted alias mirrors its member: its shape is read live from it (D139 part 2).
+    sycl::range<3> extents() const {
+        const auto& e = shape_ref();
+        return sycl::range<3>{e[0], e[1], e[2]};
+    }
     /// Element step in the OWNING allocation (a sliced peer reports its root's).
     sycl::range<3> stride() const {
         const Geometry g = geometry();
         return sycl::range<3>{g.stride[0], g.stride[1], g.stride[2]};
     }
-    std::size_t flat_size() const noexcept { return extents_[0] * extents_[1] * extents_[2]; }
+    std::size_t flat_size() const noexcept {
+        const auto& e = shape_ref();
+        return e[0] * e[1] * e[2];
+    }
     const DimRecord& dim(int d) const {
         if (d < 0 || d >= rank_) throw std::out_of_range("naga::cospan: dim index >= rank");
         return dims_[static_cast<std::size_t>(d)];
@@ -272,10 +346,23 @@ public:
             if (r.how != DimRecord::How::fixed) return true;
         return false;
     }
+    /// Declared with cs::tied: every dimension is "from the root" (a promotion of such an entry
+    /// carries its dims, so it is rank-only too).
+    bool is_rank_only() const noexcept {
+        for (const DimRecord& r : dims_)
+            if (r.how != DimRecord::How::from_root) return false;
+        return !dims_.empty();
+    }
+    /// The tie alias this entry was tied into (members, and their promotions); null if untied.
+    const IOEntry* tie_alias() const noexcept { return tie_alias_; }
+    /// A tie alias: how its shape is made, and the upstream output a from_output_* shape reads.
+    const std::optional<AliasShape>& alias_shape() const noexcept { return alias_shape_; }
+    const IOEntry*                   alias_source() const noexcept { return alias_src_; }
 
     /// The wrapper geometry of this entry: whole-root contiguous, or, for a
     /// peer with a view, the view's extents over the root's strides.
     Geometry geometry() const {
+        if (mirror_of_ != nullptr) return mirror_of_->geometry();  // a promotion shows its member's geometry, live
         Geometry g;
         if (view_) {
             const IOEntry* r = root_;
@@ -493,6 +580,11 @@ protected:
         placements_.insert(placements_.begin(), p);
     }
 
+    /// The extents this entry reports: its own, or (a promotion) its member's, live.
+    const std::array<std::size_t, 3>& shape_ref() const noexcept {
+        return mirror_of_ != nullptr ? mirror_of_->shape_ref() : extents_;
+    }
+
     std::array<std::size_t, 3> extents_{1, 1, 1};  ///< 1-padded
     std::vector<DimRecord>     dims_;
     std::vector<Placement>     placements_;        ///< roots; primary first
@@ -539,6 +631,14 @@ private:
 
     std::optional<MarkRecord> design_var_, constraint_, objective_;
 
+    // ---- D139 part 2: ties own the shape; promotions mirror ----
+    const IOEntry*            mirror_of_ = nullptr;  ///< a promoted alias: the entry it was made from
+    IOEntry*                  tie_alias_ = nullptr;  ///< members of a tie (and their set): the tie alias
+    std::optional<AliasShape> alias_shape_;          ///< a tie alias: where its shape comes from
+    IOEntry*                  alias_src_ = nullptr;  ///< a tie alias: the upstream output of a from_output_* shape
+    std::vector<IOEntry*>     tie_members_;          ///< a tie alias: the member entries, as given
+    bool                      alias_checked_ = false;  ///< a connected tie_inputs alias: its AliasShape was checked
+
     /// An initial value declared on THIS entry (ComponentBase::init_input / System::init_input),
     /// with the depth of the declaring subsystem (root System = 0). resolve() picks, per root,
     /// the declaration of the smallest depth.
@@ -570,6 +670,7 @@ public:
             switch (r.how) {
                 case DimRecord::How::fixed: break;
                 case DimRecord::How::from_source_dim: r.extent = source_extent(r.dim); break;
+                case DimRecord::How::from_root: r.extent = root_extent(static_cast<uint8_t>(d)); break;
                 case DimRecord::How::from_input_dim:
                 case DimRecord::How::from_input: break;  // resolved by the Component
             }
@@ -584,9 +685,6 @@ public:
                 throw std::invalid_argument("naga::cospan: '" + std::string{name()} +
                                             "': extents past the rank must be 1");
         extents_ = {r[0], r[1], r[2]};
-        // A value-driven tied OUTPUT resolves its extents on the member; the dynamic alias root follows.
-        if (!is_root() && kind() == IOKind::output && root()->is_dynamic() && root()->extents() != r)
-            root()->reshape(r);
         if (is_root()) {
             // Growing reallocates and frees the old storage synchronously (D135): wait the stream's kernels first.
             if (!slots_.empty() && flat_size() > slots_.front()->data.capacity())
@@ -715,6 +813,16 @@ private:
         Slot* s = find_slot(placements_.front());
         if (s == nullptr) throw no_data();
         return *s;
+    }
+
+    /// A tied entry's dimension d: its root's (or, under a view, the view's) extent. The root of a
+    /// tied entry is a tie alias (or the output a tie_inputs alias is connected to), whose shape
+    /// the root's owner resolved before this entry's Component runs.
+    std::size_t root_extent(uint8_t d) const {
+        if (is_root())
+            throw std::logic_error("naga::cospan: '" + full_path() + "' is tied (cs::tied) but is not in a tie");
+        if (const auto v = view()) return v->extents[d];
+        return root()->extents()[d];
     }
 
     std::size_t source_extent(uint8_t d) const {

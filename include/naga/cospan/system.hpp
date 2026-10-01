@@ -220,22 +220,33 @@ public:
     }
 
     /// Kind-agnostic and always allowed: a PEER alias in this namespace with a
-    /// snapshot of its root's flags; copies the promoted entry's view.
+    /// snapshot of its root's flags; copies the promoted entry's view. DT must match the
+    /// entry's value dtype and Rank its rank (a setup error otherwise). The alias MIRRORS the
+    /// entry: its shape is read live from it (D139 part 2).
+    template <DType DT, int Rank>
     void promote(std::string_view child_path, std::string promoted_name) {
+        static_assert(Rank >= 1 && Rank <= 3, "cospan: rank is 1..3");
         require_declaring("promote");
         check_new_name(promoted_name, "alias");
         detail::IOEntry& e = entry_at(child_path);
+        check_typed<DT, Rank>(e, "promote", child_path);
         detail::IOEntry& r = *e.root();
-        auto a = detail::make_alias_entry(e.dtype(), promoted_name, r.kind(), inert_dims(e),
-                                          r.can_be_source(), r.can_be_target());
-        a->view_     = e.view();
-        a->declarer_ = this;
+        auto a = detail::make_alias_entry(DT, promoted_name, r.kind(), promoted_dims(e), r.can_be_source(),
+                                          r.can_be_target());
+        a->view_      = e.view();
+        a->declarer_  = this;
+        a->mirror_of_ = &e;
         detail::IOEntry::merge(r, *a);
         register_alias(std::move(a));
     }
 
-    /// A NEW ROOT (target, not source); every member's set merges into it.
-    void tie_inputs(std::initializer_list<std::string_view> members, std::string name) {
+    /// A NEW ROOT (target, not source); every member's set merges into it. The members are
+    /// rank-only (cs::tied) entries of dtype DT and rank Rank; the alias OWNS the shape: its
+    /// `shape` (cs::alias::fixed / from_connection / from_output_shape / from_output_values) is
+    /// the root's shape, or, once an output is connected into the alias, that output's (D139 part 2).
+    template <DType DT, int Rank>
+    void tie_inputs(std::initializer_list<std::string_view> members, std::string name, AliasShape shape) {
+        static_assert(Rank >= 1 && Rank <= 3, "cospan: rank is 1..3");
         require_declaring("tie_inputs");
         check_new_name(name, "alias");
         const auto ms = resolve_members(members, "tie_inputs");
@@ -250,16 +261,11 @@ public:
             if (!m->can_be_target())
                 fail("tie_inputs", "'" + std::string{path} + "' is already tied: connect through its tie alias");
         }
-        check_same_dtype(ms, "tie_inputs");
-        const detail::IOEntry& shape = shape_source(ms, "tie_inputs");
-        auto a = detail::make_alias_entry(shape.dtype(), name, IOKind::input, shape_dims(shape),
+        check_tie_members<DT, Rank>(ms, "tie_inputs");
+        detail::IOEntry* upstream = check_alias_shape<Rank>(shape, "tie_inputs", /*is_input=*/true);
+        auto a = detail::make_alias_entry(DT, name, IOKind::input, alias_dims<Rank>(shape),
                                           /*can_source=*/false, /*can_target=*/true);
-        a->declarer_ = this;
-        detail::IOEntry& aref = *a;
-        for (const auto& [path, m] : ms) {
-            (void)path;
-            if (m->root() != &aref) detail::IOEntry::merge(aref, *m->root());
-        }
+        finish_tie(*a, std::move(shape), upstream, ms);
         for (const auto& [path, m] : ms) {  // THE EXCEPTION (§4.3): visible at every use site
             (void)path;
             m->can_be_target_ = false;
@@ -267,9 +273,13 @@ public:
         register_alias(std::move(a));
     }
 
-    /// A NEW ROOT (source, not target); atomic member dtypes unless allow_plain.
-    void tie_outputs(std::initializer_list<std::string_view> members, std::string name,
+    /// A NEW ROOT (source, not target); atomic member dtypes unless allow_plain. The members are
+    /// rank-only (cs::tied) outputs of dtype DT and rank Rank; the alias owns the shape (an output
+    /// alias defines the shape of its connections, so alias::from_connection is an error).
+    template <DType DT, int Rank>
+    void tie_outputs(std::initializer_list<std::string_view> members, std::string name, AliasShape shape,
                      TieOutputsPolicy policy = TieOutputsPolicy::require_atomic) {
+        static_assert(Rank >= 1 && Rank <= 3, "cospan: rank is 1..3");
         require_declaring("tie_outputs");
         check_new_name(name, "alias");
         const auto ms = resolve_members(members, "tie_outputs");
@@ -289,17 +299,11 @@ public:
                                         "' is not atomic (require_atomic; pass allow_plain to assert the "
                                         "producers do not race)");
         }
-        check_same_dtype(ms, "tie_outputs");
-        const detail::IOEntry& shape = shape_source(ms, "tie_outputs", /*allow_dynamic=*/true);
-        auto a = detail::make_alias_entry(shape.dtype(), name, IOKind::output,
-                                          shape.is_dynamic() ? inert_dims(shape) : shape_dims(shape),
+        check_tie_members<DT, Rank>(ms, "tie_outputs");
+        detail::IOEntry* upstream = check_alias_shape<Rank>(shape, "tie_outputs", /*is_input=*/false);
+        auto a = detail::make_alias_entry(DT, name, IOKind::output, alias_dims<Rank>(shape),
                                           /*can_source=*/true, /*can_target=*/false);
-        a->declarer_ = this;
-        detail::IOEntry& aref = *a;
-        for (const auto& [path, m] : ms) {
-            (void)path;
-            if (m->root() != &aref) detail::IOEntry::merge(aref, *m->root());
-        }
+        finish_tie(*a, std::move(shape), upstream, ms);
         for (const auto& [path, m] : ms) {
             (void)path;
             m->can_be_source_ = false;
@@ -556,6 +560,7 @@ public:
                                             "'); a marked root must outlive a forward");
             resolve_init(*r);
         }
+        check_ties(comps);  // D139 part 2: rank-only entries are tied; alias shape sources are ordered
     }
 
 private:
@@ -822,35 +827,111 @@ private:
         aliases_.emplace(std::string{p->name()}, std::move(a));
     }
 
-    // ---- alias shape ---------------------------------------------------------------------
-    /// A promotion's dims: fixed dims kept, derived dims become inert markers
-    /// (System resolves no shapes); the alias exists for naming and marks.
-    static std::vector<detail::DimRecord> inert_dims(const detail::IOEntry& e) {
+    // ---- alias shape (D139 part 2) ---------------------------------------------------------
+    using Members = std::vector<std::pair<std::string_view, detail::IOEntry*>>;
+
+    /// A promotion's dims. Its shape is read live from the entry (it mirrors it), so the dims are
+    /// only classification: fixed and from_root kept (rank-only stays rank-only), derived ones
+    /// become inert markers.
+    static std::vector<detail::DimRecord> promoted_dims(const detail::IOEntry& e) {
         std::vector<detail::DimRecord> out;
         for (int d = 0; d < e.rank(); ++d) {
             detail::DimRecord r = e.dim(d);
-            if (r.how != detail::DimRecord::How::fixed) {
-                r.how = detail::DimRecord::How::from_input;
+            if (r.how != detail::DimRecord::How::fixed && r.how != detail::DimRecord::How::from_root) {
+                r.how         = detail::DimRecord::How::from_input;
                 r.input.clear();
                 r.dim         = 0;
                 r.value_index = 0;
-                r.extent      = e.extents()[static_cast<std::size_t>(d)];
             }
             out.push_back(std::move(r));
         }
         return out;
     }
 
-    static std::vector<detail::DimRecord> shape_dims(const detail::IOEntry& e) {
-        std::vector<detail::DimRecord> out;
-        for (int d = 0; d < e.rank(); ++d) out.push_back(e.dim(d));
+    /// A tie alias's dims: fixed extents for alias::fixed, placeholders (resolved by the root's
+    /// owner, extent 0 until then) for the others.
+    template <int Rank>
+    static std::vector<detail::DimRecord> alias_dims(const AliasShape& s) {
+        std::vector<detail::DimRecord> out(static_cast<std::size_t>(Rank));
+        for (int d = 0; d < Rank; ++d) {
+            detail::DimRecord& r = out[static_cast<std::size_t>(d)];
+            if (s.kind == AliasShape::Kind::fixed) {
+                r.how    = detail::DimRecord::How::fixed;
+                r.extent = s.extents[static_cast<std::size_t>(d)];
+            } else {
+                r.how = detail::DimRecord::How::from_input;
+            }
+        }
         return out;
     }
 
-    using Members = std::vector<std::pair<std::string_view, detail::IOEntry*>>;
+    template <DType DT, int Rank>
+    void check_typed(const detail::IOEntry& e, const char* what, std::string_view path) const {
+        if (!dtype_compatible(e.dtype(), DT))
+            fail(what, "'" + std::string{path} + "' has a different dtype than the alias (the alias is declared <DType " +
+                           std::to_string(static_cast<int>(DT)) + ", " + std::to_string(Rank) + ">)");
+        if (e.rank() != Rank)
+            fail(what, "'" + std::string{path} + "' has rank " + std::to_string(e.rank()) + " but the alias is declared rank " +
+                           std::to_string(Rank));
+    }
+
+    /// Every member is of dtype DT and rank Rank, and rank-only (declared cs::tied).
+    template <DType DT, int Rank>
+    void check_tie_members(const Members& ms, const char* what) const {
+        for (const auto& [path, m] : ms) {
+            check_typed<DT, Rank>(*m, what, path);
+            if (!m->is_rank_only())
+                fail(what, "'" + std::string{path} + "' declares a shape; a tie member is rank-only (declare it with cs::tied) "
+                           "because the tie alias owns the shape");
+        }
+    }
+
+    /// Validates an AliasShape against the alias's Rank; returns the upstream output a
+    /// from_output_* shape reads (null for the others).
+    template <int Rank>
+    detail::IOEntry* check_alias_shape(const AliasShape& s, const char* what, bool is_input) {
+        switch (s.kind) {
+            case AliasShape::Kind::fixed:
+                if (s.rank != Rank)
+                    fail(what, "alias::fixed gives " + std::to_string(s.rank) + " extents but the alias is rank " +
+                                   std::to_string(Rank));
+                return nullptr;
+            case AliasShape::Kind::from_connection:
+                if (!is_input)
+                    fail(what, "an output alias defines the shape of its connections; alias::from_connection is for tie_inputs");
+                return nullptr;
+            case AliasShape::Kind::from_output_shape:
+            case AliasShape::Kind::from_output_values: {
+                detail::IOEntry& up = entry_at(s.path);
+                if (up.kind() != IOKind::output || !up.can_be_source() || !up.root()->can_be_source())
+                    fail(what, "the alias shape names '" + s.path + "', which is not an output that can be a source");
+                if (s.kind == AliasShape::Kind::from_output_shape && up.rank() != Rank)
+                    fail(what, "alias::from_output_shape('" + s.path + "') names an output of rank " +
+                                   std::to_string(up.rank()) + " but the alias is rank " + std::to_string(Rank));
+                if (s.kind == AliasShape::Kind::from_output_values && !detail::is_integer_dtype(up.dtype()))
+                    fail(what, "alias::from_output_values('" + s.path + "') names an output that is not of integer dtype");
+                return &up;
+            }
+        }
+        return nullptr;
+    }
+
+    /// Records the tie on the alias, merges the members' sets into it, and marks every entry of
+    /// the merged set as tied (resolve() requires each rank-only entry to be in a tie's set).
+    void finish_tie(detail::IOEntry& a, AliasShape shape, detail::IOEntry* upstream, const Members& ms) {
+        a.declarer_    = this;
+        a.alias_shape_ = std::move(shape);
+        a.alias_src_   = upstream;
+        for (const auto& [path, m] : ms) {
+            (void)path;
+            a.tie_members_.push_back(m);
+            if (m->root() != &a) detail::IOEntry::merge(a, *m->root());
+        }
+        for (detail::IOEntry* p : a.peers_) p->tie_alias_ = &a;
+    }
 
     Members resolve_members(std::initializer_list<std::string_view> members, const char* what) {
-        if (members.size() == 0) fail(what, "no members");
+        if (members.size() < 2) fail(what, "a tie needs two or more members; use promote for one");
         Members out;
         for (const std::string_view m : members) {
             detail::IOEntry* e = &entry_at(m);
@@ -861,25 +942,80 @@ private:
         return out;
     }
 
-    void check_same_dtype(const Members& ms, const char* what) const {
-        for (const auto& [path, m] : ms)
-            if (!dtype_compatible(m->dtype(), ms.front().second->dtype()))
-                fail(what, "'" + std::string{path} + "' has a different value dtype than '" +
-                               std::string{ms.front().first} + "'");
+    // ---- ties, checked once at the end of setup (D139 part 2) ------------------------------
+    void collect_aliases(std::vector<detail::IOEntry*>& out) {
+        for (detail::IOEntry* a : alias_order_) out.push_back(a);
+        for (Subsystem* c : child_ptrs_)
+            if (auto* s = dynamic_cast<System*>(c)) s->collect_aliases(out);
     }
 
-    /// A tie alias is a root: it needs a fixed shape from some member (or that
-    /// member's root); its dims are that member's.
-    const detail::IOEntry& shape_source(const Members& ms, const char* what, bool allow_dynamic = false) const {
-        for (const auto& [path, m] : ms) {
-            (void)path;
-            if (!m->is_dynamic()) return *m;
-            if (!m->root()->is_dynamic()) return *m->root();
+    /// Every rank-only entry is in a tie's set; a from_connection alias is connected; a
+    /// from_output_* alias reads an output whose producer runs BEFORE the tie's first member.
+    void check_ties(const std::vector<ComponentBase*>& comps) {
+        for (ComponentBase* c : comps)
+            for (detail::IOEntry* e : c->order_) {
+                if (!e->is_rank_only()) continue;
+                const detail::IOEntry* r    = e->root();
+                bool                   tied = r->tie_alias_ != nullptr;
+                for (const detail::IOEntry* p : r->peers_) tied = tied || p->tie_alias_ != nullptr;
+                if (!tied)
+                    throw std::invalid_argument("naga::cospan: '" + e->full_path() +
+                                                "' is rank-only (cs::tied) but is not a member of a tie "
+                                                "(tie_inputs / tie_outputs, directly or through promotions): "
+                                                "only a tie alias can give it a shape");
+            }
+
+        std::unordered_map<const Subsystem*, std::size_t> index;
+        for (std::size_t i = 0; i < comps.size(); ++i) index.emplace(comps[i], i);
+        std::vector<detail::IOEntry*> aliases;
+        collect_aliases(aliases);
+        for (detail::IOEntry* a : aliases) {
+            if (!a->alias_shape_) continue;
+            const AliasShape& s = *a->alias_shape_;
+            if (s.kind == AliasShape::Kind::from_connection && a->is_root())
+                throw std::invalid_argument("naga::cospan: tie alias '" + a->full_path() +
+                                            "' takes its shape from a connection (alias::from_connection) but nothing is "
+                                            "connected to it");
+            if (s.kind != AliasShape::Kind::from_output_shape && s.kind != AliasShape::Kind::from_output_values) continue;
+
+            // The tie's owner: the first member to run (members seen through their promotions).
+            std::size_t      first = comps.size();
+            std::string      first_path;
+            for (const detail::IOEntry* m : a->tie_members_) {
+                while (m->mirror_of_ != nullptr) m = m->mirror_of_;
+                const auto it = index.find(m->declarer());
+                if (it != index.end() && it->second < first) {
+                    first      = it->second;
+                    first_path = m->declarer()->path();
+                }
+            }
+            // The producer: the LAST component writing the upstream output's root.
+            const detail::IOEntry* up       = a->alias_src_;
+            const detail::IOEntry* root     = up->root();
+            bool                   found    = false;
+            std::size_t            producer = 0;
+            std::string            producer_path;
+            const auto             consider = [&](const detail::IOEntry* x) {
+                if (x->kind() != IOKind::output) return;
+                const auto it = index.find(x->declarer());
+                if (it == index.end()) return;
+                if (!found || it->second > producer) {
+                    producer      = it->second;
+                    producer_path = x->declarer()->path();
+                }
+                found = true;
+            };
+            consider(root);
+            for (const detail::IOEntry* p : root->peers_) consider(p);
+            if (!found)
+                throw std::invalid_argument("naga::cospan: tie alias '" + a->full_path() + "' takes its shape from '" +
+                                            s.path + "', which no component produces");
+            if (producer >= first)
+                throw std::invalid_argument("naga::cospan: tie alias '" + a->full_path() + "' takes its shape from '" +
+                                            s.path + "', produced by '" + producer_path +
+                                            "', which is not registered before the tie's first member ('" + first_path +
+                                            "'); the shape is read before the members run");
         }
-        // Tied OUTPUTS may all be value-driven (r01 §6.7, ZeroBins + Histogram): the alias root is
-        // dynamic too, and the members' resolved extents are propagated to it (IOEntry::reshape).
-        if (allow_dynamic) return *ms.front().second;
-        fail(what, "no member has a fixed shape; a tie alias is a root and needs one");
     }
 
     // ---- connect ---------------------------------------------------------------------------
