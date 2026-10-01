@@ -19,6 +19,7 @@ find_package(cospanmdao REQUIRED)
 find_package(Catch2 3 REQUIRED)
 
 set(COSPAN_TEST_SOURCES
+    test_chunked.cpp
     test_component.cpp
     test_flavors.cpp
     test_leading_range.cpp

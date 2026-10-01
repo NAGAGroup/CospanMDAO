@@ -1,0 +1,738 @@
+// ChunkedSystem (D140 B2). Every case builds the same subsystem twice, once as a plain System and once as
+// a ChunkedSystem, and compares the outputs bitwise; host references check both.
+//
+//   dense:   Prod [N,3] (outside) -> chunked{ A: [N,3] -> internal t [N,4]; B: t -> y [N] } -> Cons (outside)
+//   ragged:  CProd counts -> CoordGen pts [N,c_i,3] (outside) -> chunked{ S: pts -> internal ragged gram
+//            [N,c_i,c_i]; R: gram -> out [N] } -> Cons (outside)
+
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
+
+#include <sycl/sycl.hpp>
+
+#include <naga/cospan/cospan.hpp>
+
+#include "support.hpp"
+
+namespace cs = naga::cospan;
+using cs::DType;
+using cst::default_config;
+
+namespace tch {
+
+using Sizes = std::vector<std::size_t>;
+
+template <class F>
+void expect_throws(F&& f, const std::vector<std::string>& needles) {
+    std::string what = "<no exception>";
+    try {
+        f();
+    } catch (const std::exception& e) {
+        what = e.what();
+    }
+    INFO("thrown: " << what);
+    for (const auto& n : needles) CHECK_THAT(what, Catch::Matchers::ContainsSubstring(n));
+}
+
+// ---- dense components ----------------------------------------------------------------------------------
+/// Outside producer: x[i,j] = (7 i + 3 j) % 11 + 0.5, fixed [n, 3].
+struct ProdBody {
+    struct Inputs {};
+    struct Outputs {
+        cs::Output<DType::f32, 2> x;
+    };
+    void operator()(sycl::id<2> i, Inputs, Outputs o) const {
+        o.x[i] = static_cast<float>((i[0] * 7 + i[1] * 3) % 11) + 0.5f;
+    }
+};
+class Prod : public cs::Component<ProdBody> {
+    std::size_t               n_;
+    cs::Output<DType::f32, 2> x_;
+
+public:
+    explicit Prod(std::size_t n) : n_{n} {}
+    void setup() override { declare_output(x_, "x", n_, 3); }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+        return create_launch_config(x_.shape(), {}, {x_}, {});
+    }
+};
+
+/// A: t[i,k] = (in[i,0] + 2 in[i,1] + 3 in[i,2]) * (k + 1), t is [N, 4]. `in` takes its shape from its
+/// connection, or is a fixed [n, 3] free input when n_fixed > 0.
+struct ABody {
+    struct Inputs {
+        cs::Input<DType::f32, 2> in;
+    };
+    struct Outputs {
+        cs::Output<DType::f32, 2> t;
+    };
+    void operator()(sycl::id<2> i, Inputs a, Outputs o) const {
+        const float s = a.in[sycl::id<2>{i[0], 0}] + 2.0f * a.in[sycl::id<2>{i[0], 1}] + 3.0f * a.in[sycl::id<2>{i[0], 2}];
+        o.t[i]        = s * static_cast<float>(i[1] + 1);
+    }
+};
+class A : public cs::Component<ABody> {
+    std::size_t               n_fixed_;
+    cs::Input<DType::f32, 2>  in_;
+    cs::Output<DType::f32, 2> t_;
+
+public:
+    explicit A(std::size_t n_fixed = 0) : n_fixed_{n_fixed} {}
+    void setup() override {
+        if (n_fixed_ > 0)
+            declare_input(in_, "in", n_fixed_, 3);
+        else
+            declare_input(in_, "in", cs::FromSourceDim{0}, cs::FromSourceDim{1});
+        declare_output(t_, "t", cs::FromInputDim{"in", 0}, 4);
+    }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+        return create_launch_config(t_.shape(), {in_}, {t_}, {});
+    }
+};
+
+/// B: y[i] = sum_k in[i,k].
+struct BBody {
+    struct Inputs {
+        cs::Input<DType::f32, 2> in;
+    };
+    struct Outputs {
+        cs::Output<DType::f32, 1> y;
+    };
+    void operator()(sycl::id<1> i, Inputs a, Outputs o) const {
+        float s = 0.0f;
+        for (std::size_t k = 0; k < a.in.shape()[1]; ++k) s += a.in[sycl::id<2>{i[0], k}];
+        o.y[i] = s;
+    }
+};
+class B : public cs::Component<BBody> {
+    cs::Input<DType::f32, 2>  in_;
+    cs::Output<DType::f32, 1> y_;
+
+public:
+    void setup() override {
+        declare_input(in_, "in", cs::FromSourceDim{0}, cs::FromSourceDim{1});
+        declare_output(y_, "y", cs::FromInputDim{"in", 0});
+    }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+        return create_launch_config(y_.shape(), {in_}, {y_}, {});
+    }
+};
+
+/// Cons (outside): out[i] = 2 in[i] + 1.
+struct ConsBody {
+    struct Inputs {
+        cs::Input<DType::f32, 1> in;
+    };
+    struct Outputs {
+        cs::Output<DType::f32, 1> out;
+    };
+    void operator()(sycl::id<1> i, Inputs a, Outputs o) const { o.out[i] = 2.0f * a.in[i] + 1.0f; }
+};
+class Cons : public cs::Component<ConsBody> {
+    cs::Input<DType::f32, 1>  in_;
+    cs::Output<DType::f32, 1> out_;
+
+public:
+    void setup() override {
+        declare_input(in_, "in", cs::FromSourceDim{0});
+        declare_output(out_, "out", cs::FromInputDim{"in", 0});
+    }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+        return create_launch_config(out_.shape(), {in_}, {out_}, {});
+    }
+};
+
+/// The same subsystem as a plain System and as a ChunkedSystem.
+void fill_dense(cs::System& s, bool promote_t) {
+    s.add_subsystem<A>("a");
+    s.add_subsystem<B>("b");
+    s.connect("a.t", "b.in");
+    if (promote_t) s.promote<DType::f32, 2>("a.t", "t");  // boundary AND used inside by b
+}
+class InnerPlain : public cs::System {
+    bool promote_t_;
+
+public:
+    InnerPlain(std::size_t /*budget*/, bool promote_t) : promote_t_{promote_t} {}
+    void setup() override { fill_dense(*this, promote_t_); }
+};
+class InnerChunk : public cs::ChunkedSystem {
+    bool promote_t_;
+
+public:
+    InnerChunk(std::size_t budget, bool promote_t) : cs::ChunkedSystem(budget), promote_t_{promote_t} {}
+    void setup() override { fill_dense(*this, promote_t_); }
+};
+
+template <class Inner>
+class DenseTop : public cs::System {
+    std::size_t n_, budget_;
+    bool        promote_t_;
+
+public:
+    DenseTop(std::size_t n, std::size_t budget, bool promote_t = false) : n_{n}, budget_{budget}, promote_t_{promote_t} {}
+    void setup() override {
+        add_subsystem<Prod>("prod", n_);
+        add_subsystem<Inner>("inner", budget_, promote_t_);
+        add_subsystem<Cons>("cons");
+        connect("prod.x", "inner.a.in");
+        connect("inner.b.y", "cons.in");
+    }
+};
+
+/// A free input of an inside component promoted out ("w"), its output promoted out ("y") and consumed outside.
+template <class Inner>
+class PromTop : public cs::System {
+    std::size_t n_, budget_;
+
+public:
+    PromTop(std::size_t n, std::size_t budget) : n_{n}, budget_{budget} {}
+    void setup() override {
+        add_subsystem<Inner>("inner", n_, budget_);
+        add_subsystem<Cons>("cons");
+        connect("inner.y", "cons.in");
+    }
+    std::size_t n() const { return n_; }
+};
+class PromInnerPlain : public cs::System {
+    std::size_t n_;
+
+public:
+    PromInnerPlain(std::size_t n, std::size_t /*budget*/) : n_{n} {}
+    void setup() override {
+        add_subsystem<A>("a", n_);
+        add_subsystem<B>("b");
+        connect("a.t", "b.in");
+        promote<DType::f32, 2>("a.in", "w");
+        promote<DType::f32, 1>("b.y", "y");
+    }
+};
+class PromInnerChunk : public cs::ChunkedSystem {
+    std::size_t n_;
+
+public:
+    PromInnerChunk(std::size_t n, std::size_t budget) : cs::ChunkedSystem(budget), n_{n} {}
+    void setup() override {
+        add_subsystem<A>("a", n_);
+        add_subsystem<B>("b");
+        connect("a.t", "b.in");
+        promote<DType::f32, 2>("a.in", "w");
+        promote<DType::f32, 1>("b.y", "y");
+    }
+};
+
+// ---- ragged components -----------------------------------------------------------------------------------
+/// CProd: counts = a free u32 input (init from the host), copied.
+struct CProdBody {
+    struct Inputs {
+        cs::Input<DType::u32, 1> raw;
+    };
+    struct Outputs {
+        cs::Output<DType::u32, 1> counts;
+    };
+    void operator()(sycl::id<1> i, Inputs a, Outputs o) const { o.counts[i] = a.raw[i]; }
+};
+class CProd : public cs::Component<CProdBody> {
+    std::vector<std::uint32_t> init_;
+    cs::Input<DType::u32, 1>   raw_;
+    cs::Output<DType::u32, 1>  counts_;
+
+public:
+    explicit CProd(std::vector<std::uint32_t> init) : init_{std::move(init)} {}
+    void setup() override {
+        declare_input(raw_, "raw", init_.size());
+        init_input("raw", cs::init::from_host(init_));
+        declare_output(counts_, "counts", init_.size());
+    }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+        return create_launch_config(counts_.shape(), {raw_}, {counts_}, {});
+    }
+};
+
+/// CoordGen: pts [N, c_i, 3], p[j,k] = 5 (i % 3) + 2 j + k + 1.
+struct CoordBody {
+    struct Inputs {
+        cs::Input<DType::u32, 1> counts;
+    };
+    struct Outputs {
+        cs::RaggedOutput<DType::f32, 3> pts;
+    };
+    void operator()(sycl::id<1> id, Inputs, Outputs o) const {
+        const std::size_t i = id[0];
+        auto              b = o.pts.block(i);
+        for (std::size_t j = 0; j < b.shape()[0]; ++j)
+            for (std::size_t k = 0; k < b.shape()[1]; ++k) b[sycl::id<2>{j, k}] = static_cast<float>(5 * (i % 3) + 2 * j + k + 1);
+    }
+};
+class CoordGen : public cs::Component<CoordBody> {
+    cs::Input<DType::u32, 1>        counts_;
+    cs::RaggedOutput<DType::f32, 3> pts_;
+
+public:
+    void setup() override {
+        declare_input(counts_, "counts", cs::FromSourceDim{0});
+        declare_output(pts_, "pts", cs::FromInputDim{"counts", 0}, cs::FromInputValues{"counts"}, 3);
+    }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+        return create_launch_config(counts_.shape(), {counts_}, {pts_}, {});
+    }
+};
+
+/// S: gram.block(i)[j,m] = sum_k p[j,k] p[m,k], an internal ragged [N, c_i, c_i].
+struct SBody {
+    struct Inputs {
+        cs::RaggedInput<DType::f32, 3> pts;
+    };
+    struct Outputs {
+        cs::RaggedOutput<DType::f32, 3> gram;
+    };
+    void operator()(sycl::id<1> id, Inputs a, Outputs o) const {
+        auto p = a.pts.block(id[0]);
+        auto g = o.gram.block(id[0]);
+        for (std::size_t j = 0; j < g.shape()[0]; ++j)
+            for (std::size_t m = 0; m < g.shape()[1]; ++m) {
+                float s = 0.0f;
+                for (std::size_t k = 0; k < p.shape()[1]; ++k) s += p[sycl::id<2>{j, k}] * p[sycl::id<2>{m, k}];
+                g[sycl::id<2>{j, m}] = s;
+            }
+    }
+};
+class S : public cs::Component<SBody> {
+    cs::RaggedInput<DType::f32, 3>  pts_;
+    cs::RaggedOutput<DType::f32, 3> gram_;
+
+public:
+    void setup() override {
+        declare_input(pts_, "pts", cs::FromSourceDim{0}, cs::FromSourceDim{1}, cs::FromSourceDim{2});
+        declare_output(gram_, "gram", cs::FromInputDim{"pts", 0}, cs::FromInputDim{"pts", 1}, cs::FromInputDim{"pts", 1});
+    }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+        return create_launch_config(sycl::range<1>{pts_.size()}, {pts_}, {gram_}, {});
+    }
+};
+
+/// R: out[i] = the sum of block i of gram.
+struct RBody {
+    struct Inputs {
+        cs::RaggedInput<DType::f32, 3> gram;
+    };
+    struct Outputs {
+        cs::Output<DType::f32, 1> out;
+    };
+    void operator()(sycl::id<1> id, Inputs a, Outputs o) const {
+        auto  g = a.gram.block(id[0]);
+        float s = 0.0f;
+        for (std::size_t q = 0; q < g.size(); ++q) s += g[q];
+        o.out[id] = s;
+    }
+};
+class R : public cs::Component<RBody> {
+    cs::RaggedInput<DType::f32, 3> gram_;
+    cs::Output<DType::f32, 1>      out_;
+
+public:
+    void setup() override {
+        declare_input(gram_, "gram", cs::FromSourceDim{0}, cs::FromSourceDim{1}, cs::FromSourceDim{2});
+        declare_output(out_, "out", cs::FromInputDim{"gram", 0});
+    }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+        return create_launch_config(out_.shape(), {gram_}, {out_}, {});
+    }
+};
+
+void fill_ragged(cs::System& s) {
+    s.add_subsystem<S>("s");
+    s.add_subsystem<R>("r");
+    s.connect("s.gram", "r.gram");
+}
+class RInnerPlain : public cs::System {
+public:
+    explicit RInnerPlain(std::size_t) {}
+    void setup() override { fill_ragged(*this); }
+};
+class RInnerChunk : public cs::ChunkedSystem {
+public:
+    explicit RInnerChunk(std::size_t budget) : cs::ChunkedSystem(budget) {}
+    void setup() override { fill_ragged(*this); }
+};
+template <class Inner>
+class RaggedTop : public cs::System {
+    std::vector<std::uint32_t> counts_;
+    std::size_t                budget_;
+
+public:
+    RaggedTop(std::vector<std::uint32_t> counts, std::size_t budget) : counts_{std::move(counts)}, budget_{budget} {}
+    void setup() override {
+        add_subsystem<CProd>("prod", counts_);
+        add_subsystem<CoordGen>("gen");
+        add_subsystem<Inner>("inner", budget_);
+        add_subsystem<Cons>("cons");
+        connect("prod.counts", "gen.counts");
+        connect("gen.pts", "inner.s.pts");
+        connect("inner.r.out", "cons.in");
+    }
+};
+
+// ---- references -------------------------------------------------------------------------------------------
+float xval(std::size_t i, std::size_t j) { return static_cast<float>((i * 7 + j * 3) % 11) + 0.5f; }
+float tval(std::size_t i, std::size_t k) {
+    return (xval(i, 0) + 2.0f * xval(i, 1) + 3.0f * xval(i, 2)) * static_cast<float>(k + 1);
+}
+float yval(std::size_t i) { return tval(i, 0) + tval(i, 1) + tval(i, 2) + tval(i, 3); }
+
+/// What the greedy scan of the framework gives for per-index costs.
+std::size_t expected_chunks(const Sizes& cost, std::size_t budget) {
+    std::size_t chunks = 0, acc = 0;
+    for (std::size_t i = 0; i < cost.size(); ++i) {
+        if (acc + cost[i] > budget) {
+            ++chunks;
+            acc = 0;
+        }
+        acc += cost[i];
+    }
+    return cost.empty() ? 0 : chunks + 1;
+}
+
+std::vector<float> forward_out(cs::Model& m, const char* path = "cons.out") {
+    m.forward();
+    m.wait();
+    auto v = m.view_output<DType::f32, 1>(path);
+    return std::vector<float>(v.span().begin(), v.span().end());
+}
+
+std::size_t chunks_of(cs::Model& m) { return dynamic_cast<cs::ChunkedSystem&>(m.get_subsystem("inner")).last_chunk_count(); }
+
+}  // namespace tch
+
+TEST_CASE("Chunked: dense, 1 / 2 / uneven / many chunks, bitwise equal to the plain System", "[chunked]") {
+    constexpr std::size_t n = 10;
+    std::vector<float>    want(n);
+    for (std::size_t i = 0; i < n; ++i) want[i] = 2.0f * tch::yval(i) + 1.0f;
+
+    cs::Model plain = cs::create_model<tch::DenseTop<tch::InnerPlain>>(default_config(), n, std::size_t{0});
+    plain.setup();
+    const auto plain_out = tch::forward_out(plain);
+    CHECK(plain_out == want);
+
+    // the cost of one index is 16 bytes (internal t [N,4] f32)
+    struct Case {
+        std::size_t budget, chunks;
+    };
+    for (const Case c : {Case{160, 1}, Case{1000, 1}, Case{80, 2}, Case{56, 4}, Case{16, 10}}) {
+        INFO("budget " << c.budget);
+        cs::Model m = cs::create_model<tch::DenseTop<tch::InnerChunk>>(default_config(), n, c.budget);
+        m.setup();
+        const auto out = tch::forward_out(m);
+        CHECK(out == plain_out);
+        CHECK(tch::chunks_of(m) == c.chunks);
+        CHECK(tch::expected_chunks(tch::Sizes(n, 16), c.budget) == c.chunks);
+        // views from the host see whole roots after the run
+        CHECK(m.view_output<DType::f32, 1>("inner.b.y").size() == n);
+        CHECK(out == want);
+    }
+}
+
+TEST_CASE("Chunked: dense, two forwards", "[chunked]") {
+    constexpr std::size_t n = 10;
+    cs::Model m = cs::create_model<tch::DenseTop<tch::InnerChunk>>(default_config(), n, std::size_t{56});
+    m.setup();
+    const auto a = tch::forward_out(m);
+    const auto b = tch::forward_out(m);
+    CHECK(a == b);
+    CHECK(tch::chunks_of(m) == 4);
+}
+
+TEST_CASE("Chunked: an inside output both promoted out and consumed by a later inside component", "[chunked]") {
+    constexpr std::size_t n = 10;
+    cs::Model plain = cs::create_model<tch::DenseTop<tch::InnerPlain>>(default_config(), n, std::size_t{0}, true);
+    plain.setup();
+    const auto pout = tch::forward_out(plain);
+    auto       pt   = plain.view_output<DType::f32, 2>("inner.t");
+
+    for (const std::size_t budget : {std::size_t{160}, std::size_t{48}, std::size_t{16}}) {
+        INFO("budget " << budget);
+        cs::Model m = cs::create_model<tch::DenseTop<tch::InnerChunk>>(default_config(), n, budget, true);
+        m.setup();
+        CHECK(tch::forward_out(m) == pout);
+        auto t = m.view_output<DType::f32, 2>("inner.t");  // the promoted name: the whole [N,4]
+        REQUIRE(t.size() == n * 4);
+        for (std::size_t i = 0; i < n; ++i)
+            for (std::size_t k = 0; k < 4; ++k) {
+                CHECK(t.span()[i * 4 + k] == tch::tval(i, k));
+                CHECK(t.span()[i * 4 + k] == pt.span()[i * 4 + k]);
+            }
+    }
+}
+
+TEST_CASE("Chunked: a free input of an inside component, promoted out and set with init_input", "[chunked]") {
+    constexpr std::size_t n = 10;
+    const auto            make_w = [&](float scale) {
+        std::vector<float> w(n * 3);
+        for (std::size_t q = 0; q < w.size(); ++q) w[q] = scale * static_cast<float>(q % 7) + 0.25f;
+        return w;
+    };
+    const auto ref = [&](const std::vector<float>& w) {
+        std::vector<float> out(n);
+        for (std::size_t i = 0; i < n; ++i)
+            out[i] = 2.0f * ((w[i * 3] + 2.0f * w[i * 3 + 1] + 3.0f * w[i * 3 + 2]) * 10.0f) + 1.0f;
+        return out;
+    };
+    cs::Model plain = cs::create_model<tch::PromTop<tch::PromInnerPlain>>(default_config(), n, std::size_t{0});
+    plain.setup();
+    cs::Model m = cs::create_model<tch::PromTop<tch::PromInnerChunk>>(default_config(), n, std::size_t{48});
+    m.setup();
+    for (const float scale : {1.0f, 3.0f}) {  // init between forwards re-applies
+        const auto w = make_w(scale);
+        plain.init_input("inner.w", cs::init::from_host(w));
+        m.init_input("inner.w", cs::init::from_host(w));
+        const auto pout = tch::forward_out(plain);
+        const auto out  = tch::forward_out(m);
+        CHECK(out == pout);
+        CHECK(out == ref(w));
+        CHECK(dynamic_cast<cs::ChunkedSystem&>(m.get_subsystem("inner")).last_chunk_count() == 4);
+        auto wv = m.view_input<DType::f32, 2>("inner.w");  // the promoted free input holds the whole value
+        REQUIRE(wv.size() == n * 3);
+        for (std::size_t q = 0; q < w.size(); ++q) CHECK(wv.span()[q] == w[q]);
+    }
+}
+
+TEST_CASE("Chunked: ragged scratch, counts with zeros, several budgets, two forwards", "[chunked]") {
+    const std::vector<std::vector<std::uint32_t>> counts_sets{{3, 0, 2, 4, 0, 1, 2, 3}, {0, 4, 4, 1, 0, 0, 2, 1}};
+    for (const auto& counts : counts_sets) {
+        const std::size_t n = counts.size();
+        // the reference: out[i] = sum_k (sum_j p[j,k])^2
+        std::vector<float> ref(n);
+        tch::Sizes         cost(n);
+        for (std::size_t i = 0; i < n; ++i) {
+            float tot = 0.0f;
+            for (std::size_t k = 0; k < 3; ++k) {
+                float cs_ = 0.0f;
+                for (std::size_t j = 0; j < counts[i]; ++j) cs_ += static_cast<float>(5 * (i % 3) + 2 * j + k + 1);
+                tot += cs_ * cs_;
+            }
+            ref[i]  = 2.0f * tot + 1.0f;
+            cost[i] = 4u * counts[i] * counts[i];
+        }
+        cs::Model plain = cs::create_model<tch::RaggedTop<tch::RInnerPlain>>(default_config(), counts, std::size_t{0});
+        plain.setup();
+        const auto pout = tch::forward_out(plain);
+        CHECK(pout == ref);
+        for (const std::size_t budget : {std::size_t{64}, std::size_t{100}, std::size_t{128}, std::size_t{1000}}) {
+            INFO("budget " << budget);
+            cs::Model m = cs::create_model<tch::RaggedTop<tch::RInnerChunk>>(default_config(), counts, budget);
+            m.setup();
+            CHECK(tch::forward_out(m) == pout);
+            CHECK(tch::chunks_of(m) == tch::expected_chunks(cost, budget));
+        }
+    }
+    // two forwards with different counts in ONE model: the chunk count changes
+    const auto&   c1 = counts_sets[0];
+    const auto&   c2 = counts_sets[1];
+    cs::Model     m  = cs::create_model<tch::RaggedTop<tch::RInnerChunk>>(default_config(), c1, std::size_t{100});
+    m.setup();
+    cs::Model     p  = cs::create_model<tch::RaggedTop<tch::RInnerPlain>>(default_config(), c1, std::size_t{0});
+    p.setup();
+    const auto    o1 = tch::forward_out(m);
+    CHECK(o1 == tch::forward_out(p));
+    const std::size_t k1 = tch::chunks_of(m);
+    m.init_input("prod.raw", cs::init::from_host(c2));
+    p.init_input("prod.raw", cs::init::from_host(c2));
+    const auto o2 = tch::forward_out(m);
+    CHECK(o2 == tch::forward_out(p));
+    CHECK(o1 != o2);
+    tch::Sizes cost2(c2.size());
+    for (std::size_t i = 0; i < c2.size(); ++i) cost2[i] = 4u * c2[i] * c2[i];
+    CHECK(tch::chunks_of(m) == tch::expected_chunks(cost2, 100));
+    CHECK(k1 != tch::chunks_of(m));
+    // N = 0 is covered by the leading-range tests; an all-zero count set is all-empty blocks
+    m.init_input("prod.raw", cs::init::from_host(std::vector<std::uint32_t>(c1.size(), 0)));
+    p.init_input("prod.raw", cs::init::from_host(std::vector<std::uint32_t>(c1.size(), 0)));
+    CHECK(tch::forward_out(m) == tch::forward_out(p));
+    CHECK(tch::chunks_of(m) == 1);
+}
+
+TEST_CASE("Chunked: memory after the forward is the durable roots only", "[chunked][memory]") {
+    constexpr std::size_t n = 256;  // t is 16 B per row: 4 KiB internal
+    cs::Model plain = cs::create_model<tch::DenseTop<tch::InnerPlain>>(cst::pooled_config(), n, std::size_t{0});
+    plain.setup();
+    const std::size_t base = cst::pool_in_use(plain);
+    tch::forward_out(plain);
+    const std::size_t plain_after = cst::pool_in_use(plain);
+
+    cs::Model m = cs::create_model<tch::DenseTop<tch::InnerChunk>>(cst::pooled_config(), n, std::size_t{16 * 32});
+    m.setup();
+    tch::forward_out(m);
+    const std::size_t after1 = cst::pool_in_use(m);
+    tch::forward_out(m);
+    const std::size_t after2 = cst::pool_in_use(m);
+    CHECK(tch::chunks_of(m) == 8);
+    CHECK(after1 == after2);          // nothing accumulates across forwards
+    CHECK(after1 < plain_after);      // the internal roots are gone
+    CHECK(plain_after - after1 >= n * 16);  // by at least the bytes of the internal port
+    CHECK(after1 >= base);
+}
+
+// ---- errors ----------------------------------------------------------------------------------------------------------
+namespace tch {
+
+struct GenFixedBody {
+    struct Inputs {};
+    struct Outputs {
+        cs::Output<DType::f32, 1> out;
+    };
+    void operator()(sycl::id<1> i, Inputs, Outputs o) const { o.out[i] = 1.0f; }
+};
+class GenFixed : public cs::Component<GenFixedBody> {
+    std::size_t               n_;
+    cs::Output<DType::f32, 1> out_;
+
+public:
+    explicit GenFixed(std::size_t n) : n_{n} {}
+    void setup() override { declare_output(out_, "out", n_); }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+        return create_launch_config(out_.shape(), {}, {out_}, {});
+    }
+};
+
+/// An inside entry with another leading length.
+class OddInner : public cs::ChunkedSystem {
+public:
+    explicit OddInner(std::size_t budget) : cs::ChunkedSystem(budget) {}
+    void setup() override {
+        add_subsystem<A>("a");
+        add_subsystem<B>("b");
+        add_subsystem<GenFixed>("g", std::size_t{13});
+        connect("a.t", "b.in");
+    }
+};
+class OddTop : public cs::System {
+public:
+    void setup() override {
+        add_subsystem<Prod>("prod", std::size_t{8});
+        add_subsystem<OddInner>("inner", std::size_t{1000});
+        add_subsystem<Cons>("cons");
+        connect("prod.x", "inner.a.in");
+        connect("inner.b.y", "cons.in");
+    }
+};
+
+/// Two boundary roots of different N.
+class TwoNInner : public cs::ChunkedSystem {
+public:
+    explicit TwoNInner(std::size_t budget) : cs::ChunkedSystem(budget) {}
+    void setup() override {
+        add_subsystem<A>("a");
+        add_subsystem<A>("a2");
+    }
+};
+class TwoNTop : public cs::System {
+public:
+    void setup() override {
+        add_subsystem<Prod>("p1", std::size_t{8});
+        add_subsystem<Prod>("p2", std::size_t{6});
+        add_subsystem<TwoNInner>("inner", std::size_t{1000});
+        connect("p1.x", "inner.a.in");
+        connect("p2.x", "inner.a2.in");
+    }
+};
+
+/// A shape driven by a value computed inside: counts are copied inside, then size the ragged output.
+struct CopyU32Body {
+    struct Inputs {
+        cs::Input<DType::u32, 1> in;
+    };
+    struct Outputs {
+        cs::Output<DType::u32, 1> cnt;
+    };
+    void operator()(sycl::id<1> i, Inputs a, Outputs o) const { o.cnt[i] = a.in[i]; }
+};
+class CopyU32 : public cs::Component<CopyU32Body> {
+    cs::Input<DType::u32, 1>  in_;
+    cs::Output<DType::u32, 1> cnt_;
+
+public:
+    void setup() override {
+        declare_input(in_, "in", cs::FromSourceDim{0});
+        declare_output(cnt_, "cnt", cs::FromInputDim{"in", 0});
+    }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+        return create_launch_config(cnt_.shape(), {in_}, {cnt_}, {});
+    }
+};
+class ValueInner : public cs::ChunkedSystem {
+public:
+    explicit ValueInner(std::size_t budget) : cs::ChunkedSystem(budget) {}
+    void setup() override {
+        add_subsystem<CopyU32>("c");
+        add_subsystem<CoordGen>("gen");
+        connect("c.cnt", "gen.counts");
+    }
+};
+class ValueTop : public cs::System {
+public:
+    void setup() override {
+        add_subsystem<CProd>("prod", std::vector<std::uint32_t>{1, 2, 3});
+        add_subsystem<ValueInner>("inner", std::size_t{1000});
+        connect("prod.counts", "inner.c.in");
+    }
+};
+
+/// A ChunkedSystem inside a ChunkedSystem.
+class NestOuter : public cs::ChunkedSystem {
+public:
+    explicit NestOuter(std::size_t budget) : cs::ChunkedSystem(budget) {}
+    void setup() override { add_subsystem<InnerChunk>("sub", std::size_t{1000}, false); }
+};
+class NestTop : public cs::System {
+public:
+    void setup() override {
+        add_subsystem<Prod>("prod", std::size_t{8});
+        add_subsystem<NestOuter>("outer", std::size_t{1000});
+        connect("prod.x", "outer.sub.a.in");
+    }
+};
+
+}  // namespace tch
+
+TEST_CASE("Chunked: errors", "[chunked][errors]") {
+    SECTION("an inside entry with a different leading length") {
+        cs::Model m = cs::create_model<tch::OddTop>(default_config());
+        m.setup();
+        tch::expect_throws([&] { m.forward(); }, {"g.out", "leading length 13", "chunk length is 8"});
+        m.wait();
+    }
+    SECTION("a shape driven by a value computed inside") {
+        cs::Model m = cs::create_model<tch::ValueTop>(default_config());
+        m.setup();
+        tch::expect_throws([&] { m.forward(); }, {"sized by a value computed inside chunked system 'inner'"});
+        m.wait();
+    }
+    SECTION("boundary roots of different N") {
+        cs::Model m = cs::create_model<tch::TwoNTop>(default_config());
+        m.setup();
+        tch::expect_throws([&] { m.forward(); }, {"disagree", "leading length 8", "leading length 6"});
+        m.wait();
+    }
+    SECTION("one index over budget") {
+        cs::Model m = cs::create_model<tch::DenseTop<tch::InnerChunk>>(default_config(), std::size_t{10}, std::size_t{8});
+        m.setup();
+        tch::expect_throws([&] { m.forward(); }, {"index 0 needs 16 bytes", "budget of 8 bytes"});
+        m.wait();
+    }
+    SECTION("nested chunked systems") {
+        cs::Model m = cs::create_model<tch::NestTop>(default_config());
+        tch::expect_throws([&] { m.setup(); }, {"nested chunked systems are not supported"});
+    }
+    SECTION("a budget of 0") {
+        tch::expect_throws([] { cs::ChunkedSystem c{0}; }, {"budget"});
+    }
+}

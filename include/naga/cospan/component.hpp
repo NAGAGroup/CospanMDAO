@@ -230,8 +230,11 @@ public:
         }
     }
 
-    void run_pre_compute(ExecCtx& owner_ctx) override {
-        (void)owner_ctx;
+    /// Shape resolution only (D140 B2: a ChunkedSystem's full-range pass, host only, no allocation of
+    /// what it owns beyond what a FromInput read needs, and no pre_forward): the tie aliases this
+    /// Component owns, then every input, then every output.
+    void resolve_shapes() {
+        resolving_ = nullptr;
         // Tie aliases first (D139 part 2): the root's owner resolves an alias root's shape BEFORE
         // the entries below read it (and before allocation); a connected alias is checked once.
         resolve_alias_shapes();
@@ -241,6 +244,12 @@ public:
             if (e->kind() == IOKind::input) resolve(*e, done, active);
         for (detail::IOEntry* e : order_)
             if (e->kind() == IOKind::output) resolve(*e, done, active);
+        resolving_ = nullptr;
+    }
+
+    void run_pre_compute(ExecCtx& owner_ctx) override {
+        (void)owner_ctx;
+        resolve_shapes();
         {
             detail::FlagScope scope{in_pre_forward_};
             pre_forward();
@@ -322,6 +331,7 @@ private:
     /// System resolves paths into a Component's namespace and walks its
     /// entries (transient marking); nothing else reaches these.
     friend class System;
+    friend class ChunkedSystem;
 
     detail::IOEntry* lookup_entry(std::string_view name) const {
         const auto it = by_name_.find(std::string{name});
@@ -455,6 +465,7 @@ private:
     void resolve(detail::IOEntry& e, std::unordered_set<const detail::IOEntry*>& done,
                  std::unordered_set<const detail::IOEntry*>& active) {
         if (done.contains(&e)) return;
+        resolving_ = &e;
         if (!active.insert(&e).second)
             throw std::logic_error("naga::cospan: " + describe() + ": shape derivation cycle through '" +
                                    std::string{e.name()} + "'");
@@ -475,13 +486,15 @@ private:
             } else if (r.how == detail::DimRecord::How::per_index_from_input) {
                 detail::IOEntry& src = sibling_input(e, r.input);
                 resolve(src, done, active);
+                resolving_  = &e;
                 r.per_index = read_values(src, r.value_index);
                 r.per       = true;
                 r.extent    = 0;
             } else if (r.how == detail::DimRecord::How::from_input) {
                 detail::IOEntry& src = sibling_input(e, r.input);
                 resolve(src, done, active);
-                r.extent = read_value(src, r.value_index);
+                resolving_ = &e;
+                r.extent   = read_value(src, r.value_index);
             }
         }
         e.update_shape();
@@ -547,6 +560,7 @@ private:
     /// The VALUES of an integer-dtype input of rank 1 [N] (column 0) or rank 2 [N, k] (column < k),
     /// on the host: one per row (D140, FromInputValues). Negative values are an error.
     std::vector<std::size_t> read_values(detail::IOEntry& src, std::size_t column) {
+        check_not_chunk_internal(src);
         if (!detail::is_integer_dtype(src.dtype()))
             throw std::invalid_argument("naga::cospan: '" + std::string{src.name()} +
                                         "' drives per-index extents by value and must have an integer dtype");
@@ -577,8 +591,27 @@ private:
         return out;
     }
 
+    /// D140 B2: during a ChunkedSystem's full-range pass a shape may not be driven by a value of a root
+    /// that is internal to the chunked system (it would be computed per chunk).
+    void check_not_chunk_internal(const detail::IOEntry& src) const {
+        if (!chunk_pass_) return;
+        // INTERNAL roots, and the re-rooted OUTPUT roots (an inside output promoted or consumed outside):
+        // both are computed per chunk.
+        const detail::IOEntry& root = *src.root();
+        std::string            by{root.chunk_internal_by_};
+        if (by.empty() && root.chunk_rerooted_ && root.kind() == IOKind::output)
+            by = root.declarer() != nullptr ? root.declarer()->path() : std::string{"?"};
+        if (by.empty()) return;
+        const std::string who = resolving_ != nullptr ? std::string{resolving_->name()} : std::string{src.name()};
+        throw std::invalid_argument("naga::cospan: '" + who + "' is sized by a value computed inside chunked system '" +
+                                    by +
+                                    "' (the value of '" + std::string{src.name()} +
+                                    "'); chunked sizes must come from outside");
+    }
+
     /// The VALUE of element `index` of an integer-dtype input, on the host.
     std::size_t read_value(detail::IOEntry& src, std::size_t index) {
+        check_not_chunk_internal(src);
         if (!detail::is_integer_dtype(src.dtype()))
             throw std::invalid_argument("naga::cospan: '" + std::string{src.name()} +
                                         "' drives a shape by value and must have an integer dtype");
@@ -609,6 +642,8 @@ private:
 
     bool declaring_       = false;
     bool in_pre_forward_  = false;
+    bool chunk_pass_      = false;                       ///< a ChunkedSystem's full-range pass is running (D140 B2)
+    const detail::IOEntry* resolving_ = nullptr;         ///< the entry resolve() is working on
 };
 
 // -----------------------------------------------------------------------------

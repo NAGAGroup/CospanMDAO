@@ -44,6 +44,7 @@ namespace naga::cospan {
 namespace sk = ::naga::slabkit;
 
 class System;
+class ChunkedSystem;
 class ComponentBase;
 class Model;
 class Subsystem;
@@ -540,6 +541,8 @@ public:
         if (r.io_kind_ == IOKind::input) r.init_pending_ = true;
         return true;
     }
+    /// D140 B2: the path of the ChunkedSystem this root is internal to; empty otherwise.
+    std::string_view chunk_internal_by() const noexcept { return root_->chunk_internal_by_; }
     /// The Subsystem that registered this entry (a Component for I/O, a System for aliases).
     const Subsystem* declarer() const noexcept { return declarer_; }
 
@@ -714,6 +717,7 @@ private:
     friend class naga::cospan::ComponentBase;
     friend struct EntryAccess;
     friend struct LeadingRangeAccess;
+    friend class naga::cospan::ChunkedSystem;
 
     /// D140 B1, framework only (through LeadingRangeAccess). A NON-root input peer sees rows / blocks
     /// [a, b) of its root along dim 0. Dense root: its view becomes the SubarrayRef with dim-0 offset a
@@ -722,8 +726,8 @@ private:
     /// the root's [a, b) slice, and point_ragged shifts the device pointers by a. Re-runs the peer's shape
     /// update and validate_connection and re-points its wrapper, so the next forward uses the range.
     void set_leading_range(std::size_t a, std::size_t b) {
-        if (is_root() || mirror_of_ != nullptr || io_kind_ != IOKind::input)
-            throw std::logic_error("naga::cospan: '" + name_ + "': a leading range is set on a connected input (a non-root peer)");
+        if (is_root() || mirror_of_ != nullptr)
+            throw std::logic_error("naga::cospan: '" + name_ + "': a leading range is set on a connected input (or an output peer of a root at a chunked system's level), not on a root");
         const IOEntry&                    r    = *root_;
         const std::optional<SubarrayRef>& base = lead_ ? pre_lead_view_ : view_;
         if (rank_ != r.rank_)
@@ -766,9 +770,34 @@ private:
         refresh_after_range();
     }
     void refresh_after_range() {
-        update_shape();
-        validate_connection();
+        if (io_kind_ == IOKind::input) {
+            update_shape();
+            validate_connection();
+        }  // an output peer's shape is its component's to resolve (from its inputs) at the next forward
         if (root_->present_) point_wrapper();
+    }
+
+    /// ChunkedSystem (D140 B2), on an alias ROOT at its level: take the full resolved shape of `m`, the
+    /// inside entry that used to be the root (dense: its extents; ragged: N and the per-index arrays),
+    /// and apply it (resizing storage when present). The alias dims are inert markers (how from_input),
+    /// so the root is dynamic.
+    void adopt_shape(const IOEntry& m) {
+        if (!is_root() || m.rank_ != rank_)
+            throw std::logic_error("naga::cospan: '" + name_ + "': adopt_shape needs a root and a member of its rank");
+        for (std::size_t d = 0; d < static_cast<std::size_t>(rank_); ++d) {
+            DimRecord&       r = dims_[d];
+            const DimRecord& s = m.dims_[d];
+            if (d >= 1 && m.ragged_ && s.per) {
+                r.per       = true;
+                r.per_index = s.per_index;
+                r.extent    = 0;
+            } else {
+                r.per = false;
+                r.per_index.clear();
+                r.extent = m.extents_[d];
+            }
+        }
+        update_shape();
     }
 
     /// merge(into, from): `from` and its peers become peers of `into`.
@@ -825,6 +854,8 @@ private:
     bool                      init_pending_ = false;  ///< roots: the init is to be applied at the owner's next run
     const Subsystem*          last_user_ = nullptr;  ///< roots, set by System::resolve
     const Subsystem*          owner_     = nullptr;  ///< roots, set by System::resolve: the first toucher
+    bool                      chunk_rerooted_ = false;  ///< D140 B2: a root made at a ChunkedSystem's level (its owner allocates it)
+    std::string               chunk_internal_by_;       ///< D140 B2: roots internal to the named ChunkedSystem (forced transient)
     Substrates*               substrates_ = nullptr; ///< roots, bound at prepare_exec
 };
 
@@ -860,7 +891,10 @@ public:
                 case DimRecord::How::per_index_host:    // fixed at declaration
                 case DimRecord::How::per_index_from_input: break;  // resolved by the Component
             }
-            next[static_cast<std::size_t>(d)] = (d >= 1 && r.per) ? 0 : r.extent;
+            // Under a runtime leading range (D140 B1/B2) the peer's dim 0 IS the range length, whatever rule
+            // declared it (a fixed-N port of a chunked system follows its chunk).
+            next[static_cast<std::size_t>(d)] =
+                (d >= 1 && r.per) ? 0 : ((d == 0 && leading_range()) ? leading_range()->second - leading_range()->first : r.extent);
         }
 
         // ---- D140: the ragged description. Every per-index array must have one entry per index of dim 0.
@@ -869,7 +903,7 @@ public:
             if (dims_[static_cast<std::size_t>(d)].per) ragged = true;
         std::vector<std::uint64_t> offs;
         if (ragged) {
-            const std::size_t n = dims_[0].extent;
+            const std::size_t n = next[0];
             for (int d = 1; d < rank(); ++d) {
                 const DimRecord& r = dims_[static_cast<std::size_t>(d)];
                 if (r.per && r.per_index.size() != n)

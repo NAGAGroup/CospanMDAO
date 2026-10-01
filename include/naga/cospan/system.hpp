@@ -531,6 +531,7 @@ public:
     /// root with a source is ignored), and `last_user` (the last Component, in depth-first
     /// registration order, that touches the root). A mark on a transient root throws.
     void resolve() {
+        classify_chunks();  // D140 B2: ChunkedSystems classify their roots and re-root boundary ones first
         std::vector<detail::IOEntry*> roots;
         collect_roots(roots);
 
@@ -546,13 +547,18 @@ public:
                 r->last_user_      = c;
                 if (r->owner_ == nullptr) r->owner_ = c;  // the FIRST toucher owns the root
             }
+        for (detail::IOEntry* r : roots)
+            if (r->chunk_rerooted_) r->owner_ = nullptr;  // D140 B2: its ChunkedSystem allocates it, not a Component
 
         for (detail::IOEntry* r : roots) {
             bool all = registration_transient(*r);
             for (const detail::IOEntry* p : r->peers_) all = all && registration_transient(*p);
+            const bool chunk_internal = !r->chunk_internal_by_.empty();  // D140 B2: forced transient, per chunk
+            if (chunk_internal) all = true;
+            if (r->chunk_rerooted_) all = false;                        // consumed outside: never transient
             r->transient_    = all;
             r->released_     = all;  // a transient root has no storage until its first user allocates it
-            r->transient_by_ = all ? topmost_transient(*r) : std::string{};
+            r->transient_by_ = all ? (chunk_internal ? r->chunk_internal_by_ : topmost_transient(*r)) : std::string{};
             if (all && (r->design_var_ || r->constraint_ || r->objective_))
                 throw std::invalid_argument("naga::cospan: '" + r->full_path() +
                                             "' is marked (design variable, constraint or objective) but is "
@@ -563,7 +569,20 @@ public:
         check_ties(comps);  // D139 part 2: rank-only entries are tied; alias shape sources are ordered
     }
 
+protected:
+    /// D140 B2: called on every System of the tree (children first) at the start of resolve(); a
+    /// ChunkedSystem classifies its roots here.
+    virtual void chunk_classify() {}
+
 private:
+    friend class ChunkedSystem;
+
+    void classify_chunks() {
+        for (Subsystem* c : child_ptrs_)
+            if (auto* s = dynamic_cast<System*>(c)) s->classify_chunks();
+        chunk_classify();
+    }
+
     static bool registration_transient(const detail::IOEntry& e) {
         for (const Subsystem* s = e.declarer(); s != nullptr; s = s->owner())
             if (s->transient()) return true;
