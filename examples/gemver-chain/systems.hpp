@@ -266,19 +266,13 @@ public:
     }
 };
 
-// The barrier counters are zeroed by their OWN launches, before the fused kernel: one ZeroPair
-// per barrier (outputs are never initialized, D138), each a separate submission in registration
-// order. Inside the wave a late group could zero a counter after another group had incremented
-// it, so the zeroing must never be a stage of the FusedSystem.
-class ZeroBarriers : public cs::System {
-public:
-    void setup() override {
-        for (int i = 1; i <= BarrierChain::kBarriers; ++i) add_subsystem<ZeroPair>("zbar" + std::to_string(i));
-    }
-};
-
-// The barrier variant's root: the zeroing System first, then the chain, each barrier's zero
-// output tied to its counters (tie_outputs across the fuse boundary). The chain's promoted names
+// The barrier counters are zeroed by ONE ZeroCounters launch (14 outputs: count1..7, timeout1..7)
+// BEFORE the fused kernel (outputs are never initialized, D138). Inside the wave a late group
+// could zero a counter after another group had incremented it, so the zeroing must never be a
+// stage of the FusedSystem.
+//
+// The barrier variant's root: the zeroing component first, then the chain, each zero output
+// tied to its barrier's counter (tie_outputs across the fuse boundary). The chain's promoted names
 // are promoted again so the root presents the same names as the other variants; the tie aliases
 // "bar<i>_count" / "bar<i>_timeout" are the barriers' counters.
 class BarrierTop : public cs::System {
@@ -291,13 +285,12 @@ public:
         : n_{n}, R_{R}, groups_{groups}, spin_limit_{spin_limit} {}
 
     void setup() override {
-        add_subsystem<ZeroBarriers>("zero");  // BEFORE the chain: registration order is execution order
+        add_subsystem<ZeroCounters>("zero");  // BEFORE the chain: registration order is execution order
         add_subsystem<BarrierChain>("chain", n_, R_, groups_, spin_limit_);
         for (int i = 1; i <= BarrierChain::kBarriers; ++i) {
-            const std::string z = "zero.zbar" + std::to_string(i), b = "chain.bar" + std::to_string(i);
-            const std::string name = "bar" + std::to_string(i);
-            tie_outputs({z + ".count", b + ".count"}, name + "_count");
-            tie_outputs({z + ".timeout", b + ".timeout"}, name + "_timeout");
+            const std::string k = std::to_string(i), b = "chain.bar" + k;
+            tie_outputs({"zero.count" + k, b + ".count"}, "bar" + k + "_count");
+            tie_outputs({"zero.timeout" + k, b + ".timeout"}, "bar" + k + "_timeout");
         }
         for (const char* n : {"A",  "u1a", "v1a", "u2a", "v2a", "ya", "za", "u1b", "v1b", "u2b",
                               "v2b", "B1", "x1",  "w1",  "q",   "s",  "B2", "x2",  "w2"})

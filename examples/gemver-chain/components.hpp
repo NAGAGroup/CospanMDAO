@@ -361,7 +361,7 @@ public:
 // GridBarrier: a software grid barrier. Only valid when EVERY group of the launch is
 // co-resident, which is why the whole chain runs on a capped, resident number of groups.
 // =============================================================================
-// A ZeroPair (below), submitted as its OWN launch before the fused wave (never a stage inside it),
+// ZeroCounters (below), submitted as its OWN launch before the fused wave (never a stage inside it),
 // zeroes `count` and `timeout` at the start of every forward (outputs are never initialized, D138).
 // `count` then grows by G at the one crossing of the forward, which waits for count >= G.
 // A group that waits `spin_limit` polls without seeing the target gives up and sets `timeout`.
@@ -408,30 +408,56 @@ public:
 };
 
 // =============================================================================
-// ZeroPair: the zeroing producer of one barrier's counters (outputs are never initialized).
-// Registered before the chain, in a plain System; its outputs are tied to the barrier's by tie_outputs.
+// ZeroCounters: the zeroing producer of ALL the barriers' counters, in ONE launch of one item
 // =============================================================================
-struct ZeroPairBody {
+// Outputs are never initialized (D138), so the barriers' `count` and `timeout` come from a
+// producer that computes zero. It is its own component, submitted before the fused wave (never
+// a stage inside it); output `count<i>` / `timeout<i>` is tied to barrier i's by tie_outputs.
+struct ZeroCountersBody {
     struct Inputs {};
     struct Outputs {
-        cs::Output<DType::atomic_u32, 1> count, timeout;
+        cs::Output<DType::atomic_u32, 1> count1, count2, count3, count4, count5, count6, count7, timeout1, timeout2, timeout3, timeout4, timeout5, timeout6, timeout7;
     };
     void operator()(sycl::id<1> i, Inputs, Outputs out) const {
-        out.count[i].store(0u);
-        out.timeout[i].store(0u);
+        out.count1[i].store(0u);
+        out.count2[i].store(0u);
+        out.count3[i].store(0u);
+        out.count4[i].store(0u);
+        out.count5[i].store(0u);
+        out.count6[i].store(0u);
+        out.count7[i].store(0u);
+        out.timeout1[i].store(0u);
+        out.timeout2[i].store(0u);
+        out.timeout3[i].store(0u);
+        out.timeout4[i].store(0u);
+        out.timeout5[i].store(0u);
+        out.timeout6[i].store(0u);
+        out.timeout7[i].store(0u);
     }
 };
 
-class ZeroPair : public cs::Component<ZeroPairBody> {
-    cs::Output<DType::atomic_u32, 1> count_, timeout_;
+class ZeroCounters : public cs::Component<ZeroCountersBody> {
+    cs::Output<DType::atomic_u32, 1> count1_, count2_, count3_, count4_, count5_, count6_, count7_, timeout1_, timeout2_, timeout3_, timeout4_, timeout5_, timeout6_, timeout7_;
 
 public:
     void setup() override {
-        declare_output(count_, "count", 1);
-        declare_output(timeout_, "timeout", 1);
+        declare_output(count1_, "count1", 1);
+        declare_output(count2_, "count2", 1);
+        declare_output(count3_, "count3", 1);
+        declare_output(count4_, "count4", 1);
+        declare_output(count5_, "count5", 1);
+        declare_output(count6_, "count6", 1);
+        declare_output(count7_, "count7", 1);
+        declare_output(timeout1_, "timeout1", 1);
+        declare_output(timeout2_, "timeout2", 1);
+        declare_output(timeout3_, "timeout3", 1);
+        declare_output(timeout4_, "timeout4", 1);
+        declare_output(timeout5_, "timeout5", 1);
+        declare_output(timeout6_, "timeout6", 1);
+        declare_output(timeout7_, "timeout7", 1);
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(sycl::range<1>{1}, {}, {count_, timeout_}, {});
+        return create_launch_config(sycl::range<1>{1}, {}, {count1_, count2_, count3_, count4_, count5_, count6_, count7_, timeout1_, timeout2_, timeout3_, timeout4_, timeout5_, timeout6_, timeout7_}, {});
     }
 };
 
