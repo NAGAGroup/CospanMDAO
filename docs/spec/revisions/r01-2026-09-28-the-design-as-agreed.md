@@ -2544,7 +2544,7 @@ protected:
 } // namespace naga::cospan
 ```
 
-These are added like any realized type: `add_subsystem<RunOnceSystem>("operators")`,
+These are added like any realized type: `add_subsystem<Operators>("operators")` (Operators derives from RunNSystem and passes n),
 `add_subsystem<ConditionalSystem>("regime", "regime_flag")`. They compose by
 nesting.
 

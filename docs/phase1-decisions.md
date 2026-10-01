@@ -515,3 +515,13 @@ SlabKit a484713 removes the frees lane: `deallocate` waits the events it is give
 
 ## D136 — Paths are relative to the root System; host-access errors name the full dotted path.
 The Model's root System has no name or path (as in OpenMDAO): a user addresses `d1.y2`, never `top.d1.y2`, and every path in an error message is relative to the root the same way. `Model::setup` places the root with an empty name and path; child paths join as the name alone under the root. Host-access errors (`set_input`/`set_output`, `view_*`, write-back, released or unstored roots) name the entry by `IOEntry::full_path()`: its declarer's path plus its name, or the name alone at the root (`'d1.y2'`, `'z'`). Supersedes D132, and the `top.` forms quoted in D119 and D123.
+
+## D137 — RunNSystem; do-once is n = 1
+
+RunNSystem(n) runs its subtree on the first n forwards and then returns early
+(nullptr, nothing submitted). There is no RunOnceSystem: do-once is n = 1
+(Jack, 2026-09-30). n == 0 throws std::invalid_argument at construction. Users
+derive from it and override setup(). With property::transient it releases after
+each run and revives on runs 2..n; after the n-th the early return reaches no
+revive(), so the subtree stays released. Roots with a consumer outside persist.
+Lives in include/naga/cospan/run_n_system.hpp, included by cospan.hpp.

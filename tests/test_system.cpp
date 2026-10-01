@@ -513,6 +513,58 @@ public:
     }
 };
 
+// ---- run-N ----------------------------------------------------------------------------------
+/// One Axpb under a RunNSystem: y = 2 x, x a free input ("a.x").
+class RunNAxpb : public cs::RunNSystem {
+public:
+    explicit RunNAxpb(std::size_t n) : cs::RunNSystem{n} {}
+    void setup() override { add_subsystem<Axpb>("a", 2.0f, 0.0f); }
+};
+
+/// A root holding one RunNAxpb of n runs, named "op"; free input "op.a.x", output "op.a.y".
+class RunNTop : public cs::System {
+    std::size_t n_;
+
+public:
+    explicit RunNTop(std::size_t n) : n_{n} {}
+    void setup() override { add_subsystem<RunNAxpb>("op", n_); }
+};
+
+/// The transient run-N subtree: prod -> mid -> cons, y = 2 x + 3 end to end.
+class RunNTrans : public cs::RunNSystem {
+public:
+    explicit RunNTrans(std::size_t n) : cs::RunNSystem{n} {}
+    void setup() override {
+        add_subsystem<Axpb>("prod", 1.0f, 0.0f);
+        add_subsystem<Axpb>("mid", 2.0f, 0.0f);
+        add_subsystem<Axpb>("cons", 1.0f, 3.0f);
+        connect("prod.y", "mid.x");
+        connect("mid.y", "cons.x");
+    }
+    void init(sk::queue&, const sycl::device&) override { g_inits.push_back(path()); }
+};
+
+/// src (free input "src.x", y = x) -> op (RunNTrans, n = 2, transient) -> sink (y = x + 0.5).
+/// The free input lives OUTSIDE the transient subtree, so it can be set between forwards.
+class RunNTransTop : public cs::System {
+public:
+    void setup() override {
+        add_subsystem<Axpb>("src", 1.0f, 0.0f);
+        add_subsystem<RunNTrans>("op", cs::property_list{cs::property::transient{}}, std::size_t{2});
+        add_subsystem<Axpb>("sink", 1.0f, 0.5f);
+        connect("src.y", "op.prod.x");
+        connect("op.cons.y", "sink.x");
+    }
+};
+
+std::vector<float> filled(float v) { return std::vector<float>(kLen, v); }
+
+/// Write x = v (all elements) into the free input at `path`.
+void set_x(cs::Model& model, const char* path, float v) {
+    const std::vector<float> x = filled(v);
+    model.set_input<DType::f32, 1>(path, std::span<const float>{x});
+}
+
 // ---- structural errors ----------------------------------------------------------------------
 class ThreeAxpb : public cs::System {
 public:
@@ -1108,6 +1160,94 @@ TEST_CASE("transient: release after forward, kept outputs, revive, back-to-back 
         CHECK(tsys::count_of("sink") == 1);
         CHECK(tr.released());
     }
+}
+
+// =============================================================================================
+// 6b. run-N (RunNSystem; do-once is n = 1)
+// =============================================================================================
+TEST_CASE("run-N: n = 1 runs once; a later input change does not reach the output", "[system][runn]") {
+    cs::Model model = cs::create_model<tsys::RunNTop>(default_config(), std::size_t{1});
+    model.setup();
+
+    tsys::set_x(model, "op.a.x", 1.0f);
+    model.forward();
+    model.wait();
+    CHECK(to_vector(model.view_output<DType::f32, 1>("op.a.y")) == tsys::filled(2.0f));
+
+    tsys::set_x(model, "op.a.x", 5.0f);
+    model.forward();
+    model.wait();
+    CHECK(to_vector(model.view_input<DType::f32, 1>("op.a.x")) == tsys::filled(5.0f));  // the input did change
+    CHECK(to_vector(model.view_output<DType::f32, 1>("op.a.y")) == tsys::filled(2.0f));  // the output did not
+}
+
+TEST_CASE("run-N: n = 3 follows the input for three forwards, then holds", "[system][runn]") {
+    cs::Model model = cs::create_model<tsys::RunNTop>(default_config(), std::size_t{3});
+    model.setup();
+
+    const float xs[5] = {1.0f, 2.0f, 4.0f, 7.0f, 9.0f};
+    for (int k = 0; k < 5; ++k) {
+        INFO("forward " << k + 1);
+        tsys::set_x(model, "op.a.x", xs[k]);
+        model.forward();
+        model.wait();
+        const float held = k < 3 ? xs[k] : xs[2];  // the 3rd value from then on
+        CHECK(to_vector(model.view_output<DType::f32, 1>("op.a.y")) == tsys::filled(2.0f * held));
+    }
+}
+
+TEST_CASE("run-N + transient: released after each run, revived on runs 2..n, stays released after",
+          "[system][runn]") {
+    tsys::g_inits.clear();
+    cs::Model model = cs::create_model<tsys::RunNTransTop>(default_config());
+    model.setup();
+    auto& op  = dynamic_cast<cs::System&>(model.get_subsystem("op"));
+    auto& sys = model.root();
+    CHECK(op.transient());
+    CHECK(tsys::count_of("op.prod") == 1);  // setup's init
+
+    // forward 1: runs, then releases; the consumer's output feeds the sink outside, so it is kept
+    tsys::set_x(model, "src.x", 1.0f);
+    model.forward();
+    model.wait();
+    CHECK(op.released());
+    CHECK(!sys.entry_at("op.mid.y").root()->has_storage());
+    CHECK(sys.entry_at("op.cons.y").root()->has_storage());
+    CHECK(to_vector(model.view_output<DType::f32, 1>("op.cons.y")) == tsys::filled(5.0f));  // 2 * 1 + 3
+    CHECK(to_vector(model.view_output<DType::f32, 1>("sink.y")) == tsys::filled(5.5f));
+    CHECK(tsys::count_of("op.prod") == 1);
+
+    // forward 2: revived (the subtree's inits re-ran), runs on the new input, released again
+    tsys::set_x(model, "src.x", 4.0f);
+    model.forward();
+    model.wait();
+    CHECK(tsys::count_of("op.prod") == 2);
+    CHECK(tsys::count_of("op") == 2);
+    CHECK(op.released());
+    CHECK(!sys.entry_at("op.mid.y").root()->has_storage());
+    CHECK(to_vector(model.view_output<DType::f32, 1>("op.cons.y")) == tsys::filled(11.0f));  // 2 * 4 + 3
+    CHECK(to_vector(model.view_output<DType::f32, 1>("sink.y")) == tsys::filled(11.5f));
+
+    // forward 3: past n, nothing runs and nothing revives; the subtree stays released
+    tsys::set_x(model, "src.x", 9.0f);
+    model.forward();
+    model.wait();
+    CHECK(tsys::count_of("op.prod") == 2);  // no revive
+    CHECK(op.released());
+    CHECK(!sys.entry_at("op.mid.y").root()->has_storage());
+    CHECK(to_vector(model.view_output<DType::f32, 1>("op.cons.y")) == tsys::filled(11.0f));  // unchanged
+    CHECK(to_vector(model.view_output<DType::f32, 1>("sink.y")) == tsys::filled(11.5f));
+
+    // a view of the released mid root throws, naming the transient System
+    CHECK(sys.entry_at("op.mid.y").root()->released());
+    tsys::expect_throws([&] { (void)model.view_output<DType::f32, 1>("op.mid.y"); }, "op");
+    tsys::expect_throws([&] { (void)model.view_output<DType::f32, 1>("op.mid.y"); }, "transient System");
+    model.wait();
+}
+
+TEST_CASE("run-N: n = 0 throws at construction", "[system][runn]") {
+    CHECK_THROWS_AS(tsys::RunNAxpb{0}, std::invalid_argument);
+    tsys::expect_throws([] { tsys::RunNAxpb op{0}; }, "RunNSystem needs n >= 1");
 }
 
 // =============================================================================================
