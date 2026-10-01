@@ -89,9 +89,9 @@ constexpr const char* kVecNames[] = {"x1", "w1", "q", "s", "x2", "w2"};
 
 void set_inputs(cs::Model& m, const Data& d) {
     const auto v1 = [&](const char* path, const std::vector<float>& v) {
-        m.set_input<DType::f32, 1>(path, std::span<const float>{v});
+        m.init_input(path, cs::init::from_host(v));
     };
-    m.set_input<DType::f32, 2>("A", std::span<const float>{d.A0});
+    m.init_input("A", cs::init::from_host(d.A0));
     v1("u1a", d.v.u1); v1("v1a", d.v.v1); v1("u2a", d.v.u2); v1("v2a", d.v.v2); v1("ya", d.v.y); v1("za", d.v.z);
     v1("u1b", d.v.u1); v1("v1b", d.v.v1); v1("u2b", d.v.u2); v1("v2b", d.v.v2);  // G2's own copies, not tied
 }

@@ -341,15 +341,35 @@ public:
 
     /// Roots: the memory substrates allocation draws on (bound at prepare_exec).
     void bind_substrates(Substrates& s) noexcept { substrates_ = &s; }
-    /// THE ONE ALLOCATION ROUTINE of the root of this entry (route: arena, pool, OS). Allocates
-    /// when the root has no storage and a known size; returns whether it did. Used by the owner's
-    /// run_pre_compute and by a host write to a root with no storage (provisional, D138).
+    /// PRESENT (D139): the root's storage state. True once its owner has run the allocation path
+    /// (even for a size-0 root, whose storage is empty) until a transient root is released. Host
+    /// views of a root that is not present throw.
+    bool present() const noexcept { return root_->present_; }
+    /// Whether the ROOT of this entry's set is present.
+    bool has_storage() const noexcept { return root_->present_; }
+    /// An initial value waiting to be applied by the owner: set when a free input root is
+    /// allocated from nothing, and by Model::init_input. It stays set while the root has no elements.
+    bool init_pending() const noexcept { return root_->init_pending_; }
+    void clear_init_pending() noexcept { root_->init_pending_ = false; }
+    /// Model::init_input (D139): the model's initial value replaces any declared one, wins over
+    /// them, cannot be overwritten by resolve(), and is applied at the owner's next run.
+    void set_model_init(InitSpec spec) {
+        root_->init_spec_    = std::move(spec);
+        root_->model_init_   = true;
+        root_->init_pending_ = true;
+    }
+
+    /// THE ONE ALLOCATION ROUTINE of the root of this entry (route: arena, pool, OS), run by the
+    /// owner in its pre_compute. When the root is not present it allocates (an empty storage for a
+    /// size-0 root), marks it present and, for a free input root, marks its init pending; returns
+    /// whether it did.
     bool allocate_if_absent(sk::queue& q) {
         IOEntry& r = *root_;
-        if (r.flat_size() == 0 || r.has_storage()) return false;
+        if (r.present_) return false;
         if (r.substrates_ == nullptr)
             throw std::logic_error("naga::cospan: '" + r.full_path() + "' cannot be allocated before setup() completes");
         r.allocate(q, *r.substrates_);
+        if (r.io_kind_ == IOKind::input) r.init_pending_ = true;
         return true;
     }
     /// The Subsystem that registered this entry (a Component for I/O, a System for aliases).
@@ -407,8 +427,6 @@ public:
     /// (a routed copy; the ordinary copy rule).
     virtual void sync_other_placements(sk::queue& q) = 0;
 
-    /// Whether the ROOT of this entry's set has been allocated.
-    virtual bool has_storage() const = 0;
 
     /// ROOTS ONLY (no-op on peers): drop the storage of a transient root (§4.4). The CALLER
     /// waits the stream first (synchronous frees, D135): a releasing Component waits once
@@ -481,6 +499,7 @@ protected:
     std::optional<sycl::device> device_;
     sk::kind                   storage_kind_ = sk::kind::device;
     bool                       released_ = false;     ///< transient roots: no storage right now (starts true)
+    bool                       present_  = false;     ///< roots: allocated by the owner (D139); cleared by release
     std::string                transient_by_;         ///< transient roots: topmost transient subsystem's path
 
 private:
@@ -529,7 +548,9 @@ private:
         std::string by;  ///< the declaring subsystem's path, for errors
     };
     std::vector<InitDecl>     init_decls_;
-    std::optional<InitSpec>   init_spec_;        ///< roots, set by System::resolve
+    std::optional<InitSpec>   init_spec_;        ///< roots, set by System::resolve or Model::init_input
+    bool                      model_init_   = false;  ///< roots: init_spec_ came from Model::init_input (resolve keeps it)
+    bool                      init_pending_ = false;  ///< roots: the init is to be applied at the owner's next run
     const Subsystem*          last_user_ = nullptr;  ///< roots, set by System::resolve
     const Subsystem*          owner_     = nullptr;  ///< roots, set by System::resolve: the first toucher
     Substrates*               substrates_ = nullptr; ///< roots, bound at prepare_exec
@@ -601,28 +622,26 @@ public:
             register_placement(Placement{device_ ? *device_ : q.get_device(), storage_kind_});
         for (const Placement& p : placements_) {
             if (find_slot(p) != nullptr) continue;
+            // A size-0 root gets an empty vector (usm_vector(0, ...) allocates nothing).
             slots_.push_back(std::make_unique<Slot>(p, sk::usm_vector<T>(flat_size(), route(q, subs, p))));
         }
         released_ = false;
-    }
-
-    bool has_storage() const override {
-        const auto* r = dynamic_cast<const StorageEntry<T>*>(root());
-        return r != nullptr && !r->slots_.empty();
+        present_  = true;
     }
 
     void release_storage() override {
-        if (!is_root() || slots_.empty()) return;
+        if (!is_root() || !present_) return;
         // Synchronous frees (D135): the stream's kernels may still read these roots and a usm_vector waits
         // only for its own tasks, so the CALLER has waited the stream (once per releasing Component's
         // batch); the vectors free here.
         slots_.clear();
         released_ = true;
+        present_  = false;
     }
 
     void sync_other_placements(sk::queue&) override {
         if (!is_root()) throw std::logic_error("naga::cospan: sync_other_placements is for roots");
-        if (slots_.size() < 2) return;
+        if (slots_.size() < 2 || flat_size() == 0) return;
         Slot& primary = primary_slot();
         for (auto& s : slots_)
             if (s.get() != &primary) s->data = primary.data;  // routed, ordered copy
@@ -690,9 +709,9 @@ private:
         const auto no_data = [&] {
             return std::logic_error("naga::cospan: '" + full_path() +
                                     "' has no data until its owner component runs (it is allocated in the owner's "
-                                    "first forward, or by a host write)");
+                                    "first forward)");
         };
-        if (!is_root() || placements_.empty()) throw no_data();
+        if (!is_root() || !present_ || placements_.empty()) throw no_data();
         Slot* s = find_slot(placements_.front());
         if (s == nullptr) throw no_data();
         return *s;

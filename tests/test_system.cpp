@@ -17,7 +17,7 @@
 //   marks         design vars / constraints / objective recorded with their
 //                 paths and bounds; the last mark of a kind replaces; the
 //                 ill-formed ones throw
-//   init          init_input metadata: the highest level wins; set_input on a
+//   init          init_input metadata: the highest level wins; Model::init_input on a
 //                 durable free input between forwards
 //   transient     registration metadata: release after the last user, kept
 //                 outputs, transient Components, promotion, nesting, a free
@@ -666,10 +666,9 @@ public:
 
 std::vector<float> filled(float v) { return std::vector<float>(kLen, v); }
 
-/// Write x = v (all elements) into the free input at `path`.
+/// Set the initial value of the free input at `path` to x = v (all elements); the owner applies it at its next run.
 void set_x(cs::Model& model, const char* path, float v) {
-    const std::vector<float> x = filled(v);
-    model.set_input<DType::f32, 1>(path, std::span<const float>{x});
+    model.init_input(path, cs::init::from_host(filled(v)));
 }
 
 // ---- structural errors ----------------------------------------------------------------------
@@ -1030,12 +1029,12 @@ TEST_CASE("ties: tie_inputs gives one root; a tie of a tie gives three members a
     std::vector<float> x(tsys::kLen);
     for (std::size_t i = 0; i < x.size(); ++i) x[i] = static_cast<float>(i) * 0.5f + 1.0f;
 
-    SECTION("one tie: set_input on the alias is seen by both") {
+    SECTION("one tie: init_input on the alias is seen by both") {
         cs::Model model = cs::create_model<tsys::TieInSys>(default_config());
         model.setup();
         CHECK(model.root().entry_at("a.x").root() == model.root().entry_at("b.x").root());
         CHECK(model.root().entry_at("x").root() == model.root().entry_at("a.x").root());
-        model.set_input<DType::f32, 1>("x", std::span<const float>{x});
+        model.init_input("x", cs::init::from_host(x));
         model.forward();
         model.wait();
         CHECK(to_vector(model.view_input<DType::f32, 1>("a.x")) == x);
@@ -1056,7 +1055,7 @@ TEST_CASE("ties: tie_inputs gives one root; a tie of a tie gives three members a
         CHECK(sys.entry_at("in.b.x").root() == root);
         CHECK(sys.entry_at("c.x").root() == root);
         CHECK(sys.entry_at("in.t").root() == root);
-        model.set_input<DType::f32, 1>("tt", std::span<const float>{x});
+        model.init_input("tt", cs::init::from_host(x));
         model.forward();
         model.wait();
         for (const char* path : {"in.a.x", "in.b.x", "c.x", "in.t"})
@@ -1181,7 +1180,7 @@ TEST_CASE("init: the highest level wins (System init_input beats the Component's
     CHECK(to_vector(model.view_output<DType::f32, 1>("c3.y")) == std::vector<float>(tsys::kLen, tsys::kSysInit));
 }
 
-TEST_CASE("init: set_input on a durable free input between forwards", "[system][init]") {
+TEST_CASE("init: init_input on a durable free input between forwards", "[system][init]") {
     cs::Model model = cs::create_model<tsys::OneAxpb>(default_config());
     model.setup();
     // No init declared: zeros, so y = 2 * 0 + 1.
@@ -1214,14 +1213,14 @@ TEST_CASE("init: a durable free input is initialized by its owner on the first f
     CHECK(to_vector(model.view_output<DType::f32, 1>("a.y")) == tsys::filled(11.0f));  // 2 * 5 + 1
 }
 
-TEST_CASE("init: set_input before the first forward beats the init", "[system][init]") {
+TEST_CASE("init: Model::init_input before the first forward beats the declared init", "[system][init]") {
     tsys::g_inits.clear();
     cs::Model model = cs::create_model<tsys::OneAxpbLog>(default_config());
     model.setup();
-    tsys::set_x(model, "a.x", 3.0f);  // allocates the root and is its initial value
+    tsys::set_x(model, "a.x", 3.0f);  // the owner applies it at its allocation, in place of the declared init
     model.forward();
     model.wait();
-    CHECK(tsys::count_of("a") == 0);  // the owner found storage and did nothing
+    CHECK(tsys::count_of("a") == 0);  // the declared (logging) init never ran
     CHECK(to_vector(model.view_output<DType::f32, 1>("a.y")) == tsys::filled(7.0f));  // 2 * 3 + 1
 }
 
@@ -1367,7 +1366,7 @@ TEST_CASE("transient: a free input inside a transient subtree is re-initialized 
 // =============================================================================================
 // 6b. run-N (RunNSystem; do-once is n = 1)
 // =============================================================================================
-TEST_CASE("run-N: n = 1 runs once; a later input change does not reach the output", "[system][runn]") {
+TEST_CASE("run-N: n = 1 runs once; a later init_input stays pending (the owner does not run again)", "[system][runn]") {
     cs::Model model = cs::create_model<tsys::RunNTop>(default_config(), std::size_t{1});
     model.setup();
 
@@ -1379,8 +1378,9 @@ TEST_CASE("run-N: n = 1 runs once; a later input change does not reach the outpu
     tsys::set_x(model, "op.a.x", 5.0f);
     model.forward();
     model.wait();
-    CHECK(to_vector(model.view_input<DType::f32, 1>("op.a.x")) == tsys::filled(5.0f));  // the input did change
-    CHECK(to_vector(model.view_output<DType::f32, 1>("op.a.y")) == tsys::filled(2.0f));  // the output did not
+    // The owner applies a pending init in its own run (D139); it did not run, so nothing changed.
+    CHECK(to_vector(model.view_input<DType::f32, 1>("op.a.x")) == tsys::filled(1.0f));
+    CHECK(to_vector(model.view_output<DType::f32, 1>("op.a.y")) == tsys::filled(2.0f));
 }
 
 TEST_CASE("run-N: n = 3 follows the input for three forwards, then holds", "[system][runn]") {

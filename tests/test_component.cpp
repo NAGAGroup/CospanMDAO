@@ -9,7 +9,7 @@
 //   plain body, rank 1/2/3        y = 2x + 1, ragged sizes (1000, 40x30, 7x9x11)
 //   WeightedHistogram             atomic output, FromSourceDim, value-driven
 //                                 n_bins; ZeroBins + tie_outputs; two forwards, n_bins changed by
-//                                 set_input between them
+//                                 init_input between them
 //   TiledTranspose                group body, Local scratch, wg override; 37x53
 //   host component chain          producer -> host prefix sum -> consumer
 //   custom-op plumbing            device_ptr recorded at submission
@@ -108,7 +108,6 @@ public:
 
 template <int R>
 void check_affine(sycl::range<R> dims) {
-    // Spelled out (not auto): a dependent type would need `model.template set_input<...>`.
     cs::Model model = cs::create_model<TopAffine<R>>(default_config(), dims);
     model.setup();
 
@@ -119,7 +118,7 @@ void check_affine(sycl::range<R> dims) {
             x[k]    = static_cast<float>(k % 97) * 0.5f * static_cast<float>(round + 1);
             want[k] = 2.0f * x[k] + 1.0f;
         }
-        model.set_input<DType::f32, R>("aff.x", std::span<const float>{x});
+        model.init_input("aff.x", cs::init::from_host(x));
         auto y = wait_and_view<DType::f32, R>(model, "aff.y");
         REQUIRE(y.shape() == dims);
         CHECK(all_close(to_vector(y), want));
@@ -184,7 +183,7 @@ public:
     void setup() override {
         declare_input(values_, "values", cs::FromSourceDim{0});
         declare_input(weights_, "weights", cs::from_input_shape<1>("values"));
-        declare_input(n_bins_, "n_bins", 1);  // a free input: the test drives it with set_input
+        declare_input(n_bins_, "n_bins", 1);  // a free input: the test drives it with init_input
         declare_output(bins_, "bins", cs::FromInput{"n_bins", 0});
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
@@ -561,20 +560,20 @@ TEST_CASE("WeightedHistogram: atomic output, FromSourceDim, value-driven n_bins"
     const std::uint32_t nb1 = 8, nb2 = 13;
 
     SECTION("first forward, n_bins = 8") {
-        model.set_input<DType::u32, 1>("n_bins", std::span<const std::uint32_t>{&nb1, 1});
+        model.init_input("n_bins", cs::init::from_host(std::vector<std::uint32_t>{nb1}));
         auto bins = wait_and_view<DType::f32, 1>(model, "bins");
         CHECK(bins.size() == nb1);
         CHECK(to_vector(bins) == tc::histogram_ref(nb1));
     }
 
-    SECTION("second forward with n_bins changed by set_input: the root grows and accumulates") {
-        model.set_input<DType::u32, 1>("n_bins", std::span<const std::uint32_t>{&nb1, 1});
+    SECTION("second forward with n_bins changed by init_input: the root grows and accumulates") {
+        model.init_input("n_bins", cs::init::from_host(std::vector<std::uint32_t>{nb1}));
         {
             auto bins = wait_and_view<DType::f32, 1>(model, "bins");
             REQUIRE(bins.size() == nb1);
             CHECK(to_vector(bins) == tc::histogram_ref(nb1));
         }
-        model.set_input<DType::u32, 1>("n_bins", std::span<const std::uint32_t>{&nb2, 1});
+        model.init_input("n_bins", cs::init::from_host(std::vector<std::uint32_t>{nb2}));
         auto bins = wait_and_view<DType::f32, 1>(model, "bins");
         REQUIRE(bins.size() == nb2);
         // ZeroBins zeroes the grown root each forward, then the histogram accumulates onto it.

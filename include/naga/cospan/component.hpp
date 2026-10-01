@@ -377,14 +377,19 @@ private:
         return false;
     }
 
-    /// The OWNER's allocation of a root from nothing (r01 §4.4): through the one allocation
-    /// routine, and when it is a free input root (an input root: it has no source) its init is
-    /// applied, else zeros. A root this Component does not own, or one that already has storage
-    /// (a host write got there first, or an earlier run), is left alone.
+    /// The OWNER's allocation of a root (r01 §4.4, D139): through the one allocation routine (a
+    /// size-0 root becomes present with empty storage). For a free input root (an input root: it
+    /// has no source): if it was just allocated its init is applied (else zeros); else if an init
+    /// is pending (Model::init_input) the init is applied to the existing storage. Either way the
+    /// pending flag is cleared. A root this Component does not own is left alone; a connected
+    /// root (an output root) never gets an init applied.
     void allocate_owned(detail::IOEntry& root) {
         if (root.owner() != this) return;
-        if (root.allocate_if_absent(queue_ref()) && root.kind() == IOKind::input)
+        root.allocate_if_absent(queue_ref());
+        if (root.kind() == IOKind::input && root.init_pending()) {
             detail::apply_root_init(root, queue_ref());
+            root.clear_init_pending();
+        }
     }
 
     void point_if_stored(detail::IOEntry& e) {

@@ -21,6 +21,7 @@
 // (D135): call wait() before a Model is destroyed or reassigned.
 
 #include <concepts>
+#include <iostream>
 #include <cstddef>
 #include <memory>
 #include <optional>
@@ -153,29 +154,22 @@ public:
         Impl& s = ready("view_output");
         return HostView<DT, Rank>{entry_of(s, path, IOKind::output, "view_output"), s.queue};
     }
-    /// Writes land in host staging and are written back (primary, then the
-    /// other placements) on commit() and on destruction.
-    template <DType DT, int Rank>
-    HostViewMut<DT, Rank> view_output_mut(std::string_view path) {
-        Impl& s = ready("view_output_mut");
-        return HostViewMut<DT, Rank>{entry_of(s, path, IOKind::output, "view_output_mut"), s.queue};
-    }
-
-    /// Into the root's primary storage (through the entry's region if it has
-    /// one), then the root's other placements are refreshed.
-    template <DType DT, int Rank>
-    void set_input(std::string_view path, std::span<const cpp_type_t<DT>> values) {
-        Impl&             s = ready("set_input");
-        detail::IOEntry&  e = entry_of(s, path, IOKind::input, "set_input");
-        detail::check_entry(e, DT, Rank);
-        detail::write_back<cpp_type_t<DT>>(e, s.queue, values);
-    }
-    template <DType DT, int Rank>
-    void set_output(std::string_view path, std::span<const cpp_type_t<DT>> values) {
-        Impl&             s = ready("set_output");
-        detail::IOEntry&  e = entry_of(s, path, IOKind::output, "set_output");
-        detail::check_entry(e, DT, Rank);
-        detail::write_back<cpp_type_t<DT>>(e, s.queue, values);
+    // ---- initial values (D139): the only way to give an input data from the host -----------
+    /// Set the initial value of the root of the input at `path`, any time after setup(). It wins
+    /// over the Component's and the Systems' declarations, and the root's OWNER applies it at its
+    /// next run (once per call; a root not yet allocated gets it at its allocation). An output
+    /// path throws std::invalid_argument. If the input is connected to an output (it has a
+    /// source) the init is stored, a warning is printed to std::cerr, and it is never applied.
+    void init_input(std::string_view path, InitSpec init) {
+        Impl&            s = ready("init_input");
+        detail::IOEntry& e = s.root->entry_at(path);
+        if (e.kind() != IOKind::input)
+            throw std::invalid_argument("naga::cospan: Model::init_input: '" + std::string{path} +
+                                        "' is an output; outputs are never initialized");
+        e.set_model_init(std::move(init));
+        if (e.root()->kind() == IOKind::output)
+            std::cerr << "naga::cospan: warning: input '" << path
+                      << "' is connected to an output; your initializer may not run\n";
     }
 
     // ---- retrieval & observation ------------------------------------------------

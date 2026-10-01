@@ -9,8 +9,7 @@
 //   3. Lifecycle        forward / view_output before setup, setup twice, a moved-from
 //                       Model, a default_device outside the context (skipped when the
 //                       runtime enumerates one device)
-//   4. Host access      unknown path, view_input on an output, wrong dtype, wrong size,
-//                       and view_output_mut on an output the forward does not overwrite
+//   4. Host access      unknown path, view_input on an output, init_input on an output
 //   5. Memory report    a small static model: arena capacity (less the setup slack)
 //                       against the sum of flat_size x dtype_size over distinct roots
 //   6. Pool             a pool on the device and a value-driven (FromInput) output root
@@ -24,7 +23,11 @@
 #include <cstdint>
 #include <cstdio>
 #include <memory>
+#include <functional>
+#include <iostream>
 #include <span>
+#include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -302,13 +305,13 @@ void sellar_forward(double abs_tol, double rel_tol) {
     for (const Point& p : points) {
         const std::array<T, 2> z{static_cast<T>(p.z0), static_cast<T>(p.z1)};
         const T                x = static_cast<T>(p.x), y2 = static_cast<T>(p.y2);
-        model.set_input<DT, 1>("z", std::span<const T>{z});
-        model.set_input<DT, 1>("x", std::span<const T>{&x, 1});
-        model.set_input<DT, 1>("d1.y2", std::span<const T>{&y2, 1});
-        CHECK(model.view_input<DT, 1>("d2.z")[std::size_t{1}] == z[1]);  // the tie reads back everywhere
-        CHECK(model.view_input<DT, 1>("obj.x")[std::size_t{0}] == x);
+        model.init_input("z", cs::init::from_host(std::vector<T>{z.begin(), z.end()}));
+        model.init_input("x", cs::init::from_host(std::vector<T>{x}));
+        model.init_input("d1.y2", cs::init::from_host(std::vector<T>{y2}));
         model.forward();
         model.wait();
+        CHECK(model.view_input<DT, 1>("d2.z")[std::size_t{1}] == z[1]);  // the tie reads back everywhere
+        CHECK(model.view_input<DT, 1>("obj.x")[std::size_t{0}] == x);
 
         // The reference runs in double on the values the device actually saw.
         const Ref r = sellar_ref(static_cast<double>(z[0]), static_cast<double>(z[1]), static_cast<double>(x),
@@ -479,6 +482,76 @@ public:
         return create_launch_config(x_.shape(), {x_}, {y_}, {a_, b_});
     }
 };
+
+// ---- Initializer-only inputs and empty roots (D139) -------------------------------------------------
+// Scale: y = 2 x, x shaped by its source, y by x.
+struct ScaleBody {
+    struct Inputs {
+        cs::Input<DType::f32, 1> x;
+    };
+    struct Outputs {
+        cs::Output<DType::f32, 1> y;
+    };
+    void operator()(sycl::id<1> i, Inputs in, Outputs out) const { out.y[i] = 2.0f * in.x[i]; }
+};
+class Scale : public cs::Component<ScaleBody> {
+    cs::Input<DType::f32, 1>  x_;
+    cs::Output<DType::f32, 1> y_;
+
+public:
+    void setup() override {
+        declare_input(x_, "x", cs::from_source_shape<1>());
+        declare_output(y_, "y", cs::from_input_shape<1>("x"));
+    }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+        return create_launch_config(y_.shape(), {x_}, {y_}, {});
+    }
+};
+// bins.n drives bins.bins (n floats); sc doubles them. With n = 0 the root is present and empty.
+class EmptyTop : public cs::System {
+public:
+    void setup() override {
+        add_subsystem<Bins>("bins");
+        add_subsystem<Scale>("sc");
+        connect("bins.bins", "sc.x");
+    }
+};
+
+// One Axpb (y = x) with a free input a.x.
+class OneAxTop : public cs::System {
+public:
+    void setup() override { add_subsystem<Axpb>("a", 1.0f, 0.0f); }
+};
+
+// An Axpb that declares its own initial value 1.
+class AxpbInit1 : public Axpb {
+public:
+    AxpbInit1(float a, float b) : Axpb{a, b} {}
+    void setup() override {
+        Axpb::setup();
+        init_input("x", cs::init::fill(1.0f));
+    }
+};
+// The component declares 1; the System (depth 0) declares 2.
+class DeclaredTop : public cs::System {
+public:
+    void setup() override {
+        add_subsystem<AxpbInit1>("a", 1.0f, 0.0f);
+        init_input("a.x", cs::init::fill(2.0f));
+    }
+};
+
+// p (y = x + 1) feeds q (y = x): q.x is a connected input.
+class ChainTop : public cs::System {
+public:
+    void setup() override {
+        add_subsystem<Axpb>("p", 1.0f, 1.0f);
+        add_subsystem<Axpb>("q", 1.0f, 0.0f);
+        connect("p.y", "q.x");
+    }
+};
+
+int g_host_inits = 0;  // counts the custom_host initializer's runs
 
 // src (default device): y = x. mid (the other device): y = 2 src.y + 1. out (default device): y = mid.y + 2.
 class TwoDevTop : public cs::System {
@@ -685,12 +758,11 @@ TEST_CASE("Lifecycle: errors before setup, setup twice, moved-from, default_devi
 // =============================================================================================
 // 4. Host access errors
 // =============================================================================================
-TEST_CASE("Host access: errors name the path; view_output_mut survives a forward", "[model][host]") {
+TEST_CASE("Host access: errors name the path; init_input on an output throws", "[model][host]") {
     SECTION("errors") {
         auto model = cs::create_model<tmod::SellarTop<DType::f32>>(default_config());
         model.setup();
-        const std::array<float, 2> two{1.0f, 2.0f};
-        const std::array<float, 3> three{1.0f, 2.0f, 3.0f};
+        const std::vector<float> two{1.0f, 2.0f};
 
         // Unknown path: the message carries the path it could not resolve.
         tmod::expect_throws([&] { (void)model.view_output<DType::f32, 1>("nope.y"); }, {"nope.y"});
@@ -698,42 +770,11 @@ TEST_CASE("Host access: errors name the path; view_output_mut survives a forward
         // The wrong kind of entry.
         tmod::expect_throws([&] { (void)model.view_input<DType::f32, 1>("obj.f"); }, {"obj.f", "an output"});
         tmod::expect_throws([&] { (void)model.view_output<DType::f32, 1>("d1.z"); }, {"d1.z", "an input"});
-        tmod::expect_throws([&] { model.set_input<DType::f32, 1>("obj.f", std::span<const float>{two}); },
-                            {"obj.f", "an output"});
-        // The wrong dtype, rank and size name the entry's full dotted path from the root System.
-        tmod::expect_throws([&] { model.set_input<DType::f64, 1>("z", std::span<const double>{}); }, {"'z'", "dtype or rank"});
-        tmod::expect_throws([&] { model.set_input<DType::f32, 2>("z", std::span<const float>{two}); }, {"'z'", "dtype or rank"});
-        tmod::expect_throws([&] { model.set_input<DType::f64, 1>("d1.y2", std::span<const double>{}); }, {"'d1.y2'", "dtype or rank"});
-        // The wrong size (z has two elements).
-        tmod::expect_throws([&] { model.set_input<DType::f32, 1>("z", std::span<const float>{three}); }, {"'z'", "shape"});
-        tmod::expect_throws([&] { model.set_input<DType::f32, 1>("z", std::span<const float>{two.data(), 1}); }, {"'z'", "shape"});
-        // The right call still works after all that.
-        CHECK_NOTHROW(model.set_input<DType::f32, 1>("z", std::span<const float>{two}));
-        model.wait();  // setup() and the last set_input submitted work (D135)
-    }
-
-    SECTION("view_output_mut on an output the forward does not overwrite") {
-        auto model = cs::create_model<tmod::HoldTop>(default_config());
-        model.setup();
-        {
-            auto v = model.view_output_mut<DType::f32, 1>("p.y");
-            for (std::size_t k = 0; k < 4; ++k) v[k] = 10.0f * static_cast<float>(k);  // {0, 10, 20, 30}
-        }  // written back on destruction
-        const float x = 7.0f;
-        model.set_input<DType::f32, 1>("p.x", std::span<const float>{&x, 1});
-        model.forward();
-        model.wait();
-        CHECK(tmod::scalar_out<DType::f32>(model, "c.s") == 67.0f);  // 7 from the kernel + 10 + 20 + 30 from the host
-        CHECK(to_vector(model.view_output<DType::f32, 1>("p.y")) == std::vector<float>{7.0f, 10.0f, 20.0f, 30.0f});
-
-        {
-            auto v = model.view_output_mut<DType::f32, 1>("p.y");
-            v[std::size_t{2}] = 100.0f;
-            v.commit();  // the mid-scope flush
-        }
-        model.forward();
-        model.wait();
-        CHECK(tmod::scalar_out<DType::f32>(model, "c.s") == 147.0f);
+        // An initial value on an output is an error (D139).
+        tmod::expect_throws([&] { model.init_input("obj.f", cs::init::from_host(two)); }, {"obj.f", "an output"});
+        // The right call still works after that.
+        CHECK_NOTHROW(model.init_input("z", cs::init::from_host(two)));
+        model.wait();  // setup() submitted work (D135)
     }
 }
 
@@ -749,7 +790,7 @@ TEST_CASE("Memory report: arena capacity against the distinct static roots", "[m
 
     std::array<float, 8> bc{};
     for (std::size_t i = 0; i < bc.size(); ++i) bc[i] = static_cast<float>(i + 1);
-    model.set_input<DType::f32, 1>("bc", std::span<const float>{bc});
+    model.init_input("bc", cs::init::from_host(std::vector<float>{bc.begin(), bc.end()}));
     model.forward();
     model.wait();
     const auto after_fwd = tmod::report_on(model, dev);
@@ -783,7 +824,7 @@ TEST_CASE("Memory report: arena capacity against the distinct static roots", "[m
 // =============================================================================================
 // 6. Pool
 // =============================================================================================
-TEST_CASE("Pool: a value-driven root allocates from the pool and follows set_input", "[model][pool]") {
+TEST_CASE("Pool: a value-driven root allocates from the pool and follows init_input", "[model][pool]") {
     const sycl::device dev{sycl::default_selector_v};
     cs::ModelConfig    cfg = default_config();
     cfg.default_pool_bytes = std::size_t{1} << 20;  // 1 MiB, in nodes of the default 1024 B
@@ -792,7 +833,7 @@ TEST_CASE("Pool: a value-driven root allocates from the pool and follows set_inp
     CHECK(tmod::report_on(model, dev).pool_bytes > 0);
 
     std::uint32_t n = 8;
-    model.set_input<DType::u32, 1>("bins.n", std::span<const std::uint32_t>{&n, 1});
+    model.init_input("bins.n", cs::init::from_host(std::vector<std::uint32_t>{n}));
     model.forward();
     model.wait();
     {
@@ -805,7 +846,7 @@ TEST_CASE("Pool: a value-driven root allocates from the pool and follows set_inp
     }
 
     n = 3000;  // 12000 B: several nodes
-    model.set_input<DType::u32, 1>("bins.n", std::span<const std::uint32_t>{&n, 1});
+    model.init_input("bins.n", cs::init::from_host(std::vector<std::uint32_t>{n}));
     model.forward();
     model.wait();
     {
@@ -848,11 +889,125 @@ TEST_CASE("Two devices: a producer on one, its consumer on the other", "[model][
             want_out[i] = want_mid[i] + 2.0f;
         }
         INFO("round " << round);
-        model.set_input<DType::f32, 1>("src.x", std::span<const float>{x});
+        model.init_input("src.x", cs::init::from_host(x));
         model.forward();
         model.wait();
         CHECK(to_vector(model.view_output<DType::f32, 1>("src.y")) == x);
         CHECK(to_vector(model.view_output<DType::f32, 1>("mid.y")) == want_mid);
         CHECK(to_vector(model.view_output<DType::f32, 1>("out.y")) == want_out);
     }
+}
+
+// =============================================================================================
+// 8. Initializer-only inputs and empty roots (D139)
+// =============================================================================================
+TEST_CASE("D139: a size-0 root is present and empty; its consumer runs as a no-op", "[model][init][empty]") {
+    auto model = cs::create_model<tmod::EmptyTop>(default_config());
+    model.setup();
+    // Before the owner has run, a view throws.
+    tmod::expect_throws([&] { (void)model.view_output<DType::f32, 1>("bins.bins"); }, {"no data until its owner"});
+
+    model.init_input("bins.n", cs::init::from_host(std::vector<std::uint32_t>{0}));
+    model.forward();
+    model.wait();
+    {
+        auto bins = model.view_output<DType::f32, 1>("bins.bins");  // present, size 0
+        CHECK(bins.size() == 0);
+        CHECK(bins.shape()[0] == 0);
+        auto y = model.view_output<DType::f32, 1>("sc.y");
+        CHECK(y.size() == 0);
+        CHECK(y.shape()[0] == 0);
+    }
+
+    // The empty root grows when its driving value does.
+    model.init_input("bins.n", cs::init::from_host(std::vector<std::uint32_t>{4}));
+    model.forward();
+    model.wait();
+    CHECK(to_vector(model.view_output<DType::f32, 1>("bins.bins")) == std::vector<float>{1, 2, 3, 4});
+    CHECK(to_vector(model.view_output<DType::f32, 1>("sc.y")) == std::vector<float>{2, 4, 6, 8});
+}
+
+TEST_CASE("D139: init_input before the first forward is applied", "[model][init]") {
+    auto model = cs::create_model<tmod::OneAxTop>(default_config());
+    model.setup();
+    std::vector<float> x(tmod::kLen);
+    for (std::size_t i = 0; i < x.size(); ++i) x[i] = static_cast<float>(i) + 0.5f;
+    model.init_input("a.x", cs::init::from_host(x));
+    model.forward();
+    model.wait();
+    CHECK(to_vector(model.view_input<DType::f32, 1>("a.x")) == x);
+    CHECK(to_vector(model.view_output<DType::f32, 1>("a.y")) == x);
+}
+
+TEST_CASE("D139: init_input between runs re-initializes once", "[model][init]") {
+    auto model = cs::create_model<tmod::OneAxTop>(default_config());
+    model.setup();
+    const auto host_init = [](float v) {
+        return cs::init::custom_host<DType::f32, 1>(std::function<void(cs::HostViewMut<DType::f32, 1>&)>{
+            [v](cs::HostViewMut<DType::f32, 1>& h) {
+                ++tmod::g_host_inits;
+                for (std::size_t k = 0; k < h.size(); ++k) h[k] = v;
+            }});
+    };
+    tmod::g_host_inits = 0;
+    model.init_input("a.x", host_init(5.0f));
+    model.forward();
+    model.wait();
+    CHECK(tmod::g_host_inits == 1);
+    model.forward();
+    model.wait();
+    CHECK(tmod::g_host_inits == 1);  // not re-applied without a new call
+    model.init_input("a.x", host_init(7.0f));
+    model.forward();
+    model.wait();
+    CHECK(tmod::g_host_inits == 2);
+    CHECK(to_vector(model.view_output<DType::f32, 1>("a.y")) == std::vector<float>(tmod::kLen, 7.0f));
+    model.forward();
+    model.wait();
+    CHECK(tmod::g_host_inits == 2);
+}
+
+TEST_CASE("D139: Model init beats the Component's and the System's declared init", "[model][init]") {
+    {
+        auto model = cs::create_model<tmod::DeclaredTop>(default_config());
+        model.setup();
+        model.forward();
+        model.wait();
+        CHECK(to_vector(model.view_output<DType::f32, 1>("a.y")) ==
+              std::vector<float>(tmod::kLen, 2.0f));  // the System over the Component
+    }
+    {
+        auto model = cs::create_model<tmod::DeclaredTop>(default_config());
+        model.setup();
+        model.init_input("a.x", cs::init::fill(3.0f));
+        model.forward();
+        model.wait();
+        CHECK(to_vector(model.view_output<DType::f32, 1>("a.y")) ==
+              std::vector<float>(tmod::kLen, 3.0f));  // the Model over both
+    }
+}
+
+TEST_CASE("D139: init_input on a connected input warns and is not applied; on an output it throws",
+          "[model][init]") {
+    auto model = cs::create_model<tmod::ChainTop>(default_config());
+    model.setup();
+
+    std::ostringstream captured;
+    std::streambuf*    old = std::cerr.rdbuf(captured.rdbuf());
+    try {
+        model.init_input("q.x", cs::init::fill(9.0f));
+    } catch (...) {
+        std::cerr.rdbuf(old);
+        throw;
+    }
+    std::cerr.rdbuf(old);
+    CHECK(captured.str() ==
+          "naga::cospan: warning: input 'q.x' is connected to an output; your initializer may not run\n");
+
+    model.forward();
+    model.wait();
+    CHECK(to_vector(model.view_output<DType::f32, 1>("q.y")) ==
+          std::vector<float>(tmod::kLen, 1.0f));  // p.y = 1, not 9
+
+    CHECK_THROWS_AS(model.init_input("p.y", cs::init::fill(1.0f)), std::invalid_argument);
 }

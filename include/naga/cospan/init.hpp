@@ -6,9 +6,11 @@
 //
 // An initial value is METADATA on a free input root (an input root with no
 // source), declared during setup() with ComponentBase::init_input(name, init)
-// or System::init_input(path, init). The highest level wins; the framework
-// applies it when it allocates the root from nothing. There are no init hooks
-// and no initializer helpers: outputs are never initialized (§6.0).
+// or System::init_input(path, init), or at any time after setup with
+// Model::init_input(path, init) (D139), which wins over both. The highest level
+// wins; the root's owner applies it when it allocates the root, and again when
+// Model::init_input leaves one pending. There is no host write API: outputs are
+// never initialized (§6.0).
 //
 //   cs::init::fill(v)           every element = v (converted to the root's dtype)
 //   cs::init::zero()            every element = 0
@@ -16,6 +18,7 @@
 //   cs::init::custom<DT,R>(fn)  fn(queue&, Initializer<DT,R>): the function enqueues
 //                               its own kernel on the queue
 //   cs::init::custom_host<DT,R>(fn)  fn(HostViewMut<DT,R>&): host-side, committed on return
+//                               (HostViewMut is only this callback's argument type)
 
 #include <cstddef>
 #include <cstdint>

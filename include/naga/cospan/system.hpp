@@ -575,6 +575,7 @@ private:
 
     /// The winning init of a root: the declaration of the smallest depth among its alias set's.
     static void resolve_init(detail::IOEntry& r) {
+        if (r.model_init_) return;  // Model::init_input (D139) wins and is never overwritten
         r.init_spec_.reset();
         if (r.kind() == IOKind::output) return;  // the root has a source: the inputs' inits are ignored
         const detail::IOEntry::InitDecl* best  = nullptr;

@@ -383,6 +383,8 @@ private:
     friend class Model;
 };
 
+/// SUPERSEDED by D139: there are no mutable host views; HostViewMut survives only as
+/// the argument type of cs::init::custom_host (built by the framework, committed on return).
 /// HostViewMut<DT, Rank> — the same host copy, writable: commit() and
 /// destruction write the buffer into the entry's root storage
 /// (usm_vector::from_host, which owns its copy of the bytes before
@@ -941,8 +943,9 @@ InitSpec custom_host(std::function<void(HostViewMut<DT, Rank>&)> fn);         //
   OWNER allocates it from nothing, in its `run_pre_compute`: on the owner's
   first run for a durable root, at each (re)allocation for a transient one.
   Nothing is applied at setup. A value-driven resize preserves the existing
-  content and does not re-init, and a host write that allocated the root
-  first stands in for the init.
+  content and does not re-init. (Superseded by D139: a host write no longer
+  exists; `Model::init_input` leaves a pending init that the owner applies
+  at its next run, once per call.)
 
 THE LIFECYCLE IS THE COMPONENT'S, and the component is always the leaf, and
 ALLOCATION AND INIT HAVE ONE PATH, the owning component's, for durable and
@@ -965,6 +968,14 @@ group or wave returns, so a root's release follows the work of every child
 in it. A Component that does not run in a forward (a RunNSystem that is
 exhausted, a gate not taken) neither allocates nor releases; its roots
 simply wait. An exception thrown mid-forward leaves roots unreleased (D84).
+
+SUPERSEDED by D139 (the host-write part of this paragraph): there is no host
+write. `Model::init_input(path, init)` sets the root's init (it beats the
+declared ones), marks it pending, and the owner applies it at its next run;
+an output path throws, and a connected input warns on std::cerr and is never
+applied. A root is PRESENT once its owner's allocation path has run, even at
+size 0; views of a present size-0 root are empty, views of a root that is not
+present throw.
 
 HOST ACCESS. A host WRITE to a root with no storage (`Model::set_input`, or
 a `HostViewMut` write-back or commit) allocates the root through the SAME
@@ -1756,7 +1767,8 @@ work and never sees a queue except through the owner's ctx.
     at (a peer's wrapper). A root that already has storage — allocated by an
     earlier run, or by a host write — is left alone, so a value-driven
     resize keeps its content and a `set_input` before the first forward
-    beats the init.
+    beats the init. (Superseded by D139: no host write; a pending
+    `Model::init_input` is applied to the existing storage.)
 2. **`run_compute_forward()`**: `compute_forward()` — returns the
    description. The owner submits it (§7.3).
 3. **`run_post_compute(ctx)`**: through `ctx`, after the owner's
@@ -2505,6 +2517,8 @@ public:
     /// writeback.
     template <DType DT, int Rank> HostView<DT, Rank>    view_input (std::string_view path) const;
     template <DType DT, int Rank> HostView<DT, Rank>    view_output(std::string_view path) const;   // read-only
+    /// SUPERSEDED by D139: view_output_mut, set_input and set_output are removed;
+    /// Model::init_input(std::string_view path, InitSpec) replaces them.
     /// Writable output view: writes land in host staging; written back
     /// (root.from_host, then `copy_d = root` per other placement) on
     /// destruction AND on commit() (both; the destructor is the
@@ -2560,6 +2574,8 @@ private:
 
 - `view_*` on a device-kind root = `root.host_view()`; on a shared- or
   host-kind root = `queue_.wait()` then `root.get_access()`.
+- (Superseded by D139: `set_*` and `view_output_mut` are removed; initial
+  values go through `init_input`.)
 - `set_*` = `root.from_host(span)` then `copy_d = root` per other placement.
 - `view_output_mut` stages on the host and does `from_host` on commit and
   on destruction.
@@ -2571,7 +2587,7 @@ private:
 auto model = create_model<Top>(ModelConfig{});          // default device, no pools
 model.setup();                                          // declare → exec-info → substrates
                                                         //   → prepare → compile → marks (no allocation yet)
-model.set_input<DType::f64, 1>("mda.z", {{1.0, 2.0}});  // drive a free input
+model.init_input("mda.z", init::from_host(std::vector<double>{1.0, 2.0}));  // drive a free input (D139)
 model.forward();  model.wait();                         // enqueue; wait when results are wanted
 
 auto y1 = model.view_output<DType::f64, 1>("mda.y1");   // host_view, read

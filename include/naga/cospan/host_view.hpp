@@ -1,20 +1,22 @@
 #pragma once
 
 // =============================================================================
-// naga/cospan/host_view.hpp — host-side copies of an entry (r01 §2.1)
+// naga/cospan/host_view.hpp — host-side copies of an entry (r01 §2.1, D139)
 // =============================================================================
 //
 // HostView is a read-only host copy of one entry, shaped like it, taken at
-// construction. HostViewMut is the same copy, writable: commit() and
-// destruction write it back (unconditionally, D17) into the root's storage and
-// refresh the root's copies on other devices.
-//
-// Both read and write the root's PRIMARY storage (the root's producer's
+// construction. It reads the root's PRIMARY storage (the root's producer's
 // device), which is authoritative; the other devices' copies follow it. A peer
-// with a view presents its region only (r01 §8.1).
+// with a view presents its region only (r01 §8.1). A root that is not present
+// (its owner has not run yet, or a transient root was released) throws; a
+// present size-0 root gives an empty view with the right shape.
+//
+// There is NO host write API (D139): initial values go through init_input
+// (cs::init::* factories). HostViewMut survives only as the argument type of
+// cs::init::custom_host: the framework builds one over a root it is
+// initializing, hands it to the user's function and commits it on return.
 
 #include <array>
-#include <cstdio>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -86,23 +88,11 @@ Snapshot<T> take_snapshot(IOEntry& entry, sk::queue& q) {
     return {std::move(out), g.shape};
 }
 
-/// A host WRITE (set_input, a HostViewMut) to a root with no storage allocates it through the
-/// same routine the owner uses (IOEntry::allocate_if_absent), zero-filled, and the written value
-/// becomes its initial value: the owner finds storage and does nothing (D138 amendment). A
-/// transient root is left alone: its host access keeps throwing.
-inline void ensure_for_host_write(IOEntry& entry, sk::queue& q) {
-    IOEntry& root = *entry.root();
-    if (root.transient()) return;
-    if (!root.allocate_if_absent(q)) return;
-    const Placement pl = root.storage_placements().front();
-    q.memset_in_order(pl.device, root.storage_on(pl), 0, root.flat_size() * dtype_size(root.dtype()));
-}
-
-/// Write an entry's host copy back into its root's primary storage (through
-/// the region, if it has one) and refresh the other devices.
+/// Write an entry's host copy back into its root's primary storage (through the region, if it
+/// has one) and refresh the other devices. Only cs::init::custom_host calls this, through
+/// HostViewMut::commit, on a root its owner has just allocated.
 template <class T>
 void write_back(IOEntry& entry, sk::queue& q, std::span<const T> host) {
-    ensure_for_host_write(entry, q);
     const IOEntry::Geometry g    = entry.geometry();
     StorageEntry<T>&        root = storage_of<T>(entry);
     if (host.size() != element_count(g))
@@ -168,9 +158,9 @@ private:
     friend class System;
 };
 
-/// HostViewMut<DT, Rank> — the same host copy, writable. commit() writes it
-/// into the entry's root storage; so does destruction (no dirty tracking, D17;
-/// a moved-from view writes nothing).
+/// HostViewMut<DT, Rank> — the writable host copy handed to a cs::init::custom_host function.
+/// Built by the framework only (the constructor is private); the framework commits it when the
+/// function returns. It is NOT a host write API: there is none (D139).
 template <DType DT, int Rank>
 class HostViewMut {
 public:
@@ -180,11 +170,7 @@ public:
 
     HostViewMut(const HostViewMut&)            = delete;
     HostViewMut& operator=(const HostViewMut&) = delete;
-    HostViewMut(HostViewMut&& o) noexcept
-        : entry_{std::exchange(o.entry_, nullptr)}
-        , q_{o.q_}
-        , host_{std::move(o.host_)}
-        , shape_{o.shape_} {}
+    HostViewMut(HostViewMut&&) noexcept        = default;
 
     value_type& operator[](sycl::id<Rank> idx) { return host_[detail::flat_of<Rank>(idx, shape_)]; }
     value_type& operator[](std::size_t flat) { return host_[flat]; }
@@ -192,26 +178,14 @@ public:
     std::size_t       size() const { return host_.size(); }
     std::span<value_type> span() { return {host_.data(), host_.size()}; }
 
+    /// Write the copy into the root's storage (primary, then the other placements).
     void commit() {
-        if (entry_ == nullptr) return;
-        detail::write_back<value_type>(*entry_, *q_,
-                                       std::span<const value_type>{host_.data(), host_.size()});
-    }
-
-    ~HostViewMut() {
-        if (entry_ == nullptr) return;
-        try {
-            commit();
-        } catch (const std::exception& e) {
-            std::fprintf(stderr, "naga::cospan: HostViewMut write-back on destruction failed: %s\n",
-                         e.what());
-        }
+        detail::write_back<value_type>(*entry_, *q_, std::span<const value_type>{host_.data(), host_.size()});
     }
 
 private:
     HostViewMut(detail::IOEntry& entry, sk::queue& q) : entry_{&entry}, q_{&q} {
         detail::check_entry(entry, DT, Rank);
-        detail::ensure_for_host_write(entry, q);  // a writable view of a root with no storage allocates it (zeros)
         auto snap = detail::take_snapshot<value_type>(entry, q);
         host_     = std::move(snap.data);
         shape_    = detail::make_range<Rank>(snap.shape);
@@ -222,14 +196,12 @@ private:
     std::vector<value_type> host_;
     sycl::range<Rank>       shape_ = detail::filled_range<Rank>(0);
     friend struct detail::HostViewAccess;
-    friend class Model;
-    friend class ComponentBase;
-    friend class System;
 };
 
 namespace detail {
 
-/// INTERNAL / TEST-ONLY until Model exists (the friend of both views).
+/// INTERNAL: the friend of both views (Model builds HostViews; cs::init::custom_host builds the
+/// HostViewMut of the root it initializes).
 struct HostViewAccess {
     template <DType DT, int Rank>
     static HostView<DT, Rank> view(IOEntry& e, sk::queue& q) {

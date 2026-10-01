@@ -26,7 +26,7 @@ follows an OS-route free. Two things cause such a free:
 - a transient release: `System::release()` clears the roots of a `property::transient`
   subtree after its run, and the next kernel submitted after that hangs
   (`tests/test_system.cpp`, "transient: release after forward, ...", tag `[transient]`);
-- a value-driven root growing: `set_input` changes `n_bins` (8 -> 13), the root is reallocated,
+- a value-driven root growing: `init_input` changes `n_bins` (8 -> 13), the root is reallocated,
   the old storage is freed, and the following kernel submit hangs
   (`tests/test_component.cpp`, "WeightedHistogram: ...", tag `[histogram]`, second SECTION).
 

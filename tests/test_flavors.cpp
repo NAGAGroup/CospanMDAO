@@ -957,7 +957,7 @@ TEST_CASE("fused: a value-driven size driven from outside the fuse runs and foll
         model.setup();
         const std::uint32_t nb1 = 8, nb2 = 13;
         for (const std::uint32_t nb : {nb1, nb2}) {  // the second value grows the output root
-            model.set_input<DType::u32, 1>("f.b.n", std::span<const std::uint32_t>{&nb, 1});
+            model.init_input("f.b.n", cs::init::from_host(std::vector<std::uint32_t>{nb}));
             model.forward();
             model.wait();
             std::vector<float> want(nb);
