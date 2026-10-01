@@ -2478,35 +2478,30 @@ every owner above it stays ignorant. **No framework primitive exists for
 gating, counting, or change detection**: those are ordinary System
 subclasses — provided in the library where common, written by users
 where not — and their entire mechanism is an early return from
-`run_compute_forward`. RunOnceSystem and RunNSystem, the setup-step
-patterns, live inside the framework. Why: §1 need 2.2 possibility floor
-(do once / run N / run when changed / run if) · P5.
+`run_compute_forward`. RunNSystem, the setup-step pattern, lives inside
+the framework; do-once is RunNSystem with n = 1, not a separate type.
+Why: §1 need 2.2 possibility floor (do once / run N / run when changed /
+run if) · P5.
 
 ```cpp
 namespace naga::cospan {
 
-/// Run the subtree exactly once, ever. Construction-time operators
-/// (LBVH, LRPIM, nonlocal-operator assembly at static placement).
-class RunOnceSystem : public System {
-    bool done_ = false;
-protected:
-    std::unique_ptr<LaunchDescription> run_compute_forward() override {
-        if (done_) return nullptr;            // nothing submitted
-        done_ = true;
-        return System::run_compute_forward(); // the default loop
-    }
-};
-
-/// Run the subtree the first N forwards, then never.
+/// Run the subtree on the first n forwards, then never (n >= 1; n == 0
+/// throws std::invalid_argument). Do-once is n = 1: construction-time
+/// operators (LBVH, LRPIM, nonlocal-operator assembly). Users derive from it,
+/// pass n to its constructor and override setup() like any System. With
+/// property::transient it releases after each of its runs and revives on runs
+/// 2..n; after the n-th it stays released, because the early return reaches
+/// no revive(). Roots kept by a consumer outside persist.
 class RunNSystem : public System {
-    size_t remaining_;
+    std::size_t remaining_;
 public:
-    explicit RunNSystem(size_t n) : remaining_{n} {}
+    explicit RunNSystem(std::size_t n);
 protected:
     std::unique_ptr<LaunchDescription> run_compute_forward() override {
-        if (remaining_ == 0) return nullptr;
+        if (remaining_ == 0) return nullptr;   // nothing submitted
         --remaining_;
-        return System::run_compute_forward();
+        return System::run_compute_forward();  // the default loop
     }
 };
 
