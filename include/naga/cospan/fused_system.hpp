@@ -233,6 +233,7 @@ private:
     template <class T>
     void upload(std::optional<sk::usm_vector<T>>& v, const std::vector<T>& src) {
         if (!v) v.emplace(staging_allocator<T>());
+        diag::count_host_tasks();
         v->from_host(std::span<const T>{src});  // a routed, stream-ordered copy of a task-owned snapshot
     }
 

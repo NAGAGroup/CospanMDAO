@@ -4,3 +4,5 @@ build/**
 compile_commands.json
 .letta/
 tmp.log
+
+logs/

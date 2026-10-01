@@ -141,7 +141,10 @@ public:
     void forward() { (void)ready("forward").root->run_compute_forward(); }
 
     /// queue.wait_and_throw(): the caller's choice, never implicit.
-    void wait() { impl("wait").queue.wait_and_throw(); }
+    void wait() {
+        diag::count_queue_waits();
+        impl("wait").queue.wait_and_throw();
+    }
 
     // ---- host access (between runs) ---------------------------------------------
     template <DType DT, int Rank>

@@ -35,6 +35,7 @@
 
 #include "naga/slabkit/slabkit.hpp"
 
+#include "naga/cospan/diagnostics.hpp"
 #include "naga/cospan/dtype.hpp"
 #include "naga/cospan/subsystem.hpp"
 #include "naga/cospan/wrappers.hpp"
@@ -1143,6 +1144,7 @@ public:
             const std::size_t n = held_ ? reserve_elems_ : flat_size();
             slots_.push_back(std::make_unique<Slot>(p, sk::usm_vector<T>(n, route(q, subs, p, n))));
             ++allocations_;
+            diag::count_allocations();
         }
         released_ = false;
         present_  = true;
@@ -1153,11 +1155,20 @@ public:
         if (!is_root() || !present_ || subs_ == nullptr) return;
         for (auto& s : slots_) {
             if (s->version == ragged_version_) continue;
-            if (s->version != 0) q.wait();  // replacing arrays a previous forward's kernels may still read
+            diag::count_ragged_uploads();
+            if (s->version != 0) {
+                diag::count_queue_waits();
+                q.wait();  // replacing arrays a previous forward's kernels may still read
+            }
+            if (s->offs) diag::count_frees();
+            for (auto& a : s->per)
+                if (a) diag::count_frees();
             s->offs.reset();
             for (auto& a : s->per) a.reset();
             if (ragged_) {
                 s->offs.emplace(offsets_.size(), route_as<std::uint64_t>(q, *subs_, s->pl));
+                diag::count_allocations();
+                diag::count_host_tasks();
                 s->offs->from_host(std::span<const std::uint64_t>{offsets_});
                 for (int d = 1; d < rank(); ++d) {
                     if (!dims_[static_cast<std::size_t>(d)].per) continue;
@@ -1165,6 +1176,8 @@ public:
                     std::vector<std::uint64_t> conv(src.begin(), src.end());
                     auto& dst = s->per[static_cast<std::size_t>(d - 1)];
                     dst.emplace(conv.size(), route_as<std::uint64_t>(q, *subs_, s->pl));
+                    diag::count_allocations();
+                    diag::count_host_tasks();
                     dst->from_host(std::span<const std::uint64_t>{conv});
                 }
             }
@@ -1186,6 +1199,7 @@ public:
         // Synchronous frees (D135): the stream's kernels may still read these roots and a usm_vector waits
         // only for its own tasks, so the CALLER has waited the stream (once per releasing Component's
         // batch); the vectors free here.
+        diag::count_frees(slots_.size());
         slots_.clear();
         released_ = true;
         present_  = false;
@@ -1203,11 +1217,13 @@ public:
     /// usm_vector::host_view (an owned copy, ordered after the stream's prior
     /// work). Host kind: queue.wait() then get_access().
     std::vector<T> read_primary(sk::queue& q) const {
+        diag::count_host_reads();
         Slot& s = primary_slot();
         if (s.data.get_kind() == sk::kind::device) {
             auto hv = s.data.host_view();
             return std::vector<T>(hv.begin(), hv.end());
         }
+        diag::count_queue_waits();
         q.wait();
         auto acc = s.data.get_access();
         return std::vector<T>(acc.begin(), acc.end());
@@ -1216,6 +1232,7 @@ public:
     /// Replace the primary storage's contents from the host, then refresh the
     /// copies on the other placements.
     void write_primary(sk::queue& q, std::span<const T> src) {
+        diag::count_host_tasks();
         primary_slot().data.from_host(src);
         sync_other_placements(q);
     }
@@ -1259,8 +1276,10 @@ private:
     void resize_storage() {
         if (!is_root()) return;
         if (!slots_.empty() && flat_size() > slots_.front()->data.capacity()) {
+            diag::count_queue_waits();
             slots_.front()->data.get_queue().wait();
             ++allocations_;  // a usm_vector resize within its capacity never reallocates; this one does
+            diag::count_allocations();
         }
         for (auto& s : slots_) s->data.resize(flat_size());
     }

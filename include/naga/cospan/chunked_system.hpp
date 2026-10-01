@@ -95,6 +95,7 @@ public:
             for (Boundary& b : boundary_)
                 if (b.member != nullptr) allocate_rerooted(*b.root);
             hold_internal(chunks);
+            diag::window_begin();
             for (const auto& [a, b] : chunks) {
                 set_dim0(b - a, a);
                 for (Boundary& bd : boundary_)
@@ -104,6 +105,7 @@ public:
                     if (r->io_kind_ == IOKind::input) r->init_pending_ = true;
                 System::run_compute_forward();
             }
+            diag::window_end();
             set_dim0(n);  // clearing a range re-resolves the peer's shape: at the whole run's length
             clear_ranges();
             release_held();  // one queue wait, then every held root is freed
@@ -229,6 +231,7 @@ private:
         if (chunks.empty()) return;
         for (detail::IOEntry* r : internal_) {
             if (r->present_) {  // left over from a failed forward
+                diag::count_queue_waits();
                 q().wait();
                 r->release_storage();
             }
@@ -246,6 +249,7 @@ private:
         bool any = false;
         for (const detail::IOEntry* r : internal_) any = any || r->held_;
         if (!any) return;
+        diag::count_queue_waits();
         q().wait();
         for (detail::IOEntry* r : internal_)
             if (r->held_) {
@@ -264,6 +268,7 @@ private:
     /// resolves its shapes in registration order; a re-rooted root adopts the full shape of the entry
     /// that used to be its root as soon as that entry's Component has resolved.
     void full_pass() {
+        diag::count_full_passes();
         for (Boundary& b : boundary_)
             if (b.member == nullptr)
                 for (detail::IOEntry* p : b.peers) detail::LeadingRangeAccess::set(*p, 0, b.root->extents()[0]);

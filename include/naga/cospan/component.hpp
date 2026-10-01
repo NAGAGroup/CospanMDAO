@@ -248,6 +248,7 @@ public:
     /// what it owns beyond what a FromInput read needs, and no pre_forward): the tie aliases this
     /// Component owns, then every input, then every output.
     void resolve_shapes() {
+        diag::count_resolve_shapes();
         resolving_ = nullptr;
         // Tie aliases first (D139 part 2): the root's owner resolves an alias root's shape BEFORE
         // the entries below read it (and before allocation); a connected alias is checked once.
@@ -301,6 +302,7 @@ public:
                 drop.push_back(r);
         }
         if (drop.empty()) return;
+        diag::count_queue_waits();
         owner_ctx.queue->wait();
         for (detail::IOEntry* r : drop) r->release_storage();
     }
@@ -991,6 +993,7 @@ public:
         const typename KB::Outputs out  = out_;
         const KB                   body = body_;
         auto f = [=]() { body(Host{}, in, out); };
+        diag::count_host_tasks();
         if (t.group != nullptr)
             t.group->async_host(t.device, f);
         else
