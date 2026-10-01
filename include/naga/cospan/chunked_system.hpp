@@ -7,7 +7,7 @@
 // A System that runs its subtree once per CHUNK of the leading dimension, so the memory its internal
 // ports need is bounded by a budget. The leading dimension of every port is never named: every port of
 // every child, and every port crossing the boundary, has leading length N (the chunk length of the
-// whole run); a mismatch is an error.
+// whole run).
 //
 //   classification (once, at the end of setup, System::resolve):
 //     INTERNAL  every member of the root's aliasing set is declared inside the subtree: the root is
@@ -73,10 +73,15 @@ public:
 
     std::unique_ptr<LaunchDescription> run_compute_forward() override {
         std::vector<std::pair<std::size_t, std::size_t>> chunks;
+        std::optional<std::size_t>                       known_n;
         try {
+            const std::size_t n = leading_length();
+            known_n             = n;
+            set_dim0(n);  // the framework sets dim 0 of every inside port, whatever rule declared it
             // Re-rooted free INPUT roots first: a shape-driving read may need their storage.
             for (Boundary& b : boundary_)
                 if (b.member != nullptr && b.root->kind() == IOKind::input) {
+                    b.member->update_shape();  // dim 0 = N, the other dims as declared
                     b.root->adopt_shape(*b.member);
                     b.prev_flat = b.root->flat_size();
                     allocate_rerooted(*b.root);
@@ -85,22 +90,32 @@ public:
             for (Boundary& b : boundary_)  // an input root whose shape the pass changed takes its init again
                 if (b.member != nullptr && b.root->kind() == IOKind::input && b.root->flat_size() != b.prev_flat)
                     b.root->init_pending_ = true;  // applied with the allocation step below
-            const std::size_t n = chunk_length();
-            chunks              = plan_chunks(n);
-            last_chunks_        = chunks.size();
+            chunks       = plan_chunks(n);
+            last_chunks_ = chunks.size();
             for (Boundary& b : boundary_)
                 if (b.member != nullptr) allocate_rerooted(*b.root);
+            hold_internal(chunks);
             for (const auto& [a, b] : chunks) {
+                set_dim0(b - a);
                 for (Boundary& bd : boundary_)
                     for (detail::IOEntry* p : bd.peers) detail::LeadingRangeAccess::set(*p, a, b);
+                // Each chunk is a fresh computation: an internal free input takes its init again.
+                for (detail::IOEntry* r : internal_)
+                    if (r->io_kind_ == IOKind::input) r->init_pending_ = true;
                 System::run_compute_forward();
             }
+            set_dim0(n);  // clearing a range re-resolves the peer's shape: at the whole run's length
             clear_ranges();
-            full_pass();  // the shapes of the whole run again, for views from the host
+            release_held();  // one queue wait, then every held root is freed
+            full_pass();     // the shapes of the whole run again, for views from the host
             clear_ranges();
+            clear_dim0();
         } catch (...) {
             try {
+                if (known_n) set_dim0(*known_n);
                 clear_ranges();
+                release_held();
+                clear_dim0();
             } catch (...) {  // the original error is the one to report
             }
             throw;
@@ -206,6 +221,40 @@ private:
         root.upload_ragged(q());
     }
 
+    /// D140 B3: before the first chunk every INTERNAL root is allocated once, with capacity for its largest
+    /// chunk (the sum of its block sizes over the chunk's indices), and marked HELD: a last user does not
+    /// release it, an owner finds it present, and per chunk it is resized within its capacity (a usm_vector
+    /// resize within capacity, up or down, never reallocates).
+    void hold_internal(const std::vector<std::pair<std::size_t, std::size_t>>& chunks) {
+        if (chunks.empty()) return;
+        for (detail::IOEntry* r : internal_) {
+            if (r->present_) {  // left over from a failed forward
+                q().wait();
+                r->release_storage();
+            }
+            std::size_t most = 0;
+            for (const auto& [a, b] : chunks)
+                most = std::max(most, static_cast<std::size_t>(r->block_offset_at(b) - r->block_offset_at(a)));
+            r->reserve_elems_ = most;
+            r->held_          = true;
+            r->allocate_if_absent(q());
+        }
+    }
+
+    /// After the last chunk: one queue wait, then free every held root and clear HELD.
+    void release_held() {
+        bool any = false;
+        for (const detail::IOEntry* r : internal_) any = any || r->held_;
+        if (!any) return;
+        q().wait();
+        for (detail::IOEntry* r : internal_)
+            if (r->held_) {
+                r->release_storage();
+                r->held_          = false;
+                r->reserve_elems_ = 0;
+            }
+    }
+
     void clear_ranges() {
         for (Boundary& b : boundary_)
             for (detail::IOEntry* p : b.peers) detail::LeadingRangeAccess::clear(*p);
@@ -232,31 +281,44 @@ private:
         }
     }
 
-    /// N: the common leading length of the boundary roots; every inside entry must agree.
-    std::size_t chunk_length() const {
-        if (boundary_.empty())
-            throw std::invalid_argument("naga::cospan: " + describe() +
-                                        ": no port crosses the boundary, so there is no leading dimension to chunk");
-        const detail::IOEntry* first = boundary_.front().root;
-        const std::size_t      n     = first->extents()[0];
+    /// N, the chunk length of the whole run, known before the pass (the framework then sets dim 0 of every
+    /// inside port to it): the leading length of the boundary roots that exist outside, and the declared
+    /// (fixed) leading length of a re-rooted free input. They must all agree.
+    std::size_t leading_length() const {
+        const detail::IOEntry* first = nullptr;
+        std::size_t            n     = 0;
         for (const Boundary& b : boundary_) {
-            const std::size_t l = b.root->extents()[0];
-            if (l != n)
+            std::size_t l = 0;
+            if (b.member == nullptr) {
+                l = b.root->extents()[0];
+            } else if (b.root->kind() == IOKind::input && b.member->dim(0).how == detail::DimRecord::How::fixed) {
+                l = b.member->dim(0).extent;
+            } else {
+                continue;  // an inside output, or a value-driven input: no length of its own
+            }
+            if (first == nullptr) {
+                first = b.root;
+                n     = l;
+            } else if (l != n) {
                 throw std::invalid_argument("naga::cospan: " + describe() + ": boundary roots '" + std::string{first->name()} +
                                             "' (leading length " + std::to_string(n) + ") and '" + std::string{b.root->name()} +
                                             "' (leading length " + std::to_string(l) + ") disagree; the chunk length is one");
+            }
         }
-        for (const ComponentBase* c : comps_)
-            for (const detail::IOEntry* e : c->order_)
-                if (e->extents()[0] != n)
-                    throw std::invalid_argument("naga::cospan: " + describe() + ": '" + e->full_path() +
-                                                "' has leading length " + std::to_string(e->extents()[0]) +
-                                                ", chunk length is " + std::to_string(n));
-        for (const detail::IOEntry* r : internal_)
-            if (r->extents()[0] != n)
-                throw std::invalid_argument("naga::cospan: " + describe() + ": '" + r->full_path() + "' has leading length " +
-                                            std::to_string(r->extents()[0]) + ", chunk length is " + std::to_string(n));
+        if (first == nullptr)
+            throw std::invalid_argument("naga::cospan: " + describe() +
+                                        ": no port crossing the boundary gives the chunk length (an outside root or a promoted free input is needed)");
         return n;
+    }
+
+    /// Dim 0 of every port of every inside component is the current chunk length (D140 B3).
+    void set_dim0(std::size_t n) {
+        for (ComponentBase* c : comps_)
+            for (detail::IOEntry* e : c->order_) e->dim0_override_ = n;
+    }
+    void clear_dim0() {
+        for (ComponentBase* c : comps_)
+            for (detail::IOEntry* e : c->order_) e->dim0_override_.reset();
     }
 
     /// Pricing from the declared shape rules (resolved over the full range) and the greedy scan.

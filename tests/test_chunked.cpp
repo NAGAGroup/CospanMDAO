@@ -603,7 +603,8 @@ public:
     }
 };
 
-/// An inside entry with another leading length.
+/// An internal root declared with a fixed leading length (13, unrelated to N): inside a chunked system the
+/// framework sets dim 0, so it works (D140 B3).
 class OddInner : public cs::ChunkedSystem {
 public:
     explicit OddInner(std::size_t budget) : cs::ChunkedSystem(budget) {}
@@ -704,12 +705,6 @@ public:
 }  // namespace tch
 
 TEST_CASE("Chunked: errors", "[chunked][errors]") {
-    SECTION("an inside entry with a different leading length") {
-        cs::Model m = cs::create_model<tch::OddTop>(default_config());
-        m.setup();
-        tch::expect_throws([&] { m.forward(); }, {"g.out", "leading length 13", "chunk length is 8"});
-        m.wait();
-    }
     SECTION("a shape driven by a value computed inside") {
         cs::Model m = cs::create_model<tch::ValueTop>(default_config());
         m.setup();
@@ -735,4 +730,312 @@ TEST_CASE("Chunked: errors", "[chunked][errors]") {
     SECTION("a budget of 0") {
         tch::expect_throws([] { cs::ChunkedSystem c{0}; }, {"budget"});
     }
+}
+
+
+// ---- D140 B3: internal roots are kept across the chunks -------------------------------------------------
+namespace tch {
+
+/// Src1: x[i] = i / 2, fixed [n].
+struct Src1Body {
+    struct Inputs {};
+    struct Outputs {
+        cs::Output<DType::f32, 1> x;
+    };
+    void operator()(sycl::id<1> i, Inputs, Outputs o) const { o.x[i] = 0.5f * static_cast<float>(i[0]); }
+};
+class Src1 : public cs::Component<Src1Body> {
+    std::size_t               n_;
+    cs::Output<DType::f32, 1> x_;
+
+public:
+    explicit Src1(std::size_t n) : n_{n} {}
+    void setup() override { declare_output(x_, "x", n_); }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+        return create_launch_config(x_.shape(), {}, {x_}, {});
+    }
+};
+
+/// AddBias: out = in + bias. `bias` is a FREE input, internal to the chunked system (its leading length is
+/// derived from `in`); its init is a host function that counts its calls and fills the call number, so the
+/// value each chunk sees shows when (and how often) the init was applied.
+struct AddBiasBody {
+    struct Inputs {
+        cs::Input<DType::f32, 1> in;
+        cs::Input<DType::f32, 1> bias;
+    };
+    struct Outputs {
+        cs::Output<DType::f32, 1> out;
+    };
+    void operator()(sycl::id<1> i, Inputs a, Outputs o) const { o.out[i] = a.in[i] + a.bias[i]; }
+};
+class AddBias : public cs::Component<AddBiasBody> {
+    std::shared_ptr<int>      calls_;
+    cs::Input<DType::f32, 1>  in_, bias_;
+    cs::Output<DType::f32, 1> out_;
+
+public:
+    explicit AddBias(std::shared_ptr<int> calls) : calls_{std::move(calls)} {}
+    void setup() override {
+        declare_input(in_, "in", cs::FromSourceDim{0});
+        declare_input(bias_, "bias", cs::FromInputDim{"in", 0});
+        init_input("bias", cs::init::custom_host<DType::f32, 1>([c = calls_](cs::HostViewMut<DType::f32, 1>& v) {
+                       ++*c;
+                       for (std::size_t i = 0; i < v.size(); ++i) v[i] = static_cast<float>(*c);
+                   }));
+        declare_output(out_, "out", cs::FromInputDim{"in", 0});
+    }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+        return create_launch_config(out_.shape(), {in_, bias_}, {out_}, {});
+    }
+};
+class BiasInner : public cs::ChunkedSystem {
+    std::shared_ptr<int> calls_;
+
+public:
+    BiasInner(std::size_t budget, std::shared_ptr<int> calls) : cs::ChunkedSystem(budget), calls_{std::move(calls)} {}
+    void setup() override { add_subsystem<AddBias>("ab", calls_); }
+};
+class BiasTop : public cs::System {
+    std::size_t          n_, budget_;
+    std::shared_ptr<int> calls_;
+
+public:
+    BiasTop(std::size_t n, std::size_t budget, std::shared_ptr<int> calls) : n_{n}, budget_{budget}, calls_{std::move(calls)} {}
+    void setup() override {
+        add_subsystem<Src1>("src", n_);
+        add_subsystem<BiasInner>("inner", budget_, calls_);
+        add_subsystem<Cons>("cons");
+        connect("src.x", "inner.ab.in");
+        connect("inner.ab.out", "cons.in");
+    }
+};
+
+}  // namespace tch
+
+TEST_CASE("Chunked: internal roots are allocated once per forward and kept across the chunks", "[chunked][held]") {
+    SECTION("dense, ten chunks") {
+        constexpr std::size_t n = 10;
+        cs::Model plain = cs::create_model<tch::DenseTop<tch::InnerPlain>>(default_config(), n, std::size_t{0});
+        plain.setup();
+        const auto pout = tch::forward_out(plain);
+        cs::Model  m    = cs::create_model<tch::DenseTop<tch::InnerChunk>>(default_config(), n, std::size_t{16});
+        m.setup();
+        cs::detail::IOEntry& t = m.root().entry_at("inner.a.t");  // the internal [N,4] root
+        for (int rep = 0; rep < 3; ++rep) {
+            const std::size_t before = t.allocation_count();
+            const auto        out    = tch::forward_out(m);
+            CHECK(t.allocation_count() - before == 1);
+            CHECK(tch::chunks_of(m) == 10);
+            CHECK(out == pout);
+            CHECK_FALSE(t.held());
+            CHECK_FALSE(t.has_storage());  // released after the last chunk
+        }
+    }
+    SECTION("ragged, ten chunks of varying size (resized up and down within the capacity)") {
+        const std::vector<std::uint32_t> counts{1, 4, 2, 4, 3, 4, 1, 4, 2, 4};
+        tch::Sizes                       cost(counts.size());
+        for (std::size_t i = 0; i < counts.size(); ++i) cost[i] = 4u * counts[i] * counts[i];
+        cs::Model plain = cs::create_model<tch::RaggedTop<tch::RInnerPlain>>(default_config(), counts, std::size_t{0});
+        plain.setup();
+        const auto pout = tch::forward_out(plain);
+        cs::Model  m    = cs::create_model<tch::RaggedTop<tch::RInnerChunk>>(default_config(), counts, std::size_t{64});
+        m.setup();
+        cs::detail::IOEntry& g = m.root().entry_at("inner.s.gram");  // the internal ragged root
+        for (int rep = 0; rep < 2; ++rep) {
+            const std::size_t before = g.allocation_count();
+            const auto        out    = tch::forward_out(m);
+            CHECK(g.allocation_count() - before == 1);
+            CHECK(tch::chunks_of(m) == 10);
+            CHECK(tch::chunks_of(m) == tch::expected_chunks(cost, 64));
+            CHECK(out == pout);
+            CHECK_FALSE(g.held());
+        }
+    }
+}
+
+TEST_CASE("Chunked: an internal free input takes its init again in every chunk", "[chunked][held]") {
+    constexpr std::size_t n     = 10;
+    auto                  calls = std::make_shared<int>(0);
+    // 4 bytes of internal port per index, budget 12: chunks [0,3) [3,6) [6,9) [9,10)
+    cs::Model m = cs::create_model<tch::BiasTop>(default_config(), n, std::size_t{12}, calls);
+    m.setup();
+    for (int rep = 0; rep < 2; ++rep) {
+        *calls         = 0;
+        const auto out = tch::forward_out(m);
+        CHECK(tch::chunks_of(m) == 4);
+        CHECK(*calls == 4);  // once per chunk
+        REQUIRE(out.size() == n);
+        for (std::size_t i = 0; i < n; ++i) {
+            const float bias = static_cast<float>(i / 3 + 1);  // the call number of its chunk
+            CHECK(out[i] == 2.0f * (0.5f * static_cast<float>(i) + bias) + 1.0f);
+        }
+        CHECK(m.root().entry_at("inner.ab.bias").allocation_count() == static_cast<std::size_t>(rep + 1));  // once per forward
+    }
+}
+
+
+// ---- D140 B3: the framework sets dim 0 of every inside port ---------------------------------------------------
+namespace tch {
+
+/// MixFixed: t[i,k] = in[i] * (k + 1). `t` is declared with a FIXED dim 0 (`rows`).
+struct MixBody {
+    struct Inputs {
+        cs::Input<DType::f32, 1> in;
+    };
+    struct Outputs {
+        cs::Output<DType::f32, 2> t;
+    };
+    void operator()(sycl::id<2> i, Inputs a, Outputs o) const { o.t[i] = a.in[i[0]] * static_cast<float>(i[1] + 1); }
+};
+class MixFixed : public cs::Component<MixBody> {
+    std::size_t               rows_;
+    cs::Input<DType::f32, 1>  in_;
+    cs::Output<DType::f32, 2> t_;
+
+public:
+    explicit MixFixed(std::size_t rows) : rows_{rows} {}
+    void setup() override {
+        declare_input(in_, "in", cs::FromSourceDim{0});
+        declare_output(t_, "t", rows_, 3);
+    }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+        return create_launch_config(t_.shape(), {in_}, {t_}, {});
+    }
+};
+
+/// MixFromInput: the same, with dim 0 of `t` declared FromInput{"n", 0} (the value of n[0]).
+struct MixFromInputBody {
+    struct Inputs {
+        cs::Input<DType::f32, 1> in;
+    };
+    struct Outputs {
+        cs::Output<DType::f32, 2> t;
+    };
+    void operator()(sycl::id<2> i, Inputs a, Outputs o) const { o.t[i] = a.in[i[0]] * static_cast<float>(i[1] + 1); }
+};
+class MixFromInput : public cs::Component<MixFromInputBody> {
+    cs::Input<DType::u32, 1>  n_;
+    cs::Input<DType::f32, 1>  in_;
+    cs::Output<DType::f32, 2> t_;
+
+public:
+    void setup() override {
+        declare_input(n_, "n", cs::FromSourceDim{0});
+        declare_input(in_, "in", cs::FromSourceDim{0});
+        declare_output(t_, "t", cs::FromInput{"n", 0}, 3);
+    }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+        return create_launch_config(t_.shape(), {in_}, {t_}, {});
+    }
+};
+
+/// Sum3: y[i] = sum_k in[i,k].
+struct Sum3Body {
+    struct Inputs {
+        cs::Input<DType::f32, 2> in;
+    };
+    struct Outputs {
+        cs::Output<DType::f32, 1> y;
+    };
+    void operator()(sycl::id<1> i, Inputs a, Outputs o) const {
+        float s = 0.0f;
+        for (std::size_t k = 0; k < a.in.shape()[1]; ++k) s += a.in[sycl::id<2>{i[0], k}];
+        o.y[i] = s;
+    }
+};
+class Sum3 : public cs::Component<Sum3Body> {
+    cs::Input<DType::f32, 2>  in_;
+    cs::Output<DType::f32, 1> y_;
+
+public:
+    void setup() override {
+        declare_input(in_, "in", cs::FromSourceDim{0}, cs::FromSourceDim{1});
+        declare_output(y_, "y", cs::FromInputDim{"in", 0});
+    }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+        return create_launch_config(y_.shape(), {in_}, {y_}, {});
+    }
+};
+
+/// mode 0: MixFixed(rows); mode 1: MixFromInput (n comes from outside).
+void fill_mix(cs::System& s, int mode, std::size_t rows) {
+    if (mode == 0)
+        s.add_subsystem<MixFixed>("m", rows);
+    else
+        s.add_subsystem<MixFromInput>("m");
+    s.add_subsystem<Sum3>("s");
+    s.connect("m.t", "s.in");
+}
+class MixPlain : public cs::System {
+    int         mode_;
+    std::size_t rows_;
+
+public:
+    MixPlain(std::size_t, int mode, std::size_t rows) : mode_{mode}, rows_{rows} {}
+    void setup() override { fill_mix(*this, mode_, rows_); }
+};
+class MixChunk : public cs::ChunkedSystem {
+    int         mode_;
+    std::size_t rows_;
+
+public:
+    MixChunk(std::size_t budget, int mode, std::size_t rows) : cs::ChunkedSystem(budget), mode_{mode}, rows_{rows} {}
+    void setup() override { fill_mix(*this, mode_, rows_); }
+};
+template <class Inner>
+class MixTop : public cs::System {
+    std::size_t n_, budget_, rows_;
+    int         mode_;
+
+public:
+    MixTop(std::size_t n, std::size_t budget, int mode, std::size_t rows) : n_{n}, budget_{budget}, rows_{rows}, mode_{mode} {}
+    void setup() override {
+        add_subsystem<Src1>("src", n_);
+        if (mode_ == 1) add_subsystem<CProd>("ns", std::vector<std::uint32_t>(n_, static_cast<std::uint32_t>(n_)));  // n[0] = N
+        add_subsystem<Inner>("inner", budget_, mode_, rows_);
+        add_subsystem<Cons>("cons");
+        connect("src.x", "inner.m.in");
+        if (mode_ == 1) connect("ns.counts", "inner.m.n");
+        connect("inner.s.y", "cons.in");
+    }
+};
+
+}  // namespace tch
+
+TEST_CASE("Chunked: the framework sets dim 0 of every inside port (fixed, FromInput)", "[chunked][dim0]") {
+    constexpr std::size_t n = 10;
+    // t is 12 bytes per index (internal [N,3] f32); budget 36: chunks of 3
+    std::vector<float> want(n);
+    for (std::size_t i = 0; i < n; ++i) want[i] = 2.0f * (0.5f * static_cast<float>(i) * 6.0f) + 1.0f;
+    for (const int mode : {0, 1}) {
+        INFO("mode " << mode << (mode == 0 ? " (dim 0 declared FIXED, 7)" : " (dim 0 declared FromInput{n,0})"));
+        // the plain System declares the right N; the chunked one a dim 0 that has nothing to do with it
+        cs::Model plain = cs::create_model<tch::MixTop<tch::MixPlain>>(default_config(), n, std::size_t{0}, mode, n);
+        plain.setup();
+        const auto pout = tch::forward_out(plain);
+        CHECK(pout == want);
+        for (const std::size_t budget : {std::size_t{36}, std::size_t{12}, std::size_t{1000}}) {
+            cs::Model m = cs::create_model<tch::MixTop<tch::MixChunk>>(default_config(), n, budget, mode, std::size_t{7});
+            m.setup();
+            CHECK(tch::forward_out(m) == pout);
+            CHECK(tch::chunks_of(m) == (budget == 36 ? 4u : budget == 12 ? 10u : 1u));
+            CHECK(tch::forward_out(m) == pout);  // and again
+        }
+    }
+    // a chunked system whose internal port has a fixed dim 0 that is not N, with no consumer
+    cs::Model odd = cs::create_model<tch::OddTop>(default_config());
+    odd.setup();
+    const auto oout = tch::forward_out(odd);
+    REQUIRE(oout.size() == 8);
+    for (std::size_t i = 0; i < 8; ++i) CHECK(oout[i] == 2.0f * tch::yval(i) + 1.0f);
+}
+
+TEST_CASE("Chunked: a component reused outside a chunked system keeps its declared dim 0", "[chunked][dim0]") {
+    // MixFixed declares 4 rows for t: standalone, in a plain System, t has 4 rows whatever the input length
+    cs::Model m = cs::create_model<tch::MixTop<tch::MixPlain>>(default_config(), std::size_t{10}, std::size_t{0}, 0, std::size_t{4});
+    m.setup();
+    const auto out = tch::forward_out(m);
+    REQUIRE(out.size() == 4);
+    for (std::size_t i = 0; i < 4; ++i) CHECK(out[i] == 2.0f * (0.5f * static_cast<float>(i) * 6.0f) + 1.0f);
 }

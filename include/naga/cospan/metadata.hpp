@@ -541,6 +541,10 @@ public:
         if (r.io_kind_ == IOKind::input) r.init_pending_ = true;
         return true;
     }
+    /// D140 B3: this root is HELD by its ChunkedSystem (internal root kept across the chunks).
+    bool held() const noexcept { return root_->held_; }
+    /// How many times the root's storage was allocated or grew past its capacity (a test hook).
+    std::size_t allocation_count() const noexcept { return root_->allocations_; }
     /// D140 B2: the path of the ChunkedSystem this root is internal to; empty otherwise.
     std::string_view chunk_internal_by() const noexcept { return root_->chunk_internal_by_; }
     /// The Subsystem that registered this entry (a Component for I/O, a System for aliases).
@@ -702,6 +706,13 @@ protected:
     std::array<std::vector<std::size_t>, 3> applied_per_;  ///< the per-index arrays last applied
     std::uint64_t              ragged_version_ = 0;      ///< bumped whenever the ragged description changes
     bool                       ragged_port_ = false;     ///< declared with RaggedInput / RaggedOutput
+    // ---- D140 B3 (roots): kept across the chunks of a ChunkedSystem ----
+    bool                       held_          = false;   ///< set by the ChunkedSystem: no release by a last user
+    std::size_t                reserve_elems_ = 0;       ///< held: the capacity (elements) allocate() takes
+    std::size_t                allocations_   = 0;       ///< storage allocations of this root (allocate, growth past capacity)
+    /// Inside a ChunkedSystem the framework sets dim 0 of every port of every inside component to the
+    /// current chunk length (N in the full-range pass, b - a per chunk), whatever rule declared it.
+    std::optional<std::size_t> dim0_override_;
     std::vector<DimRecord>     dims_;
     std::vector<Placement>     placements_;        ///< roots; primary first
     std::optional<sycl::device> device_;
@@ -870,6 +881,10 @@ public:
         std::array<std::size_t, 3> next = extents_;
         for (int d = 0; d < rank(); ++d) {
             DimRecord& r = dims_[static_cast<std::size_t>(d)];
+            if (d == 0 && dim0_override_) {  // inside a ChunkedSystem (D140 B3): dim 0 IS the chunk length,
+                next[0] = *dim0_override_;   // whatever rule declared it
+                continue;
+            }
             switch (r.how) {
                 case DimRecord::How::fixed: break;
                 case DimRecord::How::from_source_dim:
@@ -891,10 +906,7 @@ public:
                 case DimRecord::How::per_index_host:    // fixed at declaration
                 case DimRecord::How::per_index_from_input: break;  // resolved by the Component
             }
-            // Under a runtime leading range (D140 B1/B2) the peer's dim 0 IS the range length, whatever rule
-            // declared it (a fixed-N port of a chunked system follows its chunk).
-            next[static_cast<std::size_t>(d)] =
-                (d >= 1 && r.per) ? 0 : ((d == 0 && leading_range()) ? leading_range()->second - leading_range()->first : r.extent);
+            next[static_cast<std::size_t>(d)] = (d >= 1 && r.per) ? 0 : r.extent;
         }
 
         // ---- D140: the ragged description. Every per-index array must have one entry per index of dim 0.
@@ -1015,8 +1027,11 @@ public:
         subs_ = &subs;
         for (const Placement& p : placements_) {
             if (find_slot(p) != nullptr) continue;
-            // A size-0 root gets an empty vector (usm_vector(0, ...) allocates nothing).
-            slots_.push_back(std::make_unique<Slot>(p, sk::usm_vector<T>(flat_size(), route(q, subs, p))));
+            // A size-0 root gets an empty vector (usm_vector(0, ...) allocates nothing). A HELD root (D140 B3)
+            // takes its reserved capacity: per chunk it is resized within it, which never reallocates.
+            const std::size_t n = held_ ? reserve_elems_ : flat_size();
+            slots_.push_back(std::make_unique<Slot>(p, sk::usm_vector<T>(n, route(q, subs, p, n))));
+            ++allocations_;
         }
         released_ = false;
         present_  = true;
@@ -1132,8 +1147,10 @@ private:
     /// Resize the root's storage to flat_size(); growing waits the stream first (synchronous frees, D135).
     void resize_storage() {
         if (!is_root()) return;
-        if (!slots_.empty() && flat_size() > slots_.front()->data.capacity())
+        if (!slots_.empty() && flat_size() > slots_.front()->data.capacity()) {
             slots_.front()->data.get_queue().wait();
+            ++allocations_;  // a usm_vector resize within its capacity never reallocates; this one does
+        }
         for (auto& s : slots_) s->data.resize(flat_size());
     }
 
@@ -1218,11 +1235,11 @@ private:
     /// fully fixed root outside a transient subtree takes the arena (never
     /// falling back: an arena is a budget); everything else the pool if the
     /// device has one, else the OS.
-    sk::allocator<T> route(sk::queue& q, Substrates& subs, const Placement& p) const {
+    sk::allocator<T> route(sk::queue& q, Substrates& subs, const Placement& p, std::size_t elems) const {
         if (p.kind != sk::kind::device) return sk::allocator<T>{q, p.kind, p.device};
         // An empty root (D139) allocates nothing, so it needs no arena or pool: a fixed size-0 root is
         // arena-eligible but its device has no arena (the arena is sized from the non-empty roots).
-        if (flat_size() == 0) return sk::allocator<T>{q, sk::kind::device, p.device};
+        if (elems == 0) return sk::allocator<T>{q, sk::kind::device, p.device};
         const sycl::device& d = p.device;
         const auto it = subs.find(d);
         if (arena_eligible()) {

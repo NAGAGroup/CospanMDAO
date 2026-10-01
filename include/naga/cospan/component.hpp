@@ -282,7 +282,7 @@ public:
         std::vector<detail::IOEntry*> drop;
         for (detail::IOEntry* e : order_) {
             detail::IOEntry* r = e->root();
-            if (r->transient() && r->last_user() == this && r->has_storage() &&
+            if (r->transient() && r->last_user() == this && r->has_storage() && !r->held() &&  // D140 B3: held roots stay
                 std::find(drop.begin(), drop.end(), r) == drop.end())
                 drop.push_back(r);
         }
@@ -471,6 +471,8 @@ private:
                                    std::string{e.name()} + "'");
         for (int d = 0; d < e.rank(); ++d) {
             detail::DimRecord& r = e.dims_[static_cast<std::size_t>(d)];
+            // Inside a ChunkedSystem dim 0 is the chunk length (D140 B3): its declared rule is not evaluated.
+            if (d == 0 && e.dim0_override_) continue;
             if (r.how == detail::DimRecord::How::from_input_dim) {
                 detail::IOEntry& src = sibling_input(e, r.input);
                 resolve(src, done, active);
