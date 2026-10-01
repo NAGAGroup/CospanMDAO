@@ -33,10 +33,27 @@
 //        (detail::LeadingRangeAccess), then the subtree runs once (the default loop);
 //     6. the ranges are cleared and the shapes restored to the full range.
 //   Children never see a or b.
+//
+//   TOPOLOGY CACHE AND REPLAY (the default; set_replay(false) runs the per-chunk resolution above unchanged):
+//     the first forward does the full-range pass and plans the chunks as above, and records what that pass
+//     depended on: the VALUES it read (root, write epoch, and a copy of the values) and the SHAPES of every
+//     outside boundary root (root, shape version), plus N. It then captures, for every inside entry and every
+//     internal root, the full-range ShapeState and derives each chunk's state from it (dim 0 = b - a, per-index
+//     arrays cut to [a, b), offsets rebased). A later forward whose recorded dependencies are unchanged skips the
+//     pass and the planning. Inside the chunk loop the cached state is APPLIED (no rule is evaluated, no value is
+//     read, nothing is validated or resized), the boundary peers get their leading range without a refresh, the
+//     internal roots' device index arrays (uploaded once, full range, when the roots are held) are addressed
+//     through meta_shift_ = a, and every inside Component runs in replay mode (no resolve_shapes, no ragged
+//     upload, no validate_connection; it still runs pre_forward, allocation of what it owns, pending inits and
+//     the re-pointing of its wrappers).
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
+#include <cstdlib>
+#include <functional>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
@@ -61,6 +78,47 @@ class ChunkedSystem : public System {
     std::vector<detail::IOEntry*>   internal_;
     std::vector<ComponentBase*>     comps_;
 
+    // ---- the topology cache ----
+    using Chunks = std::vector<std::pair<std::size_t, std::size_t>>;
+    struct EntryTopo {
+        detail::IOEntry*                          e = nullptr;
+        detail::IOEntry::ShapeState               full;   ///< the full-range state after the pass
+        std::vector<detail::IOEntry::ShapeState>  chunk;  ///< one per chunk, cut from `full`
+    };
+    struct ValueDep {
+        detail::IOEntry*           root = nullptr;
+        std::uint64_t              epoch = 0;
+        std::vector<std::uint64_t> values;  ///< the root's whole content when the pass read it
+    };
+    struct ShapeDep {
+        const detail::IOEntry* root = nullptr;
+        std::uint64_t          version = 0;
+    };
+    struct Topology {
+        bool                   valid = false;
+        std::size_t            n     = 0;
+        Chunks                 chunks;
+        std::vector<EntryTopo> entries;
+        std::vector<ValueDep>  values;
+        std::vector<ShapeDep>  shapes;
+    };
+    Topology                             topo_;
+    bool                                 replay_    = default_replay_ref();
+    bool                                 recording_ = false;
+    std::vector<detail::IOEntry*>        dep_roots_;
+    std::vector<const detail::IOEntry*>  shape_roots_;
+    std::function<void(std::size_t)>     chunk_hook_, chunk_post_hook_;
+
+    /// The process-wide default of set_replay: true, unless the environment has COSPAN_CHUNK_LEGACY=1 (the
+    /// whole test suite can be run on the legacy path that way).
+    static bool& default_replay_ref() {
+        static bool v = [] {
+            const char* e = std::getenv("COSPAN_CHUNK_LEGACY");
+            return !(e != nullptr && e[0] == '1');
+        }();
+        return v;
+    }
+
 public:
     /// `budget_bytes` bounds the sum, over one chunk, of the bytes of the INTERNAL ports.
     explicit ChunkedSystem(std::size_t budget_bytes) : budget_{budget_bytes} {
@@ -68,52 +126,96 @@ public:
     }
 
     std::size_t budget() const noexcept { return budget_; }
+    /// true (the default): cache the topology and replay it per chunk; false: the legacy per-chunk resolution.
+    void set_replay(bool on) {
+        replay_      = on;
+        topo_.valid  = false;
+    }
+    bool replay() const noexcept { return replay_; }
+    static void set_default_replay(bool on) { default_replay_ref() = on; }
+    static bool default_replay() { return default_replay_ref(); }
+    /// TEST HOOKS. `before_launch`: called (replay path only) for every chunk after its shapes are applied from the
+    /// cache and before its Components run. `after_chunk`: called after the chunk's Components have run (wrappers
+    /// pointed), on BOTH paths: this is where a test captures the shapes and pointers of every inside entry. Both
+    /// receive the chunk index.
+    void set_chunk_hooks(std::function<void(std::size_t)> before_launch, std::function<void(std::size_t)> after_chunk) {
+        chunk_hook_      = std::move(before_launch);
+        chunk_post_hook_ = std::move(after_chunk);
+    }
+    /// TEST ACCESS: every inside Component entry and every internal root (each once).
+    std::vector<detail::IOEntry*> chunk_entries() const {
+        std::vector<detail::IOEntry*>              out;
+        std::unordered_set<const detail::IOEntry*> seen;
+        for (ComponentBase* c : comps_)
+            for (detail::IOEntry* e : c->order_)
+                if (seen.insert(e).second) out.push_back(e);
+        for (detail::IOEntry* r : internal_)
+            if (seen.insert(r).second) out.push_back(r);
+        return out;
+    }
+    /// Whether the cached topology is currently held (a test hook).
+    bool topology_cached() const noexcept { return topo_.valid; }
     /// The number of chunks the last forward ran (0 before the first, and for N = 0).
     std::size_t last_chunk_count() const noexcept { return last_chunks_; }
 
     std::unique_ptr<LaunchDescription> run_compute_forward() override {
-        std::vector<std::pair<std::size_t, std::size_t>> chunks;
-        std::optional<std::size_t>                       known_n;
+        Chunks                     chunks;
+        std::optional<std::size_t> known_n;
         try {
             const std::size_t n = leading_length();
             known_n             = n;
-            set_dim0(n);  // the framework sets dim 0 of every inside port, whatever rule declared it
-            // Re-rooted free INPUT roots first: a shape-driving read may need their storage.
-            for (Boundary& b : boundary_)
-                if (b.member != nullptr && b.root->kind() == IOKind::input) {
-                    b.member->update_shape();  // dim 0 = N, the other dims as declared
-                    b.root->adopt_shape(*b.member);
-                    b.prev_flat = b.root->flat_size();
-                    allocate_rerooted(*b.root);
-                }
-            full_pass();
-            for (Boundary& b : boundary_)  // an input root whose shape the pass changed takes its init again
-                if (b.member != nullptr && b.root->kind() == IOKind::input && b.root->flat_size() != b.prev_flat)
-                    b.root->init_pending_ = true;  // applied with the allocation step below
-            chunks       = plan_chunks(n);
-            last_chunks_ = chunks.size();
+            const bool replay   = replay_;
+            if (replay && topology_valid(n)) {
+                // The recorded dependencies are unchanged: no full pass, no planning. The entries are put back at
+                // the full range (they are, after the last forward; this makes sure).
+                for (EntryTopo& t : topo_.entries) t.e->apply_shape(t.full);
+                chunks       = topo_.chunks;
+                last_chunks_ = chunks.size();
+            } else {
+                topo_.valid = false;
+                recording_  = replay;
+                prepare_full(n, chunks);
+                recording_ = false;
+                if (replay) build_topology(n, chunks);
+            }
             for (Boundary& b : boundary_)
                 if (b.member != nullptr) allocate_rerooted(*b.root);
             hold_internal(chunks);
+            // Replay: the internal roots' device metadata is uploaded ONCE, at the full range, before the window
+            // (version-gated: unchanged metadata is not sent again). Per chunk only meta_shift_ moves.
+            if (replay)
+                for (detail::IOEntry* r : internal_) r->upload_ragged(q());
             diag::window_begin();
-            for (const auto& [a, b] : chunks) {
-                set_dim0(b - a, a);
-                for (Boundary& bd : boundary_)
-                    for (detail::IOEntry* p : bd.peers) detail::LeadingRangeAccess::set(*p, a, b);
-                // Each chunk is a fresh computation: an internal free input takes its init again.
-                for (detail::IOEntry* r : internal_)
-                    if (r->io_kind_ == IOKind::input) r->init_pending_ = true;
-                System::run_compute_forward();
-            }
+            if (replay)
+                run_replay_loop(chunks);
+            else
+                run_legacy_loop(chunks);
             diag::window_end();
-            set_dim0(n);  // clearing a range re-resolves the peer's shape: at the whole run's length
-            clear_ranges();
-            release_held();  // one queue wait, then every held root is freed
-            full_pass();     // the shapes of the whole run again, for views from the host
-            clear_ranges();
-            clear_dim0();
+            if (replay) {
+                for (EntryTopo& t : topo_.entries) t.e->apply_shape(t.full);  // the whole run again, no second pass
+                for (detail::IOEntry* r : internal_) r->meta_shift_ = 0;
+                for (Boundary& b : boundary_)
+                    for (detail::IOEntry* p : b.peers) detail::LeadingRangeAccess::clear_no_refresh(*p);
+                release_held();  // one queue wait, then every held root is freed
+                clear_dim0();
+            } else {
+                set_dim0(n);  // clearing a range re-resolves the peer's shape: at the whole run's length
+                clear_ranges();
+                release_held();  // one queue wait, then every held root is freed
+                full_pass();     // the shapes of the whole run again, for views from the host
+                clear_ranges();
+                clear_dim0();
+            }
         } catch (...) {
+            topo_.valid = false;  // whatever failed, the next forward builds the topology again
+            recording_  = false;
+            for (ComponentBase* c : comps_) {
+                c->replay_         = false;
+                c->dep_recorder_   = nullptr;
+                c->shape_recorder_ = nullptr;
+            }
             try {
+                for (detail::IOEntry* r : internal_) r->meta_shift_ = 0;
                 if (known_n) set_dim0(*known_n);
                 clear_ranges();
                 release_held();
@@ -210,6 +312,154 @@ private:
         return p;
     }
 
+    // ---- the topology cache -----------------------------------------------------------------
+    /// The legacy pre-loop steps up to (not including) the allocation of the re-rooted outputs: dim 0 of every
+    /// inside port, the re-rooted free inputs, the full-range pass, the init of an input whose shape the pass
+    /// changed, and the chunk plan.
+    void prepare_full(std::size_t n, Chunks& chunks) {
+        set_dim0(n);  // the framework sets dim 0 of every inside port, whatever rule declared it
+        // Re-rooted free INPUT roots first: a shape-driving read may need their storage.
+        for (Boundary& b : boundary_)
+            if (b.member != nullptr && b.root->kind() == IOKind::input) {
+                b.member->update_shape();  // dim 0 = N, the other dims as declared
+                b.root->adopt_shape(*b.member);
+                b.prev_flat = b.root->flat_size();
+                allocate_rerooted(*b.root);
+            }
+        dep_roots_.clear();
+        shape_roots_.clear();
+        full_pass();
+        for (Boundary& b : boundary_)  // an input root whose shape the pass changed takes its init again
+            if (b.member != nullptr && b.root->kind() == IOKind::input && b.root->flat_size() != b.prev_flat)
+                b.root->init_pending_ = true;  // applied with the allocation step
+        chunks       = plan_chunks(n);
+        last_chunks_ = chunks.size();
+    }
+
+    static std::vector<std::uint64_t> snapshot_values(detail::IOEntry& root, sk::queue& q) {
+        std::vector<std::uint64_t> out;
+        detail::dispatch_dtype(root.dtype(), [&](auto tag) {
+            using T       = typename decltype(tag)::type;
+            const auto& v = detail::storage_of<T>(root).read_primary(q);
+            out.reserve(v.size());
+            for (const T x : v) out.push_back(static_cast<std::uint64_t>(x));
+        });
+        return out;
+    }
+
+    template <class V>
+    static V slice_vec(const V& v, std::size_t a, std::size_t b, std::size_t n) {
+        if (v.size() != n) return v;  // not one entry per index (a scalar dimension's empty array)
+        return V(v.begin() + static_cast<std::ptrdiff_t>(a), v.begin() + static_cast<std::ptrdiff_t>(b));
+    }
+
+    /// The state of chunk [a, b) cut from the full-range state: dim 0 = b - a, per-index arrays cut to [a, b),
+    /// offsets rebased to start at 0.
+    static detail::IOEntry::ShapeState slice_state(const detail::IOEntry::ShapeState& f, std::size_t a, std::size_t b) {
+        detail::IOEntry::ShapeState s = f;
+        const std::size_t           n = f.extents[0];
+        s.extents[0]                  = b - a;
+        if (f.ragged && f.offsets.size() == n + 1) {
+            s.offsets.assign(b - a + 1, 0);
+            for (std::size_t i = 0; i <= b - a; ++i) s.offsets[i] = f.offsets[a + i] - f.offsets[a];
+        }
+        for (std::size_t d = 0; d < 3; ++d) {
+            if (f.dims[d].per) s.dims[d].per_index = slice_vec(f.dims[d].per_index, a, b, n);
+            s.applied_per[d] = slice_vec(f.applied_per[d], a, b, n);
+        }
+        return s;
+    }
+
+    /// After the full pass and the plan: record what the pass depended on and capture the states.
+    void build_topology(std::size_t n, const Chunks& chunks) {
+        Topology t;
+        t.n      = n;
+        t.chunks = chunks;
+        for (detail::IOEntry* e : chunk_entries()) {
+            EntryTopo et;
+            et.e    = e;
+            et.full = e->capture_shape();
+            et.chunk.reserve(chunks.size());
+            for (const auto& [a, b] : chunks) et.chunk.push_back(slice_state(et.full, a, b));
+            t.entries.push_back(std::move(et));
+        }
+        std::unordered_set<const detail::IOEntry*> seen_v;
+        for (detail::IOEntry* r : dep_roots_) {
+            if (!seen_v.insert(r).second) continue;
+            ValueDep vd;
+            vd.root   = r;
+            vd.epoch  = r->write_epoch();
+            vd.values = snapshot_values(*r, q());
+            t.values.push_back(std::move(vd));
+        }
+        std::unordered_set<const detail::IOEntry*> seen_s;
+        const auto add_shape = [&](const detail::IOEntry* r) {
+            if (std::find(internal_.begin(), internal_.end(), r) != internal_.end()) return;  // derived inside the pass
+            if (seen_s.insert(r).second) t.shapes.push_back(ShapeDep{r, r->shape_version()});
+        };
+        for (const Boundary& b : boundary_)
+            if (b.member == nullptr) add_shape(b.root);
+        for (const detail::IOEntry* r : shape_roots_) add_shape(r);
+        dep_roots_.clear();
+        shape_roots_.clear();
+        t.valid = true;
+        topo_   = std::move(t);
+    }
+
+    /// Whether the cached topology still holds: N, the shape of every outside boundary root (and root whose
+    /// shape was copied), and the VALUES the pass read. A value root written since (its epoch moved) is compared
+    /// by content: only a changed value invalidates, not a producer that ran again.
+    bool topology_valid(std::size_t n) {
+        if (!topo_.valid || topo_.n != n) return false;
+        for (const ShapeDep& s : topo_.shapes)
+            if (s.root->shape_version() != s.version) return false;
+        for (ValueDep& v : topo_.values) {
+            if (!v.root->present()) return false;
+            if (v.root->write_epoch() == v.epoch) continue;
+            if (snapshot_values(*v.root, q()) != v.values) return false;
+            v.epoch = v.root->write_epoch();  // same content: remember the new epoch
+        }
+        return true;
+    }
+
+    void run_replay_loop(const Chunks& chunks) {
+        for (ComponentBase* c : comps_) c->replay_ = true;
+        try {
+            for (std::size_t ci = 0; ci < chunks.size(); ++ci) {
+                const auto [a, b] = chunks[ci];
+                for (EntryTopo& t : topo_.entries) t.e->apply_shape(t.chunk[ci]);
+                for (Boundary& bd : boundary_)
+                    for (detail::IOEntry* p : bd.peers) detail::LeadingRangeAccess::set_no_refresh(*p, a, b);
+                for (detail::IOEntry* r : internal_) {
+                    r->meta_shift_ = a;
+                    // Each chunk is a fresh computation: an internal free input takes its init again.
+                    if (r->io_kind_ == IOKind::input) r->init_pending_ = true;
+                }
+                if (chunk_hook_) chunk_hook_(ci);
+                System::run_compute_forward();
+                if (chunk_post_hook_) chunk_post_hook_(ci);
+            }
+        } catch (...) {
+            for (ComponentBase* c : comps_) c->replay_ = false;
+            throw;
+        }
+        for (ComponentBase* c : comps_) c->replay_ = false;
+    }
+
+    void run_legacy_loop(const Chunks& chunks) {
+        for (std::size_t ci = 0; ci < chunks.size(); ++ci) {
+            const auto [a, b] = chunks[ci];
+            set_dim0(b - a, a);
+            for (Boundary& bd : boundary_)
+                for (detail::IOEntry* p : bd.peers) detail::LeadingRangeAccess::set(*p, a, b);
+            // Each chunk is a fresh computation: an internal free input takes its init again.
+            for (detail::IOEntry* r : internal_)
+                if (r->io_kind_ == IOKind::input) r->init_pending_ = true;
+            System::run_compute_forward();
+            if (chunk_post_hook_) chunk_post_hook_(ci);
+        }
+    }
+
     // ---- the per-forward steps ---------------------------------------------------------------
     sk::queue& q() const { return queue_ref(); }
 
@@ -274,13 +524,21 @@ private:
                 for (detail::IOEntry* p : b.peers) detail::LeadingRangeAccess::set(*p, 0, b.root->extents()[0]);
         for (ComponentBase* c : comps_) {
             c->chunk_pass_ = true;
+            if (recording_) {
+                c->dep_recorder_   = &dep_roots_;
+                c->shape_recorder_ = &shape_roots_;
+            }
             try {
                 c->resolve_shapes();
             } catch (...) {
-                c->chunk_pass_ = false;
+                c->chunk_pass_     = false;
+                c->dep_recorder_   = nullptr;
+                c->shape_recorder_ = nullptr;
                 throw;
             }
-            c->chunk_pass_ = false;
+            c->chunk_pass_     = false;
+            c->dep_recorder_   = nullptr;
+            c->shape_recorder_ = nullptr;
             for (Boundary& b : boundary_)
                 if (b.member != nullptr && b.member->declarer() == c) b.root->adopt_shape(*b.member);
         }

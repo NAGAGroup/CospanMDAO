@@ -25,6 +25,7 @@
 
 #include <naga/cospan/cospan.hpp>
 
+#include "replay_oracle.hpp"
 #include "support.hpp"
 
 namespace cs = naga::cospan;
@@ -1156,4 +1157,70 @@ TEST_CASE("Ragged ties: errors", "[ragged][tie]") {
         trt::expect_throws([&] { m.forward(); }, {"is sized by a value computed inside chunked system", "inner"});
         m.wait();
     }
+}
+
+
+// =============================================================================================================================
+// The replay ORACLE (C2b) for the tie aliases inside a ChunkedSystem.
+// =============================================================================================================================
+TEST_CASE("Replay oracle: tie aliases (input_values, from_input_shape, input_dim, output_dim, per_index) inside a ChunkedSystem",
+          "[ragged][tie][chunked][replay]") {
+    const trt::Counts first{3, 1, 4, 0, 2, 5, 1, 3, 2, 4};
+    const trt::Counts second{2, 0, 5, 5, 1, 1, 3, 4, 0, 2};
+    for (int v = 0; v <= 4; ++v)
+        for (const std::size_t budget : {std::size_t{1000}, std::size_t{200}}) {
+            INFO("variant " << v << ", budget " << budget);
+            tor::oracle("inner", [&] { return cs::create_model<trt::VTop<trt::InnerChunkV>>(default_config(), first, budget, v); },
+                        [](cs::Model& m) {
+                            auto o = m.view_output<DType::f32, 1>("cons.out");
+                            return std::vector<float>(o.span().begin(), o.span().end());
+                        },
+                        3, [&](cs::Model& m, int f) {
+                            // variant 4 declares its per-index extents on the host: they cannot change between forwards
+                            if (v != 4) m.init_input("sz.raw", cs::init::from_host(f == 1 ? second : first));
+                        });
+        }
+}
+
+TEST_CASE("Replay oracle: tied ragged members connected from an outside ragged output (from_connection)",
+          "[ragged][tie][chunked][replay]") {
+    const trt::Counts first{3, 1, 4, 0, 2, 5, 1, 3, 2, 4};
+    const trt::Counts second{2, 0, 5, 5, 1, 1, 3, 4, 0, 2};
+    for (const std::size_t budget : {std::size_t{300}, std::size_t{150}, std::size_t{70}, std::size_t{60}}) {
+        INFO("budget " << budget);
+        tor::oracle("inner", [&] { return cs::create_model<trt::TieChunkTop<trt::TieChunkChunked>>(default_config(), first, budget); },
+                    [](cs::Model& m) {
+                        std::vector<float> out;
+                        for (const char* p : {"c1.out", "c2.out"}) {
+                            auto o = m.view_output<DType::f32, 1>(p);
+                            out.insert(out.end(), o.span().begin(), o.span().end());
+                        }
+                        return out;
+                    },
+                    3, [&](cs::Model& m, int f) { m.init_input("sz.raw", cs::init::from_host(f == 1 ? second : first)); });
+    }
+}
+
+TEST_CASE("Topology cache: a changed SHAPE of an outside boundary root rebuilds (no value is read inside)",
+          "[ragged][tie][chunked][replay][cache]") {
+    const trt::Counts first{3, 1, 4, 0, 2, 5, 1, 3, 2, 4};
+    const trt::Counts second{2, 0, 5, 5, 1, 1, 3, 4, 0, 2};
+    cs::Model         m = cs::create_model<trt::TieChunkTop<trt::TieChunkChunked>>(default_config(), first, std::size_t{70});
+    m.setup();
+    const auto run = [&] {
+        const auto b = cs::diag::snapshot();
+        m.forward();
+        m.wait();
+        return std::make_pair(cs::diag::snapshot() - b, cs::diag::last_window());
+    };
+    const auto f1 = run();
+    CHECK(f1.first.full_passes == 1);
+    const auto f2 = run();  // gen.pts is rewritten (same shape, same data): the producer ran again, nothing else changed
+    CHECK(f2.first.full_passes == 0);
+    CHECK(f2.second.resolve_shapes == 0);
+    CHECK(f2.second.ragged_uploads == 0);
+    m.init_input("sz.raw", cs::init::from_host(second));  // gen.pts changes SHAPE
+    const auto f3 = run();
+    CHECK(f3.first.full_passes == 1);
+    CHECK(run().first.full_passes == 0);
 }

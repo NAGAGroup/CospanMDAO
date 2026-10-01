@@ -21,6 +21,7 @@
 
 #include <naga/cospan/cospan.hpp>
 
+#include "replay_oracle.hpp"
 #include "support.hpp"
 
 namespace cs = naga::cospan;
@@ -1038,4 +1039,160 @@ TEST_CASE("Chunked: a component reused outside a chunked system keeps its declar
     const auto out = tch::forward_out(m);
     REQUIRE(out.size() == 4);
     for (std::size_t i = 0; i < 4; ++i) CHECK(out[i] == 2.0f * (0.5f * static_cast<float>(i) * 6.0f) + 1.0f);
+}
+
+
+// =============================================================================================================================
+// The replay ORACLE (C2b): the legacy per-chunk resolution and the cached replay must agree bitwise and shape by shape.
+// =============================================================================================================================
+namespace tch {
+std::vector<float> out_cons(cs::Model& m) {
+    auto v = m.view_output<DType::f32, 1>("cons.out");
+    return std::vector<float>(v.span().begin(), v.span().end());
+}
+}  // namespace tch
+
+TEST_CASE("Replay oracle: dense chain (with and without the inside output promoted out)", "[chunked][replay]") {
+    constexpr std::size_t n = 10;
+    for (const bool prom : {false, true})
+        for (const std::size_t budget : {std::size_t{160}, std::size_t{48}, std::size_t{16}}) {
+            INFO("promote " << prom << ", budget " << budget);
+            tor::oracle("inner", [&] { return cs::create_model<tch::DenseTop<tch::InnerChunk>>(default_config(), n, budget, prom); },
+                        [prom](cs::Model& m) {
+                            std::vector<float> out = tch::out_cons(m);
+                            if (prom) {  // the promoted [N,4] root, whole
+                                auto t = m.view_output<DType::f32, 2>("inner.t");
+                                out.insert(out.end(), t.span().begin(), t.span().end());
+                            }
+                            return out;
+                        });
+        }
+}
+
+TEST_CASE("Replay oracle: a promoted free input and an init between forwards", "[chunked][replay]") {
+    constexpr std::size_t n = 10;
+    tor::oracle("inner", [&] { return cs::create_model<tch::PromTop<tch::PromInnerChunk>>(default_config(), n, std::size_t{48}); }, tch::out_cons, 3,
+                [&](cs::Model& m, int f) {
+                    std::vector<float> w(n * 3);
+                    for (std::size_t q = 0; q < w.size(); ++q) w[q] = static_cast<float>(f) * static_cast<float>(q % 7) + 0.25f;
+                    m.init_input("inner.w", cs::init::from_host(w));
+                });
+}
+
+TEST_CASE("Replay oracle: ragged scratch (FromInputDim, FromInputValues, FromSourceDim), counts changing, zeros", "[chunked][replay]") {
+    const std::vector<std::uint32_t> c1{3, 0, 2, 4, 0, 1, 2, 3}, c2{0, 4, 4, 1, 0, 0, 2, 1}, c0(8, 0);
+    for (const std::size_t budget : {std::size_t{64}, std::size_t{100}, std::size_t{128}, std::size_t{1000}}) {
+        INFO("budget " << budget);
+        tor::oracle("inner", [&] { return cs::create_model<tch::RaggedTop<tch::RInnerChunk>>(default_config(), c1, budget); }, tch::out_cons, 4,
+                    [&](cs::Model& m, int f) {
+                        m.init_input("prod.raw", cs::init::from_host(f == 1 ? c2 : f == 2 ? c0 : c1));
+                    });
+    }
+}
+
+TEST_CASE("Replay oracle: an internal free input that takes its init in every chunk", "[chunked][replay]") {
+    constexpr std::size_t n = 10;
+    tor::oracle("inner",
+                [&] { return cs::create_model<tch::BiasTop>(default_config(), n, std::size_t{12}, std::make_shared<int>(0)); },
+                tch::out_cons, 3);
+}
+
+TEST_CASE("Replay oracle: dim 0 rules (fixed, FromInput)", "[chunked][replay]") {
+    constexpr std::size_t n = 10;
+    for (const int mode : {0, 1})
+        for (const std::size_t budget : {std::size_t{36}, std::size_t{12}, std::size_t{1000}}) {
+            INFO("mode " << mode << ", budget " << budget);
+            tor::oracle("inner", [&] { return cs::create_model<tch::MixTop<tch::MixChunk>>(default_config(), n, budget, mode, std::size_t{7}); },
+                        tch::out_cons);
+        }
+}
+
+// ---- the topology cache: validity and the zero-event window --------------------------------------------------------------
+namespace tch {
+struct DiagFwd {
+    cs::diag::EventCounts whole, window;
+};
+DiagFwd fwd_diag(cs::Model& m) {
+    const auto before = cs::diag::snapshot();
+    m.forward();
+    m.wait();
+    return {cs::diag::snapshot() - before, cs::diag::last_window()};
+}
+void check_quiet_window(const cs::diag::EventCounts& w) {
+    CHECK(w.queue_waits == 0);
+    CHECK(w.frees == 0);
+    CHECK(w.allocations == 0);
+    CHECK(w.host_reads == 0);
+    CHECK(w.host_read_hits == 0);
+    CHECK(w.ragged_uploads == 0);
+    CHECK(w.full_passes == 0);
+    CHECK(w.resolve_shapes == 0);
+}
+}  // namespace tch
+
+TEST_CASE("Topology cache: a value dependency rebuilds only when its VALUE changes", "[chunked][replay][cache]") {
+    const std::vector<std::uint32_t> c1{3, 0, 2, 4, 0, 1, 2, 3}, c2{0, 4, 4, 1, 0, 0, 2, 1};
+    cs::Model                        m = cs::create_model<tch::RaggedTop<tch::RInnerChunk>>(default_config(), c1, std::size_t{100});
+    m.setup();
+    // `prod` and `gen` run every forward (their outputs' epochs move) but the values and shapes they produce are the same
+    const auto f1 = tch::fwd_diag(m);
+    CHECK(f1.whole.full_passes == 1);
+    tch::check_quiet_window(f1.window);
+    for (int rep = 0; rep < 2; ++rep) {
+        const auto f = tch::fwd_diag(m);
+        CHECK(f.whole.full_passes == 0);
+        tch::check_quiet_window(f.window);
+    }
+    // the same values written again: still no rebuild
+    m.init_input("prod.raw", cs::init::from_host(c1));
+    CHECK(tch::fwd_diag(m).whole.full_passes == 0);
+    // other values: exactly one rebuild, then quiet again
+    m.init_input("prod.raw", cs::init::from_host(c2));
+    const auto f4 = tch::fwd_diag(m);
+    CHECK(f4.whole.full_passes == 1);
+    tch::check_quiet_window(f4.window);
+    CHECK(tch::fwd_diag(m).whole.full_passes == 0);
+    const auto o = tch::out_cons(m);
+    cs::Model  p = cs::create_model<tch::RaggedTop<tch::RInnerPlain>>(default_config(), c2, std::size_t{0});
+    p.setup();
+    CHECK(o == tch::forward_out(p));
+}
+
+TEST_CASE("Topology cache: writing an unrelated root (a free input's data) gives no rebuild", "[chunked][replay][cache]") {
+    constexpr std::size_t n = 10;
+    cs::Model             m = cs::create_model<tch::PromTop<tch::PromInnerChunk>>(default_config(), n, std::size_t{48});
+    m.setup();
+    CHECK(tch::fwd_diag(m).whole.full_passes == 1);
+    for (const float scale : {2.0f, 5.0f}) {
+        std::vector<float> w(n * 3);
+        for (std::size_t q = 0; q < w.size(); ++q) w[q] = scale * static_cast<float>(q % 7) + 0.25f;
+        m.init_input("inner.w", cs::init::from_host(w));
+        const auto f = tch::fwd_diag(m);
+        CHECK(f.whole.full_passes == 0);  // `w` drives no shape
+        tch::check_quiet_window(f.window);
+        const auto out = tch::out_cons(m);
+        for (std::size_t i = 0; i < n; ++i)
+            CHECK(out[i] == 2.0f * ((w[i * 3] + 2.0f * w[i * 3 + 1] + 3.0f * w[i * 3 + 2]) * 10.0f) + 1.0f);  // new data, not a stale copy
+    }
+}
+
+TEST_CASE("Topology cache: the window of an internal free input with an init", "[chunked][replay][cache]") {
+    constexpr std::size_t n     = 10;
+    auto                  calls = std::make_shared<int>(0);
+    cs::Model             m     = cs::create_model<tch::BiasTop>(default_config(), n, std::size_t{12}, calls);  // 4 chunks
+    m.setup();
+    for (int rep = 0; rep < 3; ++rep) {
+        const auto f = tch::fwd_diag(m);
+        std::printf("[replay] internal free input with a custom_host init, forward %d: window host_tasks %llu, host_reads %llu, host_read_hits %llu\n",
+                    rep + 1, static_cast<unsigned long long>(f.window.host_tasks), static_cast<unsigned long long>(f.window.host_reads),
+                    static_cast<unsigned long long>(f.window.host_read_hits));
+        CHECK(f.window.queue_waits == 0);
+        CHECK(f.window.frees == 0);
+        CHECK(f.window.allocations == 0);
+        CHECK(f.window.ragged_uploads == 0);
+        CHECK(f.window.full_passes == 0);
+        CHECK(f.window.resolve_shapes == 0);
+        CHECK(f.window.host_tasks == 4);  // the init's write, once per chunk
+        CHECK(f.whole.full_passes == (rep == 0 ? 1u : 0u));
+    }
 }

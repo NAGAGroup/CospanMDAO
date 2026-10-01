@@ -340,13 +340,24 @@ void print_row(const char* what, const Row& r) {
     line("whole", r.whole, false);
 }
 
-void check_wired(const Row& r) {
+void check_wired(const Row& r, std::uint64_t expected_full_passes) {
     CHECK(r.chunks >= 2);
-    CHECK(r.whole.full_passes >= 1);
-    CHECK(r.whole.resolve_shapes >= 1);
     CHECK(r.whole.queue_waits >= 1);
     CHECK(r.whole.allocations >= 1);
     CHECK(r.whole.frees >= 1);
+    // The topology cache: the first forward (and one whose recorded dependencies changed) does ONE full pass, an
+    // unchanged one none.
+    CHECK(r.whole.full_passes == expected_full_passes);
+    // Inside the chunk loop nothing is resolved, read back, uploaded, allocated, freed or waited for.
+    CHECK(r.window.queue_waits == 0);
+    CHECK(r.window.frees == 0);
+    CHECK(r.window.allocations == 0);
+    CHECK(r.window.host_reads == 0);
+    CHECK(r.window.host_read_hits == 0);
+    CHECK(r.window.host_tasks == 0);  // no internal free input with an init in these cases
+    CHECK(r.window.ragged_uploads == 0);
+    CHECK(r.window.full_passes == 0);
+    CHECK(r.window.resolve_shapes == 0);
 }
 
 }  // namespace tdiag
@@ -382,9 +393,9 @@ TEST_CASE("Diagnostics baseline a: dense chunked, 10 chunks", "[diag]") {
     tdiag::print_row("forward 1 (first)", r1);
     tdiag::print_row("forward 2 (inputs unchanged)", r2);
     tdiag::print_row("forward 3 (unchanged; no sizes input)", r3);
-    tdiag::check_wired(r1);
-    tdiag::check_wired(r2);
-    tdiag::check_wired(r3);
+    tdiag::check_wired(r1, 1);
+    tdiag::check_wired(r2, 0);
+    tdiag::check_wired(r3, 0);
     CHECK(r1.chunks == 10);
 }
 
@@ -405,7 +416,7 @@ TEST_CASE("Diagnostics baseline b: LRPIM pattern (ragged tie alias from input va
     tdiag::print_row("forward 1 (first)", r1);
     tdiag::print_row("forward 2 (inputs unchanged)", r2);
     tdiag::print_row("forward 3 (sizes re-initialised)", r3);
-    tdiag::check_wired(r1);
-    tdiag::check_wired(r2);
-    tdiag::check_wired(r3);
+    tdiag::check_wired(r1, 1);
+    tdiag::check_wired(r2, 0);  // the producer of `sizes` ran again, with the same values: no rebuild
+    tdiag::check_wired(r3, 1);  // `sizes` re-initialised: exactly one rebuild
 }

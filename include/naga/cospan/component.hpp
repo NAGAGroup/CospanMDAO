@@ -264,7 +264,13 @@ public:
 
     void run_pre_compute(ExecCtx& owner_ctx) override {
         (void)owner_ctx;
-        resolve_shapes();
+        // REPLAY (a ChunkedSystem with a cached topology, inside its chunk loop): the shapes were applied from the
+        // cache, the internal roots' index arrays were uploaded once and shifted per chunk (meta_shift_), and the
+        // connections were validated when the topology was built. So no shape resolution, no per-root ragged
+        // upload and no validate_connection here. pre_forward still runs (a manual reshape inside a chunked system
+        // is not supported), roots are allocated (held roots are present), pending inits are applied and the
+        // wrappers are re-pointed.
+        if (!replay_) resolve_shapes();
         {
             detail::FlagScope scope{in_pre_forward_};
             pre_forward();
@@ -274,10 +280,11 @@ public:
         // does not own is only pointed at, below.
         for (detail::IOEntry* e : order_) allocate_owned(*e->root());
         // D140: a ragged root's device index arrays follow its (possibly changed) description.
-        for (detail::IOEntry* e : order_)
-            if (e->root()->owner() == this && e->root()->has_storage()) e->root()->upload_ragged(queue_ref());
+        if (!replay_)
+            for (detail::IOEntry* e : order_)
+                if (e->root()->owner() == this && e->root()->has_storage()) e->root()->upload_ragged(queue_ref());
         for (detail::IOEntry* e : order_) {
-            if (e->kind() == IOKind::input && !e->is_root() &&
+            if (!replay_ && e->kind() == IOKind::input && !e->is_root() &&
                 (e->is_dynamic() || e->root()->is_dynamic()))
                 e->validate_connection();
             point_if_stored(*e);
@@ -565,10 +572,12 @@ private:
     void copy_alias_dim(AliasEval& out, std::size_t to, const detail::IOEntry& src, int d, const detail::IOEntry& a,
                         bool input) const {
         if (input && src.view()) {
+            if (shape_recorder_ != nullptr) shape_recorder_->push_back(src.root());
             out.ext[to] = src.view()->extents[static_cast<std::size_t>(d)];
             return;
         }
         const detail::IOEntry& up = input ? *src.root() : src;
+        if (shape_recorder_ != nullptr) shape_recorder_->push_back(up.root());  // a SHAPE dependency of the topology cache
         if (up.dim_is_per(d)) {
             if (to == 0)
                 throw std::invalid_argument("naga::cospan: a per-index dimension of '" + up.full_path() +
@@ -752,6 +761,7 @@ private:
     /// on the host: one per row (D140, FromInputValues). Negative values are an error.
     std::vector<std::size_t> read_values(detail::IOEntry& src, std::size_t column) {
         check_not_chunk_internal(src);
+        if (dep_recorder_ != nullptr) dep_recorder_->push_back(src.root());  // a VALUE dependency of the topology cache
         if (!detail::is_integer_dtype(src.dtype()))
             throw std::invalid_argument("naga::cospan: '" + std::string{src.name()} +
                                         "' drives per-index extents by value and must have an integer dtype");
@@ -814,6 +824,7 @@ private:
     /// The VALUE of element `index` of an integer-dtype input, on the host.
     std::size_t read_value(detail::IOEntry& src, std::size_t index) {
         check_not_chunk_internal(src);
+        if (dep_recorder_ != nullptr) dep_recorder_->push_back(src.root());  // a VALUE dependency of the topology cache
         if (!detail::is_integer_dtype(src.dtype()))
             throw std::invalid_argument("naga::cospan: '" + std::string{src.name()} +
                                         "' drives a shape by value and must have an integer dtype");
@@ -850,6 +861,12 @@ private:
     bool declaring_       = false;
     bool in_pre_forward_  = false;
     bool chunk_pass_      = false;                       ///< a ChunkedSystem's full-range pass is running (D140 B2)
+    bool replay_          = false;                       ///< a ChunkedSystem replays its cached topology: run_pre_compute applies, never resolves
+    /// Set by the ChunkedSystem around resolve_shapes in its full pass: every value read (read_value / read_values,
+    /// which every alias and port value read goes through) pushes the root it read; copy_alias_dim pushes the roots
+    /// whose SHAPE it copied. Single-threaded, like all submission.
+    std::vector<detail::IOEntry*>*       dep_recorder_   = nullptr;
+    std::vector<const detail::IOEntry*>* shape_recorder_ = nullptr;
     const detail::IOEntry* resolving_ = nullptr;         ///< the entry resolve() is working on
 };
 

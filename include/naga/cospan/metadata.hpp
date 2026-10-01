@@ -664,6 +664,65 @@ public:
     std::uint64_t write_epoch() const noexcept { return root_->write_epoch_; }
     /// Advance the root's write epoch (always the canonical root, never a peer, view or alias member).
     void bump_write() noexcept { ++root_->write_epoch_; }
+    /// The ROOT's shape version: advances whenever the root's extents change or its ragged description changes
+    /// (and when apply_shape sets a different state). A topology cache compares it; it never decreases.
+    std::uint64_t shape_version() const noexcept { return root_->shape_version_; }
+
+    /// The host description of an entry's shape: exactly the fields the shape rules and update_shape write.
+    /// A ChunkedSystem captures one per inside entry after its full-range pass and replays slices of it per chunk.
+    struct ShapeState {
+        struct Dim {
+            std::size_t              extent = 0;
+            bool                     per    = false;
+            std::vector<std::size_t> per_index;
+            bool operator==(const Dim&) const = default;
+        };
+        std::array<std::size_t, 3>              extents{1, 1, 1};
+        bool                                    ragged = false;
+        std::vector<std::uint64_t>              offsets;
+        std::array<std::vector<std::size_t>, 3> applied_per;
+        std::array<Dim, 3>                      dims;
+        bool operator==(const ShapeState&) const = default;
+    };
+    ShapeState capture_shape() const {
+        ShapeState s;
+        s.extents     = extents_;
+        s.ragged      = ragged_;
+        s.offsets     = offsets_;
+        s.applied_per = applied_per_;
+        for (std::size_t d = 0; d < dims_.size() && d < 3; ++d)
+            s.dims[d] = ShapeState::Dim{dims_[d].extent, dims_[d].per, dims_[d].per_index};
+        return s;
+    }
+    /// Set the shape fields directly: no rule is evaluated, nothing is validated, no storage is resized and
+    /// ragged_version_ is NOT touched (the device index arrays are not re-uploaded). shape_version_ advances
+    /// (on a root) only when the state differs.
+    void apply_shape(const ShapeState& s) {
+        const bool differs = extents_ != s.extents || ragged_ != s.ragged || offsets_ != s.offsets || applied_per_ != s.applied_per ||
+                             [&] {
+                                 for (std::size_t d = 0; d < dims_.size() && d < 3; ++d)
+                                     if (dims_[d].extent != s.dims[d].extent || dims_[d].per != s.dims[d].per ||
+                                         dims_[d].per_index != s.dims[d].per_index)
+                                         return true;
+                                 return false;
+                             }();
+        if (!differs) return;
+        extents_     = s.extents;
+        ragged_      = s.ragged;
+        offsets_     = s.offsets;
+        applied_per_ = s.applied_per;
+        for (std::size_t d = 0; d < dims_.size() && d < 3; ++d) {
+            dims_[d].extent    = s.dims[d].extent;
+            dims_[d].per       = s.dims[d].per;
+            dims_[d].per_index = s.dims[d].per_index;
+        }
+        if (is_root()) ++shape_version_;
+    }
+    /// Test probes: the data / offsets pointer the entry's wrapper was last pointed at.
+    /// ChunkedSystem replay, internal roots: the first index of the current chunk (see meta_shift_).
+    std::size_t          meta_shift() const noexcept { return meta_shift_; }
+    const void*          probe_data() const noexcept { return probe_data_; }
+    const std::uint64_t* probe_offsets() const noexcept { return probe_offs_; }
     /// D140 B2: the path of the ChunkedSystem this root is internal to; empty otherwise.
     std::string_view chunk_internal_by() const noexcept { return root_->chunk_internal_by_; }
     /// The Subsystem that registered this entry (a Component for I/O, a System for aliases).
@@ -830,6 +889,12 @@ protected:
     std::size_t                reserve_elems_ = 0;       ///< held: the capacity (elements) allocate() takes
     std::size_t                allocations_   = 0;       ///< storage allocations of this root (allocate, growth past capacity)
     std::uint64_t              write_epoch_   = 0;       ///< roots: see write_epoch()
+    std::uint64_t              shape_version_ = 0;       ///< roots: see shape_version()
+    /// ChunkedSystem replay, INTERNAL roots: the first index of the current chunk. point_ragged adds it to the
+    /// device offsets / per-index pointers (the whole run's arrays are uploaded once); the data base is unchanged.
+    std::size_t                meta_shift_    = 0;
+    mutable const void*          probe_data_ = nullptr;  ///< test probe: the data pointer the wrapper was last given
+    mutable const std::uint64_t* probe_offs_ = nullptr;  ///< test probe: the offsets pointer the wrapper was last given
     /// Inside a ChunkedSystem the framework sets dim 0 of every port of every inside component to the
     /// current chunk length (N in the full-range pass, b - a per chunk), whatever rule declared it.
     std::optional<std::size_t> dim0_override_;
@@ -857,7 +922,7 @@ private:
     /// peer's extents follow through update_shape. Ragged root: N = b - a, the host per-index arrays are
     /// the root's [a, b) slice, and point_ragged shifts the device pointers by a. Re-runs the peer's shape
     /// update and validate_connection and re-points its wrapper, so the next forward uses the range.
-    void set_leading_range(std::size_t a, std::size_t b) {
+    void set_leading_range(std::size_t a, std::size_t b, bool refresh = true) {
         if (is_root() || mirror_of_ != nullptr)
             throw std::logic_error("naga::cospan: '" + name_ + "': a leading range is set on a connected input (or an output peer of a root at a chunked system's level), not on a root");
         const IOEntry&                    r    = *root_;
@@ -891,15 +956,15 @@ private:
             pre_lead_view_ = view_;  // empty: ragged roots have no views
         }
         lead_ = std::make_pair(a, b);
-        refresh_after_range();
+        if (refresh) refresh_after_range();  // the replaying ChunkedSystem applies the cached shape instead
     }
     /// Back to the whole range (and the setup-time view, if any).
-    void clear_leading_range() {
+    void clear_leading_range(bool refresh = true) {
         if (!lead_) return;
         view_ = pre_lead_view_;
         pre_lead_view_.reset();
         lead_.reset();
-        refresh_after_range();
+        if (refresh) refresh_after_range();
     }
     void refresh_after_range() {
         if (io_kind_ == IOKind::input) {
@@ -1071,6 +1136,7 @@ public:
             applied_per_[static_cast<std::size_t>(d)] =
                 (d >= 1 && d < rank()) ? dims_[static_cast<std::size_t>(d)].per_index : std::vector<std::size_t>{};
         ++ragged_version_;
+        if (is_root()) ++shape_version_;
         resize_storage();
     }
 
@@ -1081,7 +1147,9 @@ public:
             if (r[d] != 1)
                 throw std::invalid_argument("naga::cospan: '" + std::string{name()} +
                                             "': extents past the rank must be 1");
-        extents_ = {r[0], r[1], r[2]};
+        const std::array<std::size_t, 3> next{r[0], r[1], r[2]};
+        if (next != extents_ && is_root()) ++shape_version_;
+        extents_ = next;
         resize_storage();
     }
 
@@ -1470,6 +1538,8 @@ protected:
                                    "RaggedInput / RaggedOutput (a dense Input / Output cannot see per-index extents)");
         const IOEntry::Geometry g = this->geometry();
         auto* base = static_cast<value_type*>(this->root()->storage_on(this->placement()));
+        this->probe_data_ = base != nullptr ? base + g.offset : nullptr;
+        this->probe_offs_ = nullptr;
         IOEntry::write_wrapper(w, g, base != nullptr ? base + g.offset : nullptr);
     }
 
@@ -1487,17 +1557,23 @@ protected:
             // wrapper addresses blocks relative to offsets[0]); the data starts at the root's offsets[a].
             const auto        lr = this->leading_range();
             const std::size_t a  = lr ? lr->first : 0;
+            // An INTERNAL root of a replaying ChunkedSystem holds the whole run's device arrays; its current chunk
+            // starts at meta_shift_. The data base stays the start of the held storage (block(i) is relative to
+            // offsets[0]), so only the metadata pointers move.
+            const std::size_t shift = a + r->meta_shift();
             for (int d = 1; d < Rank; ++d) {
                 if (!this->dim(d).per) {
                     ext[static_cast<std::size_t>(d - 1)] = this->dim(d).extent;
                 } else {
                     const std::uint64_t* p = r->ragged_ptr_on(pl, d);
-                    per[static_cast<std::size_t>(d - 1)] = p != nullptr ? p + a : nullptr;
+                    per[static_cast<std::size_t>(d - 1)] = p != nullptr ? p + shift : nullptr;
                 }
             }
             const std::uint64_t* offs = r->ragged_ptr_on(pl, 0);
-            if (offs != nullptr) offs += a;
+            if (offs != nullptr) offs += shift;
             if (base != nullptr && a > 0) base += r->block_offset_at(a);
+            this->probe_data_ = base;
+            this->probe_offs_ = offs;
             IOEntry::write_ragged(w, this->extents()[0], base, offs, ext, per);
         } else {
             const IOEntry::Geometry g = this->geometry();
@@ -1505,6 +1581,8 @@ protected:
                 throw std::logic_error("naga::cospan: '" + std::string{this->name()} +
                                        "': a ragged wrapper on a dense port needs contiguous storage (no sliced view)");
             for (int d = 1; d < Rank; ++d) ext[static_cast<std::size_t>(d - 1)] = g.shape[static_cast<std::size_t>(d)];
+            this->probe_data_ = base != nullptr ? base + g.offset : nullptr;
+            this->probe_offs_ = nullptr;
             IOEntry::write_ragged(w, g.shape[0], base != nullptr ? base + g.offset : nullptr, nullptr, ext, per);
         }
     }
@@ -1666,6 +1744,10 @@ struct EntryAccess {
 struct LeadingRangeAccess {
     static void set(IOEntry& e, std::size_t a, std::size_t b) { e.set_leading_range(a, b); }
     static void clear(IOEntry& e) { e.clear_leading_range(); }
+    /// The replaying ChunkedSystem: the range alone, without re-resolving the peer's shape (it applies the
+    /// cached chunk state) and without validate_connection or re-pointing.
+    static void set_no_refresh(IOEntry& e, std::size_t a, std::size_t b) { e.set_leading_range(a, b, false); }
+    static void clear_no_refresh(IOEntry& e) { e.clear_leading_range(false); }
 };
 
 }  // namespace detail

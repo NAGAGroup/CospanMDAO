@@ -28,6 +28,7 @@ set(COSPAN_TEST_SOURCES
     test_ragged_ties.cpp
     test_diagnostics.cpp
     test_epochs.cpp
+    test_replay.cpp
     test_system.cpp
 )
 
