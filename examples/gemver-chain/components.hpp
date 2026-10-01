@@ -259,6 +259,105 @@ public:
 };
 
 // =============================================================================
+// BicgkOnePass: q = B p and s = B^T r in ONE pass over B
+// =============================================================================
+// A group body over (strip c, 256-column block blk): work-item l owns column j = blk*256 + l.
+//   Ps[c][j]   = sum_{k<R} r[i] * B[i][j]                     (i = c*R + k)
+//   Pq[i][blk] = reduce_over_group(B[i][j] * p[j])            (per row i of the strip)
+// RowReduce then sums Pq over the blocks (q), and the scale-1 ColReduce sums Ps (s).
+struct BicgkOnePassBody {
+    struct Inputs {
+        cs::Input<DType::f32, 2> B;
+        cs::Input<DType::f32, 1> p, r;
+    };
+    struct Outputs {
+        cs::Output<DType::f32, 2> Ps, Pq;
+    };
+    std::uint32_t n, R, blocks, total_groups;
+
+    void operator()(cs::GroupItem<1> it, Inputs in, Outputs out) const {
+        const std::uint32_t l  = static_cast<std::uint32_t>(it.get_local_id(0));
+        const std::uint32_t ng = static_cast<std::uint32_t>(it.get_group_range(0));
+        for (std::uint32_t g = static_cast<std::uint32_t>(it.get_group(0)); g < total_groups; g += ng) {
+            const std::uint32_t c = g / blocks, blk = g - c * blocks;
+            const std::uint32_t j = blk * static_cast<std::uint32_t>(it.get_local_range(0)) + l;
+            const float         pj = in.p[sycl::id<1>{j}];
+            float               ps = 0.0f;
+            for (std::uint32_t k = 0; k < R; ++k) {
+                const std::uint32_t i = c * R + k;
+                const float         b = in.B[sycl::id<2>{i, j}];
+                ps += in.r[sycl::id<1>{i}] * b;
+                const float sum = sycl::reduce_over_group(it.get_group(), b * pj, sycl::plus<float>());
+                if (l == 0) out.Pq[sycl::id<2>{i, blk}] = sum;
+            }
+            out.Ps[sycl::id<2>{c, j}] = ps;
+        }
+    }
+};
+
+class BicgkOnePass : public cs::Component<BicgkOnePassBody> {
+    cs::Input<DType::f32, 2>  B_;
+    cs::Input<DType::f32, 1>  p_, r_;
+    cs::Output<DType::f32, 2> Ps_, Pq_;
+    int                       n_, R_;
+
+public:
+    BicgkOnePass(int n, int R) : n_{n}, R_{R} {}
+    void setup() override {
+        declare_input(B_, "B", n_, n_);
+        declare_input(p_, "p", n_);
+        declare_input(r_, "r", n_);
+        declare_output(Ps_, "Ps", n_ / R_, n_);
+        declare_output(Pq_, "Pq", n_, n_ / static_cast<int>(kWg));
+    }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+        const std::size_t blocks = static_cast<std::size_t>(n_) / kWg;
+        const std::size_t groups = static_cast<std::size_t>(n_ / R_) * blocks;
+        return create_launch_config(sycl::range<1>{groups * kWg}, sycl::range<1>{kWg},
+                                    BicgkOnePassBody::Inputs{B_, p_, r_}, BicgkOnePassBody::Outputs{Ps_, Pq_},
+                                    BicgkOnePassBody{u32(n_), u32(R_), u32(blocks), u32(groups)});
+    }
+};
+
+// RowReduce: q[i] = sum_blk Pq[i][blk]
+struct RowReduceBody {
+    struct Inputs {
+        cs::Input<DType::f32, 2> Pq;
+    };
+    struct Outputs {
+        cs::Output<DType::f32, 1> q;
+    };
+    std::uint32_t n, blocks, stride;
+
+    void operator()(cs::GroupItem<1> it, Inputs in, Outputs out) const {
+        for (std::uint32_t i = static_cast<std::uint32_t>(it.get_global_id(0)); i < n; i += stride) {
+            float acc = 0.0f;
+            for (std::uint32_t b = 0; b < blocks; ++b) acc += in.Pq[sycl::id<2>{i, b}];
+            out.q[sycl::id<1>{i}] = acc;
+        }
+    }
+};
+
+class RowReduce : public cs::Component<RowReduceBody> {
+    cs::Input<DType::f32, 2>  Pq_;
+    cs::Output<DType::f32, 1> q_;
+    int                       n_;
+
+public:
+    explicit RowReduce(int n) : n_{n} {}
+    void setup() override {
+        declare_input(Pq_, "Pq", n_, n_ / static_cast<int>(kWg));
+        declare_output(q_, "q", n_);
+    }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+        const std::size_t range = static_cast<std::size_t>(n_);
+        return create_launch_config(sycl::range<1>{range}, sycl::range<1>{kWg}, RowReduceBody::Inputs{Pq_},
+                                    RowReduceBody::Outputs{q_},
+                                    RowReduceBody{u32(n_), u32(n_ / static_cast<int>(kWg)), u32(range)});
+    }
+};
+
+// =============================================================================
 // GridBarrier: a software grid barrier. Only valid when EVERY group of the launch is
 // co-resident, which is why the whole chain runs on a capped, resident number of groups.
 // =============================================================================

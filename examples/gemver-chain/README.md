@@ -41,6 +41,12 @@ variant promotes the same names, so the driver is variant-agnostic.
 * **parallel**: as unfused, but BiCGK's `gemv_q` and `gtp_s` are a `ParallelSystem`.
 * **fused**: GEMVER = `FusedSystem(sequential, wg 256) [r2u, gtp]`, then `cred`, then `gemv`;
   BiCGK = `FusedSystem(parallel) [gemv_q, gtp_s]`, then `cred_s`. (8 launches.)
+* **onepass**: GEMVER as in fused, BiCGK in ONE pass over `B`: a group body over (strip, 256-column
+  block) that accumulates `Ps[c][j] = sum_k r[i] B[i][j]` and, per row, `reduce_over_group(B[i][j] p[j])`
+  into `Pq[i][block]`, then `RowReduce` (q) and the scale-1 `ColReduce` (s). It reads `B` once for BiCGK
+  instead of twice, but sums in a different order, so it is not bitwise equal to the others
+  (relative L2 about 3e-6 against unfused). **Skipped by `--variant all` on omp**, where its `q` is
+  wrong (see the open questions); an explicit `--variant onepass` still runs it there.
 * **barrier**: the whole chain as ONE sequential `FusedSystem` (one launch), 7 software grid
   barriers between the dependent stages, every stage on `G = SMs * blocks-per-cu` resident groups.
   A group that waits `--spin-limit` polls (default 2^24) gives up and sets a timeout flag; the
@@ -87,6 +93,7 @@ GB/s uses a **nominal** 8 * n^2 * 4 B = 8.59 GB per chain, not measured traffic
 | parallel | 16.19 | 0.99x | 531 |
 | fused | 11.66 | 1.37x | 737 |
 | barrier (G = 256) | 13.13 | 1.22x | 654 |
+| onepass (provisional) | 11.12 / 10.95 | 1.44x / 1.47x | 772 / 784 |
 | cuBLAS | 21.07 | 0.76x | 408 |
 
 Notes, honestly:
@@ -136,7 +143,29 @@ pixi run -e cublas gemver-chain-cublas --check --n 2048
 pixi run -e cublas gemver-chain-cublas --n 16384 --compare /tmp/gc   # rel L2 against the CoSpan dumps
 ```
 
-Flags: `--n --R --iters --warmup --variant all|unfused|parallel|fused|barrier --blocks-per-cu --spin-limit --check --dump`.
+Flags: `--n --R --iters --warmup --variant all|unfused|parallel|fused|barrier|onepass --blocks-per-cu --spin-limit --check --dump`.
 `--check` compares every output with the host double reference (relative L2 <= 1e-4; B2 too
 when n <= 4096) and the variants with each other (bitwise). To pick the GPU on a machine that also
 has the omp device, set `ACPP_VISIBILITY_MASK=cuda` (the default selector already picks it here).
+
+## Open questions — to explore further
+
+**These results need deeper investigation before they are treated as conclusions.** The numbers
+above are single-machine, few-run measurements, several effects are unexplained, and nothing here
+was profiled. The onepass row is provisional: it was measured in two full-size runs only
+(11.12 and 10.95 ms, two values per cell above), outside the run that produced the other rows.
+
+a. **Fused is bimodal across runs** (15.05, 15.08, 14.91, 11.82, 11.66 ms) while the other variants
+   are stable. Hypothesis to check: AdaptiveCpp's runtime adaptivity keeps re-optimizing kernels
+   across application runs (`ACPP_ADAPTIVITY_LEVEL`, the on-disk kernel cache), so it is not a
+   one-time JIT. Try fixed adaptivity levels and repeated runs.
+b. **Compiler flags.** Check whether AdaptiveCpp enables fast-math or similar by default, and how
+   that affects accuracy and timing for every variant and for the cuBLAS comparison.
+c. **Small n.** At n = 2048, fused and barrier are much slower than unfused (about 1.7 ms vs
+   0.25 ms for fused). Suspected cause: the per-forward packing and USM upload of the fused stage
+   records. This is not profiled; see the roadmap's JIT-constant and staging items.
+d. **onepass gives a wrong `q` on the omp backend** (`q[0]` right, the rest garbage). `s` and every
+   other variant are correct. Cause unknown: possibly the backend, possibly `reduce_over_group`
+   inside the per-row loop of a group body. Not confirmed.
+e. **parallel brings no gain over unfused.** Both products still read the matrix, and nothing was
+   profiled to see whether the two kernels actually overlap.

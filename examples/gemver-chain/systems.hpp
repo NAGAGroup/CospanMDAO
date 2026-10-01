@@ -37,7 +37,7 @@
 
 namespace gc {
 
-enum class Style { unfused, parallel, fused };
+enum class Style { unfused, parallel, fused, onepass };  // onepass: fused GEMVERs, one-pass BiCGK
 
 inline sycl::range<3> wg256() { return sycl::range<3>{kWg, 1, 1}; }
 
@@ -55,7 +55,7 @@ public:
     void setup() override {
         const float ab = 1.0f / std::sqrt(static_cast<float>(n_));  // alpha = beta
         std::string pre;                                             // the path prefix of r2u and gtp
-        if (style_ == Style::fused) {
+        if (style_ == Style::fused || style_ == Style::onepass) {
             // r2u and gtp share their (c, j) mapping, so the same work-item reads its own B writes.
             add_subsystem("fw",
                           cs::property_list{cs::property::fused{cs::property::fused::Mode::sequential, wg256()}},
@@ -97,6 +97,20 @@ public:
     Bicgk(Style style, int n, int R) : style_{style}, n_{n}, R_{R} {}
 
     void setup() override {
+        if (style_ == Style::onepass) {
+            // q and s from ONE pass over B: the one-pass kernel, then the two reducers.
+            add_subsystem<BicgkOnePass>("onepass", n_, R_);
+            add_subsystem<RowReduce>("rowred", n_);
+            add_subsystem<ColReduce<false>>("cred_s", n_, R_, 1.0f);
+            connect("onepass.Pq", "rowred.Pq");
+            connect("onepass.Ps", "cred_s.P");
+            promote("onepass.B", "B");
+            promote("onepass.p", "p");
+            promote("onepass.r", "r");
+            promote("rowred.q", "q");
+            promote("cred_s.x", "s");
+            return;
+        }
         std::string pre;  // the path prefix of gemv_q and gtp_s
         if (style_ == Style::parallel) {
             add_subsystem("par", cs::property_list{cs::property::parallel{}}, child<Gemv>("gemv_q", n_, 1.0f),
