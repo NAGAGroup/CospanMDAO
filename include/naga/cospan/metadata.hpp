@@ -1166,31 +1166,37 @@ public:
         for (auto& s : slots_) {
             if (s->version == ragged_version_) continue;
             diag::count_ragged_uploads();
-            if (s->version != 0) {
-                diag::count_queue_waits();
-                q.wait();  // replacing arrays a previous forward's kernels may still read
-            }
-            if (s->offs) diag::count_frees();
-            for (auto& a : s->per)
-                if (a) diag::count_frees();
-            s->offs.reset();
-            for (auto& a : s->per) a.reset();
-            if (ragged_) {
-                s->offs.emplace(offsets_.size(), route_as<std::uint64_t>(q, *subs_, s->pl));
-                diag::count_allocations();
+            // The ragged index arrays follow the DENSE storage rules: a vector is created once (empty), kept, and
+            // rewritten in place. from_host into the existing capacity is a memory task the in-order stream orders
+            // after any kernel still reading the old values, so it needs no wait. Only GROWTH past the capacity
+            // releases the old storage, and only then are its readers waited for (once per slot).
+            bool waited = false;
+            const auto upload = [&](std::optional<sk::usm_vector<std::uint64_t>>& v, std::span<const std::uint64_t> src) {
+                if (!v) v.emplace(0, route_as<std::uint64_t>(q, *subs_, s->pl));  // empty: nothing allocated yet
+                if (src.size() > v->capacity()) {                                  // growth, as for a dense root
+                    if (v->capacity() > 0) {                                       // existing storage is released
+                        if (!waited) {
+                            diag::count_queue_waits();
+                            q.wait();
+                            waited = true;
+                        }
+                        diag::count_frees();
+                    }
+                    diag::count_allocations();
+                }
                 diag::count_host_tasks();
-                s->offs->from_host(std::span<const std::uint64_t>{offsets_});
+                v->from_host(src);  // grows when needed; copies into the existing capacity otherwise
+            };
+            if (ragged_) {
+                upload(s->offs, std::span<const std::uint64_t>{offsets_});
                 for (int d = 1; d < rank(); ++d) {
                     if (!dims_[static_cast<std::size_t>(d)].per) continue;
                     const auto& src = dims_[static_cast<std::size_t>(d)].per_index;
-                    std::vector<std::uint64_t> conv(src.begin(), src.end());
-                    auto& dst = s->per[static_cast<std::size_t>(d - 1)];
-                    dst.emplace(conv.size(), route_as<std::uint64_t>(q, *subs_, s->pl));
-                    diag::count_allocations();
-                    diag::count_host_tasks();
-                    dst->from_host(std::span<const std::uint64_t>{conv});
+                    const std::vector<std::uint64_t> conv(src.begin(), src.end());  // from_host copies it into a task-owned buffer
+                    upload(s->per[static_cast<std::size_t>(d - 1)], std::span<const std::uint64_t>{conv});
                 }
             }
+            // not ragged any more: the vectors stay (point_ragged ignores them for a dense entry)
             s->version = ragged_version_;
         }
     }
@@ -1210,6 +1216,11 @@ public:
         // only for its own tasks, so the CALLER has waited the stream (once per releasing Component's
         // batch); the vectors free here.
         diag::count_frees(slots_.size());
+        for (const auto& s : slots_) {  // the metadata vectors that hold real storage go with the slot
+            if (s->offs && s->offs->capacity() > 0) diag::count_frees();
+            for (const auto& a : s->per)
+                if (a && a->capacity() > 0) diag::count_frees();
+        }
         if (!slots_.empty()) bump_write();
         host_cache_  = std::vector<T>{};  // free the cached copy with the storage
         cache_epoch_ = ~std::uint64_t{0};
