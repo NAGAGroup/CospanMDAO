@@ -91,19 +91,21 @@ public:
         get_exec_info(const sycl::device& parent_device) = 0;
     virtual void prepare_exec(sk::queue& queue, Substrates& substrates) = 0;
     virtual void compile() = 0;
-    /// Component pass of init_tree: a Component runs its init(); a System
-    /// forwards to its children in order.
-    virtual void run_init(const ExecCtx& owner_ctx) = 0;
-    /// System pass of init_tree: child Systems first, then this System's
-    /// init(). A Component's is a no-op.
-    virtual void run_system_init() = 0;
 
     // ---- forward (per forward; r01 §6.5) -------------------------------------
+    /// A Component: shapes, pre_forward, then ALLOCATE every root it touches that has no
+    /// storage and apply its init when it is a free input root (r01 §4.4).
     virtual void run_pre_compute(ExecCtx& owner_ctx) = 0;
     /// Components return a description and never submit it; Systems submit
     /// their subtree's work themselves and return null.
     virtual std::unique_ptr<LaunchDescription> run_compute_forward() = 0;
+    /// A Component: the other-placement sync, then RELEASE the transient roots it is the last
+    /// user of (one stream wait for the batch; r01 §4.4).
     virtual void run_post_compute(ExecCtx& owner_ctx) = 0;
+
+    /// Given by the OWNER at registration (property::transient): this subsystem, a Component or
+    /// a System, and everything under it are transient registrations (r01 §4.4).
+    bool transient() const noexcept { return transient_; }
 
 protected:
     Subsystem() = default;
@@ -115,6 +117,7 @@ private:
     std::string   name_;
     std::string   path_;
     const System* owner_ = nullptr;
+    bool          transient_ = false;
 };
 
 namespace detail {

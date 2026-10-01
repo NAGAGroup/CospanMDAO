@@ -361,7 +361,9 @@ public:
 // GridBarrier: a software grid barrier. Only valid when EVERY group of the launch is
 // co-resident, which is why the whole chain runs on a capped, resident number of groups.
 // =============================================================================
-// `count` is never reset: it grows by G per crossing, and crossing k waits for count >= k * G.
+// A ZeroPair stage (below), first in the chain, zeroes `count` and `timeout` at the start of every
+// forward (outputs are never initialized, D138). `count` then grows by G at the one crossing of the
+// forward, which waits for count >= G.
 // A group that waits `spin_limit` polls without seeing the target gives up and sets `timeout`.
 struct GridBarrierBody {
     struct Inputs {};
@@ -390,7 +392,6 @@ class GridBarrier : public cs::Component<GridBarrierBody> {
     cs::Output<DType::atomic_u32, 1> count_, timeout_;
     std::size_t                      groups_;
     std::uint32_t                    spin_limit_;
-    std::uint32_t                    crossings_ = 0;  // host member: forwards seen so far
 
 public:
     GridBarrier(std::size_t groups, std::uint32_t spin_limit) : groups_{groups}, spin_limit_{spin_limit} {}
@@ -398,15 +399,39 @@ public:
         declare_output(count_, "count", 1);
         declare_output(timeout_, "timeout", 1);
     }
-    void init(sk::queue&, const sycl::device&) override {
-        zero_output("count");
-        zero_output("timeout");
-    }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        ++crossings_;
+        // The counters were zeroed at the start of this forward: one crossing waits for count >= G.
         return create_launch_config(sycl::range<1>{groups_ * kWg}, sycl::range<1>{kWg}, GridBarrierBody::Inputs{},
                                     GridBarrierBody::Outputs{count_, timeout_},
-                                    GridBarrierBody{static_cast<std::uint32_t>(crossings_ * groups_), spin_limit_});
+                                    GridBarrierBody{static_cast<std::uint32_t>(groups_), spin_limit_});
+    }
+};
+
+// =============================================================================
+// ZeroPair: the zeroing producer of one barrier's counters (outputs are never initialized).
+// Registered before the chain's stages; its outputs are tied to the barrier's by tie_outputs.
+// =============================================================================
+struct ZeroPairBody {
+    struct Inputs {};
+    struct Outputs {
+        cs::Output<DType::atomic_u32, 1> count, timeout;
+    };
+    void operator()(sycl::id<1> i, Inputs, Outputs out) const {
+        out.count[i].store(0u);
+        out.timeout[i].store(0u);
+    }
+};
+
+class ZeroPair : public cs::Component<ZeroPairBody> {
+    cs::Output<DType::atomic_u32, 1> count_, timeout_;
+
+public:
+    void setup() override {
+        declare_output(count_, "count", 1);
+        declare_output(timeout_, "timeout", 1);
+    }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+        return create_launch_config(sycl::range<1>{1}, {}, {count_, timeout_}, {});
     }
 };
 

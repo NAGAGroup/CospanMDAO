@@ -129,12 +129,9 @@ public:
             s.substrates.emplace(d, std::move(m));
         }
         s.substrates.try_emplace(dev);  // the default device always has a substrate entry
-        root.prepare_exec(s.queue, s.substrates);                    // 4. allocate, point wrappers
+        root.prepare_exec(s.queue, s.substrates);                    // 4. capture queue/substrates, shapes (no allocation)
         root.compile();                                              // 5. bodies
-        ExecCtx ctx{dev, &s.queue, nullptr, &s.substrates.at(dev)};  // 6. init_tree: both passes
-        root.run_init(ctx);
-        root.run_system_init();
-        std::unordered_set<const detail::IOEntry*> seen;             // 7. marks (§8.4)
+        std::unordered_set<const detail::IOEntry*> seen;             // 6. marks (§8.4)
         collect_marks(root, s, seen);
         s.ready = true;
     }

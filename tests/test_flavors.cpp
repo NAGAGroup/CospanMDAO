@@ -34,6 +34,7 @@
 #include <vector>
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 
 #include <sycl/sycl.hpp>
@@ -357,9 +358,29 @@ class Adder : public cs::Component<AdderBody> {
 public:
     explicit Adder(float v, int n = 12) : v_{v}, n_{n} {}
     void setup() override { declare_output(acc_, "acc", n_); }
-    void init(sk::queue&, const sycl::device&) override { zero_output("acc"); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return create_launch_config(acc_.shape(), {}, {acc_}, {v_});
+    }
+};
+
+// ---- ZeroAcc: the zeroing producer (outputs are never initialized, r01 §6.0); it runs first and the
+// Adders accumulate onto the tied root --------------------------------------------------------------
+struct ZeroAccBody {
+    struct Inputs {};
+    struct Outputs {
+        cs::Output<DType::atomic_f32, 1> acc;
+    };
+    void operator()(sycl::id<1> i, Inputs, Outputs out) const { out.acc[i].store(0.0f); }
+};
+class ZeroAcc : public cs::Component<ZeroAccBody> {
+    cs::Output<DType::atomic_f32, 1> acc_;
+    int                              n_;
+
+public:
+    explicit ZeroAcc(int n = 12) : n_{n} {}
+    void setup() override { declare_output(acc_, "acc", n_); }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+        return create_launch_config(acc_.shape(), {}, {acc_}, {});
     }
 };
 
@@ -597,12 +618,13 @@ TEST_CASE("parallel: tied outputs throw at forward, naming both, unless allow_ti
           "[flavors][parallel][errors]") {
     const auto tied = [](bool allow) {
         return tfl::make([allow](cs::System& s) {
+            s.add_subsystem<tfl::ZeroAcc>("zero");
             s.add_subsystem<tfl::Par>("par", std::function<void(cs::ParallelSystem&)>{[allow](cs::ParallelSystem& p) {
                 if (allow) p.allow_tied_outputs();
                 p.add_subsystem<tfl::Adder>("a", 1.0f);
                 p.add_subsystem<tfl::Adder>("b", 2.0f);
             }});
-            s.tie_outputs({"par.a.acc", "par.b.acc"}, "sum");  // atomic writers, one root
+            s.tie_outputs({"zero.acc", "par.a.acc", "par.b.acc"}, "sum");  // atomic writers, one root
         });
     };
     SECTION("refused") {
@@ -865,6 +887,7 @@ TEST_CASE("fused: tied outputs throw in parallel mode unless allow_tied_outputs(
           "[flavors][fused][errors]") {
     const auto tied = [](cs::FusedSystem::Mode mode, bool allow) {
         return tfl::make([mode, allow](cs::System& s) {
+            s.add_subsystem<tfl::ZeroAcc>("zero");
             s.add_subsystem<tfl::Wave>(
                 "f", mode, std::optional<sycl::range<3>>{},
                 std::function<void(cs::FusedSystem&)>{[allow](cs::FusedSystem& w) {
@@ -872,7 +895,7 @@ TEST_CASE("fused: tied outputs throw in parallel mode unless allow_tied_outputs(
                     w.add_subsystem<tfl::Adder>("a", 1.0f);
                     w.add_subsystem<tfl::Adder>("b", 2.0f);
                 }});
-            s.tie_outputs({"f.a.acc", "f.b.acc"}, "sum");  // atomic writers, one root
+            s.tie_outputs({"zero.acc", "f.a.acc", "f.b.acc"}, "sum");  // atomic writers, one root
         });
     };
     SECTION("parallel, refused") {
@@ -1079,4 +1102,39 @@ TEST_CASE("fused vs unfused: four stages as a plain System and as a sequential F
         want[i]       = tfl::ref(2, tfl::ref(3, tfl::ref(1, tfl::ref(0, x))));
     }
     CHECK(cst::all_close(u, want));
+}
+
+
+// =============================================================================================
+// Transient flavors (D138): the children release after the group or wave
+// =============================================================================================
+TEST_CASE("transient: ParallelSystem and FusedSystem children release after the group or wave",
+          "[flavors][transient]") {
+    const bool fused = GENERATE(false, true);
+    CAPTURE(fused);
+    cs::Model model = cs::create_model<tfl::Top>(cst::pooled_config(), tfl::Build{[fused](cs::System& s) {
+        s.add_subsystem<tfl::Src1>("src", std::array<int, 1>{tfl::kLen});
+        const cs::property_list props = fused ? cs::property_list{cs::property::fused{}, cs::property::transient{}}
+                                              : cs::property_list{cs::property::parallel{}, cs::property::transient{}};
+        s.add_subsystem("grp", props, s.child<tfl::Elem<0>>("a"), s.child<tfl::Elem<0>>("b"));
+        s.connect("src.y", "grp.a.x");
+        s.connect("src.y", "grp.b.x");
+    }});
+    model.setup();
+    // A FusedSystem keeps its wave staging in member usm_vectors drawn from the pool (D93), so the
+    // baseline is taken after the FIRST forward: what the group's roots held is then gone, what the
+    // fuse stages stays. The roots themselves are checked directly after that first forward.
+    model.forward();
+    model.wait();
+    for (const char* p : {"grp.a.y", "grp.b.y"}) {
+        INFO(p);
+        CHECK(model.root().entry_at(p).root()->transient());
+        CHECK(!model.root().entry_at(p).root()->has_storage());
+    }
+    const auto base = cst::pool_in_use(model);
+    model.forward();
+    model.forward();
+    model.wait();
+    CHECK(cst::pool_in_use(model) == base);  // every later forward returns what it allocated
+    tfl::expect_throws([&] { (void)model.view_output<DType::f32, 1>("grp.a.y"); }, {"grp"});
 }

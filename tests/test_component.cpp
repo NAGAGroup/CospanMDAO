@@ -8,18 +8,20 @@
 //
 //   plain body, rank 1/2/3        y = 2x + 1, ragged sizes (1000, 40x30, 7x9x11)
 //   WeightedHistogram             atomic output, FromSourceDim, value-driven
-//                                 n_bins; two forwards, n_bins changed by
+//                                 n_bins; ZeroBins + tie_outputs; two forwards, n_bins changed by
 //                                 set_input between them
 //   TiledTranspose                group body, Local scratch, wg override; 37x53
 //   host component chain          producer -> host prefix sum -> consumer
 //   custom-op plumbing            device_ptr recorded at submission
-//   initializers                  fill/zero/set_*_from_host/host initializer;
-//                                 phase guards (init / pre_forward / setup)
+//   initial values                fill/zero/from_host/custom/custom_host, zeros by default,
+//                                 metadata rules; phase guards (init_input / pre_forward / setup)
 
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <type_traits>
@@ -185,9 +187,34 @@ public:
         declare_input(n_bins_, "n_bins", 1);  // a free input: the test drives it with set_input
         declare_output(bins_, "bins", cs::FromInput{"n_bins", 0});
     }
-    void init(sk::queue&, const sycl::device&) override { zero_output("bins"); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return create_launch_config(values_.shape(), {values_, weights_, n_bins_}, {bins_}, {lo_, hi_});
+    }
+};
+
+// The zeroing producer (r01 §6.7): outputs are never initialized, so what the histogram accumulates
+// onto is the output of a component that computes zero.
+struct ZeroBody {
+    struct Inputs {
+        cs::Input<DType::u32, 1> n_bins;
+    };
+    struct Outputs {
+        cs::Output<DType::atomic_f32, 1> bins;
+    };
+    void operator()(sycl::id<1> i, Inputs, Outputs out) const { out.bins[i].store(0.0f); }
+};
+
+class ZeroBins : public cs::Component<ZeroBody> {
+    cs::Input<DType::u32, 1>         n_bins_;
+    cs::Output<DType::atomic_f32, 1> bins_;
+
+public:
+    void setup() override {
+        declare_input(n_bins_, "n_bins", 1);
+        declare_output(bins_, "bins", cs::FromInput{"n_bins", 0});
+    }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+        return create_launch_config(bins_.shape(), {n_bins_}, {bins_}, {});
     }
 };
 
@@ -195,7 +222,10 @@ class TopHist : public cs::System {
 public:
     void setup() override {
         add_subsystem<HistProducer>("prod");
+        add_subsystem<ZeroBins>("zero");  // BEFORE hist: registration order is execution order
         add_subsystem<WeightedHistogram>("hist", 0.0f, 1.0f);
+        tie_inputs({"zero.n_bins", "hist.n_bins"}, "n_bins");
+        tie_outputs({"zero.bins", "hist.bins"}, "bins");
         connect("prod.values", "hist.values");
         connect("prod.weights", "hist.weights");
     }
@@ -407,23 +437,28 @@ public:
     }
 };
 
-// ---- initializers ---------------------------------------------------------------------------------
-// The body writes only y; a, b, c, d and the inputs get their values from init().
+// ---- initial values ---------------------------------------------------------------------------
+std::atomic<int>         g_host_calls{0};
+std::atomic<int>         g_custom_calls{0};
+std::atomic<std::size_t> g_custom_size{0};
+
+// y = 10 x + w + v + d. x fill, w from_host, u zero, v custom_host, m custom (device side; only
+// records its call), d declares nothing (zeros by default).
 struct InitDemoBody {
     struct Inputs {
-        cs::Input<DType::f32, 1> x, w, u, v;
+        cs::Input<DType::f32, 1> x, w, u, v, d, m;
     };
     struct Outputs {
-        cs::Output<DType::f32, 1> a, b, c, d, y;
+        cs::Output<DType::f32, 1> y;
     };
     void operator()(sycl::id<1> i, Inputs in, Outputs out) const {
-        out.y[i] = 10.0f * in.x[std::size_t{0}] + in.w[i] + in.v[i];
+        out.y[i] = 10.0f * in.x[std::size_t{0}] + in.w[i] + in.v[i] + in.d[i];
     }
 };
 
 class InitDemo : public cs::Component<InitDemoBody> {
-    cs::Input<DType::f32, 1>  x_, w_, u_, v_;
-    cs::Output<DType::f32, 1> a_, b_, c_, d_, y_;
+    cs::Input<DType::f32, 1>  x_, w_, u_, v_, d_, m_;
+    cs::Output<DType::f32, 1> y_;
     cs::Output<DType::f32, 1> extra_;  // only ever declared by the phase-guard hook
 
 public:
@@ -432,44 +467,69 @@ public:
         declare_input(w_, "w", 4);
         declare_input(u_, "u", 4);
         declare_input(v_, "v", 4);
-        declare_output(a_, "a", 4);
-        declare_output(b_, "b", 4);
-        declare_output(c_, "c", 4);
-        declare_output(d_, "d", 4);
+        declare_input(d_, "d", 4);
+        declare_input(m_, "m", 4);
         declare_output(y_, "y", 4);
-    }
-    void init(sk::queue&, const sycl::device&) override {
-        const float w[4] = {1.0f, 2.0f, 3.0f, 4.0f};
-        const float c[4] = {1.0f, 2.0f, 3.0f, 4.0f};
-        fill_input("x", 2.0f);                                     // fill_input
-        set_input_from_host<float>("w", std::span<const float>{w});  // set_input_from_host
-        fill_input("u", 7.0f);
-        zero_input("u");                                            // zero_input (over a fill)
-        {
-            auto h = get_input_host_initializer<DType::f32, 1>("v");  // host initializer (input)
-            for (std::size_t k = 0; k < 4; ++k) h[k] = 100.0f * static_cast<float>(k + 1);
-        }
-        fill_output("a", 3.5f);                                     // fill_output
-        fill_output("b", 9.0f);
-        zero_output("b");                                           // zero_output (over a fill)
-        set_output_from_host<float>("c", std::span<const float>{c});  // set_output_from_host
-        {
-            auto h = get_output_host_initializer<DType::f32, 1>("d");  // host initializer (output)
-            for (std::size_t k = 0; k < 4; ++k) h[k] = 5.0f + static_cast<float>(k);
-        }
+        init_input("x", cs::init::fill(2.0f));
+        init_input("w", cs::init::from_host(std::vector<float>{1.0f, 2.0f, 3.0f, 4.0f}));
+        init_input("u", cs::init::zero());
+        init_input("v", cs::init::custom_host<DType::f32, 1>(std::function<void(cs::HostViewMut<DType::f32, 1>&)>{
+                            [](cs::HostViewMut<DType::f32, 1>& h) {
+                                ++g_host_calls;
+                                for (std::size_t k = 0; k < 4; ++k) h[k] = 100.0f * static_cast<float>(k + 1);
+                            }}));
+        init_input("m", cs::init::custom<DType::f32, 1>(
+                            std::function<void(sk::queue&, cs::Initializer<DType::f32, 1>)>{
+                                [](sk::queue&, cs::Initializer<DType::f32, 1> out) {
+                                    ++g_custom_calls;
+                                    g_custom_size = out.size();
+                                }}));
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(y_.shape(), {x_, w_, u_, v_}, {a_, b_, c_, d_, y_}, {});
+        return create_launch_config(y_.shape(), {x_, w_, u_, v_, d_, m_}, {y_}, {});
     }
 
     // Hooks for the phase-guard checks, called by the test after setup.
     void try_declare() { declare_output(extra_, "extra", 1); }
     void try_reshape() { reshape(y_, sycl::range<1>{2}); }
+    void try_init() { init_input("x", cs::init::zero()); }
 };
 
 class TopInit : public cs::System {
 public:
     void setup() override { add_subsystem<InitDemo>("ini"); }
+};
+
+/// y = 2 x + 1 on a free 4-vector, with optional init declarations for the metadata rules:
+/// mode 0 one init on x, 1 an init on the OUTPUT y, 2 two inits on x (one depth).
+class InitAffine : public cs::Component<AffineBody<1>> {
+    cs::Input<DType::f32, 1>  x_;
+    cs::Output<DType::f32, 1> y_;
+    std::optional<cs::InitSpec> init_;
+    int                         mode_;
+
+public:
+    explicit InitAffine(std::optional<cs::InitSpec> init = std::nullopt, int mode = 0)
+        : init_{std::move(init)}, mode_{mode} {}
+    void setup() override {
+        declare_input(x_, "x", 4);
+        declare_output(y_, "y", cs::from_input_shape<1>("x"));
+        if (init_) init_input("x", *init_);
+        if (mode_ == 1) init_input("y", cs::init::zero());
+        if (mode_ == 2) init_input("x", cs::init::fill(3.0f));
+    }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+        return create_launch_config(x_.shape(), {x_}, {y_}, {});
+    }
+};
+
+/// A root System whose setup() runs a callable.
+class TopFn : public cs::System {
+    std::function<void(cs::System&)> build_;
+
+public:
+    explicit TopFn(std::function<void(cs::System&)> b) : build_{std::move(b)} {}
+    void setup() override { build_(*this); }
 };
 
 }  // namespace tc
@@ -493,27 +553,24 @@ TEST_CASE("WeightedHistogram: atomic output, FromSourceDim, value-driven n_bins"
     const std::uint32_t nb1 = 8, nb2 = 13;
 
     SECTION("first forward, n_bins = 8") {
-        model.set_input<DType::u32, 1>("hist.n_bins", std::span<const std::uint32_t>{&nb1, 1});
-        auto bins = wait_and_view<DType::f32, 1>(model, "hist.bins");
+        model.set_input<DType::u32, 1>("n_bins", std::span<const std::uint32_t>{&nb1, 1});
+        auto bins = wait_and_view<DType::f32, 1>(model, "bins");
         CHECK(bins.size() == nb1);
         CHECK(to_vector(bins) == tc::histogram_ref(nb1));
     }
 
     SECTION("second forward with n_bins changed by set_input: the root grows and accumulates") {
-        model.set_input<DType::u32, 1>("hist.n_bins", std::span<const std::uint32_t>{&nb1, 1});
+        model.set_input<DType::u32, 1>("n_bins", std::span<const std::uint32_t>{&nb1, 1});
         {
-            auto bins = wait_and_view<DType::f32, 1>(model, "hist.bins");
+            auto bins = wait_and_view<DType::f32, 1>(model, "bins");
             REQUIRE(bins.size() == nb1);
             CHECK(to_vector(bins) == tc::histogram_ref(nb1));
         }
-        model.set_input<DType::u32, 1>("hist.n_bins", std::span<const std::uint32_t>{&nb2, 1});
-        auto bins = wait_and_view<DType::f32, 1>(model, "hist.bins");
+        model.set_input<DType::u32, 1>("n_bins", std::span<const std::uint32_t>{&nb2, 1});
+        auto bins = wait_and_view<DType::f32, 1>(model, "bins");
         REQUIRE(bins.size() == nb2);
-        // The grown root is the zero-padded first bins plus the new histogram.
-        std::vector<float>       want  = tc::histogram_ref(nb2);
-        const std::vector<float> first = tc::histogram_ref(nb1);
-        for (std::size_t i = 0; i < first.size(); ++i) want[i] += first[i];
-        CHECK(to_vector(bins) == want);
+        // ZeroBins zeroes the grown root each forward, then the histogram accumulates onto it.
+        CHECK(to_vector(bins) == tc::histogram_ref(nb2));
     }
 }
 
@@ -585,49 +642,92 @@ TEST_CASE("custom op: device_ptr at submission is the storage the consumer reads
 // =============================================================================================
 // Initializers and phase guards
 // =============================================================================================
-TEST_CASE("initializers: fill / zero / set_*_from_host / host initializer", "[component][init]") {
+TEST_CASE("initial values: fill / zero / from_host / custom / custom_host, and zeros by default", "[component][init]") {
+    tc::g_host_calls   = 0;
+    tc::g_custom_calls = 0;
+    tc::g_custom_size  = 0;
     auto model = cs::create_model<tc::TopInit>(default_config());
     model.setup();
     auto y = wait_and_view<DType::f32, 1>(model, "ini.y");
 
     const std::vector<float> ramp{1.0f, 2.0f, 3.0f, 4.0f};
     SECTION("inputs") {
-        CHECK(model.view_input<DType::f32, 1>("ini.x")[std::size_t{0}] == 2.0f);  // fill_input
-        CHECK(to_vector(model.view_input<DType::f32, 1>("ini.w")) == ramp);       // set_input_from_host
-        CHECK(to_vector(model.view_input<DType::f32, 1>("ini.u")) == std::vector<float>(4, 0.0f));  // zero_input
+        CHECK(model.view_input<DType::f32, 1>("ini.x")[std::size_t{0}] == 2.0f);  // fill
+        CHECK(to_vector(model.view_input<DType::f32, 1>("ini.w")) == ramp);       // from_host
+        CHECK(to_vector(model.view_input<DType::f32, 1>("ini.u")) == std::vector<float>(4, 0.0f));  // zero
         CHECK(to_vector(model.view_input<DType::f32, 1>("ini.v")) ==
-              std::vector<float>({100.0f, 200.0f, 300.0f, 400.0f}));              // host initializer
+              std::vector<float>({100.0f, 200.0f, 300.0f, 400.0f}));  // custom_host
+        CHECK(to_vector(model.view_input<DType::f32, 1>("ini.d")) == std::vector<float>(4, 0.0f));  // default
     }
-    SECTION("outputs the body does not write") {
-        CHECK(to_vector(model.view_output<DType::f32, 1>("ini.a")) == std::vector<float>(4, 3.5f));  // fill_output
-        CHECK(to_vector(model.view_output<DType::f32, 1>("ini.b")) == std::vector<float>(4, 0.0f));  // zero_output
-        CHECK(to_vector(model.view_output<DType::f32, 1>("ini.c")) == ramp);      // set_output_from_host
-        CHECK(to_vector(model.view_output<DType::f32, 1>("ini.d")) ==
-              std::vector<float>({5.0f, 6.0f, 7.0f, 8.0f}));                      // host initializer
+    SECTION("custom ran once, with the root's shape") {
+        CHECK(tc::g_custom_calls.load() == 1);
+        CHECK(tc::g_custom_size.load() == 4);
+        CHECK(tc::g_host_calls.load() == 1);  // a durable root is initialized at setup, not per forward
     }
     SECTION("the kernel sees the initialized inputs") {
-        // y = 10 x + w + v = 20 + {1,2,3,4} + {100,200,300,400}
+        // y = 10 x + w + v + d = 20 + {1,2,3,4} + {100,200,300,400} + 0
         CHECK(to_vector(y) == std::vector<float>({121.0f, 222.0f, 323.0f, 424.0f}));
     }
 }
 
-TEST_CASE("phase guards: initializers, reshape and declare outside their phase throw", "[component][init][guards]") {
+TEST_CASE("initial values: metadata rules (connected, output, duplicates, highest level)", "[component][init][rules]") {
+    const auto top = [](std::function<void(cs::System&)> build) {
+        return cs::create_model<tc::TopFn>(default_config(), std::move(build));
+    };
+
+    SECTION("an init on a connected input is ignored") {
+        auto model = top([](cs::System& s) {
+            s.add_subsystem<tc::InitAffine>("p", std::optional<cs::InitSpec>{cs::init::fill(1.0f)});
+            s.add_subsystem<tc::InitAffine>("c", std::optional<cs::InitSpec>{cs::init::fill(100.0f)});
+            s.connect("p.y", "c.x");
+        });
+        model.setup();
+        auto y = wait_and_view<DType::f32, 1>(model, "c.y");
+        CHECK(to_vector(y) == std::vector<float>(4, 7.0f));  // 2 * (2 * 1 + 1) + 1, not 201
+    }
+    SECTION("an init on an output throws") {
+        tc::expect_throws(
+            [&] {
+                auto model = top([](cs::System& s) {
+                    s.add_subsystem<tc::InitAffine>("a", std::optional<cs::InitSpec>{}, 1);
+                });
+                model.setup();
+            },
+            "is an output");
+    }
+    SECTION("two inits at one depth on one root throw") {
+        tc::expect_throws(
+            [&] {
+                auto model = top([](cs::System& s) {
+                    s.add_subsystem<tc::InitAffine>("a", std::optional<cs::InitSpec>{cs::init::fill(1.0f)});
+                    s.add_subsystem<tc::InitAffine>("b", std::optional<cs::InitSpec>{cs::init::fill(2.0f)});
+                    s.tie_inputs({"a.x", "b.x"}, "x");
+                });
+                model.setup();
+            },
+            "two initial values");
+    }
+    SECTION("a System-level init beats the components' on a tied alias") {
+        auto model = top([](cs::System& s) {
+            s.add_subsystem<tc::InitAffine>("a", std::optional<cs::InitSpec>{cs::init::fill(1.0f)});
+            s.add_subsystem<tc::InitAffine>("b", std::optional<cs::InitSpec>{cs::init::fill(2.0f)});
+            s.tie_inputs({"a.x", "b.x"}, "x");
+            s.init_input("x", cs::init::fill(9.0f));
+        });
+        model.setup();
+        auto a = wait_and_view<DType::f32, 1>(model, "a.y");
+        CHECK(to_vector(a) == std::vector<float>(4, 19.0f));
+        CHECK(to_vector(model.view_output<DType::f32, 1>("b.y")) == std::vector<float>(4, 19.0f));
+    }
+}
+
+TEST_CASE("phase guards: init_input, reshape and declare outside their phase throw", "[component][init][guards]") {
     auto model = cs::create_model<tc::TopInit>(default_config());
     model.setup();
     auto& c = dynamic_cast<tc::InitDemo&>(model.get_subsystem("ini"));
-    const float one[4] = {1.0f, 1.0f, 1.0f, 1.0f};
 
-    SECTION("an initializer outside init() throws") {
-        tc::expect_throws([&] { c.fill_input("x", 1.0f); }, "init() only");
-        tc::expect_throws([&] { c.fill_output("a", 1.0f); }, "init() only");
-        tc::expect_throws([&] { c.zero_input("u"); }, "init() only");
-        tc::expect_throws([&] { c.zero_output("b"); }, "init() only");
-        tc::expect_throws([&] { c.set_input_from_host<float>("w", std::span<const float>{one}); }, "init() only");
-        tc::expect_throws([&] { c.set_output_from_host<float>("c", std::span<const float>{one}); }, "init() only");
-        tc::expect_throws([&] { (void)c.get_input_initializer<DType::f32, 1>("w"); }, "init() only");
-        tc::expect_throws([&] { (void)c.get_output_initializer<DType::f32, 1>("a"); }, "init() only");
-        tc::expect_throws([&] { (void)c.get_input_host_initializer<DType::f32, 1>("v"); }, "init() only");
-        tc::expect_throws([&] { (void)c.get_output_host_initializer<DType::f32, 1>("d"); }, "init() only");
+    SECTION("init_input outside setup() throws") {
+        tc::expect_throws([&] { c.try_init(); }, "setup() only");
     }
     SECTION("reshape outside pre_forward() throws") {
         tc::expect_throws([&] { c.try_reshape(); }, "pre_forward() only");
@@ -636,9 +736,9 @@ TEST_CASE("phase guards: initializers, reshape and declare outside their phase t
         tc::expect_throws([&] { c.try_declare(); }, "setup() only");
     }
     SECTION("the model is unharmed by the refused calls") {
-        tc::expect_throws([&] { c.fill_input("x", 1.0f); }, "init() only");
+        tc::expect_throws([&] { c.try_init(); }, "setup() only");
         auto y = wait_and_view<DType::f32, 1>(model, "ini.y");
         CHECK(to_vector(y) == std::vector<float>({121.0f, 222.0f, 323.0f, 424.0f}));
     }
-    model.wait();  // setup() submitted initializer work; wait before the Model goes out of scope (D135)
+    model.wait();  // setup() submitted initial-value work; wait before the Model goes out of scope (D135)
 }

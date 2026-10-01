@@ -21,10 +21,10 @@
 // stage that reads, across work-items, what an earlier stage wrote calls its own
 // group barrier first.
 //
-// One forward: revive(); pre-compute ALL; compute ALL (the descriptions stay
+// One forward: pre-compute ALL; compute ALL (the descriptions stay
 // alive to the end); validate; pack records and the three byte streams (16-byte
 // aligned) into member USM buffers; ONE outer launch through the stream;
-// post-compute ALL; release(). Groups are laid along dimension 0.
+// post-compute ALL. Groups are laid along dimension 0.
 //
 // SEQUENTIAL MODE HAS NO INTER-STAGE ACCESS CHECKS. Stage ranges may differ, and
 // a stage may read anything an earlier stage wrote: the framework runs the
@@ -133,7 +133,6 @@ public:
 
     // ---- the runner --------------------------------------------------------------------------
     std::unique_ptr<LaunchDescription> run_compute_forward() override {
-        revive();
         const std::size_t n = children_.size();
         for (std::size_t i = 0; i < n; ++i) children_[i]->run_pre_compute(child_ctx_[i]);
 
@@ -152,7 +151,6 @@ public:
         submit_wave(parts);
 
         for (std::size_t i = 0; i < n; ++i) children_[i]->run_post_compute(child_ctx_[i]);
-        release();
         return nullptr;  // "I submitted"
     }
 

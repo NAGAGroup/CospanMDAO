@@ -19,6 +19,7 @@
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -152,6 +153,25 @@ struct MarkRecord {
 };
 
 // MemorySubstrate / Substrates live in subsystem.hpp (D7).
+
+/// The initial value of a free input root (r01 §4.4, D138): type-erased, made
+/// by the cs::init factories (init.hpp). apply() runs on a root that has just
+/// been allocated from nothing; the caller refreshes the other placements.
+class InitSpec {
+public:
+    using Fn = std::function<void(detail::IOEntry& root, sk::queue& q)>;
+
+    InitSpec() = default;
+    explicit InitSpec(Fn f) : fn_{std::move(f)} {}
+
+    void apply(detail::IOEntry& root, sk::queue& q) const {
+        if (fn_) fn_(root, q);
+    }
+    explicit operator bool() const noexcept { return static_cast<bool>(fn_); }
+
+private:
+    Fn fn_;
+};
 
 namespace detail {
 
@@ -302,12 +322,37 @@ public:
     /// The kind of USM this root's storage is: device, or host for a host
     /// component's I/O (D3).
     sk::kind storage_kind() const noexcept { return storage_kind_; }
-    bool     transient() const noexcept { return transient_; }
-    /// Roots: storage dropped by the transient owner's release; host access throws until revived.
-    bool released() const noexcept { return released_; }
-    /// Roots: path of the transient System that releases this root; empty otherwise.
-    std::string_view transient_owner() const noexcept { return transient_by_; }
-    /// The Subsystem that declared this entry (a Component for I/O, a System for aliases).
+    // ---- registration metadata (ROOTS; recorded by System::resolve, r01 §4.4, D138) ----
+    /// Every registration in the root's alias set is transient: the root is allocated by the
+    /// components that touch it and released after its last user. Never arena-eligible.
+    bool     transient() const noexcept { return root_->transient_; }
+    /// A transient root's storage is dropped: from resolve until its first user allocates it,
+    /// and again after its last user. Host access to a released root throws.
+    bool released() const noexcept { return root_->released_; }
+    /// Path of the topmost transient subsystem whose registration made the root transient; empty otherwise.
+    std::string_view transient_owner() const noexcept { return root_->transient_by_; }
+    /// The winning initial value of a free input root (highest level; none = zeros).
+    const std::optional<InitSpec>& init_spec() const noexcept { return root_->init_spec_; }
+    /// The last Component, in depth-first registration order, that touches the root.
+    const Subsystem* last_user() const noexcept { return root_->last_user_; }
+    /// The OWNER: the first Component, in depth-first registration order, that touches the root.
+    /// It alone allocates the root and applies its init, in its pre_compute (D138 amendment).
+    const Subsystem* owner() const noexcept { return root_->owner_; }
+
+    /// Roots: the memory substrates allocation draws on (bound at prepare_exec).
+    void bind_substrates(Substrates& s) noexcept { substrates_ = &s; }
+    /// THE ONE ALLOCATION ROUTINE of the root of this entry (route: arena, pool, OS). Allocates
+    /// when the root has no storage and a known size; returns whether it did. Used by the owner's
+    /// run_pre_compute and by a host write to a root with no storage (provisional, D138).
+    bool allocate_if_absent(sk::queue& q) {
+        IOEntry& r = *root_;
+        if (r.flat_size() == 0 || r.has_storage()) return false;
+        if (r.substrates_ == nullptr)
+            throw std::logic_error("naga::cospan: '" + r.full_path() + "' cannot be allocated before setup() completes");
+        r.allocate(q, *r.substrates_);
+        return true;
+    }
+    /// The Subsystem that registered this entry (a Component for I/O, a System for aliases).
     const Subsystem* declarer() const noexcept { return declarer_; }
 
     /// This entry's own placement: its subsystem's device and storage kind.
@@ -365,10 +410,10 @@ public:
     /// Whether the ROOT of this entry's set has been allocated.
     virtual bool has_storage() const = 0;
 
-    /// ROOTS ONLY (no-op on peers): drop the storage of a transient root (§4.4).
+    /// ROOTS ONLY (no-op on peers): drop the storage of a transient root (§4.4). The CALLER
+    /// waits the stream first (synchronous frees, D135): a releasing Component waits once
+    /// for its whole batch.
     virtual void release_storage() = 0;
-    /// ROOTS ONLY: re-allocate a released root through the pool route (§4.4).
-    virtual void revive_storage(sk::queue& q, Substrates& substrates) = 0;
 
 protected:
     IOEntry(std::string name, IOKind k, DType dt, int rank, std::vector<DimRecord> dims,
@@ -435,8 +480,8 @@ protected:
     std::vector<Placement>     placements_;        ///< roots; primary first
     std::optional<sycl::device> device_;
     sk::kind                   storage_kind_ = sk::kind::device;
-    bool                       released_ = false;     ///< roots: storage dropped by release_storage
-    std::string                transient_by_;         ///< roots: path of the releasing System
+    bool                       released_ = false;     ///< transient roots: no storage right now (starts true)
+    std::string                transient_by_;         ///< transient roots: topmost transient subsystem's path
 
 private:
     /// The four structural operations and placement are System's (r01 §4.2);
@@ -470,10 +515,24 @@ private:
     bool                  can_be_source_;
     bool                  can_be_target_;
     std::optional<SubarrayRef> view_;
-    bool                  transient_ = false;
+    bool                  transient_ = false;     ///< roots, set by System::resolve
     const Subsystem*      declarer_  = nullptr;
 
     std::optional<MarkRecord> design_var_, constraint_, objective_;
+
+    /// An initial value declared on THIS entry (ComponentBase::init_input / System::init_input),
+    /// with the depth of the declaring subsystem (root System = 0). resolve() picks, per root,
+    /// the declaration of the smallest depth.
+    struct InitDecl {
+        InitSpec    spec;
+        std::size_t depth = 0;
+        std::string by;  ///< the declaring subsystem's path, for errors
+    };
+    std::vector<InitDecl>     init_decls_;
+    std::optional<InitSpec>   init_spec_;        ///< roots, set by System::resolve
+    const Subsystem*          last_user_ = nullptr;  ///< roots, set by System::resolve
+    const Subsystem*          owner_     = nullptr;  ///< roots, set by System::resolve: the first toucher
+    Substrates*               substrates_ = nullptr; ///< roots, bound at prepare_exec
 };
 
 // -----------------------------------------------------------------------------
@@ -504,6 +563,9 @@ public:
                 throw std::invalid_argument("naga::cospan: '" + std::string{name()} +
                                             "': extents past the rank must be 1");
         extents_ = {r[0], r[1], r[2]};
+        // A value-driven tied OUTPUT resolves its extents on the member; the dynamic alias root follows.
+        if (!is_root() && kind() == IOKind::output && root()->is_dynamic() && root()->extents() != r)
+            root()->reshape(r);
         if (is_root()) {
             // Growing reallocates and frees the old storage synchronously (D135): wait the stream's kernels first.
             if (!slots_.empty() && flat_size() > slots_.front()->data.capacity())
@@ -541,6 +603,7 @@ public:
             if (find_slot(p) != nullptr) continue;
             slots_.push_back(std::make_unique<Slot>(p, sk::usm_vector<T>(flat_size(), route(q, subs, p))));
         }
+        released_ = false;
     }
 
     bool has_storage() const override {
@@ -551,16 +614,10 @@ public:
     void release_storage() override {
         if (!is_root() || slots_.empty()) return;
         // Synchronous frees (D135): the stream's kernels may still read these roots and a usm_vector waits
-        // only for its own tasks, so wait the stream, then the vectors free here.
-        slots_.front()->data.get_queue().wait();
+        // only for its own tasks, so the CALLER has waited the stream (once per releasing Component's
+        // batch); the vectors free here.
         slots_.clear();
         released_ = true;
-    }
-
-    void revive_storage(sk::queue& q, Substrates& subs) override {
-        if (!is_root() || !released_) return;
-        released_ = false;
-        allocate(q, subs);  // transient roots are not arena-eligible: pool route, current extents
     }
 
     void sync_other_placements(sk::queue&) override {
@@ -607,11 +664,12 @@ protected:
         return s->data.data();
     }
 
-    /// Host access to a released root: the error names the transient System.
+    /// Host access to a released root: the error names the root and the transient subsystem
+    /// whose registration made it transient (D57, D138).
     [[noreturn]] void throw_released() const {
-        throw std::logic_error("naga::cospan: '" + full_path() + "' belongs to transient System '" +
+        throw std::logic_error("naga::cospan: '" + full_path() + "' belongs to transient subsystem '" +
                                transient_by_ + "' and its storage is released; it exists only while that "
-                               "System runs");
+                               "subsystem's components run");
     }
 
 private:
@@ -629,11 +687,14 @@ private:
 
     Slot& primary_slot() const {
         if (released_) throw_released();
-        if (!is_root() || placements_.empty())
-            throw std::logic_error("naga::cospan: '" + full_path() + "' has no storage");
+        const auto no_data = [&] {
+            return std::logic_error("naga::cospan: '" + full_path() +
+                                    "' has no data until its owner component runs (it is allocated in the owner's "
+                                    "first forward, or by a host write)");
+        };
+        if (!is_root() || placements_.empty()) throw no_data();
         Slot* s = find_slot(placements_.front());
-        if (s == nullptr)
-            throw std::logic_error("naga::cospan: '" + std::string{name()} + "' is not allocated");
+        if (s == nullptr) throw no_data();
         return *s;
     }
 
@@ -678,8 +739,8 @@ class TypedEntry : public StorageEntry<cpp_type_t<DT>> {
 public:
     using value_type = cpp_type_t<DT>;
 
-    /// The writable twin for init(): the same geometry as the member wrapper,
-    /// over the root's storage on this entry's device.
+    /// The writable twin for cs::init::custom: the same geometry as the member
+    /// wrapper, over the root's storage on this entry's device.
     Initializer<DT, Rank> make_initializer() const {
         Initializer<DT, Rank> init;
         point(init);

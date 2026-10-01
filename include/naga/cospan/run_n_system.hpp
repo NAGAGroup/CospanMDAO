@@ -13,10 +13,11 @@ namespace naga::cospan {
 /// Run the subtree on the first n forwards, then never (n >= 1; n == 0
 /// throws std::invalid_argument). Do-once is n = 1: construction-time
 /// operators (LBVH, LRPIM, nonlocal-operator assembly). Users derive from it,
-/// pass n to its constructor and override setup() like any System. With
-/// property::transient it releases after each of its runs and revives on runs
-/// 2..n; after the n-th it stays released, because the early return reaches
-/// no revive(). Roots kept by a consumer outside persist.
+/// pass n to its constructor and override setup() like any System. An early
+/// return means its components neither allocate nor release (r01 §4.4): when
+/// the subtree is transient, its roots are allocated and released in the runs,
+/// and after the n-th run its transient roots stay released. Roots kept by a
+/// consumer outside persist.
 class RunNSystem : public System {
     std::size_t remaining_;
 

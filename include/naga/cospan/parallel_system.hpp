@@ -8,10 +8,10 @@
 // System cannot discern its children at runtime (r01 §1 need 2.2 parallel · P5).
 // Nested Parallel is not a concept.
 //
-// One forward turn: revive(); pre-compute ALL children; compute ALL (collect
+// One forward turn: pre-compute ALL children; compute ALL (collect
 // the descriptions); check the siblings (below); ONE queue.submit_group in which
 // every child's description is submitted with its own device; post-compute ALL
-// after the group returns; release(). The group is ONE item of the stream: its
+// after the group returns. The group is ONE item of the stream: its
 // children are unordered among themselves and ordered both ways against
 // everything outside (§7.3).
 //
@@ -78,7 +78,6 @@ public:
 
     // ---- the runner (r01 §7.5, §11.3.1) ---------------------------------------------------------
     std::unique_ptr<LaunchDescription> run_compute_forward() override {
-        revive();
         const std::size_t n = children_.size();
         for (std::size_t i = 0; i < n; ++i) children_[i]->run_pre_compute(child_ctx_[i]);
 
@@ -106,7 +105,6 @@ public:
         });
 
         for (std::size_t i = 0; i < n; ++i) children_[i]->run_post_compute(child_ctx_[i]);
-        release();
         return nullptr;  // "I submitted"
     }
 

@@ -641,9 +641,9 @@ public:
     /// after update_shape.
     virtual void validate_connection() const = 0;
 
-    /// Allocation: ROOTS ONLY. A durable root is allocated in prepare_exec;
-    /// a transient root is allocated by the first component that touches it
-    /// in a forward (§4.4). Builds the root's
+    /// Allocation: ROOTS ONLY. Every root, durable or transient, is allocated
+    /// by its OWNER Component in run_pre_compute (§4.4), or by a host write.
+    /// Builds the root's
     /// slabkit::usm_vector for each placement the set spans. A device
     /// placement takes its device's substrate (§7.1): a device-kind root
     /// that is fully fixed and not transient → the arena
@@ -775,7 +775,7 @@ public:
     /// ordinary usm_vector copy rule); whoever writes a root from the host
     /// does the same. Registered in get_exec_info (register_placement;
     /// set_primary_placement puts the root's own placement first),
-    /// allocated in prepare_exec. Why: §1 need 2.2 placement · P1 (a name
+    /// allocated by its owner Component in a forward (§4.4). Why: §1 need 2.2 placement · P1 (a name
     /// yields memory where the reader is).
     void*  storage_on(const Placement&) const;                 ///< roots only
     std::span<const Placement> storage_placements() const;     ///< roots only; primary first
@@ -892,11 +892,11 @@ an owner above it, keeps its storage. The decision is recorded once per
 root by the RESOLUTION PASS, at the END of the ROOT System's setup (the
 System with no owner), not per System, because registrations made later by
 an outer System decide whether a root is transient. The pass also records,
-per root, its initial value (below) and, for a transient root, its LAST
-USER: the last Component, in depth-first registration order, that touches
-the root. A transient root is never arena-eligible and counts no static
-bytes: it takes the pool route, or the OS route when the device has no
-pool. A mark (§8.4) on a transient root is an error at setup.
+per root, its initial value (below), its OWNER (the first Component, in
+depth-first registration order, that touches the root) and its LAST USER
+(the last such Component). A transient root is never arena-eligible and
+counts no static bytes: it takes the pool route, or the OS route when the
+device has no pool. A mark (§8.4) on a transient root is an error at setup.
 
 INITIAL VALUES ARE METADATA ON FREE INPUT ROOTS. A FREE INPUT ROOT is an
 input root with no source. Its initial value is declared during `setup()`
@@ -925,45 +925,64 @@ InitSpec custom_host(std::function<void(HostViewMut<DT, Rank>&)> fn);         //
   reusable component can carry a default for the case it is left
   unconnected. An init declared on an output is an error at setup.
 - **No init, zeros.** A free input root with no init is zero-filled.
-- **When it applies.** The framework applies a root's init when it
-  allocates that root from nothing: at setup for a durable root (§11.2.6),
-  and at each (re)allocation for a transient one. A value-driven resize
-  preserves the existing content and does not re-init.
+- **When it applies.** The framework applies a root's init when the root's
+  OWNER allocates it from nothing, in its `run_pre_compute`: on the owner's
+  first run for a durable root, at each (re)allocation for a transient one.
+  Nothing is applied at setup. A value-driven resize preserves the existing
+  content and does not re-init, and a host write that allocated the root
+  first stands in for the init.
 
-THE LIFECYCLE IS THE COMPONENT'S, and the component is always the leaf.
-In `run_pre_compute`, after shape resolution and `pre_forward`, a
-Component allocates every root it touches that has no storage and applies
-that root's init when it is a free input root. In `run_post_compute`, after
-the other-placement sync, it releases the transient roots for which it is
-the LAST USER: each root waits on the stream, then is freed (synchronous
-frees, D135), with one stream wait for the component's batch. Children of a
-ParallelSystem or FusedSystem are ordered within their flavor, and their
-`post_compute` runs after the group or wave returns, so a root's release
-follows the work of every child in it. A Component that does not run in a
-forward (a RunNSystem that is exhausted, a gate not taken) neither
-allocates nor releases; its roots simply wait. An exception thrown
-mid-forward leaves roots unreleased (D84). Host access to a released root —
-a view or a setter — throws, naming the root and the transient subsystem
-whose registration made it transient, and saying the storage exists only
-while that subsystem's components run; a silent empty view would read as
-valid data. The one cost is a host stream wait per releasing component per
-forward. Why: §1 need 2.1 transient subtrees, §1 need 2.3 initialization ·
-P3 · P6 (declaration is one phase; the resolution pass is its end).
+THE LIFECYCLE IS THE COMPONENT'S, and the component is always the leaf, and
+ALLOCATION AND INIT HAVE ONE PATH, the owning component's, for durable and
+transient roots alike. Every root has an OWNER, recorded by the resolution
+pass: the FIRST Component, in depth-first registration order, that touches
+it. In `run_pre_compute`, after shape resolution and `pre_forward`, a
+Component goes over the roots it OWNS (inputs and outputs); any owned root
+without storage is allocated (the route above), and if it is a free input
+root its init from metadata is applied (zeros when none). A Component never
+allocates or inits a root it does not own; non-owners only point their
+wrappers, as peers do. A DURABLE root is allocated once, on its owner's
+first run, and never released. A TRANSIENT root is released after its last
+user and allocated again on its owner's next run. In `run_post_compute`,
+after the other-placement sync, a Component releases the transient roots
+for which it is the LAST USER: each root waits on the stream, then is freed
+(synchronous frees, D135), with one stream wait for the component's batch.
+Children of a ParallelSystem or FusedSystem are ordered within their flavor
+(for owner and last user alike), and their `post_compute` runs after the
+group or wave returns, so a root's release follows the work of every child
+in it. A Component that does not run in a forward (a RunNSystem that is
+exhausted, a gate not taken) neither allocates nor releases; its roots
+simply wait. An exception thrown mid-forward leaves roots unreleased (D84).
+
+HOST ACCESS. A host WRITE to a root with no storage (`Model::set_input`, or
+a `HostViewMut` write-back or commit) allocates the root through the SAME
+allocation routine the owner uses (one function, called by both), and the
+written value is its initial value: when the owner later runs it finds
+storage and does nothing, so `set_input` before the first forward beats the
+init. Reading a root that has no storage (`view_*`) throws, saying it has no
+data until its owner runs; for a RELEASED transient root the error names the
+root and the transient subsystem whose registration made it transient, and
+says the storage exists only while that subsystem's components run (a
+silent empty view would read as valid data). A host write to a transient
+root throws the same way. The one cost is a host stream wait per releasing
+component per forward. Why: §1 need 2.1 transient subtrees, §1 need 2.3
+initialization · P3 · P6 (declaration is one phase; the resolution pass is
+its end).
 
 ### 4.5 From sets to storage
 
 Aliasing is complete the moment each structural call returns. Storage
-follows in the setup chain (§11): `get_exec_info` registers on
-each root the placements its set spans (the root's own placement first)
-and counts the root's bytes once per such device-kind placement, none for
-a host-kind one or a transient root; `prepare_exec` allocates each DURABLE
-root's per-placement storage from the substrates and points the wrappers
-of every allocated root at `root()->storage_on(own placement)` (a transient
-root is allocated, and its wrappers pointed, by the components that touch
-it in a forward, §4.4). Regrowth of a root needs no
-notification: peers re-point at their next turn. Copies at the
-non-primary placements are refreshed by the root's producer after every
-launch.
+follows in the setup chain (§11) and the first forward: `get_exec_info`
+registers on each root the placements its set spans (the root's own
+placement first) and counts the root's bytes once per such device-kind
+placement, none for a host-kind one or a transient root, which sizes the
+arena; `prepare_exec` allocates nothing, it only binds the substrates and
+sets what can be set. Each root is allocated by its OWNER in the owner's
+`run_pre_compute` (§4.4), and the wrappers of every member of an allocated
+root are pointed at `root()->storage_on(own placement)` by the Components
+that touch it, at their turn. Regrowth of a root needs no notification:
+peers re-point at their next turn. Copies at the non-primary placements are
+refreshed by the root's producer after every launch.
 
 `tie_outputs` members MUST share the alias's placement: producers cannot
 write one storage from two placements. Checked in the members' Components'
@@ -1688,16 +1707,12 @@ private:
   producers precede consumers. Cycles are on the roadmap; their design
   owns the exception.)
   - Return `{device: bytes}`.
-- **`prepare_exec`**: for every own DURABLE ROOT allocatable now, build its
-  `usm_vector` per registered placement — a device placement from that
-  device's substrate (static, device-kind and not transient → arena
-  route; otherwise, with a known shape → pool route with
-  OS fallback), a host placement through the OS route on its device;
-  then point the wrapper of every member of an allocated root at
-  `root()->storage_on(own placement)` and validate static input peers
-  against their roots. A transient root is left unallocated: this
-  Component allocates it in its own `run_pre_compute` (§6.5). An
-  unconnected input with a `FromSourceDim` dimension errors here.
+- **`prepare_exec`**: capture the queue and substrates, bind the substrates
+  to every own root, point the wrapper of every member whose root has
+  storage, and validate static input peers against their roots. NOTHING IS
+  ALLOCATED here: the owner of each root allocates it in its own
+  `run_pre_compute` (§6.5). An unconnected input with a `FromSourceDim`
+  dimension errors here.
 - **`compile`**: the device function at the body's own rank (`kernel_rank_v<KB>`);
   the individual config; a custom-op or host body compiles nothing. A
   Component knows nothing of fusing.
@@ -1713,21 +1728,23 @@ work and never sees a queue except through the owner's ctx.
    carrying a `FromInput` spec, read the driving input's value
    on the host, whichever storage holds it (the
    one forced sync, so this turn's launch geometry is known; integer
-   dtypes only, a negative value throws), allocate the entry's root first
-   if it is still unallocated, call
+    dtypes only, a negative value throws), allocate the entry''s root first if this
+    Component owns it and it is still unallocated, call
    `root.resize(shape)`, then `point_wrapper`; no staging
    copy, nothing submitted for the resize, no reallocation inside a
    submitted task (why: §1 need 2.1 shape source · P3 — only value-driven entries pay
    it). Then shape-derived dims, `pre_forward()` hook (per-entry
    override, last write wins), dynamic connection validation, wrapper
    sync (a root that grew was reallocated by its own allocator route).
-   Then ALLOCATE every root this Component touches that has no storage
-   (pool route, or OS when there is no pool; current extents) and, for a
-   free input root, apply that root's init (§4.4) — at whichever
-   allocation from nothing comes first, which for a value-driven root is
-   the resize above; the stream orders the init before this turn's
-   launch. A root that already has storage is left alone, so a
-   value-driven resize keeps its content and does not re-init.
+    Then ALLOCATE every root this Component OWNS (inputs and outputs) that
+    has no storage (§4.4: arena for a static durable device-kind root,
+    otherwise the pool, then the OS; current extents) and, for a free input
+    root, apply that root's init (zeros when none) — the stream orders the
+    init before this turn's launch. A root it does not own is only pointed
+    at (a peer's wrapper). A root that already has storage — allocated by an
+    earlier run, or by a host write — is left alone, so a value-driven
+    resize keeps its content and a `set_input` before the first forward
+    beats the init.
 2. **`run_compute_forward()`**: `compute_forward()` — returns the
    description. The owner submits it (§7.3).
 3. **`run_post_compute(ctx)`**: through `ctx`, after the owner's
@@ -1969,13 +1986,13 @@ public:
 
     // ---- Model's entries ------------------------------------------------------
     /// Model knows its root is a System and has no ctx of its own, so the
-    /// root supplies its own. The root's two end-of-step verbs:
-    /// resolve() — the resolution pass that ends declare (§4.4, §11.2.1) —
-    /// and apply_inits() — each durable free input root's init (§11.2.6).
+    /// root supplies its own. The root's end-of-declare verb:
+    /// resolve() — the resolution pass that ends declare (§4.4, §11.2.1).
+    /// There is no apply_inits: every root's init is applied by its owner
+    /// Component when it allocates the root (§4.4).
     /// forward() == run_compute_forward() (no pre/post-compute exists for
     /// the root).
     void resolve();
-    void apply_inits();
     void forward();
 
     // ---- retrieval & enumeration (hierarchy-aware; §3.3 guarantee) ------------
@@ -2449,10 +2466,9 @@ public:
     ///      through its device's substrate. The arena's capacity is the static
 ///      bytes plus 4096*64 bytes of slack, the bytes measured exactly (the
 ///      sum over the device's distinct roots), so capacity = sum + 262144
-    ///   4. root.prepare_exec(queue_, substrates_) — allocate DURABLE roots, point wrappers; ExecCtx complete
+    ///   4. root.prepare_exec(queue_, substrates_) — capture queue and substrates, bind them to the roots, shape updates; NO allocation; ExecCtx complete
     ///   5. root.compile()                        — bodies
-    ///   6. root.apply_inits()                    — each durable free input root's init, highest level wins (§4.4)
-    ///   7. marks: walk children() depth-first in declaration order and read design_var()/constraint()/objective() off every root entry; cached (§8.4)
+    ///   6. marks: walk children() depth-first in declaration order and read design_var()/constraint()/objective() off every root entry; cached (§8.4)
     /// Runs once: a second setup(), or forward() / host access before setup(), throws.
     /// After setup the model's STATE is not yet meaningful: it holds
     /// initial values. State is defined after the first forward.
@@ -2541,7 +2557,7 @@ private:
 ```cpp
 auto model = create_model<Top>(ModelConfig{});          // default device, no pools
 model.setup();                                          // declare → exec-info → substrates
-                                                        //   → prepare → compile → apply inits
+                                                        //   → prepare → compile → marks (no allocation yet)
 model.set_input<DType::f64, 1>("mda.z", {{1.0, 2.0}});  // drive a free input
 model.forward();  model.wait();                         // enqueue; wait when results are wanted
 
@@ -2709,13 +2725,13 @@ auto model = create_model<Top>(ModelConfig{...}, top_args...);
 ### 11.2 `model.setup()` — the setup chain
 
 `run_setup + resolve → get_exec_info → substrates → prepare_exec → compile →
-apply_inits → marks`.
-Every step is a Subsystem verb driven from the root (the resolution pass and
-the inits are the root's own); Systems recurse in
+marks`.
+Every step is a Subsystem verb driven from the root (the resolution pass is
+the root's own); Systems recurse in
 declared order (`children_` IS the exec order); nobody asks what kind a
 child is. The order is the one of §9.1: (0 construct) 1 run_setup and the
 resolution pass · 2 get_exec_info · 3 substrates · 4 prepare_exec ·
-5 compile · 6 apply_inits · 7 marks.
+5 compile · 6 marks.
 
 #### 11.2.1 Declare — `root.run_setup()`
 
@@ -2785,23 +2801,19 @@ allocation for a device goes through its substrate.
 
 `System`: complete `ctx` — `queue` = the Model's, `group` = null (only a
 Parallel owner sets one, for the extent of its `submit_group`),
-`substrate = &substrates[device]`; allocate own DURABLE alias roots and point
-their wrappers; recurse.
+`substrate = &substrates[device]`; bind the substrates to its alias roots;
+recurse. NOTHING IS ALLOCATED here: every root is allocated by its OWNER
+Component in `run_pre_compute` (§6.5), or by a host write (§4.4). The arena
+is created before this step (§11.2.3), sized by `get_exec_info`, and stays
+empty until the owners run.
 
-`Component`: for every own DURABLE ROOT entry allocatable now, build its
-`usm_vector` per registered placement — a device placement from that
-device's substrate (static, device-kind and not transient from the arena
-route; otherwise, with a known shape, via the pool
-route with OS fallback), a host placement through the OS route on its
-device; roots whose shape is not yet known stay unallocated, and a
-transient root is never allocated here (its Components allocate it in a
-forward, §6.5). Then point
-every member wrapper of an allocated root at
-`root()->storage_on(own placement)` — guaranteed
-allocated by now (roots precede peers); shape and stride (+ view) set;
-static input peers validate against their roots here. An unconnected
-input carrying a `FromSourceDim` dimension has no source to derive from:
-ERROR here ("source-derived dimension on an unconnected input").
+`Component`: capture the queue and substrates, bind the substrates to each
+own root (so the one allocation routine, §4.4, can draw on them), apply the
+shape updates that need no value (`FromSourceDim` of a connected input),
+point the wrapper of every member whose root happens to have storage, and
+validate static input peers against their roots. An unconnected input
+carrying a `FromSourceDim` dimension has no source to derive from: ERROR here
+("source-derived dimension on an unconnected input").
 
 #### 11.2.5 Compile — `root.compile()`
 
@@ -2817,25 +2829,12 @@ rest of the Fused and Parallel legality is checked each forward on the
 descriptions the children return (cheap, host-side, and it is where the
 information is).
 
-#### 11.2.6 Apply inits — `root.apply_inits()`
+**State:** no root has storage yet: every root is allocated by its OWNER in its
+first forward (or by a host write, §4.4); wrappers of unallocated roots are
+unset; kernels compiled. The model can run. Its state is not meaningful
+until the first forward.
 
-For every DURABLE free input root that has storage, the root applies the
-init the resolution pass recorded (§11.2.1): the declaration of the highest
-level, else zeros. There are no init hooks, no init passes and no
-initializer helpers; "the System has the last word" by ordering is gone —
-highest-level-wins, decided at resolve, replaces it. The init writes the
-root's primary storage and copies it to the root's other-placement storage.
-A root with a source has no init to apply (it was ignored at resolve). A
-durable root that is unallocated and empty (a shape still to be resolved)
-gets its init when it is first allocated, in a forward (§6.5). Transient
-free input roots are initialized at each allocation, in a forward, not here.
-
-**State:** storage for every static durable root, with its initial value;
-wrappers current; kernels compiled. The model can run. Its state is not yet
-meaningful — it holds initial values; state is defined after the first
-forward.
-
-#### 11.2.7 Marks
+#### 11.2.6 Marks
 
 Model walks `children()` depth-first in declaration order and reads
 `design_var()`/`constraint()`/`objective()` off every root entry into its

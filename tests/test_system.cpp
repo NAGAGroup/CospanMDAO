@@ -17,10 +17,12 @@
 //   marks         design vars / constraints / objective recorded with their
 //                 paths and bounds; the last mark of a kind replaces; the
 //                 ill-formed ones throw
-//   init order    Component pass, System pass, children before owners; a
-//                 System's init has the last word over a Component's
-//   transient     release after forward; a kept output; the revive re-runs
-//                 only the subtree's inits; back-to-back forwards, one wait
+//   init          init_input metadata: the highest level wins; set_input on a
+//                 durable free input between forwards
+//   transient     registration metadata: release after the last user, kept
+//                 outputs, transient Components, promotion, nesting, a free
+//                 input re-initialized each forward, back-to-back forwards
+//   run-N         n runs; transient subtree allocated/initialized per run
 //   structural    fan-in, tie after connect, structural call outside setup,
 //                 connect from an input, unknown paths
 //   placement     property::device equal to the parent's is a no-op
@@ -32,6 +34,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -82,8 +85,17 @@ void expect_setup_throws(const std::string& needle) {
 
 constexpr std::size_t kLen = 8;
 
-// Every Component and System that logs appends its path in init().
+// A logging init (custom_host) appends its tag each time the framework applies it.
 std::vector<std::string> g_inits;
+
+/// An init that logs `tag` at each application and fills the root with v.
+cs::InitSpec logging_fill(std::string tag, float v) {
+    return cs::init::custom_host<DType::f32, 1>(std::function<void(cs::HostViewMut<DType::f32, 1>&)>{
+        [tag = std::move(tag), v](cs::HostViewMut<DType::f32, 1>& h) {
+            g_inits.push_back(tag);
+            for (std::size_t k = 0; k < h.size(); ++k) h[k] = v;
+        }});
+}
 
 std::size_t count_of(const std::string& path) {
     std::size_t n = 0;
@@ -102,7 +114,7 @@ std::vector<float> iota_plus(float first, std::size_t n, float scale = 1.0f, flo
     return v;
 }
 
-// ---- Src: y[i] = i + 1 (logs its init) ------------------------------------------------------
+// ---- Src: y[i] = i + 1 ------------------------------------------------------
 struct SrcBody {
     struct Inputs {};
     struct Outputs {
@@ -116,13 +128,12 @@ class Src : public cs::Component<SrcBody> {
 
 public:
     void setup() override { declare_output(y_, "y", static_cast<int>(kLen)); }
-    void init(sk::queue&, const sycl::device&) override { g_inits.push_back(path()); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return create_launch_config(y_.shape(), {}, {y_}, {});
     }
 };
 
-// ---- Axpb: y = a * x + b, x of kLen (logs its init; x0 is a free-input init value) ------------
+// ---- Axpb: y = a * x + b, x of kLen (x0: a fill init on x; log: a logging init instead) ------------
 struct AxpbBody {
     struct Inputs {
         cs::Input<DType::f32, 1> x;
@@ -139,16 +150,18 @@ class Axpb : public cs::Component<AxpbBody> {
     cs::Output<DType::f32, 1> y_;
     float                     a_, b_;
     std::optional<float>      x0_;
+    std::string               log_;
 
 public:
-    Axpb(float a, float b, std::optional<float> x0 = std::nullopt) : a_{a}, b_{b}, x0_{x0} {}
+    Axpb(float a, float b, std::optional<float> x0 = std::nullopt, std::string log = {})
+        : a_{a}, b_{b}, x0_{x0}, log_{std::move(log)} {}
     void setup() override {
         declare_input(x_, "x", static_cast<int>(kLen));
         declare_output(y_, "y", static_cast<int>(kLen));
-    }
-    void init(sk::queue&, const sycl::device&) override {
-        g_inits.push_back(path());
-        if (x0_) fill_input("x", *x0_);
+        if (!log_.empty())
+            init_input("x", logging_fill(log_, x0_.value_or(0.0f)));
+        else if (x0_)
+            init_input("x", cs::init::fill(*x0_));
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return create_launch_config(x_.shape(), {x_}, {y_}, {a_, b_});
@@ -225,7 +238,7 @@ public:
     }
 };
 
-// ---- Adder: acc[i] += v, an ATOMIC output (zeroed in init) ------------------------------------
+// ---- Adder: acc[i] += v, an ATOMIC output (zeroed by a ZeroAcc producer) ------------------------------------
 struct AdderBody {
     struct Inputs {};
     struct Outputs {
@@ -242,9 +255,27 @@ class Adder : public cs::Component<AdderBody> {
 public:
     explicit Adder(float v) : v_{v} {}
     void setup() override { declare_output(acc_, "acc", static_cast<int>(kLen)); }
-    void init(sk::queue&, const sycl::device&) override { zero_output("acc"); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return create_launch_config(acc_.shape(), {}, {acc_}, {v_});
+    }
+};
+
+// ---- ZeroAcc: the zeroing producer (outputs are never initialized, r01 §6.0) ---
+struct ZeroAccBody {
+    struct Inputs {};
+    struct Outputs {
+        cs::Output<DType::atomic_f32, 1> acc;
+    };
+    void operator()(sycl::id<1> i, Inputs, Outputs out) const { out.acc[i].store(0.0f); }
+};
+
+class ZeroAcc : public cs::Component<ZeroAccBody> {
+    cs::Output<DType::atomic_f32, 1> acc_;
+
+public:
+    void setup() override { declare_output(acc_, "acc", static_cast<int>(kLen)); }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+        return create_launch_config(acc_.shape(), {}, {acc_}, {});
     }
 };
 
@@ -271,12 +302,6 @@ public:
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return create_launch_config(sycl::range<1>{1}, {x_}, {f_}, {});
     }
-};
-
-/// A System whose init logs its path.
-class LogSystem : public cs::System {
-public:
-    void init(sk::queue&, const sycl::device&) override { g_inits.push_back(path()); }
 };
 
 // ---- connect --------------------------------------------------------------------------------
@@ -377,10 +402,11 @@ public:
 class TieOutAtomic : public cs::System {
 public:
     void setup() override {
+        add_subsystem<ZeroAcc>("z");  // first in registration order: zeroes the root the Adders accumulate on
         add_subsystem<Adder>("a", 1.0f);
         add_subsystem<Adder>("b", 2.0f);
         add_subsystem<Copy1>("c");
-        tie_outputs({"a.acc", "b.acc"}, "sum");  // require_atomic (the default): both are atomic
+        tie_outputs({"z.acc", "a.acc", "b.acc"}, "sum");  // require_atomic (the default): both are atomic
         connect("sum", "c.x");                    // a tie alias is a source
     }
 };
@@ -466,24 +492,21 @@ public:
     }
 };
 
-// ---- init order -----------------------------------------------------------------------------
+// ---- init: the highest level wins -----------------------------------------------------------
 constexpr float kD1Init = 99.0f;   // c1's own init: overridden
-constexpr float kSysInit = 1.5f;   // the owner System's init: the last word
+constexpr float kSysInit = 1.5f;   // the owner System's init_input: depth 1 beats depth 2
 
-class InnerB : public LogSystem {
+class InnerB : public cs::System {
 public:
     void setup() override {
         add_subsystem<Axpb>("c1", 1.0f, 0.0f, kD1Init);
         add_subsystem<Axpb>("c2", 1.0f, 0.0f);
         connect("c1.y", "c2.x");
-    }
-    void init(sk::queue& q, const sycl::device& d) override {
-        LogSystem::init(q, d);
-        fill_input("c1.x", kSysInit);  // the System pass runs after c1's own init
+        init_input("c1.x", cs::init::fill(kSysInit));
     }
 };
 
-class TopB : public LogSystem {
+class TopB : public cs::System {
 public:
     void setup() override {
         add_subsystem<InnerB>("inner");
@@ -493,7 +516,7 @@ public:
 };
 
 // ---- transient ------------------------------------------------------------------------------
-class TransSys : public LogSystem {
+class TransSys : public cs::System {
 public:
     void setup() override {
         add_subsystem<Src>("prod");
@@ -504,12 +527,97 @@ public:
     }
 };
 
-class TopC : public LogSystem {
+class TopC : public cs::System {
 public:
     void setup() override {
         add_subsystem<TransSys>("tr", cs::property_list{cs::property::transient{}});
         add_subsystem<Axpb>("sink", 1.0f, 0.5f);
         connect("tr.cons.y", "sink.x");  // the consumer's output feeds a Component OUTSIDE tr
+    }
+};
+
+// ---- transient (registration metadata) -------------------------------------------------------
+inline std::size_t pool_in_use_of(cs::Model& m) { return cst::pool_in_use(m); }
+
+const cs::property_list kTransient{cs::property::transient{}};
+
+class OneAxpb : public cs::System {
+public:
+    void setup() override { add_subsystem<Axpb>("a", 2.0f, 1.0f); }  // free x, no init: zeros
+};
+
+/// A durable free input with a logged init (x = 5): the init is applied by the owner on its first run.
+class OneAxpbLog : public cs::System {
+public:
+    void setup() override { add_subsystem<Axpb>("a", 2.0f, 1.0f, 5.0f, std::string{"a"}); }
+};
+
+/// a (transient Src) -> b (transient Axpb) -> c (plain Axpb): a.y is transient, b.y is durable.
+class TransComps : public cs::System {
+public:
+    void setup() override {
+        add_subsystem<Src>("a", kTransient);
+        add_subsystem<Axpb>("b", kTransient, 2.0f, 1.0f);
+        add_subsystem<Axpb>("c", 1.0f, 0.5f);
+        connect("a.y", "b.x");
+        connect("b.y", "c.x");
+    }
+};
+
+/// p (transient Src) read by t (transient) and n (plain): p.y has a non-transient registration.
+class SharedRead : public cs::System {
+public:
+    void setup() override {
+        add_subsystem<Src>("p", kTransient);
+        add_subsystem<Axpb>("t", kTransient, 1.0f, 0.0f);
+        add_subsystem<Axpb>("n", 1.0f, 0.0f);
+        connect("p.y", "t.x");
+        connect("p.y", "n.x");
+    }
+};
+
+class TransPromo : public cs::System {
+public:
+    void setup() override {
+        add_subsystem<Src>("p");
+        promote("p.y", "y");
+    }
+};
+
+/// "tr" is transient and promotes p.y as "y"; with `repromote` the root System promotes tr.y again.
+class PromoInTrans : public cs::System {
+    bool repromote_;
+
+public:
+    explicit PromoInTrans(bool repromote) : repromote_{repromote} {}
+    void setup() override {
+        add_subsystem<TransPromo>("tr", kTransient);
+        if (repromote_) promote("tr.y", "out");
+    }
+};
+
+class NestedOuter : public cs::System {
+public:
+    void setup() override { add_subsystem<TransSys>("inner", kTransient); }
+};
+
+class NestedTrans : public cs::System {
+public:
+    void setup() override { add_subsystem<NestedOuter>("outer", kTransient); }
+};
+
+/// p.x is a free input inside the transient subtree: a transient root, initialized (logged) at each allocation.
+class TransAxpbSys : public cs::System {
+public:
+    void setup() override { add_subsystem<Axpb>("p", 2.0f, 1.0f, 7.0f, std::string{"tr.p"}); }
+};
+
+class TransFreeInput : public cs::System {
+public:
+    void setup() override {
+        add_subsystem<TransAxpbSys>("tr", kTransient);
+        add_subsystem<Axpb>("sink", 1.0f, 0.0f);
+        connect("tr.p.y", "sink.x");
     }
 };
 
@@ -530,29 +638,28 @@ public:
     void setup() override { add_subsystem<RunNAxpb>("op", n_); }
 };
 
-/// The transient run-N subtree: prod -> mid -> cons, y = 2 x + 3 end to end.
+/// The transient run-N subtree: prod (free input x = 4, logged) -> mid -> cons, y = 2 x + 3 end to end.
 class RunNTrans : public cs::RunNSystem {
 public:
     explicit RunNTrans(std::size_t n) : cs::RunNSystem{n} {}
     void setup() override {
-        add_subsystem<Axpb>("prod", 1.0f, 0.0f);
+        add_subsystem<Axpb>("prod", 1.0f, 0.0f, 4.0f, std::string{"op.prod"});
         add_subsystem<Axpb>("mid", 2.0f, 0.0f);
         add_subsystem<Axpb>("cons", 1.0f, 3.0f);
         connect("prod.y", "mid.x");
         connect("mid.y", "cons.x");
     }
-    void init(sk::queue&, const sycl::device&) override { g_inits.push_back(path()); }
 };
 
-/// src (free input "src.x", y = x) -> op (RunNTrans, n = 2, transient) -> sink (y = x + 0.5).
-/// The free input lives OUTSIDE the transient subtree, so it can be set between forwards.
+/// op (RunNTrans, transient) -> sink (y = x + 0.5): the consumer's output feeds the sink outside, so it is durable.
 class RunNTransTop : public cs::System {
+    std::size_t n_;
+
 public:
+    explicit RunNTransTop(std::size_t n) : n_{n} {}
     void setup() override {
-        add_subsystem<Axpb>("src", 1.0f, 0.0f);
-        add_subsystem<RunNTrans>("op", cs::property_list{cs::property::transient{}}, std::size_t{2});
+        add_subsystem<RunNTrans>("op", kTransient, n_);
         add_subsystem<Axpb>("sink", 1.0f, 0.5f);
-        connect("src.y", "op.prod.x");
         connect("op.cons.y", "sink.x");
     }
 };
@@ -640,7 +747,7 @@ public:
 
 // ---- Sellar ---------------------------------------------------------------------------------
 constexpr float kSellarD1Y2 = 99.0f;  // d1's own init: overridden
-constexpr float kSellarY2   = 1.5f;   // the MDA System's init: the last word
+constexpr float kSellarY2   = 1.5f;   // the MDA System's init_input (depth 1): the last word
 
 struct D1Body {
     struct Inputs {
@@ -667,8 +774,8 @@ public:
         declare_input(x_, "x", 1);
         declare_input(y2_, "y2", 1);
         declare_output(y1_, "y1", 1);
+        init_input("y2", cs::init::fill(kSellarD1Y2));
     }
-    void init(sk::queue&, const sycl::device&) override { fill_input("y2", kSellarD1Y2); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return create_launch_config(y1_.shape(), {z_, x_, y2_}, {y1_}, {});
     }
@@ -800,8 +907,8 @@ public:
         promote("d1.y1", "y1");
         promote("d2.y2", "y2");
         promote("d2.yy", "yy");
+        init_input("d1.y2", cs::init::fill(kSellarY2));  // beats d1's own (depth 2)
     }
-    void init(sk::queue&, const sycl::device&) override { fill_input("d1.y2", kSellarY2); }
 };
 
 class SellarTop : public cs::System {
@@ -828,11 +935,8 @@ public:
         cs::Bounds b2;
         b2.upper = std::vector<double>{0.0};
         add_constraint("g2.g", b2);
-    }
-    void init(sk::queue&, const sycl::device&) override {
-        const float z[2] = {5.0f, 2.0f};
-        set_input_from_host<float>("z", std::span<const float>{z, 2});
-        fill_input("x", 1.0f);
+        init_input("z", cs::init::from_host(std::vector<float>{5.0f, 2.0f}));
+        init_input("x", cs::init::fill(1.0f));
     }
 };
 
@@ -971,9 +1075,9 @@ TEST_CASE("ties: tie_outputs", "[system][tie]") {
         auto sum = wait_and_view<DType::f32, 1>(model, "sum");
         CHECK(to_vector(sum) == std::vector<float>(tsys::kLen, 3.0f));  // 1 + 2
         CHECK(to_vector(model.view_output<DType::f32, 1>("c.y")) == std::vector<float>(tsys::kLen, 3.0f));
-        // Not reset between forwards: a second forward accumulates again.
+        // The zeroing producer runs first in every forward, so a second forward gives the same sum.
         auto again = wait_and_view<DType::f32, 1>(model, "sum");
-        CHECK(to_vector(again) == std::vector<float>(tsys::kLen, 6.0f));
+        CHECK(to_vector(again) == std::vector<float>(tsys::kLen, 3.0f));
     }
 
     SECTION("plain outputs without allow_plain throw") {
@@ -1062,31 +1166,67 @@ TEST_CASE("marks: the Model's spans are unavailable before setup", "[system][mar
 // =============================================================================================
 // 5. init order
 // =============================================================================================
-TEST_CASE("init order: Component pass, then System pass, children before owners, the System has the last word",
+TEST_CASE("init: the highest level wins (System init_input beats the Component's, children below owners)",
           "[system][init]") {
     tsys::g_inits.clear();
     cs::Model model = cs::create_model<tsys::TopB>(default_config());
     model.setup();
 
-    REQUIRE(tsys::g_inits.size() == 5);  // 3 Components + 2 Systems, each once
-    const std::size_t last_comp =
-        std::max({tsys::index_of("inner.c1"), tsys::index_of("inner.c2"), tsys::index_of("c3")});
-    const std::size_t first_sys = std::min(tsys::index_of("inner"), tsys::index_of(""));
-    CHECK(tsys::count_of("inner.c1") == 1);
-    CHECK(tsys::count_of("inner.c2") == 1);
-    CHECK(tsys::count_of("c3") == 1);
-    CHECK(last_comp < first_sys);                                          // Component pass first
-    CHECK(tsys::index_of("inner") < tsys::index_of(""));            // a child System before its owner
-
-    // c1's own init wrote 99; the owner System's init wrote 1.5 afterwards.
-    CHECK(to_vector(model.view_input<DType::f32, 1>("inner.c1.x")) == std::vector<float>(tsys::kLen, tsys::kSysInit));
+    // c1 declared 99 (depth 2); the owner System `inner` declared 1.5 (depth 1) and wins.
+    // The init is applied by the owner (c1) in the first forward.
+    // c2.x is connected, so nothing is declared on it and it is not initialized.
     model.forward();
     model.wait();
+    CHECK(to_vector(model.view_input<DType::f32, 1>("inner.c1.x")) == std::vector<float>(tsys::kLen, tsys::kSysInit));
     CHECK(to_vector(model.view_output<DType::f32, 1>("c3.y")) == std::vector<float>(tsys::kLen, tsys::kSysInit));
 }
 
+TEST_CASE("init: set_input on a durable free input between forwards", "[system][init]") {
+    cs::Model model = cs::create_model<tsys::OneAxpb>(default_config());
+    model.setup();
+    // No init declared: zeros, so y = 2 * 0 + 1.
+    model.forward();
+    model.wait();
+    CHECK(to_vector(model.view_output<DType::f32, 1>("a.y")) == tsys::filled(1.0f));
+    tsys::set_x(model, "a.x", 1.0f);
+    model.forward();
+    model.wait();
+    CHECK(to_vector(model.view_output<DType::f32, 1>("a.y")) == tsys::filled(3.0f));
+    tsys::set_x(model, "a.x", 4.0f);
+    model.forward();
+    model.wait();
+    CHECK(to_vector(model.view_output<DType::f32, 1>("a.y")) == tsys::filled(9.0f));
+}
+
+TEST_CASE("init: a durable free input is initialized by its owner on the first forward only", "[system][init]") {
+    tsys::g_inits.clear();
+    cs::Model model = cs::create_model<tsys::OneAxpbLog>(default_config());
+    model.setup();
+    CHECK(tsys::count_of("a") == 0);  // nothing is allocated or initialized at setup
+    tsys::expect_throws([&] { (void)model.view_input<DType::f32, 1>("a.x"); }, "no data until its owner");
+    tsys::expect_throws([&] { (void)model.view_output<DType::f32, 1>("a.y"); }, "no data until its owner");
+    model.forward();
+    model.forward();
+    model.forward();
+    model.wait();
+    CHECK(tsys::count_of("a") == 1);  // allocated once, initialized once, never released
+    CHECK(to_vector(model.view_input<DType::f32, 1>("a.x")) == tsys::filled(5.0f));
+    CHECK(to_vector(model.view_output<DType::f32, 1>("a.y")) == tsys::filled(11.0f));  // 2 * 5 + 1
+}
+
+TEST_CASE("init: set_input before the first forward beats the init", "[system][init]") {
+    tsys::g_inits.clear();
+    cs::Model model = cs::create_model<tsys::OneAxpbLog>(default_config());
+    model.setup();
+    tsys::set_x(model, "a.x", 3.0f);  // allocates the root and is its initial value
+    model.forward();
+    model.wait();
+    CHECK(tsys::count_of("a") == 0);  // the owner found storage and did nothing
+    CHECK(to_vector(model.view_output<DType::f32, 1>("a.y")) == tsys::filled(7.0f));  // 2 * 3 + 1
+}
+
 // =============================================================================================
-// 6. transient
+// 6. transient (registration metadata, r01 §4.4, D138)
 // =============================================================================================
 namespace {
 std::vector<float> want_cons() { return tsys::iota_plus(1.0f, tsys::kLen, 2.0f, 3.0f); }  // 2 (i + 1) + 3
@@ -1095,31 +1235,32 @@ std::vector<float> want_sink() {
     for (auto& e : v) e += 0.5f;
     return v;
 }
+std::size_t pool_in_use(cs::Model& m) { return cst::pool_in_use(m); }
 }  // namespace
 
-TEST_CASE("transient: release after forward, kept outputs, revive, back-to-back forwards", "[system][transient]") {
-    tsys::g_inits.clear();
-    cs::Model model = cs::create_model<tsys::TopC>(default_config());
+TEST_CASE("transient: release after the last user, kept outputs, back-to-back forwards", "[system][transient]") {
+    cs::Model model = cs::create_model<tsys::TopC>(cst::pooled_config());
     model.setup();
-    auto& tr = dynamic_cast<cs::System&>(model.get_subsystem("tr"));
+    auto&             tr   = dynamic_cast<cs::System&>(model.get_subsystem("tr"));
+    auto&             sys  = model.root();
+    const std::size_t base = pool_in_use(model);
+    CHECK(tr.transient());
 
-    SECTION("release after forward: host access to a released root throws, naming the System") {
+    SECTION("host access to a released root throws, naming the transient subsystem") {
         model.forward();
         model.wait();
-        CHECK(tr.transient());
-        CHECK(tr.released());
-        auto& sys = model.root();
+        CHECK(sys.entry_at("tr.prod.y").root()->transient());
         CHECK(sys.entry_at("tr.prod.y").root()->released());
         CHECK(sys.entry_at("tr.mid.y").root()->released());
         CHECK(!sys.entry_at("tr.mid.y").root()->has_storage());
+        CHECK(pool_in_use(model) == base);  // everything the subtree allocated is back in the pool
         tsys::expect_throws([&] { (void)model.view_output<DType::f32, 1>("tr.mid.y"); }, "tr");
-        tsys::expect_throws([&] { (void)model.view_output<DType::f32, 1>("tr.prod.y"); }, "transient System");
+        tsys::expect_throws([&] { (void)model.view_output<DType::f32, 1>("tr.prod.y"); }, "transient subsystem");
     }
 
-    SECTION("an output connected outside the subtree is kept") {
+    SECTION("an output connected outside the subtree stays durable") {
         model.forward();
         model.wait();
-        auto& sys  = model.root();
         auto* cons = sys.entry_at("tr.cons.y").root();
         CHECK(cons->has_storage());
         CHECK(!cons->released());
@@ -1129,24 +1270,14 @@ TEST_CASE("transient: release after forward, kept outputs, revive, back-to-back 
         CHECK(to_vector(model.view_output<DType::f32, 1>("sink.y")) == want_sink());
     }
 
-    SECTION("forward 2 revives and re-runs only the subtree's inits") {
+    SECTION("a second forward allocates again and gives the same values") {
         model.forward();
         model.wait();
-        CHECK(tsys::count_of("tr.prod") == 1);  // setup's init: nothing re-ran yet
-        CHECK(tsys::count_of("tr") == 1);
-        CHECK(tr.released());
-
-        model.forward();  // revive: re-allocate, re-run tr's subtree init (both passes), run, release
+        model.forward();
         model.wait();
         CHECK(to_vector(model.view_output<DType::f32, 1>("tr.cons.y")) == want_cons());
         CHECK(to_vector(model.view_output<DType::f32, 1>("sink.y")) == want_sink());
-        for (const char* p : {"tr.prod", "tr.mid", "tr.cons", "tr"}) {
-            INFO(p);
-            CHECK(tsys::count_of(p) == 2);  // both passes re-ran
-        }
-        CHECK(tsys::count_of("sink") == 1);  // nothing outside tr re-ran
-        CHECK(tsys::count_of("") == 1);
-        CHECK(tr.released());
+        CHECK(pool_in_use(model) == base);
     }
 
     SECTION("three forwards enqueued back to back, then one wait") {
@@ -1156,10 +1287,81 @@ TEST_CASE("transient: release after forward, kept outputs, revive, back-to-back 
         model.wait();
         CHECK(to_vector(model.view_output<DType::f32, 1>("tr.cons.y")) == want_cons());
         CHECK(to_vector(model.view_output<DType::f32, 1>("sink.y")) == want_sink());
-        CHECK(tsys::count_of("tr.prod") == 3);  // setup, then a revive before forwards 2 and 3
-        CHECK(tsys::count_of("sink") == 1);
-        CHECK(tr.released());
+        CHECK(pool_in_use(model) == base);
     }
+}
+
+TEST_CASE("transient: sequential Components A then B share a root, released after B", "[system][transient]") {
+    cs::Model model = cs::create_model<tsys::TransComps>(cst::pooled_config());
+    model.setup();
+    auto&             sys  = model.root();
+    const std::size_t base = pool_in_use(model);
+
+    CHECK(sys.entry_at("a.y").root()->transient());   // A's output, read by transient B only
+    CHECK(!sys.entry_at("b.y").root()->transient());  // B's output is read by the non-transient C: durable
+    CHECK(sys.entry_at("a.y").root()->last_user() == &model.get_subsystem("b"));
+
+    model.forward();
+    model.wait();
+    CHECK(sys.entry_at("a.y").root()->released());
+    CHECK(pool_in_use(model) == base);
+    tsys::expect_throws([&] { (void)model.view_output<DType::f32, 1>("a.y"); }, "transient subsystem 'a'");
+    // c = 1 * (2 * (i + 1) + 1) + 0.5
+    CHECK(to_vector(model.view_output<DType::f32, 1>("c.y")) == tsys::iota_plus(1.0f, tsys::kLen, 2.0f, 1.5f));
+}
+
+TEST_CASE("transient: a root read by a transient and a non-transient Component stays durable", "[system][transient]") {
+    cs::Model model = cs::create_model<tsys::SharedRead>(cst::pooled_config());
+    model.setup();
+    CHECK(!model.root().entry_at("p.y").root()->transient());
+    model.forward();
+    model.wait();
+    CHECK(to_vector(model.view_output<DType::f32, 1>("p.y")) == tsys::iota_plus(1.0f, tsys::kLen));
+}
+
+TEST_CASE("transient: promotion inside a transient stays transient; re-promoted above it is durable",
+          "[system][transient]") {
+    SECTION("promoted inside the transient subsystem only") {
+        cs::Model model = cs::create_model<tsys::PromoInTrans>(cst::pooled_config(), false);
+        model.setup();
+        CHECK(model.root().entry_at("tr.y").root()->transient());
+        model.forward();
+        model.wait();
+        tsys::expect_throws([&] { (void)model.view_output<DType::f32, 1>("tr.y"); }, "transient subsystem 'tr'");
+    }
+    SECTION("re-promoted at a non-transient level") {
+        cs::Model model = cs::create_model<tsys::PromoInTrans>(cst::pooled_config(), true);
+        model.setup();
+        CHECK(!model.root().entry_at("tr.y").root()->transient());
+        model.forward();
+        model.wait();
+        CHECK(to_vector(model.view_output<DType::f32, 1>("out")) == tsys::iota_plus(1.0f, tsys::kLen));
+    }
+}
+
+TEST_CASE("transient: nested transients, the outer one is named", "[system][transient]") {
+    cs::Model model = cs::create_model<tsys::NestedTrans>(cst::pooled_config());
+    model.setup();
+    const std::size_t base = pool_in_use(model);
+    model.forward();
+    model.wait();
+    CHECK(pool_in_use(model) == base);
+    tsys::expect_throws([&] { (void)model.view_output<DType::f32, 1>("outer.inner.cons.y"); },
+                        "transient subsystem 'outer'");
+}
+
+TEST_CASE("transient: a free input inside a transient subtree is re-initialized each forward", "[system][transient]") {
+    tsys::g_inits.clear();
+    cs::Model model = cs::create_model<tsys::TransFreeInput>(cst::pooled_config());
+    model.setup();
+    CHECK(tsys::count_of("tr.p") == 0);  // a transient root has no storage at setup
+    model.forward();
+    model.forward();
+    model.forward();
+    model.wait();
+    CHECK(tsys::count_of("tr.p") == 3);
+    CHECK(to_vector(model.view_output<DType::f32, 1>("sink.y")) == tsys::filled(15.0f));  // 2 * 7 + 1
+    tsys::expect_throws([&] { (void)model.view_input<DType::f32, 1>("tr.p.x"); }, "transient subsystem 'tr'");
 }
 
 // =============================================================================================
@@ -1196,53 +1398,60 @@ TEST_CASE("run-N: n = 3 follows the input for three forwards, then holds", "[sys
     }
 }
 
-TEST_CASE("run-N + transient: released after each run, revived on runs 2..n, stays released after",
+TEST_CASE("run-N + transient: allocated and initialized in runs 1..n, released after each, nothing after n",
           "[system][runn]") {
     tsys::g_inits.clear();
-    cs::Model model = cs::create_model<tsys::RunNTransTop>(default_config());
+    cs::Model model = cs::create_model<tsys::RunNTransTop>(cst::pooled_config(), std::size_t{2});
     model.setup();
-    auto& op  = dynamic_cast<cs::System&>(model.get_subsystem("op"));
-    auto& sys = model.root();
-    CHECK(op.transient());
-    CHECK(tsys::count_of("op.prod") == 1);  // setup's init
+    auto&             sys  = model.root();
+    const std::size_t base = tsys::pool_in_use_of(model);
+    CHECK(tsys::count_of("op.prod") == 0);  // a transient root is initialized when a run allocates it
 
-    // forward 1: runs, then releases; the consumer's output feeds the sink outside, so it is kept
-    tsys::set_x(model, "src.x", 1.0f);
+    // run 1: allocate, init, run, release; the consumer's output feeds the sink outside, so it is kept
     model.forward();
     model.wait();
-    CHECK(op.released());
+    CHECK(tsys::count_of("op.prod") == 1);
     CHECK(!sys.entry_at("op.mid.y").root()->has_storage());
     CHECK(sys.entry_at("op.cons.y").root()->has_storage());
-    CHECK(to_vector(model.view_output<DType::f32, 1>("op.cons.y")) == tsys::filled(5.0f));  // 2 * 1 + 3
-    CHECK(to_vector(model.view_output<DType::f32, 1>("sink.y")) == tsys::filled(5.5f));
-    CHECK(tsys::count_of("op.prod") == 1);
+    CHECK(to_vector(model.view_output<DType::f32, 1>("op.cons.y")) == tsys::filled(11.0f));  // 2 * 4 + 3
+    CHECK(to_vector(model.view_output<DType::f32, 1>("sink.y")) == tsys::filled(11.5f));
+    CHECK(tsys::pool_in_use_of(model) == base);
 
-    // forward 2: revived (the subtree's inits re-ran), runs on the new input, released again
-    tsys::set_x(model, "src.x", 4.0f);
+    // run 2: the free input is initialized again (a fresh allocation)
     model.forward();
     model.wait();
     CHECK(tsys::count_of("op.prod") == 2);
-    CHECK(tsys::count_of("op") == 2);
-    CHECK(op.released());
     CHECK(!sys.entry_at("op.mid.y").root()->has_storage());
-    CHECK(to_vector(model.view_output<DType::f32, 1>("op.cons.y")) == tsys::filled(11.0f));  // 2 * 4 + 3
-    CHECK(to_vector(model.view_output<DType::f32, 1>("sink.y")) == tsys::filled(11.5f));
+    CHECK(to_vector(model.view_output<DType::f32, 1>("op.cons.y")) == tsys::filled(11.0f));
+    CHECK(tsys::pool_in_use_of(model) == base);
 
-    // forward 3: past n, nothing runs and nothing revives; the subtree stays released
-    tsys::set_x(model, "src.x", 9.0f);
+    // forward 3: past n, nothing runs, so nothing is allocated, initialized or released
     model.forward();
     model.wait();
-    CHECK(tsys::count_of("op.prod") == 2);  // no revive
-    CHECK(op.released());
+    CHECK(tsys::count_of("op.prod") == 2);
     CHECK(!sys.entry_at("op.mid.y").root()->has_storage());
     CHECK(to_vector(model.view_output<DType::f32, 1>("op.cons.y")) == tsys::filled(11.0f));  // unchanged
     CHECK(to_vector(model.view_output<DType::f32, 1>("sink.y")) == tsys::filled(11.5f));
+    CHECK(tsys::pool_in_use_of(model) == base);
 
-    // a view of the released mid root throws, naming the transient System
+    // a view of the released mid root throws, naming the transient subsystem
     CHECK(sys.entry_at("op.mid.y").root()->released());
-    tsys::expect_throws([&] { (void)model.view_output<DType::f32, 1>("op.mid.y"); }, "op");
-    tsys::expect_throws([&] { (void)model.view_output<DType::f32, 1>("op.mid.y"); }, "transient System");
+    tsys::expect_throws([&] { (void)model.view_output<DType::f32, 1>("op.mid.y"); }, "transient subsystem 'op'");
     model.wait();
+}
+
+TEST_CASE("run-N + transient: n = 3, the pool returns to its baseline after every forward", "[system][runn]") {
+    tsys::g_inits.clear();
+    cs::Model model = cs::create_model<tsys::RunNTransTop>(cst::pooled_config(), std::size_t{3});
+    model.setup();
+    const std::size_t base = tsys::pool_in_use_of(model);
+    for (int k = 1; k <= 5; ++k) {
+        INFO("forward " << k);
+        model.forward();
+        model.wait();
+        CHECK(tsys::pool_in_use_of(model) == base);
+        CHECK(tsys::count_of("op.prod") == static_cast<std::size_t>(k <= 3 ? k : 3));
+    }
 }
 
 TEST_CASE("run-N: n = 0 throws at construction", "[system][runn]") {

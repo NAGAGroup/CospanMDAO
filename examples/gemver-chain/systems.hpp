@@ -205,6 +205,10 @@ public:
         const float       ab  = 1.0f / std::sqrt(static_cast<float>(n_));
         const std::size_t res = groups_ * kWg;  // resident_items of every stage
 
+        // The barrier counters are zeroed at the start of every forward by one ZeroPair stage
+        // per barrier (outputs are never initialized); each is tied to its barrier's outputs.
+        for (int i = 1; i <= kBarriers; ++i) add_subsystem<ZeroPair>("zbar" + std::to_string(i));
+
         add_subsystem<Rank2Update>("r2u1", n_, R_, res);
         add_subsystem<GemvTPartial>("gtp1", n_, R_, res);
         add_subsystem<GridBarrier>("bar1", groups_, spin_limit_);
@@ -223,6 +227,14 @@ public:
         add_subsystem<ColReduce<true>>("cred2", n_, R_, ab, res);
         add_subsystem<GridBarrier>("bar7", groups_, spin_limit_);
         add_subsystem<Gemv>("gemv2", n_, ab, res);
+
+        for (int i = 1; i <= kBarriers; ++i) {
+            const std::string z = "zbar" + std::to_string(i), b = "bar" + std::to_string(i);
+            const std::string zc = z + ".count", zt = z + ".timeout", bc = b + ".count", bt = b + ".timeout";
+            const std::string nc = b + "_count", nt = b + "_timeout";
+            tie_outputs({zc, bc}, nc);
+            tie_outputs({zt, bt}, nt);
+        }
 
         // G1
         connect("r2u1.B", "gtp1.B");

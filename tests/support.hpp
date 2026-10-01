@@ -28,6 +28,21 @@ using cs::DType;
 /// The configuration every test uses: the runtime's default device, one context.
 inline cs::ModelConfig default_config() { return cs::ModelConfig{}; }
 
+/// default_config() plus a 1 MiB pool on every device: transient roots draw from it, so
+/// pool_in_use() measures what they hold.
+inline cs::ModelConfig pooled_config() {
+    cs::ModelConfig cfg = cs::ModelConfig{};
+    cfg.default_pool_bytes = std::size_t{1} << 20;
+    return cfg;
+}
+
+/// Pool bytes handed out right now, summed over the model's devices (between runs).
+inline std::size_t pool_in_use(const cs::Model& m) {
+    std::size_t total = 0;
+    for (const auto& [d, p] : m.memory_report().devices) total += p.pool_bytes_in_use;
+    return total;
+}
+
 // ---- host-reference comparison ------------------------------------------------
 /// |got - want| <= abs_tol + rel_tol * |want| (a NaN never compares close).
 inline bool close(float got, float want, float abs_tol = 1e-6f, float rel_tol = 1e-5f) {

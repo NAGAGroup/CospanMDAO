@@ -86,10 +86,23 @@ Snapshot<T> take_snapshot(IOEntry& entry, sk::queue& q) {
     return {std::move(out), g.shape};
 }
 
+/// A host WRITE (set_input, a HostViewMut) to a root with no storage allocates it through the
+/// same routine the owner uses (IOEntry::allocate_if_absent), zero-filled, and the written value
+/// becomes its initial value: the owner finds storage and does nothing (D138 amendment). A
+/// transient root is left alone: its host access keeps throwing.
+inline void ensure_for_host_write(IOEntry& entry, sk::queue& q) {
+    IOEntry& root = *entry.root();
+    if (root.transient()) return;
+    if (!root.allocate_if_absent(q)) return;
+    const Placement pl = root.storage_placements().front();
+    q.memset_in_order(pl.device, root.storage_on(pl), 0, root.flat_size() * dtype_size(root.dtype()));
+}
+
 /// Write an entry's host copy back into its root's primary storage (through
 /// the region, if it has one) and refresh the other devices.
 template <class T>
 void write_back(IOEntry& entry, sk::queue& q, std::span<const T> host) {
+    ensure_for_host_write(entry, q);
     const IOEntry::Geometry g    = entry.geometry();
     StorageEntry<T>&        root = storage_of<T>(entry);
     if (host.size() != element_count(g))
@@ -198,6 +211,7 @@ public:
 private:
     HostViewMut(detail::IOEntry& entry, sk::queue& q) : entry_{&entry}, q_{&q} {
         detail::check_entry(entry, DT, Rank);
+        detail::ensure_for_host_write(entry, q);  // a writable view of a root with no storage allocates it (zeros)
         auto snap = detail::take_snapshot<value_type>(entry, q);
         host_     = std::move(snap.data);
         shape_    = detail::make_range<Rank>(snap.shape);
@@ -212,9 +226,6 @@ private:
     friend class ComponentBase;
     friend class System;
 };
-
-template <DType DT, int Rank>
-using HostInitializer = HostViewMut<DT, Rank>;
 
 namespace detail {
 

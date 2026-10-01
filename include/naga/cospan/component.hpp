@@ -30,6 +30,7 @@
 
 #include "naga/cospan/dtype.hpp"
 #include "naga/cospan/host_view.hpp"
+#include "naga/cospan/init.hpp"
 #include "naga/cospan/kernel.hpp"
 #include "naga/cospan/metadata.hpp"
 #include "naga/cospan/subsystem.hpp"
@@ -38,20 +39,6 @@
 namespace naga::cospan {
 
 namespace detail {
-
-/// Calls f(std::type_identity<T>{}) with T the C++ element type of `dt`.
-template <class F>
-void dispatch_dtype(DType dt, F&& f) {
-    switch (value_dtype(dt)) {
-        case DType::f32: f(std::type_identity<float>{}); break;
-        case DType::f64: f(std::type_identity<double>{}); break;
-        case DType::i32: f(std::type_identity<int32_t>{}); break;
-        case DType::u32: f(std::type_identity<uint32_t>{}); break;
-        case DType::i64: f(std::type_identity<int64_t>{}); break;
-        case DType::u64: f(std::type_identity<uint64_t>{}); break;
-        default: f(std::type_identity<uint8_t>{}); break;
-    }
-}
 
 constexpr bool is_integer_dtype(DType dt) noexcept {
     const DType v = value_dtype(dt);
@@ -78,8 +65,8 @@ public:
     // ---- HOOKS (user-implemented) ------------------------------------------
     /// Declare I/O. Runs once, during the declare pass. Zero allocation.
     virtual void setup() = 0;
-    /// Initialize own I/O; runs once after allocation and compilation.
-    virtual void init(sk::queue& q, const sycl::device& dev) { (void)q; (void)dev; }
+    /// There is no init hook: a free input's initial value is declared in setup() with
+    /// init_input, and outputs are never initialized (r01 §6.0, §4.4).
     /// Per-forward manual shape control, after automatic derivation.
     virtual void pre_forward() {}
 
@@ -147,44 +134,16 @@ public:
     EntryRefs get_inputs() const { return entries_of(IOKind::input); }
     EntryRefs get_outputs() const { return entries_of(IOKind::output); }
 
-    // ---- initializers (legal inside init() only; else throw) -----------------
-    template <DType DT, int Rank>
-    Initializer<DT, Rank> get_input_initializer(std::string_view name) {
-        return typed_initializer<DT, Rank>(name, IOKind::input, "get_input_initializer");
-    }
-    template <DType DT, int Rank>
-    Initializer<DT, Rank> get_output_initializer(std::string_view name) {
-        return typed_initializer<DT, Rank>(name, IOKind::output, "get_output_initializer");
-    }
-    template <DType DT, int Rank>
-    HostInitializer<DT, Rank> get_input_host_initializer(std::string_view name) {
-        require_init("get_input_host_initializer");
-        return HostInitializer<DT, Rank>{find_kind(name, IOKind::input), queue_ref()};
-    }
-    template <DType DT, int Rank>
-    HostInitializer<DT, Rank> get_output_host_initializer(std::string_view name) {
-        require_init("get_output_host_initializer");
-        return HostInitializer<DT, Rank>{find_kind(name, IOKind::output), queue_ref()};
-    }
-
-    template <class T>
-    void fill_input(std::string_view name, T value) {
-        fill_entry(find_kind(name, IOKind::input), value, "fill_input");
-    }
-    template <class T>
-    void fill_output(std::string_view name, T value) {
-        fill_entry(find_kind(name, IOKind::output), value, "fill_output");
-    }
-    void zero_input(std::string_view name) { zero_entry(find_kind(name, IOKind::input), "zero_input"); }
-    void zero_output(std::string_view name) { zero_entry(find_kind(name, IOKind::output), "zero_output"); }
-
-    template <class T>
-    void set_input_from_host(std::string_view name, std::span<const T> values) {
-        set_entry_from_host<T>(find_kind(name, IOKind::input), values, "set_input_from_host");
-    }
-    template <class T>
-    void set_output_from_host(std::string_view name, std::span<const T> values) {
-        set_entry_from_host<T>(find_kind(name, IOKind::output), values, "set_output_from_host");
+    // ---- initial values (legal inside setup() only; r01 §4.4, D138) -----------
+    /// Declare the initial value of one of this Component's OWN inputs, by name. Metadata on the
+    /// input's root, applied by the framework when the root is allocated from nothing; the
+    /// declaration of the highest level wins, it is ignored when the input ends up with a source,
+    /// and it is an error to name an output.
+    void init_input(std::string_view name, InitSpec init) {
+        if (!declaring_)
+            throw std::logic_error("naga::cospan: init_input is legal inside setup() only (" + describe() + ")");
+        detail::IOEntry& e = find_kind(name, IOKind::input);  // an output throws
+        e.init_decls_.push_back(detail::IOEntry::InitDecl{std::move(init), detail::depth_of(*this), path()});
     }
 
     // ---- Subsystem verbs whose bodies touch no KB-typed state -----------------
@@ -230,8 +189,10 @@ public:
         for (detail::IOEntry* e : order_)
             if (e->kind() == IOKind::input && !e->is_root() && has_source_dim(*e))
                 e->update_shape();  // throws for an unconnected input with a FromSourceDim
+        // No allocation at setup: every root is allocated, and its init applied, by its OWNER in
+        // run_pre_compute (r01 §4.4, D138 amendment). Roots only learn what to allocate from.
         for (detail::IOEntry* e : order_)
-            if (e->is_root()) allocate_if_known(*e);
+            if (e->is_root()) e->bind_substrates(substrates);
         for (detail::IOEntry* e : order_) {
             if (e->kind() == IOKind::input && !e->is_root() && !e->is_dynamic() &&
                 !e->root()->is_dynamic())
@@ -239,14 +200,6 @@ public:
             point_if_stored(*e);
         }
     }
-
-    void run_init(const ExecCtx& owner_ctx) override {
-        detail::FlagScope scope{in_init_};
-        init(*owner_ctx.queue, owner_ctx.device);
-    }
-
-    /// A Component's System pass is a no-op.
-    void run_system_init() override {}
 
     void run_pre_compute(ExecCtx& owner_ctx) override {
         (void)owner_ctx;
@@ -260,8 +213,10 @@ public:
             detail::FlagScope scope{in_pre_forward_};
             pre_forward();
         }
-        for (detail::IOEntry* e : order_)
-            if (e->is_root()) allocate_if_known(*e);
+        // ALLOCATE every root this Component OWNS (inputs and outputs) that has no storage, and
+        // apply a free input root's init at the allocation (r01 §4.4, D138 amendment). A root it
+        // does not own is only pointed at, below.
+        for (detail::IOEntry* e : order_) allocate_owned(*e->root());
         for (detail::IOEntry* e : order_) {
             if (e->kind() == IOKind::input && !e->is_root() &&
                 (e->is_dynamic() || e->root()->is_dynamic()))
@@ -271,13 +226,25 @@ public:
     }
 
     /// Refresh the other-placement copies of every output root this Component
-    /// produces (routed copies: device<->host, cross-device). Ordered after
-    /// the launch by the stream.
+    /// produces (routed copies: device<->host, cross-device), ordered after the
+    /// launch by the stream; then RELEASE the transient roots this Component is
+    /// the last user of: one stream wait for the batch (synchronous frees, D135).
     void run_post_compute(ExecCtx& owner_ctx) override {
         for (detail::IOEntry* e : order_)
             if (e->kind() == IOKind::output && e->is_root() && e->storage_placements().size() > 1 &&
                 e->has_storage())
                 e->sync_other_placements(*owner_ctx.queue);
+
+        std::vector<detail::IOEntry*> drop;
+        for (detail::IOEntry* e : order_) {
+            detail::IOEntry* r = e->root();
+            if (r->transient() && r->last_user() == this && r->has_storage() &&
+                std::find(drop.begin(), drop.end(), r) == drop.end())
+                drop.push_back(r);
+        }
+        if (drop.empty()) return;
+        owner_ctx.queue->wait();
+        for (detail::IOEntry* r : drop) r->release_storage();
     }
 
     // ---- what a fused owner needs to know, without knowing the KernelBody type --
@@ -361,14 +328,6 @@ private:
         by_name_.emplace(key, std::move(e));
     }
 
-    template <DType DT, int Rank>
-    Initializer<DT, Rank> typed_initializer(std::string_view name, IOKind k, const char* what) {
-        require_init(what);
-        auto* e = dynamic_cast<detail::TypedEntry<DT, Rank>*>(&find_kind(name, k));
-        if (e == nullptr) throw wrong_type(name);
-        return e->make_initializer();
-    }
-
     // ---- lookup -----------------------------------------------------------
     detail::IOEntry& find_kind(std::string_view name, IOKind k) {
         const auto it = by_name_.find(std::string{name});
@@ -393,11 +352,6 @@ private:
     }
 
     // ---- phase guards ------------------------------------------------------
-    void require_init(const char* what) const {
-        if (!in_init_)
-            throw std::logic_error(std::string{"naga::cospan: "} + what + " is legal inside init() only");
-    }
-
     template <class W>
     void reshape_member(const W* member, sycl::range<W::rank> shape) {
         if (!in_pre_forward_)
@@ -423,11 +377,14 @@ private:
         return false;
     }
 
-    /// Allocate a root whose shape is known (every extent > 0) and that is not
-    /// allocated yet: fixed roots at prepare_exec, the rest at first need.
-    void allocate_if_known(detail::IOEntry& root) {
-        if (root.has_storage() || root.flat_size() == 0) return;
-        root.allocate(queue_ref(), *subs_);
+    /// The OWNER's allocation of a root from nothing (r01 §4.4): through the one allocation
+    /// routine, and when it is a free input root (an input root: it has no source) its init is
+    /// applied, else zeros. A root this Component does not own, or one that already has storage
+    /// (a host write got there first, or an earlier run), is left alone.
+    void allocate_owned(detail::IOEntry& root) {
+        if (root.owner() != this) return;
+        if (root.allocate_if_absent(queue_ref()) && root.kind() == IOKind::input)
+            detail::apply_root_init(root, queue_ref());
     }
 
     void point_if_stored(detail::IOEntry& e) {
@@ -475,7 +432,7 @@ private:
         if (!detail::is_integer_dtype(src.dtype()))
             throw std::invalid_argument("naga::cospan: '" + std::string{src.name()} +
                                         "' drives a shape by value and must have an integer dtype");
-        allocate_if_known(*src.root());
+        allocate_owned(*src.root());  // only when this Component owns it
         if (!src.root()->has_storage())
             throw std::logic_error("naga::cospan: '" + std::string{src.name()} +
                                    "' drives a shape by value but has no storage yet");
@@ -496,53 +453,11 @@ private:
         return out;
     }
 
-    // ---- initializer helpers -------------------------------------------------
-    /// Runs op(root, primary device, primary pointer) on the root's primary
-    /// storage, then refreshes the other devices. A no-op on an unallocated
-    /// EMPTY root (a shape still to be resolved).
-    template <class Op>
-    void write_root(detail::IOEntry& e, const char* what, Op&& op) {
-        require_init(what);
-        detail::IOEntry& root = *e.root();
-        if (!root.has_storage()) {
-            if (root.flat_size() == 0) return;
-            throw std::logic_error("naga::cospan: " + describe() + ": '" + std::string{e.name()} +
-                                   "' has no storage to initialize");
-        }
-        const Placement pl = root.storage_placements().front();
-        op(root, pl.device, root.storage_on(pl));
-        root.sync_other_placements(queue_ref());
-    }
-
-    template <class T>
-    void fill_entry(detail::IOEntry& e, T value, const char* what) {
-        write_root(e, what, [&](detail::IOEntry& root, const sycl::device& d, void* p) {
-            detail::dispatch_dtype(root.dtype(), [&](auto tag) {
-                using E = typename decltype(tag)::type;
-                const E v = static_cast<E>(value);
-                queue_ref().fill_in_order(d, p, v, root.flat_size());
-            });
-        });
-    }
-
-    void zero_entry(detail::IOEntry& e, const char* what) {
-        write_root(e, what, [&](detail::IOEntry& root, const sycl::device& d, void* p) {
-            queue_ref().memset_in_order(d, p, 0, root.flat_size() * dtype_size(root.dtype()));
-        });
-    }
-
-    template <class T>
-    void set_entry_from_host(detail::IOEntry& e, std::span<const T> values, const char* what) {
-        require_init(what);
-        detail::write_back<T>(e, queue_ref(), values);
-    }
-
     std::unordered_map<std::string, std::unique_ptr<detail::IOEntry>> by_name_;
     std::unordered_map<const void*, detail::IOEntry*>                 by_member_;
     std::vector<detail::IOEntry*>                                     order_;  // declaration order
 
     bool declaring_       = false;
-    bool in_init_         = false;
     bool in_pre_forward_  = false;
 };
 

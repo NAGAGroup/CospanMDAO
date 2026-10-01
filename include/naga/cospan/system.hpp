@@ -50,7 +50,7 @@ namespace naga::cospan {
 namespace property {
 struct device { sycl::device dev; };  ///< placement; inherited when absent
 struct parallel {};                   ///< flavor: the helper form builds a ParallelSystem (§7.5)
-struct transient {};                  ///< the subtree's memory is released after each run (§4.4); Systems only
+struct transient {};                  ///< given by an OWNER at registration (Component or System): a transient registration (§4.4)
 struct fused {                        ///< flavor: the helper form builds a FusedSystem (§7.5)
     enum class Mode : uint8_t { sequential, parallel };
     Mode                          mode = Mode::sequential;
@@ -156,11 +156,7 @@ public:
     // ---- HOOKS ---------------------------------------------------------------
     /// Structure and wiring (legal here only).
     virtual void setup() {}
-    /// Runs in the System pass of init_tree: children before owners.
-    virtual void init(sk::queue& q, const sycl::device& dev) {
-        (void)q;
-        (void)dev;
-    }
+    // There is no init hook: initial values are declared with init_input (§4.4, D138).
 
     // ---- adding children (legal inside setup() only) ---------------------------
     /// A REALIZED System or Component type. The child is constructed, named,
@@ -294,8 +290,9 @@ public:
                                         "producers do not race)");
         }
         check_same_dtype(ms, "tie_outputs");
-        const detail::IOEntry& shape = shape_source(ms, "tie_outputs");
-        auto a = detail::make_alias_entry(shape.dtype(), name, IOKind::output, shape_dims(shape),
+        const detail::IOEntry& shape = shape_source(ms, "tie_outputs", /*allow_dynamic=*/true);
+        auto a = detail::make_alias_entry(shape.dtype(), name, IOKind::output,
+                                          shape.is_dynamic() ? inert_dims(shape) : shape_dims(shape),
                                           /*can_source=*/true, /*can_target=*/false);
         a->declarer_ = this;
         detail::IOEntry& aref = *a;
@@ -415,56 +412,30 @@ public:
         return *e;
     }
 
-    // ---- initializers by path (legal inside init() only; else throw) -------------------------
-    template <DType DT, int Rank>
-    Initializer<DT, Rank> get_input_initializer(std::string_view path) {
-        return typed_initializer<DT, Rank>(path, IOKind::input, "get_input_initializer");
-    }
-    template <DType DT, int Rank>
-    Initializer<DT, Rank> get_output_initializer(std::string_view path) {
-        return typed_initializer<DT, Rank>(path, IOKind::output, "get_output_initializer");
-    }
-    template <DType DT, int Rank>
-    HostInitializer<DT, Rank> get_input_host_initializer(std::string_view path) {
-        require_init("get_input_host_initializer");
-        return HostInitializer<DT, Rank>{entry_of_kind(path, IOKind::input), queue_ref()};
-    }
-    template <DType DT, int Rank>
-    HostInitializer<DT, Rank> get_output_host_initializer(std::string_view path) {
-        require_init("get_output_host_initializer");
-        return HostInitializer<DT, Rank>{entry_of_kind(path, IOKind::output), queue_ref()};
-    }
-    template <class T>
-    void fill_input(std::string_view path, T value) {
-        fill_entry(entry_of_kind(path, IOKind::input), value, "fill_input");
-    }
-    template <class T>
-    void fill_output(std::string_view path, T value) {
-        fill_entry(entry_of_kind(path, IOKind::output), value, "fill_output");
-    }
-    void zero_input(std::string_view path) { zero_entry(entry_of_kind(path, IOKind::input), "zero_input"); }
-    void zero_output(std::string_view path) { zero_entry(entry_of_kind(path, IOKind::output), "zero_output"); }
-    template <class T>
-    void set_input_from_host(std::string_view path, std::span<const T> values) {
-        require_init("set_input_from_host");
-        detail::write_back<T>(entry_of_kind(path, IOKind::input), queue_ref(), values);
-    }
-    template <class T>
-    void set_output_from_host(std::string_view path, std::span<const T> values) {
-        require_init("set_output_from_host");
-        detail::write_back<T>(entry_of_kind(path, IOKind::output), queue_ref(), values);
+    // ---- initial values (legal inside setup() only; r01 §4.4, D138) -------------------------
+    /// Declare the initial value of a free input root: `path` is a child input path, or one of
+    /// this System's promoted or tied input aliases. The declaration is at THIS System's depth:
+    /// it wins over any declaration below it and loses to any above it; two at one depth on one
+    /// root are an error at resolve. It is ignored when the input's root ends up with a source,
+    /// and naming an output throws.
+    void init_input(std::string_view target, InitSpec init) {
+        require_declaring("init_input");
+        detail::IOEntry& e = entry_at(target);
+        if (e.kind() != IOKind::input)
+            fail("init_input", "'" + std::string{target} + "' is an output; outputs are never initialized");
+        e.init_decls_.push_back(detail::IOEntry::InitDecl{std::move(init), detail::depth_of(*this), path()});
     }
 
     // ---- Subsystem verbs: the DEFAULT orchestration (r01 §7.2, §11.2) ------------------------
     /// setup(); children's run_setup fired inside add_subsystem. The ROOT
-    /// (no owner) then settles the transient subtrees: only now is every
-    /// peer a later structural call could add known.
+    /// (no owner) then runs resolve(): only now is every registration a later
+    /// structural call could add known (§4.4).
     void run_setup() override {
         {
             detail::FlagScope scope{declaring_};
             setup();
         }
-        if (owner() == nullptr) mark_transient_roots();
+        if (owner() == nullptr) resolve();
     }
 
     /// ctx.device = the placed device or `parent_device` (the owner passes the
@@ -516,28 +487,16 @@ public:
             c.group     = nullptr;
             c.substrate = &substrates[c.device];
         }
+        // No allocation here: the owning Component allocates each root in its pre_compute (§4.4).
         for (detail::IOEntry* a : alias_order_)
-            if (a->is_root() && !a->has_storage() && a->flat_size() > 0) a->allocate(queue, substrates);
+            if (a->is_root()) a->bind_substrates(substrates);
         for (auto& c : children_) c->prepare_exec(queue, substrates);
-        for (detail::IOEntry* a : alias_order_) a->point_wrapper();
+        for (detail::IOEntry* a : alias_order_)
+            if (a->has_storage()) a->point_wrapper();
     }
 
     void compile() override {
         for (auto& c : children_) c->compile();
-    }
-
-    /// Component pass of init_tree: forwards to the children in order.
-    void run_init(const ExecCtx& owner_ctx) override {
-        (void)owner_ctx;
-        for (std::size_t i = 0; i < children_.size(); ++i) children_[i]->run_init(child_ctx_[i]);
-    }
-
-    /// System pass: child Systems first (a Component's is a no-op), then this
-    /// System's own init() — the last word over its children's.
-    void run_system_init() override {
-        for (auto& c : children_) c->run_system_init();
-        detail::FlagScope scope{in_init_};
-        init(*ctx_.queue, ctx_.device);
     }
 
     void run_pre_compute(ExecCtx&) override {}   ///< Systems do no work
@@ -545,9 +504,9 @@ public:
 
     /// THE DEFAULT LOOP (§7.3): per child pre_compute -> compute_forward ->
     /// submit (through this System's queue, to the child's device) ->
-    /// post_compute; revive() first, release() last. "I submitted": null.
+    /// post_compute (the Components allocate and release their own roots there, §4.4).
+    /// "I submitted": null.
     std::unique_ptr<LaunchDescription> run_compute_forward() override {
-        revive();
         for (std::size_t i = 0; i < children_.size(); ++i) {
             Subsystem& c  = *children_[i];
             ExecCtx&   cc = child_ctx_[i];
@@ -558,45 +517,86 @@ public:
             }
             c.run_post_compute(cc);
         }
-        release();
         return nullptr;
     }
 
-    /// Whether this transient System's roots are currently released.
-    bool transient() const noexcept { return transient_; }
-    bool released() const noexcept { return released_; }
-
-private:
-    // ---- transient subtrees (§4.4) -------------------------------------------------------------
-    /// The ROOT's job, at the end of its setup: every root declared in a
-    /// transient System's subtree with NO peer declared outside that subtree
-    /// belongs to the INNERMOST transient System for which that holds. It
-    /// takes no arena bytes (arena_eligible reads the flag) and is released
-    /// after that System's run.
-    void mark_transient_roots() {
+    /// The ROOT System's end-of-setup pass (§4.4, §11.2.1; run_setup runs it when this System has
+    /// no owner). Per root it records: `transient` (EVERY registration in the alias set is
+    /// transient: the registering subsystem or any ancestor was added with property::transient),
+    /// the winning initial value (smallest declaring depth; two at one depth throw; an init on a
+    /// root with a source is ignored), and `last_user` (the last Component, in depth-first
+    /// registration order, that touches the root). A mark on a transient root throws.
+    void resolve() {
         std::vector<detail::IOEntry*> roots;
         collect_roots(roots);
+
+        std::vector<ComponentBase*> comps;
+        collect_components(comps);
         for (detail::IOEntry* r : roots) {
-            for (const Subsystem* s = r->declarer(); s != nullptr; s = s->owner()) {
-                // owner() is const; the tree is this root System's own, so it may be mutated here.
-                auto* x = const_cast<System*>(dynamic_cast<const System*>(s));
-                if (x == nullptr || !x->transient_) continue;
-                bool outside = false;
-                for (const detail::IOEntry* p : r->peers_)
-                    if (!inside(p->declarer(), x)) outside = true;
-                if (outside) continue;
-                r->transient_    = true;
-                r->transient_by_ = x->path();
-                x->owned_roots_.push_back(r);
-                break;
+            r->last_user_ = nullptr;
+            r->owner_     = nullptr;
+        }
+        for (ComponentBase* c : comps)
+            for (detail::IOEntry* e : c->order_) {
+                detail::IOEntry* r = e->root();
+                r->last_user_      = c;
+                if (r->owner_ == nullptr) r->owner_ = c;  // the FIRST toucher owns the root
             }
+
+        for (detail::IOEntry* r : roots) {
+            bool all = registration_transient(*r);
+            for (const detail::IOEntry* p : r->peers_) all = all && registration_transient(*p);
+            r->transient_    = all;
+            r->released_     = all;  // a transient root has no storage until its first user allocates it
+            r->transient_by_ = all ? topmost_transient(*r) : std::string{};
+            if (all && (r->design_var_ || r->constraint_ || r->objective_))
+                throw std::invalid_argument("naga::cospan: '" + r->full_path() +
+                                            "' is marked (design variable, constraint or objective) but is "
+                                            "transient (subsystem '" + r->transient_by_ +
+                                            "'); a marked root must outlive a forward");
+            resolve_init(*r);
         }
     }
 
-    static bool inside(const Subsystem* d, const System* x) {
-        for (; d != nullptr; d = d->owner())
-            if (d == x) return true;
+private:
+    static bool registration_transient(const detail::IOEntry& e) {
+        for (const Subsystem* s = e.declarer(); s != nullptr; s = s->owner())
+            if (s->transient()) return true;
         return false;
+    }
+
+    /// The path of the topmost transient subsystem on the root's own registration chain.
+    static std::string topmost_transient(const detail::IOEntry& r) {
+        std::string by;
+        for (const Subsystem* s = r.declarer(); s != nullptr; s = s->owner())
+            if (s->transient()) by = s->path();
+        return by;
+    }
+
+    /// The winning init of a root: the declaration of the smallest depth among its alias set's.
+    static void resolve_init(detail::IOEntry& r) {
+        r.init_spec_.reset();
+        if (r.kind() == IOKind::output) return;  // the root has a source: the inputs' inits are ignored
+        const detail::IOEntry::InitDecl* best  = nullptr;
+        const detail::IOEntry::InitDecl* clash = nullptr;
+        const auto consider = [&](const detail::IOEntry& e) {
+            for (const auto& d : e.init_decls_) {
+                if (best == nullptr || d.depth < best->depth) {
+                    best  = &d;
+                    clash = nullptr;
+                } else if (d.depth == best->depth) {
+                    clash = &d;
+                }
+            }
+        };
+        consider(r);
+        for (const detail::IOEntry* p : r.peers_) consider(*p);
+        if (clash != nullptr)
+            throw std::invalid_argument("naga::cospan: two initial values are declared at depth " +
+                                        std::to_string(best->depth) + " for '" + r.full_path() + "' (by '" +
+                                        best->by + "' and '" + clash->by +
+                                        "'); the highest level wins, and one level may declare only one");
+        if (best != nullptr) r.init_spec_ = best->spec;
     }
 
     void collect_roots(std::vector<detail::IOEntry*>& out) {
@@ -612,47 +612,14 @@ private:
         }
     }
 
-protected:
-    // The transient contract for System flavors (ParallelSystem, ...): every
-    // run_compute_forward that runs the subtree calls revive() on entry and
-    // release() on exit (§4.4, §7.2); both are no-ops when not transient.
-
-    /// Re-allocate released roots (pool route, current extents) and re-run the
-    /// subtree's init, both passes, when released. A no-op otherwise.
-    void revive() {
-        if (!transient_ || !released_) return;
-        revive_storage();
-        for (std::size_t i = 0; i < children_.size(); ++i) children_[i]->run_init(child_ctx_[i]);
-        run_system_init();
-    }
-
-    /// Drop the storage of every root this System owns. Each root waits the
-    /// stream before it drops its storage, and SlabKit frees synchronously (D135).
-    void release() {
-        if (!transient_) return;
-        for (detail::IOEntry* r : owned_roots_)
-            if (r->has_storage()) {
-                r->release_storage();
-                released_ = true;
-            }
-    }
-
-private:
-    /// This System's roots, and those of every released nested transient
-    /// System (their storage is needed by the init this revive re-runs).
-    void revive_storage() {
-        for (detail::IOEntry* r : owned_roots_) r->revive_storage(*queue_, *subs_);
-        released_ = false;
-        for (Subsystem* c : child_ptrs_)
-            if (auto* s = dynamic_cast<System*>(c)) s->revive_nested();
-    }
-    void revive_nested() {
-        if (transient_ && released_) {
-            revive_storage();
-            return;
+    /// Depth-first in registration order: the order of "last user".
+    void collect_components(std::vector<ComponentBase*>& out) {
+        for (Subsystem* c : child_ptrs_) {
+            if (auto* s = dynamic_cast<System*>(c))
+                s->collect_components(out);
+            else if (auto* comp = dynamic_cast<ComponentBase*>(c))
+                out.push_back(comp);
         }
-        for (Subsystem* c : child_ptrs_)
-            if (auto* s = dynamic_cast<System*>(c)) s->revive_nested();
     }
 
     // ---- placement ----------------------------------------------------------------------------
@@ -667,12 +634,7 @@ private:
         a.storage_kind_ = sk::kind::device;
     }
 
-    // ---- initializer helpers (the Component's, by path) ---------------------------------------
-    void require_init(const char* what) const {
-        if (!in_init_)
-            throw std::logic_error(std::string{"naga::cospan: "} + what + " is legal inside init() only (" +
-                                   describe() + ")");
-    }
+    // ---- helpers ---------------------------------------
     sk::queue& queue_ref() const {
         if (queue_ == nullptr)
             throw std::logic_error("naga::cospan: " + describe() + " has no queue yet (prepare_exec)");
@@ -685,48 +647,6 @@ private:
                                         (k == IOKind::input ? "output" : "input"));
         return e;
     }
-    template <DType DT, int Rank>
-    Initializer<DT, Rank> typed_initializer(std::string_view path, IOKind k, const char* what) {
-        require_init(what);
-        auto* e = dynamic_cast<detail::TypedEntry<DT, Rank>*>(&entry_of_kind(path, k));
-        if (e == nullptr)
-            throw std::invalid_argument("naga::cospan: " + describe() + ": '" + std::string{path} +
-                                        "' was asked for with the wrong dtype or rank");
-        return e->make_initializer();
-    }
-    /// op(root, primary device, primary pointer) on the root's primary storage,
-    /// then refresh the other placements; a no-op on an unallocated EMPTY root.
-    template <class Op>
-    void write_root(detail::IOEntry& e, const char* what, Op&& op) {
-        require_init(what);
-        detail::IOEntry& root = *e.root();
-        if (!root.has_storage()) {
-            if (root.flat_size() == 0) return;
-            throw std::logic_error("naga::cospan: " + describe() + ": '" + std::string{e.name()} +
-                                   "' has no storage to initialize");
-        }
-        const Placement pl = root.storage_placements().front();
-        op(root, pl.device, root.storage_on(pl));
-        root.sync_other_placements(queue_ref());
-    }
-    template <class T>
-    void fill_entry(detail::IOEntry& e, T value, const char* what) {
-        write_root(e, what, [&](detail::IOEntry& root, const sycl::device& d, void* p) {
-            detail::dispatch_dtype(root.dtype(), [&](auto tag) {
-                using E   = typename decltype(tag)::type;
-                const E v = static_cast<E>(value);
-                queue_ref().fill_in_order(d, p, v, root.flat_size());
-            });
-        });
-    }
-    void zero_entry(detail::IOEntry& e, const char* what) {
-        write_root(e, what, [&](detail::IOEntry& root, const sycl::device& d, void* p) {
-            queue_ref().memset_in_order(d, p, 0, root.flat_size() * dtype_size(root.dtype()));
-        });
-    }
-
-    std::vector<detail::IOEntry*> owned_roots_;  ///< transient roots this System releases
-
 private:
     /// What a path resolves to: the System reached and either one of its
     /// Components' (comp != null) or its own alias (comp == null) named `leaf`.
@@ -882,13 +802,11 @@ private:
     /// (Subsystem's friend).
     void attach(std::unique_ptr<Subsystem> c, std::string name, const property_list& props) {
         const bool tr = props.has_property<property::transient>();
-        if (tr && dynamic_cast<System*>(c.get()) == nullptr)
-            throw std::invalid_argument("naga::cospan: property::transient is for Systems only ('" + name + "')");
         Subsystem& b = *c;
         b.path_      = path().empty() ? name : path() + "." + name;
         b.name_      = name;
         b.owner_     = this;
-        if (auto* s = dynamic_cast<System*>(c.get())) s->transient_ = tr;
+        b.transient_ = tr;
         placed_.push_back(props.has_property<property::device>()
                               ? std::optional<sycl::device>{props.get_property<property::device>().dev}
                               : std::nullopt);
@@ -951,12 +869,15 @@ private:
 
     /// A tie alias is a root: it needs a fixed shape from some member (or that
     /// member's root); its dims are that member's.
-    const detail::IOEntry& shape_source(const Members& ms, const char* what) const {
+    const detail::IOEntry& shape_source(const Members& ms, const char* what, bool allow_dynamic = false) const {
         for (const auto& [path, m] : ms) {
             (void)path;
             if (!m->is_dynamic()) return *m;
             if (!m->root()->is_dynamic()) return *m->root();
         }
+        // Tied OUTPUTS may all be value-driven (r01 §6.7, ZeroBins + Histogram): the alias root is
+        // dynamic too, and the members' resolved extents are propagated to it (IOEntry::reshape).
+        if (allow_dynamic) return *ms.front().second;
         fail(what, "no member has a fixed shape; a tie alias is a root and needs one");
     }
 
@@ -1062,9 +983,6 @@ private:
 
     // ---- state ---------------------------------------------------------------------------------
     bool declaring_ = false;
-    bool in_init_   = false;
-    bool transient_ = false;  ///< set by the owner from property::transient
-    bool released_  = false;
 
 protected:
     // What a flavor's runner needs (ParallelSystem): this System's ctx, one ctx
