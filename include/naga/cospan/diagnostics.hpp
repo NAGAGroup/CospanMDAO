@@ -19,6 +19,7 @@ struct EventCounts {
     std::uint64_t ragged_uploads = 0;  ///< upload_ragged slot uploads that passed the version check
     std::uint64_t full_passes    = 0;  ///< ChunkedSystem full passes
     std::uint64_t resolve_shapes = 0;  ///< Component::resolve_shapes calls
+    std::uint64_t resizes        = 0;  ///< resize_storage calls on a root with storage (each usm_vector resize CoSpan triggers)
 };
 
 inline EventCounts operator-(const EventCounts& a, const EventCounts& b) {
@@ -26,14 +27,14 @@ inline EventCounts operator-(const EventCounts& a, const EventCounts& b) {
                        a.allocations - b.allocations,       a.host_reads - b.host_reads,
                        a.host_read_hits - b.host_read_hits, a.host_tasks - b.host_tasks,
                        a.ragged_uploads - b.ragged_uploads, a.full_passes - b.full_passes,
-                       a.resolve_shapes - b.resolve_shapes};
+                       a.resolve_shapes - b.resolve_shapes, a.resizes - b.resizes};
 }
 
 namespace detail {
 
 struct Counters {
     std::atomic<std::uint64_t> queue_waits{0}, frees{0}, allocations{0}, host_reads{0}, host_read_hits{0}, host_tasks{0},
-        ragged_uploads{0}, full_passes{0}, resolve_shapes{0};
+        ragged_uploads{0}, full_passes{0}, resolve_shapes{0}, resizes{0};
     EventCounts win_begin{}, win_end{};  ///< the chunk loop's window (written by the one thread that runs it)
 };
 
@@ -55,6 +56,7 @@ inline void count_host_tasks(std::uint64_t n = 1) { detail::bump(detail::counter
 inline void count_ragged_uploads(std::uint64_t n = 1) { detail::bump(detail::counters().ragged_uploads, n); }
 inline void count_full_passes(std::uint64_t n = 1) { detail::bump(detail::counters().full_passes, n); }
 inline void count_resolve_shapes(std::uint64_t n = 1) { detail::bump(detail::counters().resolve_shapes, n); }
+inline void count_resizes(std::uint64_t n = 1) { detail::bump(detail::counters().resizes, n); }
 
 /// The counters now.
 inline EventCounts snapshot() {
@@ -62,7 +64,7 @@ inline EventCounts snapshot() {
     const auto  r = std::memory_order_relaxed;
     return EventCounts{c.queue_waits.load(r),     c.frees.load(r),          c.allocations.load(r),
                        c.host_reads.load(r),      c.host_read_hits.load(r), c.host_tasks.load(r),
-                       c.ragged_uploads.load(r),  c.full_passes.load(r),    c.resolve_shapes.load(r)};
+                       c.ragged_uploads.load(r),  c.full_passes.load(r),    c.resolve_shapes.load(r), c.resizes.load(r)};
 }
 
 /// Zero every counter (and the window).
@@ -78,6 +80,7 @@ inline void reset() {
     c.ragged_uploads.store(0, r);
     c.full_passes.store(0, r);
     c.resolve_shapes.store(0, r);
+    c.resizes.store(0, r);
     c.win_begin = EventCounts{};
     c.win_end   = EventCounts{};
 }

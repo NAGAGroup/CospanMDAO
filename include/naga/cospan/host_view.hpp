@@ -284,9 +284,11 @@ public:
 private:
     HostViewMut(detail::IOEntry& entry, sk::queue& q) : entry_{&entry}, q_{&q} {
         detail::check_entry(entry, DT, Rank);
-        auto snap = detail::take_snapshot<value_type>(entry, q);
-        host_     = std::move(snap.data);
-        shape_    = detail::make_range<Rank>(snap.shape);
+        // An init runs on a root its owner has just allocated (or re-marked pending): the device contents mean
+        // nothing, so the copy starts value-initialised and NO device read is made.
+        const detail::IOEntry::Geometry g = entry.geometry();
+        host_.assign(detail::element_count(g), value_type{});
+        shape_ = detail::make_range<Rank>(g.shape);
     }
 
     detail::IOEntry*        entry_ = nullptr;

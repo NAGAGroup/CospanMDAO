@@ -47,6 +47,7 @@ inline std::string describe_entry(const cs::detail::IOEntry& e) {
 struct Capture {
     std::vector<std::string> chunks;  ///< one string per chunk: every entry, in order
     std::vector<float>       out;
+    cs::diag::EventCounts    window;  ///< the chunk loop's event window of this forward
 };
 
 inline Capture run_once(cs::Model& m, const char* chunked_path, const std::function<std::vector<float>(cs::Model&)>& read) {
@@ -60,18 +61,22 @@ inline Capture run_once(cs::Model& m, const char* chunked_path, const std::funct
     m.forward();
     m.wait();
     sys.set_chunk_hooks(nullptr, nullptr);
-    c.out = read(m);
+    c.window = cs::diag::last_window();
+    c.out    = read(m);
     return c;
 }
 
 /// Builds a model with the given replay mode (the ChunkedSystem constructor takes the process default).
 template <class Make>
 cs::Model make_model(bool replay, Make&& make) {
-    const bool prev = cs::ChunkedSystem::default_replay();
+    // restore the process default even if setup throws (a failed case must not leave the legacy path on for the rest)
+    struct Restore {
+        bool prev = cs::ChunkedSystem::default_replay();
+        ~Restore() { cs::ChunkedSystem::set_default_replay(prev); }
+    } restore;
     cs::ChunkedSystem::set_default_replay(replay);
     cs::Model m = make();
     m.setup();
-    cs::ChunkedSystem::set_default_replay(prev);
     return m;
 }
 
@@ -99,6 +104,14 @@ void oracle(const char* chunked_path, Make&& make, const std::function<std::vect
             CHECK(l.chunks[c] == r.chunks[c]);
         }
         CHECK(l.out == r.out);  // bitwise (no NaN in these models)
+        // The replay window: nothing resolved, uploaded, allocated, freed, waited for or RESIZED (held roots keep their size).
+        CHECK(r.window.resizes == 0);
+        CHECK(r.window.resolve_shapes == 0);
+        CHECK(r.window.full_passes == 0);
+        CHECK(r.window.ragged_uploads == 0);
+        CHECK(r.window.allocations == 0);
+        CHECK(r.window.frees == 0);
+        CHECK(r.window.queue_waits == 0);
         CHECK(dynamic_cast<cs::ChunkedSystem&>(replay.get_subsystem(chunked_path)).topology_cached());
         CHECK_FALSE(dynamic_cast<cs::ChunkedSystem&>(legacy.get_subsystem(chunked_path)).topology_cached());
     }

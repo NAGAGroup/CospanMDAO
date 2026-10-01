@@ -20,6 +20,7 @@
 
 #include <naga/cospan/cospan.hpp>
 
+#include "replay_oracle.hpp"
 #include "support.hpp"
 
 namespace cs = naga::cospan;
@@ -345,4 +346,99 @@ TEST_CASE("Size-0 fixed roots: an empty root consumed downstream; the views are 
     m.forward();  // and again
     m.wait();
     CHECK(m.view_output<DType::f32, 1>("cons.out").size() == 0);
+}
+
+
+// =============================================================================================================================
+// The replay ORACLE (C2c) on the leading-range models wrapped in a ChunkedSystem: a boundary input that is a dense or a ragged
+// OUTSIDE root (the consumer is pointed at the chunk's range), an inside output consumed outside (RE-ROOTED), and a ragged
+// root with host per-index arrays declared inside (cs::per_index on a component port). (A re-rooted free INPUT is the promoted
+// free input of "Replay oracle: a promoted free input", in test_chunked.cpp.)
+// =============================================================================================================================
+namespace tlr {
+
+/// cons (the model's consumer) -> cp (an inside output, re-rooted: consumed outside). `local`: the ragged source is inside too.
+class LRInner : public cs::ChunkedSystem {
+    Kind  kind_;
+    bool  local_;
+    Sizes sizes_;
+
+public:
+    LRInner(std::size_t budget, Kind k, bool local, Sizes sizes)
+        : cs::ChunkedSystem(budget), kind_{k}, local_{local}, sizes_{std::move(sizes)} {}
+    void setup() override {
+        if (local_) {
+            add_subsystem<RaggedSrc>("rs", sizes_);
+            add_subsystem<RSum<3>>("cons");
+            connect("rs.out", "cons.in");
+            add_subsystem<DenseSum>("ds");  // reads the outside dense source: the chunk length comes from a boundary root
+        } else if (kind_ == Kind::dense_dense) {
+            add_subsystem<DenseSum>("cons");
+        } else if (kind_ == Kind::dense_ragged) {
+            add_subsystem<RSum<2>>("cons");
+        } else {
+            add_subsystem<RSum<3>>("cons");
+        }
+        add_subsystem<Copy>("cp");
+        connect("cons.sums", "cp.in");
+    }
+};
+class LRChunkTop : public cs::System {
+    Kind        kind_;
+    bool        local_;
+    std::size_t n_, budget_;
+    Sizes       sizes_;
+
+public:
+    LRChunkTop(Kind k, bool local, std::size_t n, Sizes sizes, std::size_t budget)
+        : kind_{k}, local_{local}, n_{n}, budget_{budget}, sizes_{std::move(sizes)} {}
+    void setup() override {
+        if (local_) {
+            add_subsystem<DenseSrc>("src", n_);
+        } else {
+            if (kind_ == Kind::ragged_ragged)
+                add_subsystem<RaggedSrc>("src", sizes_);
+            else
+                add_subsystem<DenseSrc>("src", n_);
+        }
+        add_subsystem<LRInner>("inner", budget_, kind_, local_, sizes_);
+        add_subsystem<Copy>("fin");
+        connect("src.out", local_ ? "inner.ds.in" : "inner.cons.in");
+        connect("inner.cp.out", "fin.in");
+    }
+};
+}  // namespace tlr
+
+TEST_CASE("Replay oracle: leading-range models in a ChunkedSystem (dense / ragged outside roots, re-rooted output)",
+          "[leading_range][chunked][replay]") {
+    const tlr::Sizes sizes{0, 3, 0, 2, 4, 0};
+    const auto       read = [](cs::Model& m) {
+        auto v = m.view_output<DType::f32, 1>("fin.out");
+        return std::vector<float>(v.span().begin(), v.span().end());
+    };
+    for (const std::size_t budget : {std::size_t{4}, std::size_t{12}, std::size_t{1000}}) {
+        INFO("budget " << budget);
+        tor::oracle("inner", [&] { return cs::create_model<tlr::LRChunkTop>(default_config(), tlr::Kind::dense_dense, false, std::size_t{6}, sizes, budget); }, read);
+        tor::oracle("inner", [&] { return cs::create_model<tlr::LRChunkTop>(default_config(), tlr::Kind::dense_ragged, false, std::size_t{6}, sizes, budget); }, read);
+        tor::oracle("inner", [&] { return cs::create_model<tlr::LRChunkTop>(default_config(), tlr::Kind::ragged_ragged, false, std::size_t{6}, sizes, budget); }, read);
+    }
+    // all-empty and no-empty ragged blocks
+    for (const tlr::Sizes& s : {tlr::Sizes{0, 0, 0, 0, 0, 0}, tlr::Sizes{1, 2, 3, 1, 2, 3}})
+        tor::oracle("inner", [&] { return cs::create_model<tlr::LRChunkTop>(default_config(), tlr::Kind::ragged_ragged, false, std::size_t{6}, s, std::size_t{8}); }, read);
+}
+
+TEST_CASE("Replay oracle: an internal ragged port with host per-index arrays (cs::per_index on a component port)",
+          "[.port_per_index][leading_range][chunked][replay]") {
+    // HIDDEN: a host per-index array on a COMPONENT port inside a chunked system is not sliced per chunk (only a tie alias
+    // slices it); the LEGACY path already fails with "per-index dimension 1 has N extents but dimension 0 has M".
+    const auto read = [](cs::Model& m) {
+        auto v = m.view_output<DType::f32, 1>("fin.out");
+        return std::vector<float>(v.span().begin(), v.span().end());
+    };
+    // per index: 4 B (cons.sums) + 4 B (ds.sums) + 12 B per row of rs.out (at most 4 rows: 56 B)
+    for (const tlr::Sizes& s : {tlr::Sizes{0, 3, 0, 2, 4, 0}, tlr::Sizes{1, 2, 3, 1, 2, 3}})
+        for (const std::size_t budget : {std::size_t{56}, std::size_t{100}, std::size_t{1000}}) {
+            INFO("budget " << budget);
+            tor::oracle("inner", [&] { return cs::create_model<tlr::LRChunkTop>(default_config(), tlr::Kind::ragged_ragged, true, s.size(), s, budget); }, read);
+        }
 }

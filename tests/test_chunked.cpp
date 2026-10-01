@@ -1192,7 +1192,9 @@ TEST_CASE("Topology cache: the window of an internal free input with an init", "
         CHECK(f.window.ragged_uploads == 0);
         CHECK(f.window.full_passes == 0);
         CHECK(f.window.resolve_shapes == 0);
-        CHECK(f.window.host_tasks == 4);  // the init's write, once per chunk
+        CHECK(f.window.host_tasks == 4);  // the commits (queued copies), once per chunk
+        CHECK(f.window.host_reads == 0);  // custom_host starts from a zeroed host buffer: no device read
+        CHECK(f.window.host_read_hits == 0);  // the init's write, once per chunk
         CHECK(f.whole.full_passes == (rep == 0 ? 1u : 0u));
     }
 }

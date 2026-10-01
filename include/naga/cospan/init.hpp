@@ -135,7 +135,8 @@ InitSpec custom(std::function<void(sk::queue&, Initializer<DT, Rank>)> fn) {
     }};
 }
 
-/// A host-side initial value: `fn` edits a host copy of the root; it is written back on return.
+/// A host-side initial value: the function receives a zero-initialised host copy of the root (its previous
+/// contents are NOT read from the device); it is written back (a queued copy) on return.
 template <DType DT, int Rank>
 InitSpec custom_host(std::function<void(HostViewMut<DT, Rank>&)> fn) {
     return InitSpec{[fn = std::move(fn)](detail::IOEntry& root, sk::queue& q) {

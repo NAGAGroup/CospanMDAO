@@ -1224,3 +1224,129 @@ TEST_CASE("Topology cache: a changed SHAPE of an outside boundary root rebuilds 
     CHECK(f3.first.full_passes == 1);
     CHECK(run().first.full_passes == 0);
 }
+
+
+// ---- aliases declared DIRECTLY in a ChunkedSystem's own setup() (C2c) -----------------------------------------------------
+namespace trt {
+/// The variant-0 shape of GV, but the promote and the tie live in the chunked system itself (no child system g).
+class DirectChunk : public cs::ChunkedSystem {
+public:
+    explicit DirectChunk(std::size_t budget) : cs::ChunkedSystem(budget) {}
+    void setup() override {
+        add_subsystem<BuildS>("p");
+        promote<DType::u32, 1>("p.sizes", "sizes");
+        add_subsystem<Factor>("q");
+        add_subsystem<SumT>("s");
+        tie_outputs<DType::f32, 3>({"p.t", "q.t"}, "t",
+                                   cs::alias::dims(cs::alias::input_dim("sizes", 0), cs::alias::input_values("sizes"),
+                                                   cs::alias::input_values("sizes")),
+                                   cs::TieOutputsPolicy::allow_plain);
+        connect("t", "s.pts");
+    }
+};
+class DirectPlain : public cs::System {
+public:
+    explicit DirectPlain(std::size_t) {}
+    void setup() override {
+        add_subsystem<BuildS>("p");
+        promote<DType::u32, 1>("p.sizes", "sizes");
+        add_subsystem<Factor>("q");
+        add_subsystem<SumT>("s");
+        tie_outputs<DType::f32, 3>({"p.t", "q.t"}, "t",
+                                   cs::alias::dims(cs::alias::input_dim("sizes", 0), cs::alias::input_values("sizes"),
+                                                   cs::alias::input_values("sizes")),
+                                   cs::TieOutputsPolicy::allow_plain);
+        connect("t", "s.pts");
+    }
+};
+template <class Inner>
+class DirectTop : public cs::System {
+    Counts      counts_;
+    std::size_t budget_;
+
+public:
+    DirectTop(Counts counts, std::size_t budget) : counts_{std::move(counts)}, budget_{budget} {}
+    void setup() override {
+        add_subsystem<CProd>("sz", counts_);
+        add_subsystem<Src>("src", counts_.size());
+        add_subsystem<Inner>("inner", budget_);
+        add_subsystem<Cons>("cons");
+        connect("src.x", "inner.p.in");
+        connect("sz.counts", "inner.sizes");
+        connect("inner.s.sums", "cons.in");
+    }
+};
+}  // namespace trt
+
+TEST_CASE("Chunked: promote + tie_outputs with input_values declared in the chunked system's own setup", "[.segv][ragged][tie][chunked]") {
+    const trt::Counts counts{3, 1, 4, 0, 2, 5, 1, 3, 2, 4};
+    cs::Model         plain = cs::create_model<trt::DirectTop<trt::DirectPlain>>(default_config(), counts, std::size_t{0});
+    plain.setup();
+    const auto want = trt::forward_out(plain);
+    cs::Model  m    = cs::create_model<trt::DirectTop<trt::DirectChunk>>(default_config(), counts, std::size_t{200});
+    m.setup();
+    CHECK(trt::forward_out(m) == want);
+}
+
+
+// =============================================================================================================================
+// Named replay oracle cases (C2c): the mechanisms that were only covered in combination.
+// =============================================================================================================================
+namespace trt {
+
+/// output_values from an OUTSIDE output, the tie declared by the TOP system with its members inside the chunked system.
+class OvInner : public cs::ChunkedSystem {
+public:
+    explicit OvInner(std::size_t budget) : cs::ChunkedSystem(budget) {}
+    void setup() override {
+        add_subsystem<Zero>("p");
+        add_subsystem<Acc>("q");
+        add_subsystem<SumT>("sum");
+    }
+};
+class OvTop : public cs::System {
+    Counts      init_;
+    std::size_t budget_;
+
+public:
+    OvTop(Counts init, std::size_t budget) : init_{std::move(init)}, budget_{budget} {}
+    void setup() override {
+        add_subsystem<CProd>("sz", init_);
+        add_subsystem<OvInner>("inner", budget_);
+        add_subsystem<Cons>("cons");
+        tie_outputs<DType::f32, 3>({"inner.p.t", "inner.q.t"}, "t",
+                                   cs::alias::dims(cs::alias::output_dim("sz.counts", 0), cs::alias::output_values("sz.counts"),
+                                                   cs::alias::output_values("sz.counts")),
+                                   cs::TieOutputsPolicy::allow_plain);
+        connect("t", "inner.sum.pts");
+        connect("inner.sum.sums", "cons.in");
+    }
+};
+}  // namespace trt
+
+TEST_CASE("Replay oracle: cs::per_index host arrays on a tie alias, several budgets", "[ragged][tie][chunked][replay]") {
+    const trt::Sizes sizes{3, 1, 4, 0, 2, 5, 1, 3, 2, 4};
+    for (const std::size_t budget : {std::size_t{1000}, std::size_t{400}, std::size_t{200}, std::size_t{100}}) {
+        INFO("budget " << budget);
+        tor::oracle("inner", [&] { return cs::create_model<trt::ChunkTop<trt::InnerChunk>>(default_config(), sizes.size(), budget, sizes); },
+                    [](cs::Model& m) {
+                        auto o = m.view_output<DType::f32, 1>("cons.out");
+                        return std::vector<float>(o.span().begin(), o.span().end());
+                    });
+    }
+}
+
+TEST_CASE("Replay oracle: output_values / output_dim of an OUTSIDE output sizing a tie whose members are inside",
+          "[.no_legal_form][ragged][tie][chunked][replay]") {
+    const trt::Counts first{3, 1, 4, 0, 2, 5, 1, 3, 2, 4};
+    const trt::Counts second{2, 0, 5, 5, 1, 1, 3, 4, 0, 2};
+    for (const std::size_t budget : {std::size_t{1000}, std::size_t{200}}) {
+        INFO("budget " << budget);
+        tor::oracle("inner", [&] { return cs::create_model<trt::OvTop>(default_config(), first, budget); },
+                    [](cs::Model& m) {
+                        auto o = m.view_output<DType::f32, 1>("cons.out");
+                        return std::vector<float>(o.span().begin(), o.span().end());
+                    },
+                    3, [&](cs::Model& m, int f) { m.init_input("sz.raw", cs::init::from_host(f == 1 ? second : first)); });
+    }
+}

@@ -193,3 +193,21 @@ TEST_CASE("Replay: the before-launch hook sees every chunk's cached shape and le
     CHECK(m.root().entry_at("inner.a.t").extents()[0] == n);
     CHECK(sys.last_chunk_count() == 4);
 }
+
+
+TEST_CASE("Replay: the resize counter is 0 in a replay window and counts the per-chunk resizes of the legacy path", "[chunked][replay][diag]") {
+    constexpr std::size_t n = 10, budget = 56;  // chunks of 3, 3, 3, 1
+    cs::Model             m = cs::create_model<trp::Top>(default_config(), n, budget);
+    m.setup();
+    auto& sys = dynamic_cast<cs::ChunkedSystem&>(m.get_subsystem("inner"));
+    for (int rep = 0; rep < 2; ++rep) {
+        trp::fwd(m);
+        CHECK(cs::diag::last_window().resizes == 0);
+    }
+    sys.set_replay(false);
+    trp::fwd(m);
+    CHECK(cs::diag::last_window().resizes > 0);  // legacy: a held root is resized to each chunk
+    sys.set_replay(true);
+    trp::fwd(m);
+    CHECK(cs::diag::last_window().resizes == 0);
+}

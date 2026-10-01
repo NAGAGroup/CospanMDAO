@@ -1383,6 +1383,7 @@ private:
     /// Resize the root's storage to flat_size(); growing waits the stream first (synchronous frees, D135).
     void resize_storage() {
         if (!is_root()) return;
+        if (!slots_.empty()) diag::count_resizes();
         if (!slots_.empty() && flat_size() > slots_.front()->data.capacity()) {
             diag::count_queue_waits();
             slots_.front()->data.get_queue().wait();
