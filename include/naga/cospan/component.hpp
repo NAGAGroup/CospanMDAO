@@ -266,8 +266,8 @@ public:
         // apply a free input root's init at the allocation (r01 §4.4, D138 amendment). A root it
         // does not own is only pointed at, below.
         for (detail::IOEntry* e : order_) allocate_owned(*e->root());
-        // FALLBACK: a free input root whose owner has stopped (its run counter is 0) is allocated and
-        // initialized by the next Component that needs it.
+        // A free input root whose owner has stopped (its run counter is 0) has no one left to allocate it:
+        // the next Component that needs it allocates it and applies its init.
         for (detail::IOEntry* e : order_) {
             detail::IOEntry& r = *e->root();
             if (r.kind() == IOKind::input && !r.has_storage() && r.owner() != nullptr && r.owner() != this &&

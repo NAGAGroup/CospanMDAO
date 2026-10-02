@@ -100,13 +100,9 @@ public:
     /// Components return a description and never submit it; Systems submit
     /// their subtree's work themselves and return null.
     virtual std::unique_ptr<LaunchDescription> run_compute_forward() = 0;
-    /// A Component: the other-placement sync, then RELEASE the transient roots it is the last
-    /// user of (one stream wait for the batch; r01 §4.4).
+    /// A Component: the other-placement sync, then DECREMENT every root it touches and free the ones that
+    /// reach 0 (one stream wait for the batch; r01 §4.4).
     virtual void run_post_compute(ExecCtx& owner_ctx) = 0;
-
-    /// Given by the OWNER at registration (property::transient): this subsystem, a Component or
-    /// a System, and everything under it are transient registrations (r01 §4.4).
-    bool transient() const noexcept { return transient_; }
 
     /// Run policy (given by the owner at registration): the LIVE counter (-1 eternal, -2 transient,
     /// n > 0 runs left, 0 skipped) and the value the owner asked for.
@@ -130,7 +126,6 @@ private:
     std::string   name_;
     std::string   path_;
     const System* owner_ = nullptr;
-    bool          transient_ = false;
     long          requested_run_ = -1;     ///< -1 eternal, -2 transient, n > 0 (as asked at registration)
     bool          run_explicit_  = false;  ///< run_n / do_once was given
     long          setup_run_     = -1;     ///< the effective value, derived at setup

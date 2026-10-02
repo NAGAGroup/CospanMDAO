@@ -20,7 +20,7 @@
 
 #include <naga/cospan/cospan.hpp>
 
-#include "replay_oracle.hpp"
+#include "chunk_capture.hpp"
 #include "support.hpp"
 
 namespace cs = naga::cospan;
@@ -350,57 +350,67 @@ TEST_CASE("Size-0 fixed roots: an empty root consumed downstream; the views are 
 
 
 // =============================================================================================================================
-// The replay ORACLE (C2c) on the leading-range models wrapped in a ChunkedSystem: a boundary input that is a dense or a ragged
-// OUTSIDE root (the consumer is pointed at the chunk's range), an inside output consumed outside (RE-ROOTED), and a ragged
-// root with host per-index arrays declared inside (cs::per_index on a component port). (A re-rooted free INPUT is the promoted
-// free input of "Replay oracle: a promoted free input", in test_chunked.cpp.)
+// The leading-range models wrapped in a ChunkedSystem, against the same models in a plain System: a boundary input that is a
+// dense or a ragged OUTSIDE root (the consumer is pointed at the chunk's range), an inside output consumed outside (RE-ROOTED),
+// and a ragged root with host per-index arrays declared inside (cs::per_index on a component port). Per-chunk ranges, sliced
+// per-index arrays and rebased offsets are checked against values computed by hand. (A re-rooted free INPUT is the promoted
+// free input of "Chunked vs plain: a promoted free input", in test_chunked.cpp.)
 // =============================================================================================================================
 namespace tlr {
 
 /// cons (the model's consumer) -> cp (an inside output, re-rooted: consumed outside). `local`: the ragged source is inside too.
-class LRInner : public cs::ChunkedSystem {
+/// The subtree of the chunked system, written once for the ChunkedSystem and for its plain twin.
+template <class Base>
+class LRInnerT : public Base {
     Kind  kind_;
     bool  local_;
     Sizes sizes_;
 
 public:
-    LRInner(std::size_t budget, Kind k, bool local, Sizes sizes)
-        : cs::ChunkedSystem(budget), kind_{k}, local_{local}, sizes_{std::move(sizes)} {}
+    LRInnerT(std::size_t budget, Kind k, bool local, Sizes sizes) : Base(budget), kind_{k}, local_{local}, sizes_{std::move(sizes)} {}
     void setup() override {
         if (local_) {
-            add_subsystem<RaggedSrc>("rs", sizes_);
-            add_subsystem<RSum<3>>("cons");
-            connect("rs.out", "cons.in");
-            add_subsystem<DenseSum>("ds");  // reads the outside dense source: the chunk length comes from a boundary root
+            this->template add_subsystem<RaggedSrc>("rs", sizes_);
+            this->template add_subsystem<RSum<3>>("cons");
+            this->connect("rs.out", "cons.in");
+            this->template add_subsystem<DenseSum>("ds");  // reads the outside dense source: the chunk length comes from a boundary root
         } else if (kind_ == Kind::dense_dense) {
-            add_subsystem<DenseSum>("cons");
+            this->template add_subsystem<DenseSum>("cons");
         } else if (kind_ == Kind::dense_ragged) {
-            add_subsystem<RSum<2>>("cons");
+            this->template add_subsystem<RSum<2>>("cons");
         } else {
-            add_subsystem<RSum<3>>("cons");
+            this->template add_subsystem<RSum<3>>("cons");
         }
-        add_subsystem<Copy>("cp");
-        connect("cons.sums", "cp.in");
-        // the interface of an opaque chunked system: its promotions
+        this->template add_subsystem<Copy>("cp");
+        this->connect("cons.sums", "cp.in");
+        // the interface of an opaque system: its promotions
         if (local_ || kind_ == Kind::ragged_ragged) {
             if (local_)
-                promote<DType::f32, 2>("ds.in", "in");
+                this->template promote<DType::f32, 2>("ds.in", "in");
             else
-                promote<DType::f32, 3>("cons.in", "in");
+                this->template promote<DType::f32, 3>("cons.in", "in");
         } else {
-            promote<DType::f32, 2>("cons.in", "in");
+            this->template promote<DType::f32, 2>("cons.in", "in");
         }
-        promote<DType::f32, 1>("cp.out", "out");
+        this->template promote<DType::f32, 1>("cp.out", "out");
     }
 };
-class LRChunkTop : public cs::System {
+/// The plain twin's base: a System that takes (and ignores) a budget.
+struct PlainBase : cs::System {
+    explicit PlainBase(std::size_t) {}
+};
+using LRInner      = LRInnerT<cs::ChunkedSystem>;
+using LRInnerPlain = LRInnerT<PlainBase>;
+
+template <class InnerT>
+class LRChunkTopT : public cs::System {
     Kind        kind_;
     bool        local_;
     std::size_t n_, budget_;
     Sizes       sizes_;
 
 public:
-    LRChunkTop(Kind k, bool local, std::size_t n, Sizes sizes, std::size_t budget)
+    LRChunkTopT(Kind k, bool local, std::size_t n, Sizes sizes, std::size_t budget)
         : kind_{k}, local_{local}, n_{n}, budget_{budget}, sizes_{std::move(sizes)} {}
     void setup() override {
         if (local_) {
@@ -411,43 +421,137 @@ public:
             else
                 add_subsystem<DenseSrc>("src", n_);
         }
-        add_subsystem<LRInner>("inner", budget_, kind_, local_, sizes_);
+        add_subsystem<InnerT>("inner", budget_, kind_, local_, sizes_);
         add_subsystem<Copy>("fin");
         connect("src.out", "inner.in");
         connect("inner.out", "fin.in");
     }
 };
-}  // namespace tlr
+using LRChunkTop      = LRChunkTopT<LRInner>;
+using LRChunkTopPlain = LRChunkTopT<LRInnerPlain>;
 
-TEST_CASE("Replay oracle: leading-range models in a ChunkedSystem (dense / ragged outside roots, re-rooted output)",
-          "[leading_range][chunked][replay]") {
-    const tlr::Sizes sizes{0, 3, 0, 2, 4, 0};
-    const auto       read = [](cs::Model& m) {
-        auto v = m.view_output<DType::f32, 1>("fin.out");
-        return std::vector<float>(v.span().begin(), v.span().end());
-    };
-    for (const std::size_t budget : {std::size_t{4}, std::size_t{12}, std::size_t{1000}}) {
-        INFO("budget " << budget);
-        tor::oracle("inner", [&] { return cs::create_model<tlr::LRChunkTop>(default_config(), tlr::Kind::dense_dense, false, std::size_t{6}, sizes, budget); }, read);
-        tor::oracle("inner", [&] { return cs::create_model<tlr::LRChunkTop>(default_config(), tlr::Kind::dense_ragged, false, std::size_t{6}, sizes, budget); }, read);
-        tor::oracle("inner", [&] { return cs::create_model<tlr::LRChunkTop>(default_config(), tlr::Kind::ragged_ragged, false, std::size_t{6}, sizes, budget); }, read);
-    }
-    // all-empty and no-empty ragged blocks
-    for (const tlr::Sizes& s : {tlr::Sizes{0, 0, 0, 0, 0, 0}, tlr::Sizes{1, 2, 3, 1, 2, 3}})
-        tor::oracle("inner", [&] { return cs::create_model<tlr::LRChunkTop>(default_config(), tlr::Kind::ragged_ragged, false, std::size_t{6}, s, std::size_t{8}); }, read);
+std::vector<float> read_fin(cs::Model& m) {
+    auto v = m.view_output<DType::f32, 1>("fin.out");
+    return std::vector<float>(v.span().begin(), v.span().end());
 }
 
-TEST_CASE("Replay oracle: an internal ragged port with host per-index arrays (cs::per_index on a component port)",
-          "[port_per_index][leading_range][chunked][replay]") {
-    // The full-length host array of rs.out is cut to each chunk [start, start + dim0) (C2d), as a tie alias''s is.
-    const auto read = [](cs::Model& m) {
-        auto v = m.view_output<DType::f32, 1>("fin.out");
-        return std::vector<float>(v.span().begin(), v.span().end());
-    };
+/// The block offsets of blocks [a, b) of a ragged [N, c_i, 3] root, rebased to start at 0 (worked out from the sizes).
+std::vector<std::uint64_t> rebased_offsets(const Sizes& s, std::size_t a, std::size_t b) {
+    std::vector<std::uint64_t> offs{0};
+    for (std::size_t i = a; i < b; ++i) offs.push_back(offs.back() + s[i] * 3);
+    return offs;
+}
+
+/// fin.out of a row whose ragged block rs.out has `c` rows and sits at position `r` of its run: RaggedSrc writes
+/// 1000 r + 10 j + k, RSum<3> sums the block, and the two Copy components double it each (so 4 x the sum).
+float fin_by_hand(std::size_t c, std::size_t r) {
+    float s = 0.0f;
+    for (std::size_t j = 0; j < c; ++j)
+        for (std::size_t k = 0; k < 3; ++k) s += static_cast<float>(r * 1000 + j * 10 + k);
+    return 4.0f * s;
+}
+
+/// Run the chunked model once with a Recorder on `paths` and require the plain twin's values, bitwise. Whatever the budget,
+/// by hand: the chunk ranges of paths[0] (a boundary input) tile [0, n) in order, each chunk's dim 0 is its range length,
+/// and after the forward the whole run is back (no range, the full dim 0 on the re-rooted output).
+std::vector<std::vector<tcc::EntryShape>> run_recorded(Kind kind, bool local, std::size_t n, const Sizes& sizes, std::size_t budget,
+                                                       const std::vector<std::string>& paths) {
+    cs::Model plain = cs::create_model<LRChunkTopPlain>(default_config(), kind, local, n, sizes, std::size_t{0});
+    plain.setup();
+    plain.forward();
+    plain.wait();
+    const std::vector<float> want = read_fin(plain);
+
+    cs::Model m = cs::create_model<LRChunkTop>(default_config(), kind, local, n, sizes, budget);
+    m.setup();
+    auto&         sys = dynamic_cast<cs::ChunkedSystem&>(m.get_subsystem("inner"));
+    tcc::Recorder rec;
+    rec.attach(sys, paths);
+    m.forward();
+    m.wait();
+    if (!local) CHECK(read_fin(m) == want);
+    CHECK(sys.last_chunk_count() == rec.chunks.size());
+    std::size_t next = 0;
+    for (const auto& row : rec.chunks) {
+        const auto& in = row[0];
+        REQUIRE(in.range.has_value());
+        CHECK(in.range->first == next);
+        CHECK(in.dim0 == in.range->second - in.range->first);
+        next = in.range->second;
+    }
+    CHECK(next == n);
+    if (local) {
+        // rs.out is declared inside, and RaggedSrc numbers its blocks from 0 within whatever run it is given: the plain twin
+        // numbers them over the whole run, the chunked one within each chunk. Both are worked out by hand.
+        std::vector<float> by_hand_plain(n), by_hand_chunked(n);
+        for (std::size_t i = 0; i < n; ++i) by_hand_plain[i] = fin_by_hand(sizes[i], i);
+        for (const auto& row : rec.chunks)
+            for (std::size_t i = row[0].range->first; i < row[0].range->second; ++i)
+                by_hand_chunked[i] = fin_by_hand(sizes[i], i - row[0].range->first);
+        CHECK(want == by_hand_plain);
+        CHECK(read_fin(m) == by_hand_chunked);
+    }
+    CHECK_FALSE(sys.entry_at(paths[0]).leading_range().has_value());
+    CHECK(sys.entry_at("cp.out").extents()[0] == n);
+    return rec.chunks;
+}
+
+/// Entry paths[k] in every chunk: its dim 0, its per-index array of dim 1 and its block offsets are the hand-computed slice
+/// of `sizes` for the chunk's range [a, b).
+void check_slices(const std::vector<std::vector<tcc::EntryShape>>& chunks, const Sizes& sizes, std::size_t k) {
+    for (const auto& row : chunks) {
+        const std::size_t a = row[0].range->first, b = row[0].range->second;
+        INFO("chunk [" << a << ", " << b << ")");
+        CHECK(row[k].dim0 == b - a);
+        CHECK(row[k].per1 == Sizes(sizes.begin() + static_cast<std::ptrdiff_t>(a), sizes.begin() + static_cast<std::ptrdiff_t>(b)));
+        CHECK(row[k].offsets == rebased_offsets(sizes, a, b));
+    }
+}
+}  // namespace tlr
+
+TEST_CASE("Chunked vs plain: leading-range models (dense / ragged outside roots, re-rooted output)", "[leading_range][chunked]") {
+    const tlr::Sizes sizes{0, 3, 0, 2, 4, 0};  // a zero-length row first, in the middle and last
+    for (const std::size_t budget : {std::size_t{4}, std::size_t{12}, std::size_t{1000}}) {
+        INFO("budget " << budget);
+        for (const tlr::Kind k : {tlr::Kind::dense_dense, tlr::Kind::dense_ragged}) {
+            const auto chunks = tlr::run_recorded(k, false, 6, sizes, budget, {"cons.in"});
+            if (budget == 1000) {  // by hand: everything fits, one chunk over the whole range
+                REQUIRE(chunks.size() == 1);
+                CHECK(*chunks[0][0].range == std::make_pair(std::size_t{0}, std::size_t{6}));
+            } else {
+                CHECK(chunks.size() > 1);
+            }
+        }
+        const auto chunks = tlr::run_recorded(tlr::Kind::ragged_ragged, false, 6, sizes, budget, {"cons.in"});
+        tlr::check_slices(chunks, sizes, 0);
+        if (budget == 1000) {
+            // by hand: blocks of 0, 9, 0, 6, 12, 0 elements, rebased from 0
+            REQUIRE(chunks.size() == 1);
+            CHECK(chunks[0][0].per1 == tlr::Sizes{0, 3, 0, 2, 4, 0});
+            CHECK(chunks[0][0].offsets == std::vector<std::uint64_t>{0, 0, 9, 9, 15, 27, 27});
+        } else {
+            CHECK(chunks.size() > 1);
+        }
+    }
+    // all-empty and no-empty ragged blocks
+    for (const tlr::Sizes& s : {tlr::Sizes{0, 0, 0, 0, 0, 0}, tlr::Sizes{1, 2, 3, 1, 2, 3}}) {
+        const auto chunks = tlr::run_recorded(tlr::Kind::ragged_ragged, false, 6, s, 8, {"cons.in"});
+        tlr::check_slices(chunks, s, 0);
+    }
+}
+
+TEST_CASE("Chunked vs plain: an internal ragged port with host per-index arrays (cs::per_index on a component port)",
+          "[port_per_index][leading_range][chunked]") {
+    // The full-length host array of rs.out is cut to each chunk's range, as a tie alias's is. paths[0] (ds.in) gives the range.
     // per index: 4 B (cons.sums) + 4 B (ds.sums) + 12 B per row of rs.out (at most 4 rows: 56 B)
     for (const tlr::Sizes& s : {tlr::Sizes{0, 3, 0, 2, 4, 0}, tlr::Sizes{1, 2, 3, 1, 2, 3}})
         for (const std::size_t budget : {std::size_t{56}, std::size_t{100}, std::size_t{1000}}) {
             INFO("budget " << budget);
-            tor::oracle("inner", [&] { return cs::create_model<tlr::LRChunkTop>(default_config(), tlr::Kind::ragged_ragged, true, s.size(), s, budget); }, read);
+            const auto chunks = tlr::run_recorded(tlr::Kind::ragged_ragged, true, s.size(), s, budget, {"ds.in", "rs.out"});
+            tlr::check_slices(chunks, s, 1);
+            if (budget == 1000) {  // by hand: one chunk, the whole host array
+                REQUIRE(chunks.size() == 1);
+                CHECK(chunks[0][1].per1 == s);
+            }
         }
 }

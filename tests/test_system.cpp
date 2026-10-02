@@ -1422,7 +1422,7 @@ TEST_CASE("transient: release after the last user, kept outputs, back-to-back fo
     auto&             tr   = dynamic_cast<cs::System&>(model.get_subsystem("tr"));
     auto&             sys  = model.root();
     const std::size_t base = pool_in_use(model);
-    CHECK(tr.transient());
+    CHECK(tr.requested_run() == -2);
 
     SECTION("host access to a released root throws, naming who released it") {
         model.forward();

@@ -68,7 +68,7 @@ inline const ComponentBase* stage_component(const Subsystem* s) {
 }
 
 /// (D140) FusedSystem and ParallelSystem: a child with any ragged port (declared with RaggedInput /
-/// RaggedOutput, or with a per-index dimension spec) is a setup error for now.
+/// RaggedOutput, or with a per-index dimension spec) is a setup error.
 inline void check_no_ragged_ports(const std::string& owner, std::span<Subsystem* const> stages) {
     for (const Subsystem* s : stages) {
         const ComponentBase* c = stage_component(s);

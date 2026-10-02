@@ -1,7 +1,7 @@
 // Ragged tie aliases (D140): a tie alias takes the same per-index shape rules as a port.
 //
 //   alias::dims(spec0, spec1, ...) with an integer, per_index, output_value, output_values, output_dim;
-//   from_output_shape and from_connection copy a ragged shape.
+//   from_output_shape copies a ragged shape, and so does a connection (an unspecified dim takes its source's).
 //
 // Members are RaggedOutput / RaggedInput declared with cs::tied. Plain members use TieOutputsPolicy::allow_plain
 // (the producers run in order, they do not race); atomic ragged members take the require_atomic default.
@@ -25,7 +25,7 @@
 
 #include <naga/cospan/cospan.hpp>
 
-#include "replay_oracle.hpp"
+#include "chunk_capture.hpp"
 #include "support.hpp"
 
 namespace cs = naga::cospan;
@@ -276,7 +276,7 @@ void run_tie_out(cs::Model& m, const Counts& counts, int shape_mode, bool factor
         CHECK_FALSE(pts.is_per_index(2));
 }
 
-// ---- tie_inputs top: gen -> (two ragged inputs tied, from_connection) -----------------------------------------------
+// ---- tie_inputs top: gen -> (two ragged inputs tied, connected from a ragged output) -----------------------------------------------
 template <int K>
 struct SumKBody {
     struct Inputs {
@@ -1027,7 +1027,7 @@ TEST_CASE("Ragged ties: a connected tie_inputs alias with dims(input_dim, input_
     }
 }
 
-TEST_CASE("Ragged ties: tie_inputs of two RaggedInputs, from_connection to a ragged output", "[ragged][tie]") {
+TEST_CASE("Ragged ties: tie_inputs of two RaggedInputs, connected from a ragged output", "[ragged][tie]") {
     cs::Model m = cs::create_model<trt::TieInTop>(default_config(), trt::Counts{2, 0, 3, 1});
     m.setup();
     for (const trt::Counts& counts : {trt::Counts{2, 0, 3, 1}, trt::Counts{0, 4, 0, 2}, trt::Counts{1, 1, 1, 1}}) {
@@ -1202,16 +1202,17 @@ TEST_CASE("Ragged ties: errors", "[ragged][tie]") {
 
 
 // =============================================================================================================================
-// The replay ORACLE (C2b) for the tie aliases inside a ChunkedSystem.
+// The tie aliases inside a ChunkedSystem, against the same models in a plain System.
 // =============================================================================================================================
-TEST_CASE("Replay oracle: tie aliases (input_values, from_input_shape, input_dim, output_dim, per_index) inside a ChunkedSystem",
+TEST_CASE("Chunked vs plain: tie aliases (input_values, from_input_shape, input_dim, output_dim, per_index) inside a ChunkedSystem",
           "[ragged][tie][chunked][replay]") {
     const trt::Counts first{3, 1, 4, 0, 2, 5, 1, 3, 2, 4};
     const trt::Counts second{2, 0, 5, 5, 1, 1, 3, 4, 0, 2};
     for (int v = 0; v <= 4; ++v)
         for (const std::size_t budget : {std::size_t{1000}, std::size_t{200}}) {
             INFO("variant " << v << ", budget " << budget);
-            tor::oracle("inner", [&] { return cs::create_model<trt::VTop<trt::InnerChunkV>>(default_config(), first, budget, v); },
+            tcc::against_plain("inner", [&] { return cs::create_model<trt::VTop<trt::InnerChunkV>>(default_config(), first, budget, v); },
+                        [&] { return cs::create_model<trt::VTop<trt::InnerPlainV>>(default_config(), first, std::size_t{0}, v); },
                         [](cs::Model& m) {
                             auto o = m.view_output<DType::f32, 1>("cons.out");
                             return std::vector<float>(o.span().begin(), o.span().end());
@@ -1223,13 +1224,14 @@ TEST_CASE("Replay oracle: tie aliases (input_values, from_input_shape, input_dim
         }
 }
 
-TEST_CASE("Replay oracle: tied ragged members connected from an outside ragged output (from_connection)",
+TEST_CASE("Chunked vs plain: tied ragged members connected from an outside ragged output",
           "[ragged][tie][chunked][replay]") {
     const trt::Counts first{3, 1, 4, 0, 2, 5, 1, 3, 2, 4};
     const trt::Counts second{2, 0, 5, 5, 1, 1, 3, 4, 0, 2};
     for (const std::size_t budget : {std::size_t{300}, std::size_t{150}, std::size_t{70}, std::size_t{60}}) {
         INFO("budget " << budget);
-        tor::oracle("inner", [&] { return cs::create_model<trt::TieChunkTop<trt::TieChunkChunked>>(default_config(), first, budget); },
+        tcc::against_plain("inner", [&] { return cs::create_model<trt::TieChunkTop<trt::TieChunkChunked>>(default_config(), first, budget); },
+                    [&] { return cs::create_model<trt::TieChunkTop<trt::TieChunkPlain>>(default_config(), first, std::size_t{0}); },
                     [](cs::Model& m) {
                         std::vector<float> out;
                         for (const char* p : {"c1.out", "c2.out"}) {
@@ -1337,12 +1339,13 @@ TEST_CASE("Chunked: a tie declared in the chunked system's own setup is internal
     CHECK(trt::inner_entry(m, "t").held() == false);
 }
 
-TEST_CASE("Replay oracle: a tie declared in the chunked system's own setup", "[chunked-level-tie][ragged][tie][chunked][replay]") {
+TEST_CASE("Chunked vs plain: a tie declared in the chunked system's own setup", "[chunked-level-tie][ragged][tie][chunked][replay]") {
     const trt::Counts first{3, 1, 4, 0, 2, 5, 1, 3, 2, 4};
     const trt::Counts second{2, 0, 5, 5, 1, 1, 3, 4, 0, 2};
     for (const std::size_t budget : {std::size_t{1000}, std::size_t{200}, std::size_t{100}}) {
         INFO("budget " << budget);
-        tor::oracle("inner", [&] { return cs::create_model<trt::DirectTop<trt::DirectChunk>>(default_config(), first, budget); },
+        tcc::against_plain("inner", [&] { return cs::create_model<trt::DirectTop<trt::DirectChunk>>(default_config(), first, budget); },
+                    [&] { return cs::create_model<trt::DirectTop<trt::DirectPlain>>(default_config(), first, std::size_t{0}); },
                     [](cs::Model& m) {
                         auto o = m.view_output<DType::f32, 1>("cons.out");
                         return std::vector<float>(o.span().begin(), o.span().end());
@@ -1575,7 +1578,7 @@ public:
 };
 }  // namespace trt
 
-TEST_CASE("Replay oracle: an outside tie_outputs over a promotion of an inside tied output plus an outside writer",
+TEST_CASE("Chunked vs plain: an outside tie_outputs over a promotion of an inside tied output plus an outside writer",
           "[outside-tie-inside-members][ragged][tie][chunked][replay]") {
     const trt::Counts first{3, 1, 4, 0, 2, 5, 1, 3, 2, 4};
     const trt::Counts second{2, 0, 5, 5, 1, 1, 3, 4, 0, 2};
@@ -1596,12 +1599,13 @@ TEST_CASE("Replay oracle: an outside tie_outputs over a promotion of an inside t
         m.forward();
         m.wait();
         CHECK(read(m) == pout);  // matches the unchunked run (the alias is the full root, the chunks wrote their slices)
-        tor::oracle("inner", [&] { return cs::create_model<trt::OtTop<trt::OtChunk>>(default_config(), first, budget); }, read, 3,
+        tcc::against_plain("inner", [&] { return cs::create_model<trt::OtTop<trt::OtChunk>>(default_config(), first, budget); },
+                    [&] { return cs::create_model<trt::OtTop<trt::OtPlain>>(default_config(), first, std::size_t{0}); }, read, 3,
                     [&](cs::Model& mm, int f) { mm.init_input("sz.raw", cs::init::from_host(f == 1 ? second : first)); });
     }
 }
 
-TEST_CASE("Replay oracle: an outside tie_inputs over a promotion of an inside tied input", "[outside-tie-inside-members][ragged][tie][chunked][replay]") {
+TEST_CASE("Chunked vs plain: an outside tie_inputs over a promotion of an inside tied input", "[outside-tie-inside-members][ragged][tie][chunked][replay]") {
     const trt::Counts first{3, 1, 4, 0, 2, 5, 1, 3, 2, 4};
     const trt::Counts second{2, 0, 5, 5, 1, 1, 3, 4, 0, 2};
     const auto        read = [](cs::Model& m) {
@@ -1622,19 +1626,49 @@ TEST_CASE("Replay oracle: an outside tie_inputs over a promotion of an inside ti
         m.forward();
         m.wait();
         CHECK(read(m) == pout);
-        tor::oracle("inner", [&] { return cs::create_model<trt::TiTop<trt::TiChunk>>(default_config(), first, budget); }, read, 3,
+        tcc::against_plain("inner", [&] { return cs::create_model<trt::TiTop<trt::TiChunk>>(default_config(), first, budget); },
+                    [&] { return cs::create_model<trt::TiTop<trt::TiPlain>>(default_config(), first, std::size_t{0}); }, read, 3,
                     [&](cs::Model& mm, int f) { mm.init_input("sz.raw", cs::init::from_host(f == 1 ? second : first)); });
     }
 }
 
-TEST_CASE("Replay oracle: cs::per_index host arrays on a tie alias, several budgets", "[ragged][tie][chunked][replay]") {
+TEST_CASE("Chunked vs plain: cs::per_index host arrays on a tie alias, several budgets", "[ragged][tie][chunked][replay]") {
     const trt::Sizes sizes{3, 1, 4, 0, 2, 5, 1, 3, 2, 4};
     for (const std::size_t budget : {std::size_t{1000}, std::size_t{400}, std::size_t{200}, std::size_t{100}}) {
         INFO("budget " << budget);
-        tor::oracle("inner", [&] { return cs::create_model<trt::ChunkTop<trt::InnerChunk>>(default_config(), sizes.size(), budget, sizes); },
+        tcc::against_plain("inner", [&] { return cs::create_model<trt::ChunkTop<trt::InnerChunk>>(default_config(), sizes.size(), budget, sizes); },
+                    [&] { return cs::create_model<trt::ChunkTop<trt::InnerPlain>>(default_config(), sizes.size(), std::size_t{0}, sizes); },
                     [](cs::Model& m) {
                         auto o = m.view_output<DType::f32, 1>("cons.out");
                         return std::vector<float>(o.span().begin(), o.span().end());
                     });
+
+        // by hand: the tie member g.p.t is [N, m_i, m_i]; in each chunk [a, b) its dim 0 is b - a and both per-index arrays are
+        // sizes[a..b)
+        cs::Model m = cs::create_model<trt::ChunkTop<trt::InnerChunk>>(default_config(), sizes.size(), budget, sizes);
+        m.setup();
+        auto&         sys = dynamic_cast<cs::ChunkedSystem&>(m.get_subsystem("inner"));
+        tcc::Recorder rec;
+        rec.attach(sys, {"g.p.in", "g.p.t"});
+        m.forward();
+        m.wait();
+        std::size_t next = 0;
+        for (const auto& row : rec.chunks) {
+            REQUIRE(row[0].range.has_value());
+            const std::size_t a = row[0].range->first, b = row[0].range->second;
+            INFO("chunk [" << a << ", " << b << ")");
+            CHECK(a == next);
+            next = b;
+            const trt::Sizes want(sizes.begin() + static_cast<std::ptrdiff_t>(a), sizes.begin() + static_cast<std::ptrdiff_t>(b));
+            CHECK(row[1].dim0 == b - a);
+            CHECK(row[1].per1 == want);
+            CHECK(row[1].per2 == want);
+        }
+        CHECK(next == sizes.size());
+        if (budget == 1000) {  // everything fits: one chunk, the whole arrays
+            REQUIRE(rec.chunks.size() == 1);
+            CHECK(rec.chunks[0][1].per1 == sizes);
+        }
+        if (budget <= 200) CHECK(rec.chunks.size() > 1);  // the tie root alone is 4 * (9+1+16+0+4+25+1+9+4+16) = 340 B
     }
 }

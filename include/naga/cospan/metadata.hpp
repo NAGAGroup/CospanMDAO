@@ -367,7 +367,7 @@ struct DimRecord {
     /// from_input_dim / from_root when that dimension is per-index.
     std::vector<std::size_t> per_index;
     /// per_index_host: the declared full-length array. Inside a ChunkedSystem `per_index` is the chunk's slice of it
-    /// ([dim0_start_, dim0_start_ + dim0), D140 B3); outside, `per_index` is this array itself.
+    /// ([0, dim0), D140 B3); outside, `per_index` is this array itself.
     std::vector<std::size_t> host_full;
     /// The dimension is per-index (even when `per_index` is empty because N is 0): true from
     /// declaration for per_index_host / per_index_from_input, copied with the array by the derived hows.
@@ -895,9 +895,8 @@ protected:
     std::uint64_t              ragged_version_ = 0;      ///< bumped whenever the ragged description changes
     bool                       ragged_port_ = false;     ///< declared with RaggedInput / RaggedOutput
     // ---- D140 B3 (roots): kept across the chunks of a ChunkedSystem ----
-    bool                       held_          = false;   ///< set by the ChunkedSystem: no release by a last user
+    bool                       held_          = false;   ///< set by the ChunkedSystem: the capacity is reserved for the chunk loop
     std::size_t                reserve_elems_ = 0;       ///< held: the capacity (elements) allocate() takes
-    bool                       resize_frozen_ = false;   ///< a ChunkedSystem's full-range pass: storage is not resized (an eternal internal root keeps its chunk capacity)
     std::size_t                allocations_   = 0;       ///< storage allocations of this root (allocate, growth past capacity)
     std::uint64_t              write_epoch_   = 0;       ///< roots: see write_epoch()
     std::uint64_t              shape_version_ = 0;       ///< roots: see shape_version()
@@ -909,7 +908,6 @@ protected:
     /// Inside a ChunkedSystem the framework sets dim 0 of every port of every inside component to the
     /// current chunk length (N in the full-range pass, b - a per chunk), whatever rule declared it.
     std::optional<std::size_t> dim0_override_;
-    std::size_t                dim0_start_ = 0;  ///< with dim0_override_: the first index of the chunk (host per-index slices)
     std::vector<DimRecord>     dims_;
     std::vector<Placement>     placements_;        ///< roots; primary first
     std::optional<sycl::device> device_;
@@ -1118,7 +1116,7 @@ public:
                         if (!dim0_override_) {
                             if (r.per_index != r.host_full) r.per_index = r.host_full;
                         } else if (r.host_full.size() != *dim0_override_) {
-                            const std::size_t first = dim0_start_, len = *dim0_override_;
+                            const std::size_t first = 0, len = *dim0_override_;
                             if (r.host_full.size() < first + len)
                                 throw std::invalid_argument("naga::cospan: '" + full_path() + "': per-index dimension " +
                                                             std::to_string(d) + " has " + std::to_string(r.host_full.size()) +
@@ -1505,7 +1503,7 @@ private:
 
     /// Resize the root's storage to flat_size(); growing waits the stream first (synchronous frees, D135).
     void resize_storage() {
-        if (!is_root() || resize_frozen_) return;
+        if (!is_root()) return;
         if (!slots_.empty()) diag::count_resizes();
         if (!slots_.empty() && flat_size() > slots_.front()->data.capacity()) {
             diag::count_queue_waits();

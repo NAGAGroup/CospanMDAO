@@ -4,7 +4,7 @@
 // =============================================================================
 //
 // What evaluates a tie alias's shape rule and reads the values and shapes a rule depends on (D139 part 2,
-// D140). It used to live inside ComponentBase; a Component and a System each OWN one now (a tie alias root is
+// D140). A Component and a System each OWN one (a tie alias root is
 // owned and resolved by its declaring System, D141). It holds the queue it reads through, the recorders and
 // the read log a ChunkedSystem's full pass fills (its topology cache and dependency self-check), and the
 // chunk-pass state.
@@ -82,7 +82,7 @@ public:
     /// chunk-sized (an inside entry's, resolved under the chunk) is kept as it is.
     std::vector<std::size_t> chunk_slice(const detail::IOEntry& a, std::vector<std::size_t> v) const {
         if (!a.dim0_override_ || v.size() == *a.dim0_override_) return v;
-        const std::size_t first = a.dim0_start_, len = *a.dim0_override_;
+        const std::size_t first = 0, len = *a.dim0_override_;
         if (v.size() < first + len)
             throw std::invalid_argument("naga::cospan: tie alias '" + a.full_path() + "': a per-index source has " +
                                         std::to_string(v.size()) + " entries but the chunk reaches index " +
@@ -144,7 +144,7 @@ public:
                         case AliasDim::How::per_index_host: {
                             std::vector<std::size_t> v = sp.values;
                             if (a.dim0_override_) {  // inside a ChunkedSystem: this chunk's slice of the host array
-                                const std::size_t first = a.dim0_start_, len = *a.dim0_override_;
+                                const std::size_t first = 0, len = *a.dim0_override_;
                                 if (v.size() < first + len)
                                     throw std::invalid_argument("naga::cospan: tie alias '" + a.full_path() + "': per-index dimension " +
                                                                 std::to_string(d) + " has " + std::to_string(v.size()) +

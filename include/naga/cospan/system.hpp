@@ -292,7 +292,7 @@ public:
 
     /// A NEW ROOT (source, not target); atomic member dtypes unless allow_plain. The members are
     /// rank-only (cs::tied) outputs of dtype DT and rank Rank; the alias owns the shape (an output
-    /// alias defines the shape of its connections, so alias::from_connection is an error).
+    /// alias defines the shape of its connections, so it cannot take its shape from one).
     template <DType DT, int Rank>
     void tie_outputs(std::initializer_list<std::string_view> members, std::string name, AliasShape shape,
                      TieOutputsPolicy policy = TieOutputsPolicy::require_atomic) {
@@ -780,7 +780,7 @@ private:
         }
     }
 
-    /// Depth-first in registration order: the order of "last user".
+    /// Depth-first in registration order: the order that decides a root''s owner (its first toucher).
     void collect_components(std::vector<ComponentBase*>& out) {
         for (Subsystem* c : child_ptrs_) {
             if (auto* s = dynamic_cast<System*>(c))
@@ -998,7 +998,6 @@ private:
         b.path_      = path().empty() ? name : path() + "." + name;
         b.name_      = name;
         b.owner_     = this;
-        b.transient_ = tr;
         const bool has_n = props.has_property<property::run_n>();
         const bool once  = props.has_property<property::do_once>();
         b.run_explicit_  = has_n || once;

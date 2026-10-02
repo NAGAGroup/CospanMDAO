@@ -1,5 +1,6 @@
-// ChunkedSystem replay: the switch, the hooks and the legacy path (C2b). The oracle, the cache validity and the
-// zero-event window are in test_chunked.cpp and test_ragged_ties.cpp, next to the models they use.
+// ChunkedSystem topology cache: the one full-pass build, the hooks and the resize counter. The comparison with the
+// unchunked twin, the cache validity and the zero-event window are in test_chunked.cpp and test_ragged_ties.cpp,
+// next to the models they use.
 
 #include <cstddef>
 #include <cstdint>
@@ -103,30 +104,40 @@ public:
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(out_.shape(), {in_}, {out_}, {}); }
 };
+void fill_inner(cs::System& s) {
+    s.add_subsystem<A>("a");
+    s.add_subsystem<B>("b");
+    s.connect("a.t", "b.in");
+    s.promote<DType::f32, 2>("a.in", "in");  // the interface of an opaque chunked system
+    s.promote<DType::f32, 1>("b.y", "y");
+}
 class Inner : public cs::ChunkedSystem {
 public:
     explicit Inner(std::size_t budget) : cs::ChunkedSystem(budget) {}
-    void setup() override {
-        add_subsystem<A>("a");
-        add_subsystem<B>("b");
-        connect("a.t", "b.in");
-        promote<DType::f32, 2>("a.in", "in");  // the interface of an opaque chunked system
-        promote<DType::f32, 1>("b.y", "y");
-    }
+    void setup() override { fill_inner(*this); }
 };
-class Top : public cs::System {
+/// The unchunked twin: the same subtree in a plain System.
+class InnerPlain : public cs::System {
+public:
+    explicit InnerPlain(std::size_t /*budget*/) {}
+    void setup() override { fill_inner(*this); }
+};
+template <class InnerT>
+class TopT : public cs::System {
     std::size_t n_, budget_;
 
 public:
-    Top(std::size_t n, std::size_t budget) : n_{n}, budget_{budget} {}
+    TopT(std::size_t n, std::size_t budget) : n_{n}, budget_{budget} {}
     void setup() override {
         add_subsystem<Prod>("prod", n_);
-        add_subsystem<Inner>("inner", budget_);
+        add_subsystem<InnerT>("inner", budget_);
         add_subsystem<Cons>("cons");
         connect("prod.x", "inner.in");
         connect("inner.y", "cons.in");  // y crosses the boundary: only t (16 B per index) is internal
     }
 };
+using Top      = TopT<Inner>;
+using PlainTop = TopT<InnerPlain>;
 
 std::vector<float> y_of(cs::Model& m) {
     auto v = m.view_output<DType::f32, 1>("cons.out");
@@ -141,30 +152,25 @@ cs::diag::EventCounts fwd(cs::Model& m) {
 
 }  // namespace trp
 
-TEST_CASE("Replay: set_replay(false) is the legacy path (a pass per chunk, two full passes) and agrees bitwise", "[chunked][replay]") {
+TEST_CASE("Replay: the topology is built by ONE full pass, cached, and the output equals the unchunked twin's", "[chunked][replay]") {
     constexpr std::size_t n = 10, budget = 56;  // 16 B per index: chunks of 3, 3, 3, 1
-    cs::Model             m = cs::create_model<trp::Top>(default_config(), n, budget);
+    cs::Model             plain = cs::create_model<trp::PlainTop>(default_config(), n, std::size_t{0});
+    plain.setup();
+    trp::fwd(plain);
+    const auto want = trp::y_of(plain);
+
+    cs::Model m = cs::create_model<trp::Top>(default_config(), n, budget);
     m.setup();
     auto& sys = dynamic_cast<cs::ChunkedSystem&>(m.get_subsystem("inner"));
-    CHECK(sys.replay());  // the default
+    CHECK_FALSE(sys.topology_cached());
     const auto a = trp::fwd(m);
-    const auto want = trp::y_of(m);
-    CHECK(a.full_passes == 1);
+    CHECK(a.full_passes == 1);  // the one build
     CHECK(sys.topology_cached());
-    CHECK(trp::fwd(m).full_passes == 0);
-
-    sys.set_replay(false);
-    CHECK_FALSE(sys.topology_cached());
-    const auto l = trp::fwd(m);
-    CHECK(l.full_passes == 2);  // before the loop and after it
-    CHECK(cs::diag::last_window().resolve_shapes > 0);  // the shapes are resolved per chunk
     CHECK(trp::y_of(m) == want);
-    CHECK_FALSE(sys.topology_cached());
-
-    sys.set_replay(true);
-    CHECK(trp::fwd(m).full_passes == 1);  // rebuilt
-    CHECK(trp::fwd(m).full_passes == 0);
-    CHECK(trp::y_of(m) == want);
+    for (int rep = 0; rep < 2; ++rep) {  // unchanged dependencies: no pass, same values
+        CHECK(trp::fwd(m).full_passes == 0);
+        CHECK(trp::y_of(m) == want);
+    }
 }
 
 TEST_CASE("Replay: the before-launch hook sees every chunk's cached shape and leading range", "[chunked][replay]") {
@@ -197,19 +203,15 @@ TEST_CASE("Replay: the before-launch hook sees every chunk's cached shape and le
 }
 
 
-TEST_CASE("Replay: the resize counter is 0 in a replay window and counts the per-chunk resizes of the legacy path", "[chunked][replay][diag]") {
-    constexpr std::size_t n = 10, budget = 56;  // chunks of 3, 3, 3, 1
+TEST_CASE("Replay: the resize counter is 0 in the chunk loop's window and a chunked run keeps the chunk capacity", "[chunked][replay][diag]") {
+    constexpr std::size_t n = 10, budget = 56;  // chunks of 3, 3, 3, 1; t is [N,4] f32: 16 B per index
     cs::Model             m = cs::create_model<trp::Top>(default_config(), n, budget);
     m.setup();
     auto& sys = dynamic_cast<cs::ChunkedSystem&>(m.get_subsystem("inner"));
-    for (int rep = 0; rep < 2; ++rep) {
+    for (int rep = 0; rep < 3; ++rep) {
         trp::fwd(m);
         CHECK(cs::diag::last_window().resizes == 0);
+        // the internal root's storage holds exactly the largest chunk (3 rows of 4), never the whole run
+        CHECK(sys.entry_at("a.t").capacity_elems() == 3 * 4);
     }
-    sys.set_replay(false);
-    trp::fwd(m);
-    CHECK(cs::diag::last_window().resizes > 0);  // legacy: a held root is resized to each chunk
-    sys.set_replay(true);
-    trp::fwd(m);
-    CHECK(cs::diag::last_window().resizes == 0);
 }

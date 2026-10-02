@@ -35,7 +35,7 @@
 //     6. the ranges are cleared and the shapes restored to the full range.
 //   Children never see a or b.
 //
-//   TOPOLOGY CACHE AND REPLAY (the default; set_replay(false) runs the per-chunk resolution above unchanged):
+//   TOPOLOGY CACHE AND REPLAY:
 //     the first forward does the full-range pass and plans the chunks as above, and records what that pass
 //     depended on: the VALUES it read (root, write epoch, and a copy of the values) and the SHAPES of every
 //     outside boundary root (root, shape version), plus N. It then captures, for every inside entry and every
@@ -51,7 +51,6 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <cstdlib>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -105,26 +104,14 @@ class ChunkedSystem : public System {
         std::vector<ShapeDep>  shapes;
     };
     Topology                             topo_;
-    bool                                 replay_    = default_replay_ref();
     bool                                 recording_ = false;
     std::vector<detail::IOEntry*>        dep_roots_;
     std::vector<const detail::IOEntry*>  shape_roots_;
-    mutable std::size_t                 dep_checks_ = 0;  ///< how many times the dependency self-check ran (a test hook)
     std::vector<detail::AliasEvaluator::DepRead> reads_;  ///< the reads of the recording pass with their readers (self-check)
     std::function<void(std::size_t)>     chunk_hook_, chunk_post_hook_;
     std::vector<System*>                 systems_;       ///< this system and every descendant System (chunk_replay_ is set on them)
     std::vector<std::pair<detail::IOEntry*, ComponentBase*>> internal_ties_;  ///< internal tie roots, with the first Component that uses each
     detail::DeferSink                    sink_;  ///< decrements and run-counter moves, deferred to after the last chunk (D141)
-
-    /// The process-wide default of set_replay: true, unless the environment has COSPAN_CHUNK_LEGACY=1 (the
-    /// whole test suite can be run on the legacy path that way).
-    static bool& default_replay_ref() {
-        static bool v = [] {
-            const char* e = std::getenv("COSPAN_CHUNK_LEGACY");
-            return !(e != nullptr && e[0] == '1');
-        }();
-        return v;
-    }
 
 public:
     /// `budget_bytes` bounds the sum, over one chunk, of the bytes of the INTERNAL ports.
@@ -135,18 +122,9 @@ public:
     std::size_t budget() const noexcept { return budget_; }
     /// OPAQUE (D140 amendment): from outside, only this system's own promotions are visible.
     bool is_opaque() const noexcept override { return true; }
-    /// true (the default): cache the topology and replay it per chunk; false: the legacy per-chunk resolution.
-    void set_replay(bool on) {
-        replay_      = on;
-        topo_.valid  = false;
-    }
-    bool replay() const noexcept { return replay_; }
-    static void set_default_replay(bool on) { default_replay_ref() = on; }
-    static bool default_replay() { return default_replay_ref(); }
-    /// TEST HOOKS. `before_launch`: called (replay path only) for every chunk after its shapes are applied from the
-    /// cache and before its Components run. `after_chunk`: called after the chunk's Components have run (wrappers
-    /// pointed), on BOTH paths: this is where a test captures the shapes and pointers of every inside entry. Both
-    /// receive the chunk index.
+    /// TEST HOOKS. `before_launch`: called for every chunk after its shapes are applied from the cache and before
+    /// its Components run. `after_chunk`: called after the chunk's Components have run (wrappers pointed): this is
+    /// where a test captures the shapes and pointers of every inside entry. Both receive the chunk index.
     void set_chunk_hooks(std::function<void(std::size_t)> before_launch, std::function<void(std::size_t)> after_chunk) {
         chunk_hook_      = std::move(before_launch);
         chunk_post_hook_ = std::move(after_chunk);
@@ -162,8 +140,6 @@ public:
             if (seen.insert(r).second) out.push_back(r);
         return out;
     }
-    /// How many times the dependency self-check (every recorded dependency is internal or a boundary root) ran.
-    std::size_t dependency_checks() const noexcept { return dep_checks_; }
     /// Whether the cached topology is currently held (a test hook).
     bool topology_cached() const noexcept { return topo_.valid; }
     /// The number of chunks the last forward ran (0 before the first, and for N = 0).
@@ -177,8 +153,7 @@ public:
             resolve_outside_ties(false);  // their shapes are known before the chunk length is
             const std::size_t n = leading_length();
             known_n             = n;
-            const bool replay   = replay_;
-            if (replay && topology_valid(n)) {
+            if (topology_valid(n)) {
                 // The recorded dependencies are unchanged: no full pass, no planning. The entries are put back at
                 // the full range (they are, after the last forward; this makes sure).
                 for (EntryTopo& t : topo_.entries) t.e->apply_shape(t.full);
@@ -186,46 +161,32 @@ public:
                 last_chunks_ = chunks.size();
             } else {
                 topo_.valid = false;
-                recording_  = replay;
+                recording_  = true;
                 prepare_full(n, chunks);
                 recording_ = false;
-                if (replay) build_topology(n, chunks);
+                build_topology(n, chunks);
             }
             for (Boundary& b : boundary_)
                 if (b.member != nullptr || b.root->chunk_outside_tie_) allocate_rerooted(*b.root);
             hold_internal(chunks);
-            // Replay: the internal roots' device metadata is uploaded ONCE, at the full range, before the window
+            // The internal roots' device metadata is uploaded ONCE, at the full range, before the window
             // (version-gated: unchanged metadata is not sent again). Per chunk only meta_shift_ moves.
-            if (replay)
-                for (detail::IOEntry* r : internal_) r->upload_ragged(q());
+            for (detail::IOEntry* r : internal_) r->upload_ragged(q());
             sink_.active = true;  // the chunk loop: decrements and counter moves are deferred
             diag::window_begin();
-            if (replay)
-                run_replay_loop(chunks);
-            else
-                run_legacy_loop(chunks);
+            run_chunks(chunks);
             diag::window_end();
-            if (replay) {
-                for (EntryTopo& t : topo_.entries) t.e->apply_shape(t.full);  // the whole run again, no second pass
-                for (detail::IOEntry* r : internal_) r->meta_shift_ = 0;
-                for (Boundary& b : boundary_)
-                    for (detail::IOEntry* p : b.peers) detail::LeadingRangeAccess::clear_no_refresh(*p);
-                finish_lifetimes();  // the deferred decrements, once; ONE queue wait if any root reaches 0
-                release_held();
-                clear_dim0();
-            } else {
-                set_dim0(n);  // clearing a range re-resolves the peer's shape: at the whole run's length
-                clear_ranges();
-                finish_lifetimes();
-                release_held();
-                full_pass();     // the shapes of the whole run again, for views from the host
-                clear_ranges();
-                clear_dim0();
-            }
+            for (EntryTopo& t : topo_.entries) t.e->apply_shape(t.full);  // the whole run again, no second pass
+            for (detail::IOEntry* r : internal_) r->meta_shift_ = 0;
+            for (Boundary& b : boundary_)
+                for (detail::IOEntry* p : b.peers) detail::LeadingRangeAccess::clear_no_refresh(*p);
+            finish_lifetimes();  // the deferred decrements, once; ONE queue wait if any root reaches 0
+            release_held();
+            clear_dim0();
         } catch (...) {
             topo_.valid = false;  // whatever failed, the next forward builds the topology again
             recording_  = false;
-            set_replay_flags(false);
+            use_cached_shapes(false);
             for (ComponentBase* c : comps_) {
                 c->replay_         = false;
                 c->ev_.dep_recorder_   = nullptr;
@@ -354,7 +315,7 @@ private:
     }
 
     // ---- the topology cache -----------------------------------------------------------------
-    /// The legacy pre-loop steps up to (not including) the allocation of the re-rooted outputs: dim 0 of every
+    /// The pre-loop steps up to (not including) the allocation of the re-rooted outputs: dim 0 of every
     /// inside port, the re-rooted free inputs, the full-range pass, the init of an input whose shape the pass
     /// changed, and the chunk plan.
     void prepare_full(std::size_t n, Chunks& chunks) {
@@ -431,7 +392,6 @@ private:
     /// OPACITY self-check: every dependency the full pass recorded is an INTERNAL root or a boundary root (one reached
     /// through a promotion, or an outside tie of this system). Anything else means something read across the boundary.
     void check_dependencies() const {
-        ++dep_checks_;
         for (const detail::AliasEvaluator::DepRead& r : reads_) {
             const detail::IOEntry* root = r.root->root();
             bool                   ok   = std::find(internal_.begin(), internal_.end(), root) != internal_.end();
@@ -496,9 +456,9 @@ private:
         return true;
     }
 
-    void run_replay_loop(const Chunks& chunks) {
+    void run_chunks(const Chunks& chunks) {
         for (ComponentBase* c : comps_) c->replay_ = true;
-        set_replay_flags(true);  // the Systems too: their alias materialization takes the cached shapes
+        use_cached_shapes(true);  // the Systems too: their alias materialization takes the cached shapes
         try {
             for (std::size_t ci = 0; ci < chunks.size(); ++ci) {
                 const auto [a, b] = chunks[ci];
@@ -516,25 +476,11 @@ private:
             }
         } catch (...) {
             for (ComponentBase* c : comps_) c->replay_ = false;
-            set_replay_flags(false);
+            use_cached_shapes(false);
             throw;
         }
         for (ComponentBase* c : comps_) c->replay_ = false;
-        set_replay_flags(false);
-    }
-
-    void run_legacy_loop(const Chunks& chunks) {
-        for (std::size_t ci = 0; ci < chunks.size(); ++ci) {
-            const auto [a, b] = chunks[ci];
-            set_dim0(b - a, a);
-            for (Boundary& bd : boundary_)
-                for (detail::IOEntry* p : bd.peers) detail::LeadingRangeAccess::set(*p, a, b);
-            // Each chunk is a fresh computation: an internal free input takes its init again.
-            for (detail::IOEntry* r : internal_)
-                if (r->io_kind_ == IOKind::input) r->init_pending_ = true;
-            System::run_compute_forward();
-            if (chunk_post_hook_) chunk_post_hook_(ci);
-        }
+        use_cached_shapes(false);
     }
 
     // ---- the per-forward steps ---------------------------------------------------------------
@@ -616,7 +562,7 @@ private:
         for (Subsystem* c : s.child_ptrs_)
             if (auto* sub = dynamic_cast<System*>(c)) collect_systems(*sub);
     }
-    void set_replay_flags(bool on) {
+    void use_cached_shapes(bool on) {
         for (System* s : systems_) s->chunk_replay_ = on;
     }
 
@@ -656,15 +602,6 @@ private:
     /// that used to be its root as soon as that entry's Component has resolved.
     void full_pass() {
         diag::count_full_passes();
-        // The pass resolves shapes at the FULL range. An internal root that stays allocated across forwards (D141)
-        // keeps its chunk capacity: its storage is not resized to the whole run here.
-        for (detail::IOEntry* r : internal_) r->resize_frozen_ = true;
-        struct Unfreeze {
-            ChunkedSystem& s;
-            ~Unfreeze() {
-                for (detail::IOEntry* r : s.internal_) r->resize_frozen_ = false;
-            }
-        } unfreeze{*this};
         for (Boundary& b : boundary_)
             if (b.member == nullptr)
                 for (detail::IOEntry* p : b.peers) detail::LeadingRangeAccess::set(*p, 0, b.root->extents()[0]);
@@ -739,33 +676,20 @@ private:
         return n;
     }
 
-    /// Dim 0 of every port of every inside component is the current chunk length (D140 B3).
-    /// `start` is the first index of the chunk (0 for the whole run). An INTERNAL tie alias root (declared by a
-    /// descendant, owning no port) has no Component entry to carry the override: it gets it too, and slices
-    /// a host per-index array by [start, start + n).
-    void set_dim0(std::size_t n, std::size_t start = 0) {
+    /// Dim 0 of every port of every inside component is N, the length of the whole run, during the full pass (D140
+    /// B3). An INTERNAL tie alias root (declared by a descendant, owning no port) has no Component entry to carry the
+    /// override: it gets it too.
+    void set_dim0(std::size_t n) {
         for (ComponentBase* c : comps_)
-            for (detail::IOEntry* e : c->order_) {
-                e->dim0_override_ = n;
-                e->dim0_start_    = start;  // a host per-index array on a port is cut to [start, start + n)
-            }
+            for (detail::IOEntry* e : c->order_) e->dim0_override_ = n;
         for (detail::IOEntry* r : internal_)
-            if (r->alias_shape_) {
-                r->dim0_override_ = n;
-                r->dim0_start_    = start;
-            }
+            if (r->alias_shape_) r->dim0_override_ = n;
     }
     void clear_dim0() {
         for (ComponentBase* c : comps_)
-            for (detail::IOEntry* e : c->order_) {
-                e->dim0_override_.reset();
-                e->dim0_start_ = 0;
-            }
+            for (detail::IOEntry* e : c->order_) e->dim0_override_.reset();
         for (detail::IOEntry* r : internal_)
-            if (r->alias_shape_) {
-                r->dim0_override_.reset();
-                r->dim0_start_ = 0;
-            }
+            if (r->alias_shape_) r->dim0_override_.reset();
     }
 
     /// Pricing from the declared shape rules (resolved over the full range) and the greedy scan.

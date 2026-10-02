@@ -21,7 +21,7 @@
 
 #include <naga/cospan/cospan.hpp>
 
-#include "replay_oracle.hpp"
+#include "chunk_capture.hpp"
 #include "support.hpp"
 
 namespace cs = naga::cospan;
@@ -967,6 +967,34 @@ TEST_CASE("Chunked: an internal free input takes its init again in every chunk",
     }
 }
 
+TEST_CASE("Chunked: the init of an internal free input runs once per chunk per forward, at every budget", "[chunked][held]") {
+    constexpr std::size_t n = 10;
+    constexpr int         forwards = 3;
+    // 4 B of internal port per index, so a chunk holds budget / 4 indices and a forward runs ceil(10 / (budget / 4)) chunks:
+    //   budget 1000 -> 250 per chunk, 1 chunk;  40 -> 10, 1;  16 -> 4, 3 (4 + 4 + 2);  12 -> 3, 4;  4 -> 1, 10
+    struct Case {
+        std::size_t budget, rows, chunks;
+    };
+    for (const Case c : {Case{1000, 10, 1}, Case{40, 10, 1}, Case{16, 4, 3}, Case{12, 3, 4}, Case{4, 1, 10}}) {
+        INFO("budget " << c.budget);
+        auto      calls = std::make_shared<int>(0);
+        cs::Model m     = cs::create_model<tch::BiasTop>(default_config(), n, c.budget, calls);
+        m.setup();
+        for (int f = 0; f < forwards; ++f) {
+            const auto out = tch::forward_out(m);
+            CHECK(tch::chunks_of(m) == c.chunks);
+            CHECK(*calls == static_cast<int>(c.chunks) * (f + 1));  // never reset: chunks per forward x forwards so far
+            REQUIRE(out.size() == n);
+            for (std::size_t i = 0; i < n; ++i) {
+                // the init fills its call number; index i is in chunk i / rows of this forward, whose call is f * chunks + chunk + 1
+                const float bias = static_cast<float>(static_cast<std::size_t>(f) * c.chunks + i / c.rows + 1);
+                CHECK(out[i] == 2.0f * (0.5f * static_cast<float>(i) + bias) + 1.0f);
+            }
+        }
+        CHECK(*calls == static_cast<int>(c.chunks) * forwards);
+    }
+}
+
 
 // ---- D140 B3: the framework sets dim 0 of every inside port ---------------------------------------------------
 namespace tch {
@@ -1120,7 +1148,7 @@ TEST_CASE("Chunked: the framework sets dim 0 of every inside port (fixed, FromIn
         }
     }
     // a chunked system whose internal port has a fixed dim 0 that is not N, with no consumer
-    // D142: that is a constraint violation now, reported at the full length (it used to be overridden silently)
+    // D142: that is a constraint violation, reported at the full length
     cs::Model odd = cs::create_model<tch::OddTop>(default_config());
     odd.setup();
     tch::expect_throws([&] { (void)tch::forward_out(odd); }, {"shape mismatch", "dimension 0 of 'inner.g.out'", "fixed = 13", "full length 8"});
@@ -1138,7 +1166,7 @@ TEST_CASE("Chunked: a component reused outside a chunked system keeps its declar
 
 
 // =============================================================================================================================
-// The replay ORACLE (C2b): the legacy per-chunk resolution and the cached replay must agree bitwise and shape by shape.
+// Chunked runs against the unchunked twin (the same Top with a plain System), forward for forward, bitwise.
 // =============================================================================================================================
 namespace tch {
 std::vector<float> out_cons(cs::Model& m) {
@@ -1147,58 +1175,59 @@ std::vector<float> out_cons(cs::Model& m) {
 }
 }  // namespace tch
 
-TEST_CASE("Replay oracle: dense chain (with and without the inside output promoted out)", "[chunked][replay]") {
+TEST_CASE("Chunked vs plain: dense chain (with and without the inside output promoted out)", "[chunked][replay]") {
     constexpr std::size_t n = 10;
     for (const bool prom : {false, true})
         for (const std::size_t budget : {std::size_t{160}, std::size_t{48}, std::size_t{16}}) {
             INFO("promote " << prom << ", budget " << budget);
-            tor::oracle("inner", [&] { return cs::create_model<tch::DenseTop<tch::InnerChunk>>(default_config(), n, budget, prom); },
-                        [prom](cs::Model& m) {
-                            std::vector<float> out = tch::out_cons(m);
-                            if (prom) {  // the promoted [N,4] root, whole
-                                auto t = m.view_output<DType::f32, 2>("inner.t");
-                                out.insert(out.end(), t.span().begin(), t.span().end());
-                            }
-                            return out;
-                        });
+            const auto caps = tcc::against_plain(
+                "inner", [&] { return cs::create_model<tch::DenseTop<tch::InnerChunk>>(default_config(), n, budget, prom); },
+                [&] { return cs::create_model<tch::DenseTop<tch::InnerPlain>>(default_config(), n, std::size_t{0}, prom); },
+                [prom](cs::Model& m) {
+                    std::vector<float> out = tch::out_cons(m);
+                    if (prom) {  // the promoted [N,4] root, whole
+                        auto t = m.view_output<DType::f32, 2>("inner.t");
+                        out.insert(out.end(), t.span().begin(), t.span().end());
+                    }
+                    return out;
+                });
+            // by hand: t is 16 B per index, so 10 / 3 / 1 indices fit the budgets 160 / 48 / 16
+            if (!prom)
+                for (const auto& c : caps) CHECK(c.chunks.size() == (budget == 160 ? 1u : budget == 48 ? 4u : 10u));
         }
 }
 
-TEST_CASE("Replay oracle: a promoted free input and an init between forwards", "[chunked][replay]") {
+TEST_CASE("Chunked vs plain: a promoted free input and an init between forwards", "[chunked][replay]") {
     constexpr std::size_t n = 10;
-    tor::oracle("inner", [&] { return cs::create_model<tch::PromTop<tch::PromInnerChunk>>(default_config(), n, std::size_t{48}); }, tch::out_cons, 3,
-                [&](cs::Model& m, int f) {
-                    std::vector<float> w(n * 3);
-                    for (std::size_t q = 0; q < w.size(); ++q) w[q] = static_cast<float>(f) * static_cast<float>(q % 7) + 0.25f;
-                    m.init_input("inner.w", cs::init::from_host(w));
-                });
+    tcc::against_plain("inner", [&] { return cs::create_model<tch::PromTop<tch::PromInnerChunk>>(default_config(), n, std::size_t{48}); },
+                       [&] { return cs::create_model<tch::PromTop<tch::PromInnerPlain>>(default_config(), n, std::size_t{0}); },
+                       tch::out_cons, 3, [&](cs::Model& m, int f) {
+                           std::vector<float> w(n * 3);
+                           for (std::size_t q = 0; q < w.size(); ++q) w[q] = static_cast<float>(f) * static_cast<float>(q % 7) + 0.25f;
+                           m.init_input("inner.w", cs::init::from_host(w));
+                       });
 }
 
-TEST_CASE("Replay oracle: ragged scratch (FromInputDim, FromInputValues, FromSourceDim), counts changing, zeros", "[chunked][replay]") {
+TEST_CASE("Chunked vs plain: ragged scratch (FromInputDim, FromInputValues, unspecified), counts changing, zeros", "[chunked][replay]") {
     const std::vector<std::uint32_t> c1{3, 0, 2, 4, 0, 1, 2, 3}, c2{0, 4, 4, 1, 0, 0, 2, 1}, c0(8, 0);
     for (const std::size_t budget : {std::size_t{64}, std::size_t{100}, std::size_t{128}, std::size_t{1000}}) {
         INFO("budget " << budget);
-        tor::oracle("inner", [&] { return cs::create_model<tch::RaggedTop<tch::RInnerChunk>>(default_config(), c1, budget); }, tch::out_cons, 4,
-                    [&](cs::Model& m, int f) {
-                        m.init_input("prod.raw", cs::init::from_host(f == 1 ? c2 : f == 2 ? c0 : c1));
-                    });
+        tcc::against_plain("inner", [&] { return cs::create_model<tch::RaggedTop<tch::RInnerChunk>>(default_config(), c1, budget); },
+                           [&] { return cs::create_model<tch::RaggedTop<tch::RInnerPlain>>(default_config(), c1, std::size_t{0}); },
+                           tch::out_cons, 4, [&](cs::Model& m, int f) {
+                               m.init_input("prod.raw", cs::init::from_host(f == 1 ? c2 : f == 2 ? c0 : c1));
+                           });
     }
 }
 
-TEST_CASE("Replay oracle: an internal free input that takes its init in every chunk", "[chunked][replay]") {
-    constexpr std::size_t n = 10;
-    tor::oracle("inner",
-                [&] { return cs::create_model<tch::BiasTop>(default_config(), n, std::size_t{12}, std::make_shared<int>(0)); },
-                tch::out_cons, 3);
-}
-
-TEST_CASE("Replay oracle: dim 0 rules (fixed, FromInput)", "[chunked][replay]") {
+TEST_CASE("Chunked vs plain: dim 0 rules (fixed, FromInput)", "[chunked][replay]") {
     constexpr std::size_t n = 10;
     for (const int mode : {0, 1})
         for (const std::size_t budget : {std::size_t{36}, std::size_t{12}, std::size_t{1000}}) {
             INFO("mode " << mode << ", budget " << budget);
-            tor::oracle("inner", [&] { return cs::create_model<tch::MixTop<tch::MixChunk>>(default_config(), n, budget, mode, n); },
-                        tch::out_cons);
+            tcc::against_plain("inner", [&] { return cs::create_model<tch::MixTop<tch::MixChunk>>(default_config(), n, budget, mode, n); },
+                               [&] { return cs::create_model<tch::MixTop<tch::MixPlain>>(default_config(), n, std::size_t{0}, mode, n); },
+                               tch::out_cons);
         }
 }
 
