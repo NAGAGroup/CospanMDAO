@@ -637,7 +637,7 @@ private:
                 ev_.apply_alias_root(root);
             root.allocate_if_absent(queue_ref());
             if (root.kind() == IOKind::input && root.init_pending()) {
-                detail::apply_root_init(root, queue_ref());
+                detail::apply_root_init(root, queue_ref(), !chunk_replay_);
                 root.clear_init_pending();
             }
             if (!chunk_replay_) root.upload_ragged(queue_ref());
@@ -1212,11 +1212,13 @@ private:
                                                 std::to_string(is->shape()->rank) + " shape");
                 for (int d = 0; d < e->rank(); ++d) {
                     const detail::DimRecord& r = e->dim(d);
-                    if (r.how == detail::DimRecord::How::fixed && r.extent != is->shape()->extents[static_cast<std::size_t>(d)])
+                    const bool init_per = d >= 1 && is->shape()->per[static_cast<std::size_t>(d)];
+                    if (r.how == detail::DimRecord::How::fixed && (init_per || r.extent != is->shape()->extents[static_cast<std::size_t>(d)]))
                         throw std::invalid_argument("naga::cospan: shape mismatch: dimension " + std::to_string(d) + " of '" +
                                                     e->full_path() + "' is fixed = " + std::to_string(r.extent) +
                                                     " but its initializer gives " +
-                                                    std::to_string(is->shape()->extents[static_cast<std::size_t>(d)]));
+                                                    (init_per ? std::string{"a per-index dimension"}
+                                                              : std::to_string(is->shape()->extents[static_cast<std::size_t>(d)])));
                 }
             }
 

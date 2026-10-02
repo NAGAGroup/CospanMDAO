@@ -658,6 +658,9 @@ private:
                                                     " (its producer must run before this chunked system and resolve it)");
             } else if (b.root->kind() == IOKind::input && b.member->dim(0).how == detail::DimRecord::How::fixed) {
                 l = b.member->dim(0).extent;
+            } else if (b.root->kind() == IOKind::input && b.member->dim(0).how == detail::DimRecord::How::unspecified &&
+                       b.root->init_spec() && b.root->init_spec()->shape() && b.root->init_spec()->shape()->rank == b.root->rank()) {
+                l = b.root->init_spec()->shape()->extents[0];  // a free input shaped by its init: the init gives the length
             } else {
                 continue;  // an inside output, or a value-driven input: no length of its own
             }

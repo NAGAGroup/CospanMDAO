@@ -22,6 +22,7 @@ set(COSPAN_TEST_SOURCES
     test_chunked.cpp
     test_component.cpp
     test_flavors.cpp
+    test_init_shapes.cpp
     test_leading_range.cpp
     test_model.cpp
     test_ragged.cpp

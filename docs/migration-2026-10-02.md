@@ -81,6 +81,17 @@ init_input("x", cs::init::custom_host<DType::f32, 2>(fn, {n, m}));
 
 The shape-less forms (`fill(v)`, `zero()`, `custom(fn)`, `custom_host(fn)`) stay valid when every dim of the input is specified. The initializer's rank must equal the input's; a fixed dim must equal the initializer's.
 
+The shape argument is a `cs::init::Shape`. Vector shapes still work: `{n, m}` and a `std::vector<std::size_t>` convert to a `Shape` implicitly, which is the ordinary way to spell it. A ragged shape is `cs::init::ragged(n, d1[, d2])`, each `di` one extent or a vector of `n` extents (one per index):
+
+```cpp
+init_input("x", cs::init::from_host(data, cs::init::ragged(n, counts)));   // [n, counts[i]]; data.size() = sum(counts)
+init_input("y", cs::init::fill(0.0f, cs::init::ragged(n, counts, 3)));      // [n, counts[i], 3]
+```
+
+`from_host(data, ragged(...))` needs `data.size()` to equal the sum of the block sizes. A free ragged input with unspecified dims takes its per-index arrays from the init, also inside a `ChunkedSystem` (a promoted free input gives the chunk length from the init's dim 0).
+
+**Inits can now throw where they did not.** The init's shape, when it has one, is checked against the resolved root on the rank and on every dim when the init is applied, at the full range. Before, only the rank and the fixed dims were checked, and only at setup. Now an init whose shape disagrees with an INHERITED (`FromInputDim`), VALUE-DRIVEN (`FromInput`, `FromInputValues`) or PER-INDEX dim throws `std::invalid_argument` naming both sides ("init for 'x' has dimension 1 = [3,0,4] but 'x' resolved dimension 1 (PerIndex) = [3,1,4]"). An init that carried a wrong shape for such a dim, and was silently accepted, must be corrected. `from_host(data)` without a shape is not affected: it describes a rank-1 root only, and a rank-2 or rank-3 root takes it by its size.
+
 ## 6. `tie_inputs`' shape argument is optional
 
 `tie_inputs<DT, R>({members...}, "name")` leaves the tie unspecified: it takes its shape from the output connected into it, else from an `init_input` on the tie (with a shape), else the free-input setup error. `tie_outputs` still requires a shape (`fixed`, `dims`, `from_output_shape`, `from_output_values`, `from_input_shape`).

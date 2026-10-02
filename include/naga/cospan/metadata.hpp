@@ -322,10 +322,28 @@ struct MarkRecord {
 /// The initial value of a free input root (r01 §4.4, D138): type-erased, made
 /// by the cs::init factories (init.hpp). apply() runs on a root that has just
 /// been allocated from nothing; the caller refreshes the other placements.
-/// The shape an initializer carries (D142): extents 1-padded, and the rank they were given for.
+/// The shape an initializer carries (D142): extents 1-padded, and the rank they were given for. Each dim >= 1 is a
+/// scalar (extents[d]) or a per-index vector (per[d], per_index[d]: one extent per index of dim 0, extents[d] = 0);
+/// dim 0 is always a scalar. `flat`: the shape of bare data (from_host(vec)): rank 1, it only describes a rank-1 root.
 struct InitShape {
-    std::array<std::size_t, 3> extents{1, 1, 1};
-    int                        rank = 0;
+    std::array<std::size_t, 3>              extents{1, 1, 1};
+    int                                     rank = 0;
+    std::array<bool, 3>                     per{false, false, false};
+    std::array<std::vector<std::size_t>, 3> per_index{};
+    bool                                    flat = false;
+
+    bool ragged() const noexcept { return per[1] || per[2]; }
+    /// The number of elements: the product of the extents, or the sum of the block sizes of a ragged shape.
+    std::size_t elements() const {
+        if (!ragged()) return extents[0] * extents[1] * extents[2];
+        std::size_t total = 0;
+        for (std::size_t i = 0; i < extents[0]; ++i) {
+            std::size_t block = 1;
+            for (std::size_t d = 1; d < 3; ++d) block *= per[d] ? per_index[d][i] : extents[d];
+            total += block;
+        }
+        return total;
+    }
 };
 
 class InitSpec {
@@ -517,11 +535,27 @@ public:
     }
     /// The runtime leading range [a, b) this connected input sees of its root (D140 B1); none = whole.
     std::optional<std::pair<std::size_t, std::size_t>> leading_range() const { return lead_; }
+    /// A root a ChunkedSystem made at its own level (D140 B2).
+    bool is_rerooted() const noexcept { return chunk_rerooted_; }
     /// The raw per-index array of dimension d (empty: scalar). Internal.
     const std::vector<std::size_t>& per_index_raw(int d) const { return dims_[static_cast<std::size_t>(d)].per_index; }
     const DimRecord& dim(int d) const {
         if (d < 0 || d >= rank_) throw std::out_of_range("naga::cospan: dim index >= rank");
         return dims_[static_cast<std::size_t>(d)];
+    }
+    /// How this entry's dimension d was declared, for an error message.
+    std::string declared_rule(int d) const {
+        const DimRecord& r = dims_[static_cast<std::size_t>(d)];
+        switch (r.how) {
+            case DimRecord::How::fixed: return "fixed";
+            case DimRecord::How::unspecified: return "unspecified";
+            case DimRecord::How::from_input_dim: return "FromInputDim{'" + r.input + "', " + std::to_string(r.dim) + "}";
+            case DimRecord::How::from_input: return "FromInput{'" + r.input + "', " + std::to_string(r.value_index) + "}";
+            case DimRecord::How::per_index_host: return "PerIndex";
+            case DimRecord::How::per_index_from_input:
+                return "FromInputValues{'" + r.input + "', " + std::to_string(r.value_index) + "}";
+        }
+        return "?";
     }
     bool is_dynamic() const noexcept {
         for (const DimRecord& r : dims_)
@@ -1094,9 +1128,22 @@ public:
             switch (r.how) {
                 case DimRecord::How::fixed: break;
                 case DimRecord::How::unspecified:
-                    if (is_root()) {  // a free input root: its initializer's shape (B3 guarantees one exists at setup)
-                        if (const auto& is = init_spec(); is && is->shape() && is->shape()->rank == rank())
-                            r.extent = is->shape()->extents[static_cast<std::size_t>(d)];
+                    // a free input root, or the inside member of one a ChunkedSystem re-rooted: its initializer's shape
+                    // (B3 guarantees one exists at setup)
+                    if (is_root() || (root()->is_rerooted() && root()->kind() == IOKind::input)) {
+                        if (const auto& is = init_spec(); is && is->shape() && is->shape()->rank == rank()) {
+                            const InitShape&  s = *is->shape();
+                            const auto        u = static_cast<std::size_t>(d);
+                            if (d >= 1 && s.per[u]) {  // a ragged shape: the per-index array of the full range
+                                r.per       = true;
+                                r.per_index = s.per_index[u];
+                                r.extent    = 0;
+                            } else {
+                                r.per = false;
+                                r.per_index.clear();
+                                r.extent = s.extents[u];
+                            }
+                        }
                     } else {  // supplied by the connection, the slice or the tie
                         check_rank();
                         r.extent = source_extent(static_cast<uint8_t>(d));
@@ -1191,20 +1238,6 @@ public:
         resize_storage();
     }
 
-    /// How this entry's dimension d was declared, for an error message.
-    std::string declared_rule(int d) const {
-        const DimRecord& r = dims_[static_cast<std::size_t>(d)];
-        switch (r.how) {
-            case DimRecord::How::fixed: return "fixed";
-            case DimRecord::How::unspecified: return "unspecified";
-            case DimRecord::How::from_input_dim: return "FromInputDim{'" + r.input + "', " + std::to_string(r.dim) + "}";
-            case DimRecord::How::from_input: return "FromInput{'" + r.input + "', " + std::to_string(r.value_index) + "}";
-            case DimRecord::How::per_index_host: return "PerIndex";
-            case DimRecord::How::per_index_from_input:
-                return "FromInputValues{'" + r.input + "', " + std::to_string(r.value_index) + "}";
-        }
-        return "?";
-    }
     /// What supplies the shape of this entry's root, for an error message.
     std::string supplier_str() const {
         const IOEntry& r = *root();

@@ -179,7 +179,13 @@ public:
                     throw std::invalid_argument("naga::cospan: shape mismatch: tie alias '" + a.full_path() + "' has rank " +
                                                 std::to_string(a.rank()) + " but its initializer gives a rank-" +
                                                 std::to_string(is->shape()->rank) + " shape");
-                out.ext = is->shape()->extents;
+                const InitShape& sh = *is->shape();
+                out.ext             = sh.extents;
+                for (std::size_t u = 1; u < 3; ++u)
+                    if (sh.per[u]) {  // a ragged init shape: its per-index array of the full range (cut to the chunk inside one)
+                        out.per[u]       = true;
+                        out.per_index[u] = chunk_slice(a, sh.per_index[u]);
+                    }
                 break;
             }
         }

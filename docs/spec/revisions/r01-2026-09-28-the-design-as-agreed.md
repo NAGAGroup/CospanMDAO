@@ -763,6 +763,31 @@ initializer that gives a shape. Initializers carry shapes:
 `from_host(data, shape)`, `custom(fn, shape)`, `custom_host(fn, shape)`; the
 shape-less forms stay valid when every dim is specified.
 
+**The shape type.** `cs::init::Shape` is what those calls take. It is written as a
+list of extents, `{n, m}`, or a `std::vector<std::size_t>`: both convert to it
+implicitly, as the API's ordinary spelling. A RAGGED shape comes from
+`cs::init::ragged(n, d1[, d2])`: dim 0 is `n`, and each `di` is either one
+extent for every index (a `std::size_t`) or a `std::vector<std::size_t>` of
+exactly `n` extents, one per index (a wrong length throws `std::invalid_argument`
+when the shape is built; `n = 0` is legal). Dim 0 is always a scalar.
+`from_host(data, ragged(...))` requires `data.size()` to equal the SUM of the
+block sizes (the blocks end to end; a size-0 leading dim takes no data), else
+it throws at the call. For a free input with unspecified dims the init's ragged
+shape supplies them: each per-index vector becomes the root's full-range
+per-index host array (cut to the chunk inside a ChunkedSystem, as any host
+array is), and a ChunkedSystem takes its chunk length from it when the
+input is a promoted free input.
+
+**Every dim is checked.** When a free input root's init is applied (at the
+full range only: never per chunk, never in a ChunkedSystem's replay) the
+init's shape, if it has one, is compared with the resolved root on the rank and
+on EVERY dim: fixed, inherited, value-driven, and per-index arrays element
+by element. A mismatch throws `std::invalid_argument` naming both sides, e.g.
+`init for 'x' has dimension 1 = [3,0,4] but 'x' resolved dimension 1 (PerIndex) = [3,1,4]`.
+An init with no shape still needs every dim of the root specified (the setup
+error above). Bare data, `from_host(data)`, describes a rank-1 root only: for a
+rank-2 or rank-3 root it is taken by its size, as before.
+
 Inside a ChunkedSystem dim 0 is supplied by the chunked system (§7.7). A
 SPECIFIED dim 0 is not an error in itself: a fixed one is a constraint checked
 once, against the full length, on the full pass, never per chunk.
@@ -1059,6 +1084,10 @@ namespace naga::cospan::init {
 template <class T> InitSpec fill(T value);                 // every element = value
 InitSpec                    zero();                        // every element = 0
 template <class T> InitSpec from_host(std::vector<T> v);   // element i = v[i]; size = the root's flat size
+// A shape: {n, m}, a std::vector<std::size_t>, or ragged(n, d1[, d2]) (§3.6). fill, zero, from_host, custom and
+// custom_host also take one (fill(v, shape), from_host(v, shape), ...); a ragged from_host needs the sum of the block sizes.
+class Shape;
+Shape ragged(std::size_t n, /* d1 */ std::size_t or std::vector<std::size_t>, /* d2 */ std::size_t or std::vector<std::size_t> = none);
 template <DType DT, int Rank>
 InitSpec custom(std::function<void(sk::queue&, Initializer<DT, Rank>)> fn);   // device-side; the function enqueues on the queue
 template <DType DT, int Rank>

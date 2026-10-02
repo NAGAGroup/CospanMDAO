@@ -19,10 +19,16 @@
 //                               its own kernel on the queue
 //   cs::init::custom_host<DT,R>(fn)  fn(HostViewMut<DT,R>&): host-side, committed on return
 //                               (HostViewMut is only this callback's argument type)
+//
+// A shape (cs::init::Shape) is written as a list of extents, {n, m}, or as a ragged one:
+//   cs::init::ragged(n, d1[, d2])  each di is one extent for every index or a vector of n extents, one per index
+// An initializer that carries a shape supplies a free input's unspecified dimensions, and EVERY dimension of it is
+// checked against the resolved root when it is applied (at the full range): a mismatch throws, naming both sides.
 
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <initializer_list>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -69,9 +75,49 @@ inline void zero_primary(IOEntry& root, sk::queue& q) {
     q.memset_in_order(pl.device, root.storage_on(pl), 0, root.flat_size() * dtype_size(root.dtype()));
 }
 
+inline std::string extents_str(const std::vector<std::size_t>& v) {
+    std::string out = "[";
+    for (std::size_t i = 0; i < v.size(); ++i) out += (i ? "," : "") + std::to_string(v[i]);
+    return out + "]";
+}
+
+/// The shape an init carries against the root's resolved shape: the rank and EVERY dimension (fixed, inherited,
+/// value-driven, per-index element by element). A scalar extent c equals a per-index array of c's. Bare data
+/// (from_host(vec)) describes only a rank-1 root; its size is checked when it is written.
+inline void check_init_shape(const IOEntry& root, const InitShape& s) {
+    if (s.flat && root.rank() != 1) return;
+    const std::string name = root.full_path();
+    if (s.rank != root.rank())
+        throw std::invalid_argument("naga::cospan: init for '" + name + "' has rank " + std::to_string(s.rank) + " but '" + name +
+                                    "' resolved rank " + std::to_string(root.rank()));
+    const std::size_t n = root.extents()[0];
+    for (int d = 0; d < root.rank(); ++d) {
+        const auto        u         = static_cast<std::size_t>(d);
+        const bool        init_per  = d >= 1 && s.per[u];
+        const bool        root_per  = d >= 1 && root.dim_is_per(d);
+        std::vector<std::size_t> init_v, root_v;
+        if (d == 0) {
+            init_v = {s.extents[0]};
+            root_v = {n};
+        } else {
+            init_v = init_per ? s.per_index[u] : std::vector<std::size_t>(s.extents[0], s.extents[u]);
+            root_v = root_per ? root.per_index_extents(d) : std::vector<std::size_t>(n, root.extents()[u]);
+        }
+        if (init_v == root_v) continue;
+        const std::string init_str = init_per ? extents_str(init_v) : std::to_string(s.extents[u]);
+        const std::string root_str = root_per ? extents_str(root_v) : std::to_string(root.extents()[u]);
+        throw std::invalid_argument("naga::cospan: init for '" + name + "' has dimension " + std::to_string(d) + " = " + init_str +
+                                    " but '" + name + "' resolved dimension " + std::to_string(d) + " (" + root.declared_rule(d) +
+                                    ") = " + root_str);
+    }
+}
+
 /// A free input root that its owner has just allocated from nothing: its init, else zeros;
-/// then the other placements follow the primary.
-inline void apply_root_init(IOEntry& root, sk::queue& q) {
+/// then the other placements follow the primary. `full_range`: the root holds the whole run (not one chunk of a
+/// ChunkedSystem's replay), so the init's shape is checked against it.
+inline void apply_root_init(IOEntry& root, sk::queue& q, bool full_range = true) {
+    if (full_range)
+        if (const auto& s = root.init_spec(); s && s->shape()) check_init_shape(root, *s->shape());
     if (root.flat_size() == 0) return;
     root.bump_write();  // the init (fill, zero, from_host, custom) rewrites the whole root
     if (const auto& s = root.init_spec())
@@ -98,6 +144,71 @@ inline InitShape init_shape_of(const std::vector<std::size_t>& extents) {
 }
 }  // namespace impl
 
+/// The shape of an initializer: a list of extents, {n, m} or a std::vector<std::size_t> (the spelling of the API), or a
+/// ragged one made by ragged().
+class Shape {
+public:
+    Shape(const std::vector<std::size_t>& extents) : s_{impl::init_shape_of(extents)} {}
+    Shape(std::initializer_list<std::size_t> extents) : s_{impl::init_shape_of(std::vector<std::size_t>(extents))} {}
+    static Shape of(InitShape s) {
+        Shape out{std::vector<std::size_t>{1}};
+        out.s_ = std::move(s);
+        return out;
+    }
+    const InitShape& get() const noexcept { return s_; }
+
+private:
+    InitShape s_;
+};
+
+namespace impl {
+/// One dimension (>= 1) given to ragged(): one extent for every index, or one per index.
+struct RaggedDim {
+    bool                     per = false;
+    std::size_t              scalar = 0;
+    std::vector<std::size_t> values;
+    static RaggedDim one(std::size_t c) { return {false, c, {}}; }
+    static RaggedDim each(const std::vector<std::size_t>& v) { return {true, 0, v}; }
+};
+inline Shape ragged_shape(std::size_t n, const std::vector<RaggedDim>& dims) {
+    InitShape s;
+    s.rank       = 1 + static_cast<int>(dims.size());
+    s.extents[0] = n;
+    for (std::size_t i = 0; i < dims.size(); ++i) {
+        const std::size_t d = i + 1;
+        if (dims[i].per) {
+            if (dims[i].values.size() != n)
+                throw std::invalid_argument("naga::cospan: init::ragged: dimension " + std::to_string(d) + " has " +
+                                            std::to_string(dims[i].values.size()) + " extents but dimension 0 has " +
+                                            std::to_string(n) + " indices");
+            s.per[d]       = true;
+            s.per_index[d] = dims[i].values;
+            s.extents[d]   = 0;
+        } else {
+            s.extents[d] = dims[i].scalar;
+        }
+    }
+    return Shape::of(std::move(s));
+}
+}  // namespace impl
+
+/// A ragged shape [n, d1] or [n, d1, d2]: dimension 0 is n; each di is one extent (a std::size_t) or a vector of n extents,
+/// one per index. A vector of the wrong length throws here; n = 0 is legal.
+inline Shape ragged(std::size_t n, std::size_t d1) { return impl::ragged_shape(n, {impl::RaggedDim::one(d1)}); }
+inline Shape ragged(std::size_t n, const std::vector<std::size_t>& d1) { return impl::ragged_shape(n, {impl::RaggedDim::each(d1)}); }
+inline Shape ragged(std::size_t n, std::size_t d1, std::size_t d2) {
+    return impl::ragged_shape(n, {impl::RaggedDim::one(d1), impl::RaggedDim::one(d2)});
+}
+inline Shape ragged(std::size_t n, std::size_t d1, const std::vector<std::size_t>& d2) {
+    return impl::ragged_shape(n, {impl::RaggedDim::one(d1), impl::RaggedDim::each(d2)});
+}
+inline Shape ragged(std::size_t n, const std::vector<std::size_t>& d1, std::size_t d2) {
+    return impl::ragged_shape(n, {impl::RaggedDim::each(d1), impl::RaggedDim::one(d2)});
+}
+inline Shape ragged(std::size_t n, const std::vector<std::size_t>& d1, const std::vector<std::size_t>& d2) {
+    return impl::ragged_shape(n, {impl::RaggedDim::each(d1), impl::RaggedDim::each(d2)});
+}
+
 /// Every element = value (converted to the root's element type). The one-argument form carries no shape: it is
 /// valid when every dimension of the root is specified.
 namespace impl {
@@ -121,8 +232,8 @@ InitSpec fill(T value) {
 }
 /// fill(v, {n, m}): every element = v, and the shape is {n, m} (it supplies the root's unspecified dimensions).
 template <class T>
-InitSpec fill(T value, const std::vector<std::size_t>& shape) {
-    return impl::fill_impl(value, std::optional<InitShape>{impl::init_shape_of(shape)});
+InitSpec fill(T value, const Shape& shape) {
+    return impl::fill_impl(value, std::optional<InitShape>{shape.get()});
 }
 
 /// Every element = 0 (no shape).
@@ -130,8 +241,8 @@ inline InitSpec zero() {
     return InitSpec{[](detail::IOEntry& root, sk::queue& q) { detail::zero_primary(root, q); }};
 }
 /// zero({n, m}): every element = 0, with that shape.
-inline InitSpec zero(const std::vector<std::size_t>& shape) {
-    return InitSpec{[](detail::IOEntry& root, sk::queue& q) { detail::zero_primary(root, q); }, impl::init_shape_of(shape)};
+inline InitSpec zero(const Shape& shape) {
+    return InitSpec{[](detail::IOEntry& root, sk::queue& q) { detail::zero_primary(root, q); }, shape.get()};
 }
 
 namespace impl {
@@ -160,16 +271,18 @@ InitSpec from_host(std::vector<T> values) {
     InitShape s;
     s.rank       = 1;
     s.extents[0] = values.size();
+    s.flat       = true;
     return impl::from_host_impl(std::move(values), s);
 }
-/// from_host(data, {n, m}): rank > 1 data with its shape (the product must equal data.size()).
+/// from_host(data, shape): data with its shape, {n, m} or ragged(...). data.size() must equal the number of elements of
+/// the shape: the product of the extents, or, for a ragged shape, the sum of the block sizes (the blocks end to end).
 template <class T>
-InitSpec from_host(std::vector<T> values, const std::vector<std::size_t>& shape) {
-    const InitShape s = impl::init_shape_of(shape);
-    if (s.extents[0] * s.extents[1] * s.extents[2] != values.size())
-        throw std::invalid_argument("naga::cospan: init::from_host has " + std::to_string(values.size()) +
-                                    " values but its shape has " + std::to_string(s.extents[0] * s.extents[1] * s.extents[2]) +
-                                    " elements");
+InitSpec from_host(std::vector<T> values, const Shape& shape) {
+    const InitShape& s = shape.get();
+    if (s.elements() != values.size())
+        throw std::invalid_argument("naga::cospan: init::from_host has " + std::to_string(values.size()) + " values but its shape has " +
+                                    std::to_string(s.elements()) + " elements" +
+                                    (s.ragged() ? " (the sum of its block sizes)" : ""));
     return impl::from_host_impl(std::move(values), s);
 }
 
@@ -195,11 +308,11 @@ InitSpec custom(std::function<void(sk::queue&, Initializer<DT, Rank>)> fn) {
 }
 /// custom with a shape: custom<DT, R>(fn, {n, m}); the shape has Rank extents.
 template <DType DT, int Rank>
-InitSpec custom(std::function<void(sk::queue&, Initializer<DT, Rank>)> fn, const std::vector<std::size_t>& shape) {
-    if (static_cast<int>(shape.size()) != Rank)
+InitSpec custom(std::function<void(sk::queue&, Initializer<DT, Rank>)> fn, const Shape& shape) {
+    if (shape.get().rank != Rank)
         throw std::invalid_argument("naga::cospan: init::custom<..., " + std::to_string(Rank) + "> was given a shape of rank " +
-                                    std::to_string(shape.size()));
-    return impl::custom_impl<DT, Rank>(std::move(fn), std::optional<InitShape>{impl::init_shape_of(shape)});
+                                    std::to_string(shape.get().rank));
+    return impl::custom_impl<DT, Rank>(std::move(fn), std::optional<InitShape>{shape.get()});
 }
 
 /// A host-side initial value: the function receives a zero-initialised host copy of the root (its previous
@@ -221,11 +334,11 @@ InitSpec custom_host(std::function<void(HostViewMut<DT, Rank>&)> fn) {
 }
 /// custom_host with a shape: custom_host<DT, R>(fn, {n, m}).
 template <DType DT, int Rank>
-InitSpec custom_host(std::function<void(HostViewMut<DT, Rank>&)> fn, const std::vector<std::size_t>& shape) {
-    if (static_cast<int>(shape.size()) != Rank)
+InitSpec custom_host(std::function<void(HostViewMut<DT, Rank>&)> fn, const Shape& shape) {
+    if (shape.get().rank != Rank)
         throw std::invalid_argument("naga::cospan: init::custom_host<..., " + std::to_string(Rank) + "> was given a shape of rank " +
-                                    std::to_string(shape.size()));
-    return impl::custom_host_impl<DT, Rank>(std::move(fn), std::optional<InitShape>{impl::init_shape_of(shape)});
+                                    std::to_string(shape.get().rank));
+    return impl::custom_host_impl<DT, Rank>(std::move(fn), std::optional<InitShape>{shape.get()});
 }
 
 }  // namespace init

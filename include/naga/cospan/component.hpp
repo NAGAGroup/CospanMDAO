@@ -274,7 +274,7 @@ public:
                 r.owner()->run_counter() == 0) {
                 r.allocate_if_absent(queue_ref());
                 if (r.init_pending()) {
-                    detail::apply_root_init(r, queue_ref());
+                    detail::apply_root_init(r, queue_ref(), !replay_);
                     r.clear_init_pending();
                 }
             }
@@ -473,7 +473,7 @@ private:
         detail::revive(root, *this);  // idempotent: a shape-driving read may reach the root before pre_compute's revive
         root.allocate_if_absent(queue_ref());
         if (root.kind() == IOKind::input && root.init_pending()) {
-            detail::apply_root_init(root, queue_ref());
+            detail::apply_root_init(root, queue_ref(), !replay_);
             root.clear_init_pending();
         }
     }
