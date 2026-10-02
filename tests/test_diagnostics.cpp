@@ -347,11 +347,23 @@ void print_row(const char* what, const Row& r) {
     line("whole", r.whole, false);
 }
 
-void check_wired(const Row& r, std::uint64_t expected_full_passes) {
+/// first: the forward that allocates the eternal internal roots; steady: later forwards; rebuilt: a later forward whose
+/// topology was rebuilt (a longer run: at most one ragged index array grows).
+enum class Fwd { first, steady, rebuilt };
+
+void check_wired(const Row& r, std::uint64_t expected_full_passes, Fwd which) {
     CHECK(r.chunks >= 2);
     CHECK(r.whole.queue_waits >= 1);
-    CHECK(r.whole.allocations >= 1);
-    CHECK(r.whole.frees >= 1);
+    // The internal roots are eternal (D141): the first forward allocates them, later forwards neither allocate nor free.
+    if (which == Fwd::first) {
+        CHECK(r.whole.allocations >= 1);
+    } else if (which == Fwd::steady) {
+        CHECK(r.whole.allocations == 0);
+        CHECK(r.whole.frees == 0);
+    } else {
+        CHECK(r.whole.allocations <= 1);
+        CHECK(r.whole.frees == 0);
+    }
     // The topology cache: the first forward (and one whose recorded dependencies changed) does ONE full pass, an
     // unchanged one none.
     CHECK(r.whole.full_passes == expected_full_passes);
@@ -400,9 +412,9 @@ TEST_CASE("Diagnostics baseline a: dense chunked, 10 chunks", "[diag]") {
     tdiag::print_row("forward 1 (first)", r1);
     tdiag::print_row("forward 2 (inputs unchanged)", r2);
     tdiag::print_row("forward 3 (unchanged; no sizes input)", r3);
-    tdiag::check_wired(r1, 1);
-    tdiag::check_wired(r2, 0);
-    tdiag::check_wired(r3, 0);
+    tdiag::check_wired(r1, 1, tdiag::Fwd::first);
+    tdiag::check_wired(r2, 0, tdiag::Fwd::steady);
+    tdiag::check_wired(r3, 0, tdiag::Fwd::steady);
     CHECK(r1.chunks == 10);
 }
 
@@ -423,7 +435,7 @@ TEST_CASE("Diagnostics baseline b: LRPIM pattern (ragged tie alias from input va
     tdiag::print_row("forward 1 (first)", r1);
     tdiag::print_row("forward 2 (inputs unchanged)", r2);
     tdiag::print_row("forward 3 (sizes re-initialised)", r3);
-    tdiag::check_wired(r1, 1);
-    tdiag::check_wired(r2, 0);  // the producer of `sizes` ran again, with the same values: no rebuild
-    tdiag::check_wired(r3, 1);  // `sizes` re-initialised: exactly one rebuild
+    tdiag::check_wired(r1, 1, tdiag::Fwd::first);
+    tdiag::check_wired(r2, 0, tdiag::Fwd::steady);  // the producer of `sizes` ran again, with the same values: no rebuild
+    tdiag::check_wired(r3, 1, tdiag::Fwd::rebuilt);  // `sizes` re-initialised: exactly one rebuild
 }

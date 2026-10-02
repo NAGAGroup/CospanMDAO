@@ -72,6 +72,7 @@ public:
 
 namespace detail {
 struct SubsystemAccess;
+struct DeferSink;  // lifetime.hpp: a ChunkedSystem's deferred decrements
 }
 
 /// The ONE contract between an owner and what it owns.
@@ -111,6 +112,9 @@ public:
     /// n > 0 runs left, 0 skipped) and the value the owner asked for.
     long run_counter() const noexcept { return run_counter_; }
     long requested_run() const noexcept { return requested_run_; }
+    long setup_run() const noexcept { return setup_run_; }  ///< the effective value derived at setup
+    /// Inside a ChunkedSystem: where decrements are deferred to (null elsewhere).
+    detail::DeferSink* defer_sink() const noexcept { return defer_sink_; }
 
     /// Resets run_counter_ to its setup value for this subsystem and every descendant.
     void rearm();
@@ -120,6 +124,7 @@ protected:
 
 private:
     friend class System;
+    friend class ChunkedSystem;
     friend struct detail::SubsystemAccess;
 
     std::string   name_;
@@ -130,6 +135,7 @@ private:
     bool          run_explicit_  = false;  ///< run_n / do_once was given
     long          setup_run_     = -1;     ///< the effective value, derived at setup
     long          run_counter_   = -1;     ///< the live value
+    detail::DeferSink* defer_sink_ = nullptr;  ///< inside a ChunkedSystem: where decrements are deferred to
 };
 
 namespace detail {

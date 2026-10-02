@@ -1127,7 +1127,7 @@ TEST_CASE("transient: ParallelSystem and FusedSystem children release after the 
     model.wait();
     for (const char* p : {"grp.a.y", "grp.b.y"}) {
         INFO(p);
-        CHECK(model.root().entry_at(p).root()->transient());
+        CHECK(model.root().entry_at(p).root()->lifetime_count() == 0);
         CHECK(!model.root().entry_at(p).root()->has_storage());
     }
     const auto base = cst::pool_in_use(model);

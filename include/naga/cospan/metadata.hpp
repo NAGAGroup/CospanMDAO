@@ -52,6 +52,7 @@ class Subsystem;
 
 namespace detail {
 class IOEntry;
+struct LifetimeOps;  // lifetime.hpp: the one place a root's count is changed
 struct EntryAccess;
 }  // namespace detail
 
@@ -606,21 +607,18 @@ public:
     /// The kind of USM this root's storage is: device, or host for a host
     /// component's I/O (D3).
     sk::kind storage_kind() const noexcept { return storage_kind_; }
-    // ---- registration metadata (ROOTS; recorded by System::resolve, r01 §4.4, D138) ----
-    /// Every registration in the root's alias set is transient: the root is allocated by the
-    /// components that touch it and released after its last user. Never arena-eligible.
-    bool     transient() const noexcept { return root_->transient_; }
-    /// A transient root's storage is dropped: from resolve until its first user allocates it,
-    /// and again after its last user. Host access to a released root throws.
+    // ---- registration metadata (ROOTS; recorded by System::resolve, r01 §4.4, D138, D141) ----
+    /// The root's storage was dropped by a count reaching 0 (its last partner finished). Host access
+    /// to a released root throws.
     bool released() const noexcept { return root_->released_; }
-    /// Path of the topmost transient subsystem whose registration made the root transient; empty otherwise.
-    std::string_view transient_owner() const noexcept { return root_->transient_by_; }
+    /// Lifetime by counting (D141): 0 out of scope, -1 eternal, > 0 decrements owed.
+    long lifetime_count() const noexcept { return root_->count_; }
+    /// Path of the subsystem whose decrement released the root last; empty if never released.
+    std::string_view released_by() const noexcept { return root_->released_by_; }
     /// The winning initial value of a free input root (highest level; none = zeros).
     const std::optional<InitSpec>& init_spec() const noexcept { return root_->init_spec_; }
-    /// The last Component, in depth-first registration order, that touches the root.
-    const Subsystem* last_user() const noexcept { return root_->last_user_; }
-    /// The OWNER: the first Component, in depth-first registration order, that touches the root.
-    /// It alone allocates the root and applies its init, in its pre_compute (D138 amendment).
+    /// The OWNER: the first Component, in depth-first registration order, that touches the root (a
+    /// re-rooted root: its ChunkedSystem). It alone allocates the root and applies its init.
     const Subsystem* owner() const noexcept { return root_->owner_; }
 
     /// Roots: the memory substrates allocation draws on (bound at prepare_exec).
@@ -656,8 +654,10 @@ public:
         if (r.io_kind_ == IOKind::input) r.init_pending_ = true;
         return true;
     }
-    /// D140 B3: this root is HELD by its ChunkedSystem (internal root kept across the chunks).
+    /// D140 B3: this root's capacity is RESERVED by its ChunkedSystem for the chunk loop (capacity role only).
     bool held() const noexcept { return root_->held_; }
+    /// The elements the root's primary storage can hold without reallocating (0 when not present).
+    std::size_t capacity_elems() const noexcept { return root_->capacity_elems_impl(); }
     /// How many times the root's storage was allocated or grew past its capacity (a test hook).
     std::size_t allocation_count() const noexcept { return root_->allocations_; }
     /// The ROOT's write epoch: a counter that advances whenever the root's data may have changed (a
@@ -746,10 +746,15 @@ public:
     /// Roots only; primary (the declarer's own placement) first.
     std::span<const Placement> storage_placements() const noexcept { return placements_; }
 
-    /// Arena route: a root, fully fixed, outside every transient subtree, in
-    /// device-kind storage (arenas are device-kind).
+    /// Arena route: a root, fully fixed, in device-kind storage (arenas are device-kind), that is
+    /// marked or whose every partner runs eternally (setup_run_ == -1), and that is not internal to
+    /// a ChunkedSystem (those are sized per chunk).
     bool arena_eligible() const noexcept {
-        return is_root() && !is_dynamic() && !transient_ && storage_kind_ == sk::kind::device;
+        if (!is_root() || is_dynamic() || storage_kind_ != sk::kind::device || !chunk_internal_by_.empty()) return false;
+        if (design_var_ || constraint_ || objective_) return true;
+        for (const Partner& p : partners_)
+            if (p.holder != nullptr && p.holder->setup_run() != -1) return false;
+        return true;
     }
     /// The bytes ONE device's arena must hold for this root; 0 when the root
     /// takes another route. get_exec_info counts this once per device.
@@ -798,6 +803,7 @@ public:
     /// waits the stream first (synchronous frees, D135): a releasing Component waits once
     /// for its whole batch.
     virtual void release_storage() = 0;
+    virtual std::size_t capacity_elems_impl() const noexcept = 0;
 
 protected:
     IOEntry(std::string name, IOKind k, DType dt, int rank, std::vector<DimRecord> dims,
@@ -891,6 +897,7 @@ protected:
     // ---- D140 B3 (roots): kept across the chunks of a ChunkedSystem ----
     bool                       held_          = false;   ///< set by the ChunkedSystem: no release by a last user
     std::size_t                reserve_elems_ = 0;       ///< held: the capacity (elements) allocate() takes
+    bool                       resize_frozen_ = false;   ///< a ChunkedSystem's full-range pass: storage is not resized (an eternal internal root keeps its chunk capacity)
     std::size_t                allocations_   = 0;       ///< storage allocations of this root (allocate, growth past capacity)
     std::uint64_t              write_epoch_   = 0;       ///< roots: see write_epoch()
     std::uint64_t              shape_version_ = 0;       ///< roots: see shape_version()
@@ -907,9 +914,9 @@ protected:
     std::vector<Placement>     placements_;        ///< roots; primary first
     std::optional<sycl::device> device_;
     sk::kind                   storage_kind_ = sk::kind::device;
-    bool                       released_ = false;     ///< transient roots: no storage right now (starts true)
-    bool                       present_  = false;     ///< roots: allocated by the owner (D139); cleared by release
-    std::string                transient_by_;         ///< transient roots: topmost transient subsystem's path
+    bool                       released_ = false;     ///< roots: storage dropped by a count reaching 0
+    bool                       present_  = false;     ///< roots: allocated (D139); cleared by release
+    std::string                released_by_;          ///< roots: the subsystem whose decrement released the root
 
 private:
     /// The four structural operations and placement are System's (r01 §4.2);
@@ -919,6 +926,7 @@ private:
     friend struct EntryAccess;
     friend struct LeadingRangeAccess;
     friend class naga::cospan::ChunkedSystem;
+    friend struct LifetimeOps;
 
     /// D140 B1, framework only (through LeadingRangeAccess). A NON-root input peer sees rows / blocks
     /// [a, b) of its root along dim 0. Dense root: its view becomes the SubarrayRef with dim-0 offset a
@@ -1028,7 +1036,6 @@ private:
     std::optional<SubarrayRef> view_;
     std::optional<std::pair<std::size_t, std::size_t>> lead_;  ///< D140 B1: the runtime leading range
     std::optional<SubarrayRef> pre_lead_view_;                 ///< the setup-time view saved while lead_ is set
-    bool                  transient_ = false;     ///< roots, set by System::resolve
     const Subsystem*      declarer_  = nullptr;
 
     std::optional<MarkRecord> design_var_, constraint_, objective_;
@@ -1053,11 +1060,20 @@ private:
     std::optional<InitSpec>   init_spec_;        ///< roots, set by System::resolve or Model::init_input
     bool                      model_init_   = false;  ///< roots: init_spec_ came from Model::init_input (resolve keeps it)
     bool                      init_pending_ = false;  ///< roots: the init is to be applied at the owner's next run
-    const Subsystem*          last_user_ = nullptr;  ///< roots, set by System::resolve
     const Subsystem*          owner_     = nullptr;  ///< roots, set by System::resolve: the first toucher
+    /// LIFETIME BY COUNTING (D141, roots only). count_: 0 out of scope (every root starts there), -1
+    /// eternal, > 0 decrements owed. partners_: who holds the root (set by System::resolve); `owed` is the
+    /// decrements this partner still owes while the root is in scope.
+    struct Partner {
+        const Subsystem* holder = nullptr;
+        bool             writer = false;
+        long             owed   = 0;
+    };
+    long                 count_ = 0;
+    std::vector<Partner> partners_;
     bool                      chunk_outside_tie_ = false;  ///< a tie alias declared outside a ChunkedSystem whose inside members make it a boundary root: the chunked system resolves its shape
     bool                      chunk_rerooted_ = false;  ///< D140 B2: a root made at a ChunkedSystem's level (its owner allocates it)
-    std::string               chunk_internal_by_;       ///< D140 B2: roots internal to the named ChunkedSystem (forced transient)
+    std::string               chunk_internal_by_;       ///< D140 B2: roots internal to the named ChunkedSystem
     Substrates*               substrates_ = nullptr; ///< roots, bound at prepare_exec
 };
 
@@ -1302,6 +1318,10 @@ public:
         return a ? a->data() : nullptr;
     }
 
+    std::size_t capacity_elems_impl() const noexcept override {
+        return slots_.empty() ? 0 : slots_.front()->data.capacity();
+    }
+
     void release_storage() override {
         if (!is_root() || !present_) return;
         // Synchronous frees (D135): the stream's kernels may still read these roots and a usm_vector waits
@@ -1384,12 +1404,10 @@ protected:
         return s->data.data();
     }
 
-    /// Host access to a released root: the error names the root and the transient subsystem
-    /// whose registration made it transient (D57, D138).
+    /// Host access to a released root: the error names the root and who released it (D141).
     [[noreturn]] void throw_released() const {
-        throw std::logic_error("naga::cospan: '" + full_path() + "' belongs to transient subsystem '" +
-                               transient_by_ + "' and its storage is released; it exists only while that "
-                               "subsystem's components run");
+        throw std::logic_error("naga::cospan: '" + full_path() + "' was released after its last use (by '" +
+                               released_by_ + "'); it exists only while something that uses it runs");
     }
 
 private:
@@ -1406,7 +1424,7 @@ private:
 
     /// Resize the root's storage to flat_size(); growing waits the stream first (synchronous frees, D135).
     void resize_storage() {
-        if (!is_root()) return;
+        if (!is_root() || resize_frozen_) return;
         if (!slots_.empty()) diag::count_resizes();
         if (!slots_.empty() && flat_size() > slots_.front()->data.capacity()) {
             diag::count_queue_waits();

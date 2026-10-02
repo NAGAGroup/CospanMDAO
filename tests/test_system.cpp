@@ -171,7 +171,7 @@ class Axpb : public cs::Component<AxpbBody> {
 public:
     Axpb(float a, float b, std::optional<float> x0 = std::nullopt, std::string log = {})
         : a_{a}, b_{b}, x0_{x0}, log_{std::move(log)} {}
-    Axpb(TiedX, float a, float b) : a_{a}, b_{b}, tied_{true} {}
+    Axpb(TiedX, float a, float b, std::optional<float> x0 = std::nullopt) : a_{a}, b_{b}, x0_{x0}, tied_{true} {}
     void setup() override {
         if (tied_)
             declare_input(x_, "x", cs::tied);
@@ -652,13 +652,18 @@ public:
     void setup() override { add_subsystem<Axpb>("a", 2.0f, 0.0f); }
 };
 
-/// A root holding one OpAxpb added with run_n{n}, named "op"; free input "op.a.x", output "op.a.y".
+/// A root holding one OpAxpb added with run_n{n}, named "op"; free input "op.a.x", output "op.a.y". A plain
+/// sink reads op.a.y: its eternal answer keeps the output alive after the last run (D141); op.a.x is freed then.
 class RunNTop : public cs::System {
     std::size_t n_;
 
 public:
     explicit RunNTop(std::size_t n) : n_{n} {}
-    void setup() override { add_subsystem<OpAxpb>("op", cs::property_list{cs::property::run_n{n_}}); }
+    void setup() override {
+        add_subsystem<OpAxpb>("op", cs::property_list{cs::property::run_n{n_}});
+        add_subsystem<Axpb>("sink", 1.0f, 0.0f);
+        connect("op.a.y", "sink.x");
+    }
 };
 
 /// The transient run-N subtree: prod (free input x = 4, logged) -> mid -> cons, y = 2 x + 3 end to end.
@@ -673,14 +678,14 @@ public:
     }
 };
 
-/// op (OpTrans, transient, run_n{n}) -> sink (y = x + 0.5): the consumer's output feeds the sink outside, so it is durable.
+/// op (OpTrans, run_n{n}) -> sink (y = x + 0.5): the consumer's output feeds the sink outside (an eternal partner), so it is durable.
 class RunNTransTop : public cs::System {
     std::size_t n_;
 
 public:
     explicit RunNTransTop(std::size_t n) : n_{n} {}
     void setup() override {
-        add_subsystem<OpTrans>("op", cs::property_list{cs::property::transient{}, cs::property::run_n{n_}});
+        add_subsystem<OpTrans>("op", cs::property_list{cs::property::run_n{n_}});
         add_subsystem<Axpb>("sink", 1.0f, 0.5f);
         connect("op.cons.y", "sink.x");
     }
@@ -729,6 +734,108 @@ public:
     CerrCapture(const CerrCapture&)            = delete;
     CerrCapture& operator=(const CerrCapture&) = delete;
     std::string str() const { return ss_.str(); }
+};
+
+// ---- lifetime fixtures (D141) ---------------------------------------------------------------------
+/// p (transient Src) -> t (transient Axpb, y = 2 x + 1) -> sink (plain Axpb): t.y is eternal (the sink answers -1);
+/// p.y and t.x come into scope and go out of it with every run.
+class TransChain : public cs::System {
+public:
+    void setup() override {
+        add_subsystem<Src>("p", kTransient);
+        add_subsystem<Axpb>("t", kTransient, 2.0f, 1.0f);
+        add_subsystem<Axpb>("sink", 1.0f, 0.0f);
+        connect("p.y", "t.x");
+        connect("t.y", "sink.x");
+    }
+};
+
+/// A transient System holding one Axpb "c" added with run_n{5} (a clamp to transient, with a warning).
+class TransRunNKid : public cs::System {
+public:
+    void setup() override {
+        add_subsystem<Axpb>("c", cs::property_list{cs::property::run_n{5}}, 2.0f, 0.0f, 4.0f, std::string{"tr.c"});
+    }
+};
+
+/// p (Src, do_once) -> r (plain Axpb, y = 2 x), or -> t (transient Axpb).
+class DoOnceProducer : public cs::System {
+    bool transient_reader_;
+
+public:
+    explicit DoOnceProducer(bool transient_reader) : transient_reader_{transient_reader} {}
+    void setup() override {
+        add_subsystem<Src>("p", cs::property_list{cs::property::do_once{}});
+        if (transient_reader_)
+            add_subsystem<Axpb>("t", kTransient, 1.0f, 0.0f);
+        else
+            add_subsystem<Axpb>("r", 2.0f, 0.0f);
+        connect("p.y", transient_reader_ ? "t.x" : "r.x");
+    }
+};
+
+/// Two plain writers tie_outputs'd into "t" and read by rd, all inside a transient System; rd's output feeds an
+/// eternal sink outside.
+class TransTieSys : public cs::System {
+public:
+    void setup() override {
+        add_subsystem<Src>("a", true);
+        add_subsystem<Src>("b", true);
+        add_subsystem<Axpb>("rd", 1.0f, 0.0f);
+        tie_outputs<DType::f32, 1>({"a.y", "b.y"}, "t", cs::alias::fixed(kLen), cs::TieOutputsPolicy::allow_plain);
+        connect("t", "rd.x");
+    }
+};
+class TransTieOutTop : public cs::System {
+public:
+    void setup() override {
+        add_subsystem<TransTieSys>("tr", kTransient);
+        add_subsystem<Axpb>("sink", 1.0f, 0.0f);
+        connect("tr.rd.y", "sink.x");
+    }
+};
+
+/// Two tied members with inits of their own (100, 200); the tie declares x = 3 one level up.
+class TieInit : public cs::System {
+public:
+    void setup() override {
+        add_subsystem<Axpb>("a", tied_x, 2.0f, 0.0f, 100.0f);
+        add_subsystem<Axpb>("b", tied_x, 3.0f, 0.0f, 200.0f);
+        tie_inputs<DType::f32, 1>({"a.x", "b.x"}, "x", cs::alias::fixed(kLen));
+        init_input("x", cs::init::fill(3.0f));
+    }
+};
+
+/// A transient System holding a free-input Axpb whose x is marked as a design variable by the root.
+class MarkedHolder : public cs::System {
+public:
+    void setup() override { add_subsystem<Axpb>("a", 2.0f, 1.0f); }
+};
+class MarkedInTransient : public cs::System {
+public:
+    void setup() override {
+        add_subsystem<MarkedHolder>("tr", kTransient);
+        add_design_var("tr.a.x");
+    }
+};
+
+/// A root promotion of a transient child's output.
+class PromoteFromTransient : public cs::System {
+public:
+    void setup() override {
+        add_subsystem<Src>("p", kTransient);
+        promote<DType::f32, 1>("p.y", "y");
+    }
+};
+
+/// p (Axpb, free x = 4 logged, do_once) -> r (plain Axpb): p.x and p.y are rebuilt after a rearm.
+class DoOnceInit : public cs::System {
+public:
+    void setup() override {
+        add_subsystem<Axpb>("p", cs::property_list{cs::property::do_once{}}, 1.0f, 0.0f, 4.0f, std::string{"p"});
+        add_subsystem<Axpb>("r", 2.0f, 0.0f);
+        connect("p.y", "r.x");
+    }
 };
 
 std::vector<float> filled(float v) { return std::vector<float>(kLen, v); }
@@ -1304,6 +1411,9 @@ std::vector<float> want_sink() {
     return v;
 }
 std::size_t pool_in_use(cs::Model& m) { return cst::pool_in_use(m); }
+// An eternal root whose partners include a transient or finite one is not arena-eligible (D141): it lives in the
+// pool, one node here, for as long as the model.
+const std::size_t kEternalNode = cst::pooled_config().pool_node_size;
 }  // namespace
 
 TEST_CASE("transient: release after the last user, kept outputs, back-to-back forwards", "[system][transient]") {
@@ -1314,16 +1424,17 @@ TEST_CASE("transient: release after the last user, kept outputs, back-to-back fo
     const std::size_t base = pool_in_use(model);
     CHECK(tr.transient());
 
-    SECTION("host access to a released root throws, naming the transient subsystem") {
+    SECTION("host access to a released root throws, naming who released it") {
         model.forward();
         model.wait();
-        CHECK(sys.entry_at("tr.prod.y").root()->transient());
+        CHECK(sys.entry_at("tr.prod.y").root()->lifetime_count() == 0);  // out of scope again
         CHECK(sys.entry_at("tr.prod.y").root()->released());
         CHECK(sys.entry_at("tr.mid.y").root()->released());
         CHECK(!sys.entry_at("tr.mid.y").root()->has_storage());
-        CHECK(pool_in_use(model) == base);  // everything the subtree allocated is back in the pool
+        CHECK(pool_in_use(model) == base + kEternalNode);  // everything the subtree allocated is back, except the eternal output
         tsys::expect_throws([&] { (void)model.view_output<DType::f32, 1>("tr.mid.y"); }, "tr");
-        tsys::expect_throws([&] { (void)model.view_output<DType::f32, 1>("tr.prod.y"); }, "transient subsystem");
+        tsys::expect_throws([&] { (void)model.view_output<DType::f32, 1>("tr.prod.y"); },
+                            "was released after its last use (by 'tr.mid')");
     }
 
     SECTION("an output connected outside the subtree stays durable") {
@@ -1332,8 +1443,8 @@ TEST_CASE("transient: release after the last user, kept outputs, back-to-back fo
         auto* cons = sys.entry_at("tr.cons.y").root();
         CHECK(cons->has_storage());
         CHECK(!cons->released());
-        CHECK(!cons->transient());
-        CHECK(sys.entry_at("tr.mid.y").root()->transient());  // the intermediates are the transient ones
+        CHECK(cons->lifetime_count() == -1);                                   // the sink outside answers -1: eternal
+        CHECK(sys.entry_at("tr.mid.y").root()->lifetime_count() == 0);       // the intermediates went out of scope
         CHECK(to_vector(model.view_output<DType::f32, 1>("tr.cons.y")) == want_cons());
         CHECK(to_vector(model.view_output<DType::f32, 1>("sink.y")) == want_sink());
     }
@@ -1345,7 +1456,7 @@ TEST_CASE("transient: release after the last user, kept outputs, back-to-back fo
         model.wait();
         CHECK(to_vector(model.view_output<DType::f32, 1>("tr.cons.y")) == want_cons());
         CHECK(to_vector(model.view_output<DType::f32, 1>("sink.y")) == want_sink());
-        CHECK(pool_in_use(model) == base);
+        CHECK(pool_in_use(model) == base + kEternalNode);
     }
 
     SECTION("three forwards enqueued back to back, then one wait") {
@@ -1355,7 +1466,7 @@ TEST_CASE("transient: release after the last user, kept outputs, back-to-back fo
         model.wait();
         CHECK(to_vector(model.view_output<DType::f32, 1>("tr.cons.y")) == want_cons());
         CHECK(to_vector(model.view_output<DType::f32, 1>("sink.y")) == want_sink());
-        CHECK(pool_in_use(model) == base);
+        CHECK(pool_in_use(model) == base + kEternalNode);
     }
 }
 
@@ -1365,15 +1476,14 @@ TEST_CASE("transient: sequential Components A then B share a root, released afte
     auto&             sys  = model.root();
     const std::size_t base = pool_in_use(model);
 
-    CHECK(sys.entry_at("a.y").root()->transient());   // A's output, read by transient B only
-    CHECK(!sys.entry_at("b.y").root()->transient());  // B's output is read by the non-transient C: durable
-    CHECK(sys.entry_at("a.y").root()->last_user() == &model.get_subsystem("b"));
-
     model.forward();
     model.wait();
+    CHECK(sys.entry_at("a.y").root()->lifetime_count() == 0);   // A's output, read by transient B only: out of scope
+    CHECK(sys.entry_at("b.y").root()->lifetime_count() == -1);  // B's output is read by the plain C: eternal
+    CHECK(sys.entry_at("a.y").root()->released_by() == "b");    // B is its last partner
     CHECK(sys.entry_at("a.y").root()->released());
-    CHECK(pool_in_use(model) == base);
-    tsys::expect_throws([&] { (void)model.view_output<DType::f32, 1>("a.y"); }, "transient subsystem 'a'");
+    CHECK(pool_in_use(model) == base + kEternalNode);  // b.y (read by the plain C) is the eternal one
+    tsys::expect_throws([&] { (void)model.view_output<DType::f32, 1>("a.y"); }, "was released after its last use (by 'b')");
     // c = 1 * (2 * (i + 1) + 1) + 0.5
     CHECK(to_vector(model.view_output<DType::f32, 1>("c.y")) == tsys::iota_plus(1.0f, tsys::kLen, 2.0f, 1.5f));
 }
@@ -1381,9 +1491,9 @@ TEST_CASE("transient: sequential Components A then B share a root, released afte
 TEST_CASE("transient: a root read by a transient and a non-transient Component stays durable", "[system][transient]") {
     cs::Model model = cs::create_model<tsys::SharedRead>(cst::pooled_config());
     model.setup();
-    CHECK(!model.root().entry_at("p.y").root()->transient());
     model.forward();
     model.wait();
+    CHECK(model.root().entry_at("p.y").root()->lifetime_count() == -1);  // the plain reader answers -1
     CHECK(to_vector(model.view_output<DType::f32, 1>("p.y")) == tsys::iota_plus(1.0f, tsys::kLen));
 }
 
@@ -1392,17 +1502,17 @@ TEST_CASE("transient: promotion inside a transient stays transient; re-promoted 
     SECTION("promoted inside the transient subsystem only") {
         cs::Model model = cs::create_model<tsys::PromoInTrans>(cst::pooled_config(), false);
         model.setup();
-        CHECK(model.root().entry_at("tr.y").root()->transient());
         model.forward();
         model.wait();
-        tsys::expect_throws([&] { (void)model.view_output<DType::f32, 1>("tr.y"); }, "transient subsystem 'tr'");
+        CHECK(model.root().entry_at("tr.y").root()->lifetime_count() == 0);
+        tsys::expect_throws([&] { (void)model.view_output<DType::f32, 1>("tr.y"); }, "was released after its last use (by 'tr.p')");
     }
     SECTION("re-promoted at a non-transient level") {
         cs::Model model = cs::create_model<tsys::PromoInTrans>(cst::pooled_config(), true);
         model.setup();
-        CHECK(!model.root().entry_at("tr.y").root()->transient());
         model.forward();
         model.wait();
+        CHECK(model.root().entry_at("tr.y").root()->lifetime_count() == -1);  // the root System's promotion answers -1
         CHECK(to_vector(model.view_output<DType::f32, 1>("out")) == tsys::iota_plus(1.0f, tsys::kLen));
     }
 }
@@ -1415,7 +1525,7 @@ TEST_CASE("transient: nested transients, the outer one is named", "[system][tran
     model.wait();
     CHECK(pool_in_use(model) == base);
     tsys::expect_throws([&] { (void)model.view_output<DType::f32, 1>("outer.inner.cons.y"); },
-                        "transient subsystem 'outer'");
+                        "was released after its last use");
 }
 
 TEST_CASE("transient: a free input inside a transient subtree is re-initialized each forward", "[system][transient]") {
@@ -1429,7 +1539,8 @@ TEST_CASE("transient: a free input inside a transient subtree is re-initialized 
     model.wait();
     CHECK(tsys::count_of("tr.p") == 3);
     CHECK(to_vector(model.view_output<DType::f32, 1>("sink.y")) == tsys::filled(15.0f));  // 2 * 7 + 1
-    tsys::expect_throws([&] { (void)model.view_input<DType::f32, 1>("tr.p.x"); }, "transient subsystem 'tr'");
+    tsys::expect_throws([&] { (void)model.view_input<DType::f32, 1>("tr.p.x"); },
+                        "was released after its last use (by 'tr.p')");
 }
 
 // =============================================================================================
@@ -1447,8 +1558,10 @@ TEST_CASE("run-N: n = 1 runs once; a later init_input stays pending (the owner d
     tsys::set_x(model, "op.a.x", 5.0f);
     model.forward();
     model.wait();
-    // The owner applies a pending init in its own run (D139); it did not run, so nothing changed.
-    CHECK(to_vector(model.view_input<DType::f32, 1>("op.a.x")) == tsys::filled(1.0f));
+    // The owner applies a pending init in its own run (D139); it did not run, so nothing changed. Its input
+    // root was freed after the single run (no eternal partner); the output is kept by the sink.
+    tsys::expect_throws([&] { (void)model.view_input<DType::f32, 1>("op.a.x"); },
+                        "was released after its last use (by 'op.a')");
     CHECK(to_vector(model.view_output<DType::f32, 1>("op.a.y")) == tsys::filled(2.0f));
 }
 
@@ -1467,59 +1580,72 @@ TEST_CASE("run-N: n = 3 follows the input for three forwards, then holds", "[sys
     }
 }
 
-TEST_CASE("run-N + transient: allocated and initialized in runs 1..n, released after each, nothing after n",
+TEST_CASE("run-N subtree: its roots live for the n runs and are freed after the last, unless an eternal partner keeps them",
           "[system][runn]") {
     tsys::g_inits.clear();
     cs::Model model = cs::create_model<tsys::RunNTransTop>(cst::pooled_config(), std::size_t{2});
     model.setup();
     auto&             sys  = model.root();
     const std::size_t base = tsys::pool_in_use_of(model);
-    CHECK(tsys::count_of("op.prod") == 0);  // a transient root is initialized when a run allocates it
+    CHECK(tsys::count_of("op.prod") == 0);  // nothing is allocated at setup
 
-    // run 1: allocate, init, run, release; the consumer's output feeds the sink outside, so it is kept
+    // run 1: the roots come into scope (counts 2 and 4), the free input is initialized once; the consumer's
+    // output feeds the sink outside (eternal), the rest stays allocated for run 2
+    model.forward();
+    model.wait();
+    CHECK(tsys::count_of("op.prod") == 1);
+    CHECK(sys.entry_at("op.mid.y").root()->has_storage());
+    CHECK(sys.entry_at("op.mid.y").root()->lifetime_count() > 0);
+    CHECK(sys.entry_at("op.cons.y").root()->lifetime_count() == -1);
+    CHECK(to_vector(model.view_output<DType::f32, 1>("op.cons.y")) == tsys::filled(11.0f));  // 2 * 4 + 3
+    CHECK(to_vector(model.view_output<DType::f32, 1>("sink.y")) == tsys::filled(11.5f));
+    const std::size_t after1 = tsys::pool_in_use_of(model);
+    CHECK(after1 > base);
+
+    // run 2 is the last: the subtree's roots are freed (one wait), the eternal one stays; the init is not applied again
     model.forward();
     model.wait();
     CHECK(tsys::count_of("op.prod") == 1);
     CHECK(!sys.entry_at("op.mid.y").root()->has_storage());
-    CHECK(sys.entry_at("op.cons.y").root()->has_storage());
-    CHECK(to_vector(model.view_output<DType::f32, 1>("op.cons.y")) == tsys::filled(11.0f));  // 2 * 4 + 3
-    CHECK(to_vector(model.view_output<DType::f32, 1>("sink.y")) == tsys::filled(11.5f));
-    CHECK(tsys::pool_in_use_of(model) == base);
-
-    // run 2: the free input is initialized again (a fresh allocation)
-    model.forward();
-    model.wait();
-    CHECK(tsys::count_of("op.prod") == 2);
-    CHECK(!sys.entry_at("op.mid.y").root()->has_storage());
+    CHECK(sys.entry_at("op.mid.y").root()->lifetime_count() == 0);
     CHECK(to_vector(model.view_output<DType::f32, 1>("op.cons.y")) == tsys::filled(11.0f));
-    CHECK(tsys::pool_in_use_of(model) == base);
+    const std::size_t after2 = tsys::pool_in_use_of(model);
+    CHECK(after2 < after1);
 
     // forward 3: past n, nothing runs, so nothing is allocated, initialized or released
     model.forward();
     model.wait();
-    CHECK(tsys::count_of("op.prod") == 2);
+    CHECK(tsys::count_of("op.prod") == 1);
     CHECK(!sys.entry_at("op.mid.y").root()->has_storage());
     CHECK(to_vector(model.view_output<DType::f32, 1>("op.cons.y")) == tsys::filled(11.0f));  // unchanged
     CHECK(to_vector(model.view_output<DType::f32, 1>("sink.y")) == tsys::filled(11.5f));
-    CHECK(tsys::pool_in_use_of(model) == base);
+    CHECK(tsys::pool_in_use_of(model) == after2);
 
-    // a view of the released mid root throws, naming the transient subsystem
+    // a view of the released mid root throws, naming who released it
     CHECK(sys.entry_at("op.mid.y").root()->released());
-    tsys::expect_throws([&] { (void)model.view_output<DType::f32, 1>("op.mid.y"); }, "transient subsystem 'op'");
+    tsys::expect_throws([&] { (void)model.view_output<DType::f32, 1>("op.mid.y"); },
+                        "was released after its last use (by 'op.cons')");
     model.wait();
 }
 
-TEST_CASE("run-N + transient: n = 3, the pool returns to its baseline after every forward", "[system][runn]") {
+TEST_CASE("run-N subtree: n = 3, the roots stay for runs 1..3 and the pool drops after the third", "[system][runn]") {
     tsys::g_inits.clear();
     cs::Model model = cs::create_model<tsys::RunNTransTop>(cst::pooled_config(), std::size_t{3});
     model.setup();
-    const std::size_t base = tsys::pool_in_use_of(model);
+    std::size_t held = 0, freed = 0;
     for (int k = 1; k <= 5; ++k) {
         INFO("forward " << k);
         model.forward();
         model.wait();
-        CHECK(tsys::pool_in_use_of(model) == base);
-        CHECK(tsys::count_of("op.prod") == static_cast<std::size_t>(k <= 3 ? k : 3));
+        const std::size_t now = tsys::pool_in_use_of(model);
+        if (k == 1) held = now;
+        if (k <= 3 && k >= 1 && k < 3) CHECK(now == held);  // runs 1 and 2: everything stays allocated
+        if (k == 3) {
+            freed = now;
+            CHECK(freed < held);
+        }
+        if (k > 3) CHECK(now == freed);
+        CHECK(tsys::count_of("op.prod") == 1);  // allocated and initialized once, with the first run
     }
 }
 
@@ -2217,10 +2343,177 @@ TEST_CASE("D139-2: a tie alias inside a transient subsystem is released and the 
         model.forward();
         model.wait();
         auto& sys = model.root();
-        CHECK(sys.entry_at("tr.x").root()->transient());
+        CHECK(sys.entry_at("tr.x").root()->lifetime_count() == 0);
         CHECK(sys.entry_at("tr.x").root()->released());
         CHECK(!sys.entry_at("tr.x").root()->has_storage());
         CHECK(tsys::pool_in_use_of(model) == base);
-        tsys::expect_throws([&] { (void)model.view_input<DType::f32, 1>("tr.x"); }, "transient subsystem 'tr'");
+        tsys::expect_throws([&] { (void)model.view_input<DType::f32, 1>("tr.x"); }, "was released after its last use");
     }
+}
+
+// =============================================================================================
+// 6d. lifetime by counting (D141)
+// =============================================================================================
+TEST_CASE("lifetime: a bare transient producer and a transient reader are freed every run, values right on run 2", "[system][lifetime]") {
+    cs::Model model = cs::create_model<tsys::TransChain>(cst::pooled_config());
+    model.setup();
+    auto&             sys  = model.root();
+    const std::size_t base = pool_in_use(model);
+    for (int run = 1; run <= 3; ++run) {
+        INFO("run " << run);
+        model.forward();
+        model.wait();
+        CHECK(sys.entry_at("p.y").root()->released());
+        CHECK(sys.entry_at("p.y").root()->lifetime_count() == 0);
+        CHECK(sys.entry_at("t.y").root()->lifetime_count() == -1);
+        CHECK(to_vector(model.view_output<DType::f32, 1>("sink.y")) == tsys::iota_plus(1.0f, tsys::kLen, 2.0f, 1.0f));
+        CHECK(pool_in_use(model) == base + kEternalNode);
+    }
+}
+
+TEST_CASE("lifetime: transient parent forces a run_n(5) child to transient", "[system][lifetime]") {
+    tsys::g_inits.clear();
+    std::string err;
+    cs::Model   model = policy_model([](cs::System& s) { s.add_subsystem<tsys::TransRunNKid>("tr", tsys::kTransient); }, err);
+    CHECK_THAT(err, Catch::Matchers::ContainsSubstring("'tr.c' asks to run 5 time(s) but 'tr' allows transient"));
+    CHECK(model.get_subsystem("tr.c").run_counter() == -2);
+    forwards(model, 7);
+    // transient: its free input root is revived, allocated and initialized again at every forward
+    CHECK(tsys::count_of("tr.c") == 7);
+}
+
+TEST_CASE("lifetime: a run_n(3) parent's roots are freed after the third run unless an eternal partner keeps them",
+          "[system][lifetime]") {
+    tsys::g_inits.clear();
+    cs::Model model = cs::create_model<tsys::RunNTransTop>(cst::pooled_config(), std::size_t{3});
+    model.setup();
+    auto& sys = model.root();
+    for (int k = 1; k <= 4; ++k) {
+        INFO("forward " << k);
+        model.forward();
+        model.wait();
+        const bool alive = sys.entry_at("op.mid.y").root()->has_storage();
+        CHECK(alive == (k < 3));  // freed by the third run, not before
+        CHECK(sys.entry_at("op.cons.y").root()->has_storage());  // the sink outside: eternal
+    }
+    CHECK(sys.entry_at("op.mid.y").root()->released_by() == "op.cons");
+    CHECK(tsys::count_of("op.prod") == 1);
+}
+
+TEST_CASE("lifetime: a do_once producer with an eternal reader is eternal; its value is held across runs", "[system][lifetime]") {
+    cs::Model model = cs::create_model<tsys::DoOnceProducer>(cst::pooled_config(), false);
+    model.setup();
+    for (int run = 1; run <= 3; ++run) {
+        INFO("run " << run);
+        model.forward();
+        model.wait();
+        CHECK(model.get_subsystem("p").run_counter() == 0);
+        CHECK(model.root().entry_at("p.y").root()->lifetime_count() == -1);
+        CHECK(model.root().entry_at("p.y").root()->has_storage());
+        CHECK(to_vector(model.view_output<DType::f32, 1>("r.y")) == tsys::iota_plus(1.0f, tsys::kLen, 2.0f, 0.0f));
+    }
+}
+
+TEST_CASE("lifetime: a do_once producer with a transient reader fails on run 2, naming the root, the producer and the reader",
+          "[system][lifetime]") {
+    cs::Model model = cs::create_model<tsys::DoOnceProducer>(default_config(), true);
+    model.setup();
+    model.forward();  // run 1: both run, the root is freed after them
+    model.wait();
+    CHECK(model.root().entry_at("p.y").root()->lifetime_count() == 0);
+    const auto again = [&] { model.forward(); };
+    tsys::expect_throws(again, "'p.y' is revived by 't'");
+    tsys::expect_throws(again, "its producer 'p' has stopped");
+    tsys::expect_throws(again, "promote it, or don't mark its holder transient");
+    model.wait();
+}
+
+TEST_CASE("lifetime: a tie_outputs root under a transient System is freed every run, values right", "[system][lifetime]") {
+    cs::Model model = cs::create_model<tsys::TransTieOutTop>(cst::pooled_config());
+    model.setup();
+    const std::size_t base = pool_in_use(model);
+    for (int run = 1; run <= 2; ++run) {
+        INFO("run " << run);
+        model.forward();
+        model.wait();
+        auto* t = model.root().entry_at("tr.t").root();
+        CHECK(t->released());
+        CHECK(t->lifetime_count() == 0);
+        CHECK(to_vector(model.view_output<DType::f32, 1>("sink.y")) == tsys::iota_plus(1.0f, tsys::kLen));
+        CHECK(pool_in_use(model) == base + kEternalNode);  // rd.y, kept by the sink
+    }
+}
+
+TEST_CASE("lifetime: a tie_inputs root is initialized by the tie; the members' own inits are ignored", "[system][lifetime]") {
+    cs::Model model = cs::create_model<tsys::TieInit>(default_config());
+    model.setup();
+    model.forward();
+    model.wait();
+    CHECK(to_vector(model.view_output<DType::f32, 1>("a.y")) == tsys::filled(6.0f));  // 2 * 3, not 2 * 100
+    CHECK(to_vector(model.view_output<DType::f32, 1>("b.y")) == tsys::filled(9.0f));  // 3 * 3, not 3 * 200
+}
+
+TEST_CASE("lifetime: a model-level promotion is eternal", "[system][lifetime]") {
+    cs::Model model = cs::create_model<tsys::PromoteFromTransient>(cst::pooled_config());
+    model.setup();
+    for (int run = 1; run <= 2; ++run) {
+        model.forward();
+        model.wait();
+        CHECK(model.root().entry_at("p.y").root()->lifetime_count() == -1);
+        CHECK(to_vector(model.view_output<DType::f32, 1>("y")) == tsys::iota_plus(1.0f, tsys::kLen));
+    }
+}
+
+TEST_CASE("lifetime: a marked root under a transient System does not throw and is eternal", "[system][lifetime]") {
+    cs::Model model = cs::create_model<tsys::MarkedInTransient>(cst::pooled_config());
+    CHECK_NOTHROW(model.setup());
+    for (int run = 1; run <= 2; ++run) {
+        model.forward();
+        model.wait();
+        CHECK(model.root().entry_at("tr.a.x").root()->lifetime_count() == -1);
+        CHECK(model.root().entry_at("tr.a.x").root()->has_storage());
+    }
+}
+
+TEST_CASE("lifetime: rearm sends a do_once's roots back out of scope and they are initialized again", "[system][lifetime]") {
+    tsys::g_inits.clear();
+    cs::Model model = cs::create_model<tsys::DoOnceInit>(cst::pooled_config());
+    model.setup();
+    forwards(model, 3);
+    CHECK(tsys::count_of("p") == 1);
+    CHECK(to_vector(model.view_output<DType::f32, 1>("r.y")) == tsys::filled(8.0f));  // 2 * (1 * 4)
+    CHECK(model.get_subsystem("p").run_counter() == 0);
+
+    model.get_subsystem("p").rearm();
+    CHECK(model.get_subsystem("p").run_counter() == 1);
+    CHECK(model.root().entry_at("p.y").root()->lifetime_count() == 0);
+    CHECK_FALSE(model.root().entry_at("p.y").root()->has_storage());
+    forwards(model, 3);
+    CHECK(tsys::count_of("p") == 2);  // p.x was allocated and initialized again
+    CHECK(to_vector(model.view_output<DType::f32, 1>("r.y")) == tsys::filled(8.0f));
+    CHECK(model.get_subsystem("p").run_counter() == 0);
+}
+
+TEST_CASE("lifetime: transient together with run_n or do_once throws, naming the subsystem", "[system][lifetime]") {
+    std::string err;
+    tsys::expect_throws(
+        [&] {
+            (void)policy_model(
+                [](cs::System& s) {
+                    s.add_subsystem<tsys::RunCounted>("a", cs::property_list{cs::property::transient{}, cs::property::run_n{2}},
+                                                      std::string{"a"});
+                },
+                err);
+        },
+        "add_subsystem('a'): transient cannot be combined with run_n or do_once");
+    tsys::expect_throws(
+        [&] {
+            (void)policy_model(
+                [](cs::System& s) {
+                    s.add_subsystem<tsys::RunCounted>("b", cs::property_list{cs::property::do_once{}, cs::property::transient{}},
+                                                      std::string{"b"});
+                },
+                err);
+        },
+        "add_subsystem('b'): transient cannot be combined with run_n or do_once");
 }

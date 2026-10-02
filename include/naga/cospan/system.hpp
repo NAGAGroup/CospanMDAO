@@ -38,6 +38,7 @@
 
 #include "naga/cospan/component.hpp"
 #include "naga/cospan/host_view.hpp"
+#include "naga/cospan/lifetime.hpp"
 #include "naga/cospan/metadata.hpp"
 #include "naga/cospan/subsystem.hpp"
 #include "naga/cospan/wrappers.hpp"
@@ -533,6 +534,7 @@ public:
         for (std::size_t i = 0; i < children_.size(); ++i) {
             Subsystem& c  = *children_[i];
             ExecCtx&   cc = child_ctx_[i];
+            materialize_slot(i);                // the aliases whose first partner is child i (D141)
             if (c.run_counter_ == 0) continue;  // run policy: exhausted, no pre, compute or post
             c.run_pre_compute(cc);
             if (auto d = c.run_compute_forward()) {
@@ -540,17 +542,23 @@ public:
                 d->submit(t);
             }
             c.run_post_compute(cc);
-            if (c.run_counter_ > 0) --c.run_counter_;
+            if (c.run_counter_ > 0) {
+                // Inside a ChunkedSystem's chunk loop the counter moves once per forward, after the last chunk.
+                if (defer_sink() != nullptr && defer_sink()->active)
+                    defer_sink()->note_ran(&c);
+                else
+                    --c.run_counter_;
+            }
         }
         return nullptr;
     }
 
     /// The ROOT System's end-of-setup pass (§4.4, §11.2.1; run_setup runs it when this System has
-    /// no owner). Per root it records: `transient` (EVERY registration in the alias set is
-    /// transient: the registering subsystem or any ancestor was added with property::transient),
-    /// the winning initial value (smallest declaring depth; two at one depth throw; an init on a
-    /// root with a source is ignored), and `last_user` (the last Component, in depth-first
-    /// registration order, that touches the root). A mark on a transient root throws.
+    /// no owner). Per root it records: its OWNER (the first Component, in depth-first registration
+    /// order, that touches it; a re-rooted root's ChunkedSystem), its PARTNERS (D141: one per
+    /// distinct Component or alias-declaring System on its alias set), and the winning initial value
+    /// (smallest declaring depth; two at one depth throw; an init on a root with a source is
+    /// ignored). Counts are NOT set here: a root comes into scope when it is first revived.
     void resolve() {
         classify_chunks();  // D140 B2: ChunkedSystems classify their roots and re-root boundary ones first
         std::vector<detail::IOEntry*> roots;
@@ -559,35 +567,26 @@ public:
         std::vector<ComponentBase*> comps;
         collect_components(comps);
         for (detail::IOEntry* r : roots) {
-            r->last_user_ = nullptr;
-            r->owner_     = nullptr;
+            r->owner_       = nullptr;
+            r->count_       = 0;
+            r->released_    = false;
+            r->released_by_.clear();
+            r->partners_.clear();
         }
         for (ComponentBase* c : comps)
             for (detail::IOEntry* e : c->order_) {
                 detail::IOEntry* r = e->root();
-                r->last_user_      = c;
                 if (r->owner_ == nullptr) r->owner_ = c;  // the FIRST toucher owns the root
             }
         for (detail::IOEntry* r : roots)
-            if (r->chunk_rerooted_) r->owner_ = nullptr;  // D140 B2: its ChunkedSystem allocates it, not a Component
+            if (r->chunk_rerooted_) r->owner_ = r->declarer_;  // D140 B2: its ChunkedSystem allocates it, not a Component
 
         for (detail::IOEntry* r : roots) {
-            bool all = registration_transient(*r);
-            for (const detail::IOEntry* p : r->peers_) all = all && registration_transient(*p);
-            const bool chunk_internal = !r->chunk_internal_by_.empty();  // D140 B2: forced transient, per chunk
-            if (chunk_internal) all = true;
-            if (r->chunk_rerooted_) all = false;                        // consumed outside: never transient
-            r->transient_    = all;
-            r->released_     = all;  // a transient root has no storage until its first user allocates it
-            r->transient_by_ = all ? (chunk_internal ? r->chunk_internal_by_ : topmost_transient(*r)) : std::string{};
-            if (all && (r->design_var_ || r->constraint_ || r->objective_))
-                throw std::invalid_argument("naga::cospan: '" + r->full_path() +
-                                            "' is marked (design variable, constraint or objective) but is "
-                                            "transient (subsystem '" + r->transient_by_ +
-                                            "'); a marked root must outlive a forward");
+            record_partners(*r);
             resolve_init(*r);
         }
         check_ties(comps);  // D139 part 2: rank-only entries are tied; alias shape sources are ordered
+        build_materialize_slots();
     }
 
 protected:
@@ -595,9 +594,29 @@ protected:
     /// ChunkedSystem classifies its roots here.
     virtual void chunk_classify() {}
 
+    /// Right before child i, every alias in slot i is brought into scope (D141). A flavor's runner calls
+    /// this before each child's pre_compute, on the thread that drives the loop.
+    void materialize_slot(std::size_t i) {
+        if (i >= materialize_before_.size()) return;
+        for (detail::IOEntry* a : materialize_before_[i]) materialize(*a);
+    }
+
 private:
     friend class ChunkedSystem;
+    friend class Subsystem;  // rearm
     friend struct detail::SystemAccess;
+
+    std::vector<std::vector<detail::IOEntry*>> materialize_before_;  ///< size children + 1: aliases touched before child i
+    static void rearm_subtree(Subsystem& self);
+
+    /// An alias comes into scope: its root is revived and this System, one of its partners, decrements at once.
+    void materialize(detail::IOEntry& a) {
+        detail::IOEntry& root = *a.root();
+        detail::revive(root, *this);
+        std::vector<detail::IOEntry*> batch;
+        detail::decrement_or_defer(root, *this, batch, defer_sink());
+        detail::release(batch, queue_ref());
+    }
 
     /// Top-down: each child's effective run value from its parent's effective value P and its own
     /// requested value C (-1 eternal, -2 transient, n > 0). Sets setup_run_ = run_counter_.
@@ -624,18 +643,50 @@ private:
         chunk_classify();
     }
 
-    static bool registration_transient(const detail::IOEntry& e) {
-        for (const Subsystem* s = e.declarer(); s != nullptr; s = s->owner())
-            if (s->transient()) return true;
-        return false;
+    /// The root's PARTNERS (D141): one per distinct holder on its alias set. A Component holder is a
+    /// writer when it has an OUTPUT entry on the root; the owner of a free input root writes it (applies
+    /// its init) too.
+    static void record_partners(detail::IOEntry& r) {
+        const auto add = [&](const detail::IOEntry& e) {
+            const Subsystem* holder = e.declarer();
+            if (holder == nullptr) return;
+            const bool is_comp = dynamic_cast<const ComponentBase*>(holder) != nullptr;
+            const bool writer  = (is_comp && e.kind() == IOKind::output) || (holder == r.owner_ && r.kind() == IOKind::input);
+            for (detail::IOEntry::Partner& p : r.partners_)
+                if (p.holder == holder) {
+                    p.writer = p.writer || writer;
+                    return;
+                }
+            r.partners_.push_back(detail::IOEntry::Partner{holder, writer, 0});
+        };
+        add(r);
+        for (const detail::IOEntry* p : r.peers_) add(*p);
     }
 
-    /// The path of the topmost transient subsystem on the root's own registration chain.
-    static std::string topmost_transient(const detail::IOEntry& r) {
-        std::string by;
-        for (const Subsystem* s = r.declarer(); s != nullptr; s = s->owner())
-            if (s->transient()) by = s->path();
-        return by;
+    /// Per System: the aliases touched right before child i (slot i): the first child whose subtree
+    /// holds a Component partner of the alias's root; slot 0 when there is none. A re-rooted alias is its
+    /// ChunkedSystem's own business (allocate_rerooted).
+    void build_materialize_slots() {
+        materialize_before_.assign(children_.size() + 1, {});
+        for (detail::IOEntry* a : alias_order_) {
+            if (a->chunk_rerooted_) continue;
+            std::size_t slot  = 0;
+            bool        found = false;
+            for (const detail::IOEntry::Partner& p : a->root()->partners_) {
+                if (dynamic_cast<const ComponentBase*>(p.holder) == nullptr) continue;
+                const Subsystem* x = p.holder;
+                while (x != nullptr && x->owner() != this) x = x->owner();
+                if (x == nullptr) continue;
+                const std::size_t i = child_index_.at(std::string{x->name()});
+                if (!found || i < slot) {
+                    slot  = i;
+                    found = true;
+                }
+            }
+            materialize_before_[slot].push_back(a);
+        }
+        for (Subsystem* c : child_ptrs_)
+            if (auto* s = dynamic_cast<System*>(c)) s->build_materialize_slots();
     }
 
     /// The winning init of a root: the declaration of the smallest depth among its alias set's.
@@ -888,6 +939,10 @@ private:
     /// (Subsystem's friend).
     void attach(std::unique_ptr<Subsystem> c, std::string name, const property_list& props) {
         const bool tr = props.has_property<property::transient>();
+        if (tr && (props.has_property<property::run_n>() || props.has_property<property::do_once>()))
+            throw std::invalid_argument("naga::cospan: " + describe() + ": add_subsystem('" + name +
+                                        "'): transient cannot be combined with run_n or do_once; a transient subsystem "
+                                        "runs every forward");
         Subsystem& b = *c;
         b.path_      = path().empty() ? name : path() + "." + name;
         b.name_      = name;
@@ -1296,10 +1351,56 @@ private:
     Substrates*                                                        subs_  = nullptr;
 };
 
-inline void Subsystem::rearm() {
-    run_counter_ = setup_run_;
-    if (auto* s = dynamic_cast<System*>(this))
-        for (Subsystem* c : s->children()) c->rearm();
+/// Resets every run counter of the subtree, then sends every root OWNED by the subtree back out of scope:
+/// one queue wait, the storage of those that have any is released, count and owed go to 0 (eternal ones
+/// included), so the next forward revives, allocates and initializes them again (D141).
+inline void Subsystem::rearm() { System::rearm_subtree(*this); }
+
+inline void System::rearm_subtree(Subsystem& self) {
+    const std::function<void(Subsystem&)> reset_counters = [&](Subsystem& s) {
+        s.run_counter_ = s.setup_run_;
+        if (auto* sys = dynamic_cast<System*>(&s))
+            for (Subsystem* c : sys->children()) reset_counters(*c);
+    };
+    reset_counters(self);
+
+    const auto in_subtree = [&](const Subsystem* x) {
+        for (; x != nullptr; x = x->owner())
+            if (x == &self) return true;
+        return false;
+    };
+    std::vector<detail::IOEntry*> owned;
+    const auto consider = [&](detail::IOEntry* r) {
+        if (r->is_root() && r->owner() != nullptr && in_subtree(r->owner()) &&
+            std::find(owned.begin(), owned.end(), r) == owned.end())
+            owned.push_back(r);
+    };
+    sk::queue* queue = nullptr;
+    const std::function<void(Subsystem&)> walk = [&](Subsystem& s) {
+        if (auto* comp = dynamic_cast<ComponentBase*>(&s)) {
+            if (queue == nullptr) queue = comp->queue_;
+            for (detail::IOEntry* e : comp->order_) consider(e->root());
+        } else if (auto* sys = dynamic_cast<System*>(&s)) {
+            if (queue == nullptr) queue = sys->queue_;
+            for (detail::IOEntry* a : sys->alias_order_) consider(a->root());
+            for (Subsystem* c : sys->children()) walk(*c);
+        }
+    };
+    walk(self);
+    std::vector<detail::IOEntry*> present;
+    for (detail::IOEntry* r : owned)
+        if (r->present_) present.push_back(r);
+    if (!present.empty()) {
+        if (queue == nullptr)
+            throw std::logic_error("naga::cospan: rearm of '" + self.path() + "' before setup() has completed");
+        diag::count_queue_waits();
+        queue->wait();
+        for (detail::IOEntry* r : present) r->release_storage();
+    }
+    for (detail::IOEntry* r : owned) {
+        detail::LifetimeOps::reset(*r);
+        detail::LifetimeOps::set_released_by(*r, self.path());
+    }
 }
 
 namespace detail {

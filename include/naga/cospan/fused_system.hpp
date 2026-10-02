@@ -137,7 +137,10 @@ public:
     // ---- the runner --------------------------------------------------------------------------
     std::unique_ptr<LaunchDescription> run_compute_forward() override {
         const std::size_t n = children_.size();
-        for (std::size_t i = 0; i < n; ++i) children_[i]->run_pre_compute(child_ctx_[i]);
+        for (std::size_t i = 0; i < n; ++i) {
+            materialize_slot(i);
+            children_[i]->run_pre_compute(child_ctx_[i]);
+        }
 
         std::vector<std::unique_ptr<LaunchDescription>> ds;  // alive until the wave is staged
         ds.reserve(n);

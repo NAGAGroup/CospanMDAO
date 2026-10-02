@@ -587,8 +587,10 @@ TEST_CASE("Chunked: memory after the forward is the durable roots only", "[chunk
     const std::size_t after2 = cst::pool_in_use(m);
     CHECK(tch::chunks_of(m) == 8);
     CHECK(after1 == after2);          // nothing accumulates across forwards
-    CHECK(after1 < plain_after);      // the internal roots are gone
-    CHECK(plain_after - after1 >= n * 16);  // by at least the bytes of the internal port
+    CHECK(after1 < plain_after);      // the internal root is only a chunk big (D141: eternal, kept across forwards)
+    cs::detail::IOEntry& t = tch::inner_entry(m, "a.t");
+    CHECK(t.has_storage());
+    CHECK(t.capacity_elems() * sizeof(float) <= 16 * 32);  // its capacity is the largest chunk, never the whole run
     CHECK(after1 >= base);
 }
 
@@ -904,7 +906,7 @@ public:
 
 }  // namespace tch
 
-TEST_CASE("Chunked: internal roots are allocated once per forward and kept across the chunks", "[chunked][held]") {
+TEST_CASE("Chunked: internal roots are allocated once and kept across the chunks and the forwards", "[chunked][held]") {
     SECTION("dense, ten chunks") {
         constexpr std::size_t n = 10;
         cs::Model plain = cs::create_model<tch::DenseTop<tch::InnerPlain>>(default_config(), n, std::size_t{0});
@@ -916,11 +918,11 @@ TEST_CASE("Chunked: internal roots are allocated once per forward and kept acros
         for (int rep = 0; rep < 3; ++rep) {
             const std::size_t before = t.allocation_count();
             const auto        out    = tch::forward_out(m);
-            CHECK(t.allocation_count() - before == 1);
+            CHECK(t.allocation_count() - before == (rep == 0 ? 1u : 0u));  // eternal (D141): allocated by the first forward only
             CHECK(tch::chunks_of(m) == 10);
             CHECK(out == pout);
             CHECK_FALSE(t.held());
-            CHECK_FALSE(t.has_storage());  // released after the last chunk
+            CHECK(t.has_storage());  // kept after the last chunk
         }
     }
     SECTION("ragged, ten chunks of varying size (resized up and down within the capacity)") {
@@ -936,7 +938,7 @@ TEST_CASE("Chunked: internal roots are allocated once per forward and kept acros
         for (int rep = 0; rep < 2; ++rep) {
             const std::size_t before = g.allocation_count();
             const auto        out    = tch::forward_out(m);
-            CHECK(g.allocation_count() - before == 1);
+            CHECK(g.allocation_count() - before == (rep == 0 ? 1u : 0u));
             CHECK(tch::chunks_of(m) == 10);
             CHECK(tch::chunks_of(m) == tch::expected_chunks(cost, 64));
             CHECK(out == pout);
@@ -961,7 +963,7 @@ TEST_CASE("Chunked: an internal free input takes its init again in every chunk",
             const float bias = static_cast<float>(i / 3 + 1);  // the call number of its chunk
             CHECK(out[i] == 2.0f * (0.5f * static_cast<float>(i) + bias) + 1.0f);
         }
-        CHECK(tch::inner_entry(m, "ab.bias").allocation_count() == static_cast<std::size_t>(rep + 1));  // once per forward
+        CHECK(tch::inner_entry(m, "ab.bias").allocation_count() == 1);  // once, with the first forward (eternal, D141)
     }
 }
 
@@ -1289,5 +1291,103 @@ TEST_CASE("Topology cache: the window of an internal free input with an init", "
         CHECK(f.window.host_reads == 0);  // custom_host starts from a zeroed host buffer: no device read
         CHECK(f.window.host_read_hits == 0);  // the init's write, once per chunk
         CHECK(f.whole.full_passes == (rep == 0 ? 1u : 0u));
+    }
+}
+
+// ---- D141: lifetime by counting inside a ChunkedSystem ----------------------------------------------------------------
+namespace tch {
+
+/// DenseTop with the chunked system added as a TRANSIENT subsystem.
+template <class Inner>
+class DenseTopTransient : public cs::System {
+    std::size_t n_, budget_;
+
+public:
+    DenseTopTransient(std::size_t n, std::size_t budget) : n_{n}, budget_{budget} {}
+    void setup() override {
+        add_subsystem<Prod>("prod", n_);
+        add_subsystem<Inner>("inner", cs::property_list{cs::property::transient{}}, budget_, false);
+        add_subsystem<Cons>("cons");
+        connect("prod.x", "inner.in");
+        connect("inner.y", "cons.in");
+    }
+};
+
+/// The dense chunked system with b added with run_n{2}: b's counter moves once per FORWARD, not once per chunk.
+class RunNInner : public cs::ChunkedSystem {
+public:
+    RunNInner(std::size_t budget, bool /*promote_t*/) : cs::ChunkedSystem(budget) {}
+    void setup() override {
+        add_subsystem<A>("a");
+        add_subsystem<B>("b", cs::property_list{cs::property::run_n{2}});
+        connect("a.t", "b.in");
+        promote<DType::f32, 2>("a.in", "in");
+        promote<DType::f32, 1>("b.y", "y");
+    }
+};
+
+/// One forward and its wait, with the whole-forward event counts.
+cs::diag::EventCounts counted_forward(cs::Model& m) {
+    const auto before = cs::diag::snapshot();
+    m.forward();
+    m.wait();
+    return cs::diag::snapshot() - before;
+}
+
+}  // namespace tch
+
+TEST_CASE("Chunked eternal: the internal roots are allocated once across three forwards", "[chunked][lifetime]") {
+    cs::Model m = cs::create_model<tch::DenseTop<tch::InnerChunk>>(default_config(), std::size_t{10}, std::size_t{16});
+    m.setup();
+    const auto f1 = tch::counted_forward(m);
+    const auto f2 = tch::counted_forward(m);
+    const auto f3 = tch::counted_forward(m);
+    CHECK(f1.allocations >= 1);
+    CHECK(f2.allocations == 0);
+    CHECK(f3.allocations == 0);
+    CHECK(f2.frees == 0);
+    CHECK(f3.frees == 0);
+    CHECK(tch::inner_entry(m, "a.t").allocation_count() == 1);
+    CHECK(tch::inner_entry(m, "a.t").lifetime_count() == -1);
+}
+
+TEST_CASE("Chunked transient: the internal roots are freed after the last chunk with ONE queue wait per forward",
+          "[chunked][lifetime]") {
+    constexpr std::size_t n = 10;
+    cs::Model plain = cs::create_model<tch::DenseTop<tch::InnerPlain>>(default_config(), n, std::size_t{0});
+    plain.setup();
+    const auto pout = tch::forward_out(plain);
+    cs::Model m = cs::create_model<tch::DenseTopTransient<tch::InnerChunk>>(default_config(), n, std::size_t{16});
+    m.setup();
+    for (int rep = 0; rep < 3; ++rep) {
+        INFO("forward " << rep + 1);
+        const auto d = tch::counted_forward(m);
+        CHECK(tch::chunks_of(m) == 10);
+        CHECK(d.frees == 1);         // the one internal root
+        CHECK(d.queue_waits == 2);   // the batch release, plus the Model::wait of this helper
+        if (rep > 0) CHECK(d.allocations == 1);
+        cs::detail::IOEntry& t = tch::inner_entry(m, "a.t");
+        CHECK_FALSE(t.has_storage());
+        CHECK(t.released());
+        CHECK(t.lifetime_count() == 0);
+        const auto v = m.view_output<DType::f32, 1>("cons.out");
+        CHECK(std::vector<float>(v.span().begin(), v.span().end()) == pout);
+    }
+}
+
+TEST_CASE("Chunked: a run_n child counts forwards, not chunks", "[chunked][lifetime]") {
+    constexpr std::size_t n = 10;
+    cs::Model m = cs::create_model<tch::DenseTop<tch::RunNInner>>(default_config(), n, std::size_t{16});
+    m.setup();
+    auto&             inner = dynamic_cast<cs::ChunkedSystem&>(m.get_subsystem("inner"));
+    const cs::Subsystem* b  = inner.children()[1];
+    REQUIRE(b->name() == "b");
+    CHECK(b->run_counter() == 2);
+    const long expected[3] = {1, 0, 0};
+    for (int rep = 0; rep < 3; ++rep) {
+        INFO("forward " << rep + 1);
+        (void)tch::forward_out(m);
+        CHECK(tch::chunks_of(m) == 10);  // ten chunks every forward, b skipped in all of them once it has run twice
+        CHECK(b->run_counter() == expected[rep]);
     }
 }

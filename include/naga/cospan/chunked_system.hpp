@@ -10,8 +10,9 @@
 // whole run).
 //
 //   classification (once, at the end of setup, System::resolve):
-//     INTERNAL  every member of the root's aliasing set is declared inside the subtree: the root is
-//               forced transient, so its last user inside releases it (per chunk).
+//     INTERNAL  every member of the root's aliasing set is declared inside the subtree: the root lives by
+//               its partners' counts like any other (D141); inside the chunk loop their decrements are
+//               deferred to after the last chunk.
 //     BOUNDARY  the set has members inside and outside (a producer outside, a consumer outside, a
 //               promotion at this level or above). A boundary root that is itself INSIDE (an inside
 //               output consumed outside, an inside free input promoted out) is RE-ROOTED: a new alias
@@ -111,6 +112,7 @@ class ChunkedSystem : public System {
     mutable std::size_t                 dep_checks_ = 0;  ///< how many times the dependency self-check ran (a test hook)
     std::vector<ComponentBase::DepRead> reads_;  ///< the reads of the recording pass with their readers (self-check)
     std::function<void(std::size_t)>     chunk_hook_, chunk_post_hook_;
+    detail::DeferSink                    sink_;  ///< decrements and run-counter moves, deferred to after the last chunk (D141)
 
     /// The process-wide default of set_replay: true, unless the environment has COSPAN_CHUNK_LEGACY=1 (the
     /// whole test suite can be run on the legacy path that way).
@@ -169,6 +171,7 @@ public:
         Chunks                     chunks;
         std::optional<std::size_t> known_n;
         try {
+            sink_.clear();
             resolve_outside_ties(false);  // their shapes are known before the chunk length is
             const std::size_t n = leading_length();
             known_n             = n;
@@ -193,6 +196,7 @@ public:
             // (version-gated: unchanged metadata is not sent again). Per chunk only meta_shift_ moves.
             if (replay)
                 for (detail::IOEntry* r : internal_) r->upload_ragged(q());
+            sink_.active = true;  // the chunk loop: decrements and counter moves are deferred
             diag::window_begin();
             if (replay)
                 run_replay_loop(chunks);
@@ -204,12 +208,14 @@ public:
                 for (detail::IOEntry* r : internal_) r->meta_shift_ = 0;
                 for (Boundary& b : boundary_)
                     for (detail::IOEntry* p : b.peers) detail::LeadingRangeAccess::clear_no_refresh(*p);
-                release_held();  // one queue wait, then every held root is freed
+                finish_lifetimes();  // the deferred decrements, once; ONE queue wait if any root reaches 0
+                release_held();
                 clear_dim0();
             } else {
                 set_dim0(n);  // clearing a range re-resolves the peer's shape: at the whole run's length
                 clear_ranges();
-                release_held();  // one queue wait, then every held root is freed
+                finish_lifetimes();
+                release_held();
                 full_pass();     // the shapes of the whole run again, for views from the host
                 clear_ranges();
                 clear_dim0();
@@ -226,6 +232,7 @@ public:
                 for (detail::IOEntry* r : internal_) r->meta_shift_ = 0;
                 if (known_n) set_dim0(*known_n);
                 clear_ranges();
+                abort_lifetimes();
                 release_held();
                 clear_dim0();
             } catch (...) {  // the original error is the one to report
@@ -247,6 +254,7 @@ protected:
         for (detail::IOEntry* a : outside_ties_) a->chunk_outside_tie_ = false;
         outside_ties_.clear();
         for (ComponentBase* c : comps_) c->chunk_inside_ = true;
+        set_sinks(*this);
 
         std::vector<detail::IOEntry*>                    roots;
         std::unordered_set<const detail::IOEntry*>       seen;
@@ -516,6 +524,8 @@ private:
 
     /// A re-rooted root: allocate at its current size if absent; apply a free input's pending init.
     void allocate_rerooted(detail::IOEntry& root) {
+        detail::revive(root, *this);   // this System is the root's partner and owner: its materialization
+        sink_.record(root, *this);     // ... whose decrement waits for the end of the chunk loop
         root.allocate_if_absent(q());
         if (root.kind() == IOKind::input && root.init_pending()) {
             detail::apply_root_init(root, q());
@@ -524,40 +534,72 @@ private:
         root.upload_ragged(q());
     }
 
-    /// D140 B3: before the first chunk every INTERNAL root is allocated once, with capacity for its largest
-    /// chunk (the sum of its block sizes over the chunk's indices), and marked HELD: a last user does not
-    /// release it, an owner finds it present, and per chunk it is resized within its capacity (a usm_vector
-    /// resize within capacity, up or down, never reallocates).
+    /// Before the first chunk every INTERNAL root is present with capacity for its largest chunk (the sum
+    /// of its block sizes over the chunk's indices); its capacity is RESERVED (held_, reserve_elems_), and per
+    /// chunk it is resized within it (a usm_vector resize within capacity, up or down, never reallocates). An
+    /// eternal root that is still present from an earlier forward is kept when it is big enough (D141); one
+    /// that is too small is freed behind one wait and allocated again.
     void hold_internal(const std::vector<std::pair<std::size_t, std::size_t>>& chunks) {
         if (chunks.empty()) return;
         for (detail::IOEntry* r : internal_) {
-            if (r->present_) {  // left over from a failed forward
-                diag::count_queue_waits();
-                q().wait();
-                r->release_storage();
-            }
             std::size_t most = 0;
             for (const auto& [a, b] : chunks)
                 most = std::max(most, static_cast<std::size_t>(r->block_offset_at(b) - r->block_offset_at(a)));
+            if (r->present_ && r->capacity_elems() < most) {
+                diag::count_queue_waits();
+                q().wait();
+                r->release_storage();
+                detail::LifetimeOps::reset(*r);
+            }
             r->reserve_elems_ = most;
             r->held_          = true;
             r->allocate_if_absent(q());
         }
     }
 
-    /// After the last chunk: one queue wait, then free every held root and clear HELD.
+    /// After the last chunk: the reservation ends (the roots themselves live by their counts).
     void release_held() {
-        bool any = false;
-        for (const detail::IOEntry* r : internal_) any = any || r->held_;
-        if (!any) return;
-        diag::count_queue_waits();
-        q().wait();
+        for (detail::IOEntry* r : internal_) {
+            r->held_          = false;
+            r->reserve_elems_ = 0;
+        }
+    }
+
+    /// After the last chunk: the run counters of the children that ran move once, every deferred decrement is
+    /// applied once, and the roots that reached 0 are freed behind ONE queue wait.
+    void finish_lifetimes() {
+        sink_.active = false;
+        for (Subsystem* c : sink_.ran)
+            if (c->run_counter_ > 0) --c->run_counter_;
+        std::vector<detail::IOEntry*> batch;
+        for (const auto& [r, p] : sink_.items) detail::decrement(*r, *p, batch);
+        sink_.items.clear();
+        sink_.ran.clear();
+        detail::release(batch, q());
+    }
+
+    /// A failed forward: nothing deferred is applied; the internal roots go back out of scope (one wait if any
+    /// has storage), so the next forward starts clean.
+    void abort_lifetimes() {
+        sink_.clear();
+        std::vector<detail::IOEntry*> present;
         for (detail::IOEntry* r : internal_)
-            if (r->held_) {
-                r->release_storage();
-                r->held_          = false;
-                r->reserve_elems_ = 0;
-            }
+            if (r->present_) present.push_back(r);
+        if (!present.empty()) {
+            diag::count_queue_waits();
+            q().wait();
+            for (detail::IOEntry* r : present) r->release_storage();
+        }
+        for (detail::IOEntry* r : internal_) detail::LifetimeOps::reset(*r);
+    }
+
+    /// Every descendant (Systems and Components) defers its decrements to this system's sink.
+    void set_sinks(System& s) {
+        s.defer_sink_ = &sink_;
+        for (Subsystem* c : s.child_ptrs_) {
+            c->defer_sink_ = &sink_;
+            if (auto* sub = dynamic_cast<System*>(c)) set_sinks(*sub);
+        }
     }
 
     void clear_ranges() {
@@ -570,6 +612,15 @@ private:
     /// that used to be its root as soon as that entry's Component has resolved.
     void full_pass() {
         diag::count_full_passes();
+        // The pass resolves shapes at the FULL range. An internal root that stays allocated across forwards (D141)
+        // keeps its chunk capacity: its storage is not resized to the whole run here.
+        for (detail::IOEntry* r : internal_) r->resize_frozen_ = true;
+        struct Unfreeze {
+            ChunkedSystem& s;
+            ~Unfreeze() {
+                for (detail::IOEntry* r : s.internal_) r->resize_frozen_ = false;
+            }
+        } unfreeze{*this};
         for (Boundary& b : boundary_)
             if (b.member == nullptr)
                 for (detail::IOEntry* p : b.peers) detail::LeadingRangeAccess::set(*p, 0, b.root->extents()[0]);

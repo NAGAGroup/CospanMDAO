@@ -32,6 +32,7 @@
 #include "naga/cospan/host_view.hpp"
 #include "naga/cospan/init.hpp"
 #include "naga/cospan/kernel.hpp"
+#include "naga/cospan/lifetime.hpp"
 #include "naga/cospan/metadata.hpp"
 #include "naga/cospan/subsystem.hpp"
 #include "naga/cospan/wrappers.hpp"
@@ -275,10 +276,26 @@ public:
             detail::FlagScope scope{in_pre_forward_};
             pre_forward();
         }
+        // REVIVE every root this Component touches (D141): a root out of scope comes into scope with the
+        // answers of its partners; an in-scope root is left alone. Before any allocation.
+        for (detail::IOEntry* e : order_) detail::revive(*e->root(), *this);
         // ALLOCATE every root this Component OWNS (inputs and outputs) that has no storage, and
         // apply a free input root's init at the allocation (r01 §4.4, D138 amendment). A root it
         // does not own is only pointed at, below.
         for (detail::IOEntry* e : order_) allocate_owned(*e->root());
+        // FALLBACK: a free input root whose owner has stopped (its run counter is 0) is allocated and
+        // initialized by the next Component that needs it.
+        for (detail::IOEntry* e : order_) {
+            detail::IOEntry& r = *e->root();
+            if (r.kind() == IOKind::input && !r.has_storage() && r.owner() != nullptr && r.owner() != this &&
+                r.owner()->run_counter() == 0) {
+                r.allocate_if_absent(queue_ref());
+                if (r.init_pending()) {
+                    detail::apply_root_init(r, queue_ref());
+                    r.clear_init_pending();
+                }
+            }
+        }
         // D140: a ragged root's device index arrays follow its (possibly changed) description.
         if (!replay_)
             for (detail::IOEntry* e : order_)
@@ -293,8 +310,8 @@ public:
 
     /// Refresh the other-placement copies of every output root this Component
     /// produces (routed copies: device<->host, cross-device), ordered after the
-    /// launch by the stream; then RELEASE the transient roots this Component is
-    /// the last user of: one stream wait for the batch (synchronous frees, D135).
+    /// launch by the stream; then DECREMENT every root it touches and RELEASE the
+    /// ones that reached 0: one stream wait for the batch (synchronous frees, D135, D141).
     void run_post_compute(ExecCtx& owner_ctx) override {
         // Write epochs: every launch path ends here, with this Component's kernels submitted. Each OUTPUT's
         // root advances once per call (tied members of one root are separate Components, so N writers give +N).
@@ -313,17 +330,16 @@ public:
                 e->has_storage())
                 e->sync_other_placements(*owner_ctx.queue);
 
-        std::vector<detail::IOEntry*> drop;
+        // DECREMENT once per distinct root (deferred inside a ChunkedSystem's chunk loop), then free the
+        // roots whose count reached 0 behind ONE queue wait (D141).
+        std::vector<detail::IOEntry*> seen, batch;
         for (detail::IOEntry* e : order_) {
             detail::IOEntry* r = e->root();
-            if (r->transient() && r->last_user() == this && r->has_storage() && !r->held() &&  // D140 B3: held roots stay
-                std::find(drop.begin(), drop.end(), r) == drop.end())
-                drop.push_back(r);
+            if (std::find(seen.begin(), seen.end(), r) != seen.end()) continue;
+            seen.push_back(r);
+            detail::decrement_or_defer(*r, *this, batch, defer_sink());
         }
-        if (drop.empty()) return;
-        diag::count_queue_waits();
-        owner_ctx.queue->wait();
-        for (detail::IOEntry* r : drop) r->release_storage();
+        detail::release(batch, *owner_ctx.queue);
     }
 
     // ---- what a fused owner needs to know, without knowing the KernelBody type --
@@ -476,6 +492,7 @@ private:
     /// root (an output root) never gets an init applied.
     void allocate_owned(detail::IOEntry& root) {
         if (root.owner() != this) return;
+        detail::revive(root, *this);  // idempotent: a shape-driving read may reach the root before pre_compute's revive
         root.allocate_if_absent(queue_ref());
         if (root.kind() == IOKind::input && root.init_pending()) {
             detail::apply_root_init(root, queue_ref());

@@ -86,7 +86,10 @@ public:
     // ---- the runner (r01 §7.5, §11.3.1) ---------------------------------------------------------
     std::unique_ptr<LaunchDescription> run_compute_forward() override {
         const std::size_t n = children_.size();
-        for (std::size_t i = 0; i < n; ++i) children_[i]->run_pre_compute(child_ctx_[i]);
+        for (std::size_t i = 0; i < n; ++i) {
+            materialize_slot(i);
+            children_[i]->run_pre_compute(child_ctx_[i]);
+        }
 
         std::vector<std::unique_ptr<LaunchDescription>> ds;
         ds.reserve(n);

@@ -1050,7 +1050,7 @@ TEST_CASE("Ragged ties: tie_inputs of two RaggedInputs, from_connection to a rag
     }
 }
 
-TEST_CASE("Ragged ties: a tie inside a ChunkedSystem, bitwise equal to unchunked, one allocation per forward",
+TEST_CASE("Ragged ties: a tie inside a ChunkedSystem, bitwise equal to unchunked, allocated once",
           "[ragged][tie][chunked]") {
     const trt::Sizes sizes{1, 3, 2, 3, 0, 3, 1, 2};
     const std::size_t n = sizes.size();
@@ -1069,7 +1069,7 @@ TEST_CASE("Ragged ties: a tie inside a ChunkedSystem, bitwise equal to unchunked
             const std::size_t before = t.allocation_count();
             const auto        out    = trt::forward_out(m);
             CHECK(out == pout);
-            CHECK(t.allocation_count() - before == 1);
+            CHECK(t.allocation_count() - before == (rep == 0 ? 1u : 0u));  // eternal (D141): the first forward allocates it
             CHECK_FALSE(t.held());
         }
     }
@@ -1106,10 +1106,10 @@ TEST_CASE("Ragged ties: alias shapes from inputs and from internal entries insid
                 const std::size_t before = t.allocation_count();
                 const auto        out    = trt::forward_out(m);
                 CHECK(out == pout);
-                CHECK(t.allocation_count() - before == 1);
+                CHECK(t.allocation_count() - before == (rep == 0 ? 1u : 0u));
                 if (v == 3) {  // the internal ragged OUTPUT the alias inherits its shape from
                     cs::detail::IOEntry& r = trt::inner_entry(m, "g.mk.r");
-                    CHECK(r.allocation_count() == static_cast<std::size_t>(rep + 1));
+                    CHECK(r.allocation_count() == 1);
                 }
             }
         }
@@ -1332,8 +1332,8 @@ TEST_CASE("Chunked: a tie declared in the chunked system's own setup is internal
     cs::Model  m    = cs::create_model<trt::DirectTop<trt::DirectChunk>>(default_config(), counts, std::size_t{200});
     m.setup();
     CHECK(trt::forward_out(m) == want);
-    // internal and transient: nothing of the tie is left allocated after the forward
-    CHECK_FALSE(trt::inner_entry(m, "t").has_storage());
+    // internal and eternal (its holders answer -1, D141): the tie stays allocated, at a chunk's capacity
+    CHECK(trt::inner_entry(m, "t").has_storage());
     CHECK(trt::inner_entry(m, "t").held() == false);
 }
 
