@@ -1,7 +1,7 @@
 #pragma once
 
 // =============================================================================
-// naga/cospan/host_view.hpp — host-side copies of an entry (r01 §2.1, D139)
+// naga/cospan/host_view.hpp — host-side copies of an entry (r01 §2.1)
 // =============================================================================
 //
 // HostView is a read-only host copy of one entry, shaped like it, taken at
@@ -11,7 +11,7 @@
 // (its owner has not run yet, or a transient root was released) throws; a
 // present size-0 root gives an empty view with the right shape.
 //
-// There is NO host write API (D139): initial values go through init_input
+// There is NO host write API: initial values go through init_input
 // (cs::init::* factories). HostViewMut survives only as the argument type of
 // cs::init::custom_host: the framework builds one over a root it is
 // initializing, hands it to the user's function and commits it on return.
@@ -67,7 +67,7 @@ inline void check_entry_type(const IOEntry& e, DType dt, int rank) {
                                     "' asked for the wrong dtype or rank");
 }
 
-/// The dense views: a ragged entry has no rectangular shape (D140), view_ragged_* is for it.
+/// The dense views: a ragged entry has no rectangular shape, view_ragged_* is for it.
 inline void check_entry(const IOEntry& e, DType dt, int rank) {
     check_entry_type(e, dt, rank);
     if (e.is_ragged())
@@ -186,7 +186,7 @@ private:
     sycl::range<R>     shape_ = detail::filled_range<R>(0);
 };
 
-/// HostRagged<DT, Rank> — a read-only host copy of a ragged entry (D140), Rank 2..3: the flat data
+/// HostRagged<DT, Rank> — a read-only host copy of a ragged entry, Rank 2..3: the flat data
 /// (`data`, the total size), the block offsets (`offsets`, N + 1 entries, u64) and the per-dimension
 /// extents. Also taken of a DENSE entry (offsets are the row starts, extents the constants).
 template <DType DT, int Rank>
@@ -223,7 +223,7 @@ private:
     HostRagged(detail::IOEntry& entry, sk::queue& q) {
         detail::check_entry_type(entry, DT, Rank);
         if (entry.is_ragged()) {
-            // Under a runtime leading range [a, b) (D140 B1) the view is that range: its offsets start at 0
+            // Under a runtime leading range [a, b) the view is that range: its offsets start at 0
             // and its data starts at the root's block a.
             const std::vector<value_type>& whole = detail::storage_of<value_type>(entry).read_primary(q);
             offsets                       = entry.block_offsets();
@@ -258,7 +258,7 @@ private:
 
 /// HostViewMut<DT, Rank> — the writable host copy handed to a cs::init::custom_host function.
 /// Built by the framework only (the constructor is private); the framework commits it when the
-/// function returns. It is NOT a host write API: there is none (D139).
+/// function returns. It is NOT a host write API: there is none.
 template <DType DT, int Rank>
 class HostViewMut {
 public:

@@ -1,6 +1,6 @@
 // Model tests, every case through a cospan::Model (create_model / setup / forward /
 // wait / view_* / set_*); the only reach past those is the Model's own retrieval
-// (root().entry_at, D113).
+// (root().entry_at).
 //
 //   1. Sellar forward   the same Systems templated on the dtype, run in f32 and f64
 //                       over several design points against a host reference in double
@@ -15,7 +15,7 @@
 //   6. Pool             a pool on the device and a value-driven (FromInput) output root
 //   7. Two devices      producer and consumer on different devices of one context
 //
-// The components live in namespace tmod (D118).
+// The components live in namespace tmod.
 
 #include <array>
 #include <cmath>
@@ -339,7 +339,7 @@ constexpr std::size_t kCvtBytes = 64 * sizeof(double);
 constexpr std::size_t kBcBytes  = 8 * sizeof(float);
 constexpr std::size_t kOutBytes = 16 * sizeof(float);
 constexpr std::size_t kExpectedStatic = kGenBytes + kCvtBytes + kBcBytes + kOutBytes;  // 1008
-constexpr std::size_t kArenaSlack     = 4096 * 64;                                     // D106
+constexpr std::size_t kArenaSlack     = 4096 * 64;
 
 struct GenBody {
     struct Inputs {};
@@ -483,7 +483,7 @@ public:
     }
 };
 
-// ---- Initializer-only inputs and empty roots (D139) -------------------------------------------------
+// ---- Initializer-only inputs and empty roots -------------------------------------------------
 // Scale: y = 2 x, x shaped by its source, y by x.
 struct ScaleBody {
     struct Inputs {
@@ -715,7 +715,7 @@ TEST_CASE("Marks: design variables, objective, constraints, one record per root"
     }
     CHECK(on_g1 == 1);
     CHECK(on_g2 == 1);
-    model.wait();  // setup() submitted initializer work; wait before the Model goes out of scope (D135)
+    model.wait();  // setup() submitted initializer work; wait before the Model goes out of scope
 }
 
 // =============================================================================================
@@ -736,7 +736,7 @@ TEST_CASE("Lifecycle: errors before setup, setup twice, moved-from, default_devi
         auto m = cs::create_model<Top>(default_config());
         m.setup();
         tmod::expect_throws([&] { m.setup(); }, {"runs once"});
-        m.wait();  // the first setup() submitted initializer work (D135)
+        m.wait();  // the first setup() submitted initializer work
     }
     SECTION("forward on a moved-from Model throws; the moved-to Model runs") {
         auto m = cs::create_model<Top>(default_config());
@@ -770,11 +770,11 @@ TEST_CASE("Host access: errors name the path; init_input on an output throws", "
         // The wrong kind of entry.
         tmod::expect_throws([&] { (void)model.view_input<DType::f32, 1>("obj.f"); }, {"obj.f", "an output"});
         tmod::expect_throws([&] { (void)model.view_output<DType::f32, 1>("d1.z"); }, {"d1.z", "an input"});
-        // An initial value on an output is an error (D139).
+        // An initial value on an output is an error.
         tmod::expect_throws([&] { model.init_input("obj.f", cs::init::from_host(two)); }, {"obj.f", "an output"});
         // The right call still works after that.
         CHECK_NOTHROW(model.init_input("z", cs::init::from_host(two)));
-        model.wait();  // setup() submitted work (D135)
+        model.wait();  // setup() submitted work
     }
 }
 
@@ -899,7 +899,7 @@ TEST_CASE("Two devices: a producer on one, its consumer on the other", "[model][
 }
 
 // =============================================================================================
-// 8. Initializer-only inputs and empty roots (D139)
+// 8. Initializer-only inputs and empty roots
 // =============================================================================================
 TEST_CASE("D139: a size-0 root is present and empty; its consumer runs as a no-op", "[model][init][empty]") {
     auto model = cs::create_model<tmod::EmptyTop>(default_config());

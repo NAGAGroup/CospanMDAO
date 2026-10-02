@@ -1,4 +1,4 @@
-// D140 B1: runtime leading-range views (the plumbing the chunked system will use), and size-0 fixed roots.
+// runtime leading-range views (the plumbing the chunked system will use), and size-0 fixed roots.
 //
 // A consumer's connected input is pointed, between forwards, at rows / blocks [a, b) of its root through
 // detail::LeadingRangeAccess (the framework-only hook); the consumer's results are checked against host

@@ -18,7 +18,7 @@
 // records, root, substrates, queue, ctx.
 //
 // LAYERING (§9.4). Each layer orders what it submits; ~Model does not wait
-// (D135): call wait() before a Model is destroyed or reassigned.
+//: call wait() before a Model is destroyed or reassigned.
 
 #include <concepts>
 #include <iostream>
@@ -99,7 +99,7 @@ public:
     Model(const Model&)            = delete;
     Model& operator=(const Model&) = delete;
 
-    /// Does not wait (D135); never throws.
+    /// Does not wait; never throws.
     ~Model() { finish(); }
 
     // ---- lifecycle -------------------------------------------------------------
@@ -163,7 +163,7 @@ public:
         Impl& s = ready("view_output");
         return HostView<DT, Rank>{entry_of(s, path, IOKind::output, "view_output"), s.queue};
     }
-    /// D140: host copies of a ragged entry (also of a dense one: offsets are the row starts).
+    /// host copies of a ragged entry (also of a dense one: offsets are the row starts).
     template <DType DT, int Rank>
     HostRagged<DT, Rank> view_ragged_input(std::string_view path) const {
         Impl& s = ready("view_ragged_input");
@@ -174,7 +174,7 @@ public:
         Impl& s = ready("view_ragged_output");
         return detail::HostViewAccess::ragged<DT, Rank>(entry_of(s, path, IOKind::output, "view_ragged_output"), s.queue);
     }
-    // ---- initial values (D139): the only way to give an input data from the host -----------
+    // ---- initial values: the only way to give an input data from the host -----------
     /// Set the initial value of the root of the input at `path`, any time after setup(). It wins
     /// over the Component's and the Systems' declarations, and the root's OWNER applies it at its
     /// next run (once per call; a root not yet allocated gets it at its allocation). An output
@@ -213,7 +213,7 @@ public:
         struct PerDevice {
             std::size_t arena_bytes = 0, arena_bytes_in_use = 0;  ///< capacity (with the alignment slack) / handed out
             std::size_t pool_bytes = 0, pool_bytes_in_use = 0;    ///< slots x node size
-            std::size_t os_allocations = 0, os_bytes_in_use = 0;  ///< not tracked anywhere yet: always 0 (D107)
+            std::size_t os_allocations = 0, os_bytes_in_use = 0;  ///< not tracked anywhere yet: always 0
         };
         std::unordered_map<sycl::device, PerDevice> devices;
     };
@@ -305,7 +305,7 @@ private:
         return e;
     }
 
-    /// Releases the Impl in the §9.4 order. Does not wait: the user waits before destroying or reassigning a Model (D135).
+    /// Releases the Impl in the §9.4 order. Does not wait: the user waits before destroying or reassigning a Model.
     void finish() noexcept {
         if (!s_) return;
         s_.reset();

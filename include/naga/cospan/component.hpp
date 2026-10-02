@@ -103,7 +103,7 @@ public:
         add_output<DT, Rank>(m, std::move(name), detail::expand_from_input_array<Rank>(marker));
     }
 
-    /// Ragged ports (D140) take the array form too: cs::unspecified_shape<R>() (every dimension supplied from outside).
+    /// Ragged ports take the array form too: cs::unspecified_shape<R>() (every dimension supplied from outside).
     template <DType DT, int Rank, DimSpec S>
     void declare_input(RaggedInput<DT, Rank>& m, std::string name, const std::array<S, static_cast<std::size_t>(Rank)>& specs) {
         register_entry(std::make_unique<detail::RaggedInputEntry<DT, Rank>>(name, records_of<Rank>(specs), &m), &m, "declare_input");
@@ -113,7 +113,7 @@ public:
         register_entry(std::make_unique<detail::RaggedOutputEntry<DT, Rank>>(name, records_of<Rank>(specs), &m), &m, "declare_output");
     }
 
-    /// Ragged ports (D140): RaggedInput / RaggedOutput members, Rank 2..3, with the same DimSpec
+    /// Ragged ports: RaggedInput / RaggedOutput members, Rank 2..3, with the same DimSpec
     /// arguments (scalar and per-index mixed: PerIndex, FromInputValues on dims >= 1).
     template <DType DT, int Rank, DimSpec... Specs>
         requires(sizeof...(Specs) == Rank)
@@ -158,7 +158,7 @@ public:
     EntryRefs get_inputs() const { return entries_of(IOKind::input); }
     EntryRefs get_outputs() const { return entries_of(IOKind::output); }
 
-    // ---- initial values (legal inside setup() only; r01 §4.4, D138) -----------
+    // ---- initial values (legal inside setup() only; r01 §4.4) -----------
     /// Declare the initial value of one of this Component's OWN inputs, by name. Metadata on the
     /// input's root, applied by the framework when the root is allocated from nothing; the
     /// declaration of the highest level wins, it is ignored when the input ends up with a source,
@@ -216,7 +216,7 @@ public:
             if (e->kind() == IOKind::input && !e->is_root() && e->tie_alias_ == nullptr && e->has_unspecified())
                 e->update_shape();  // takes the connected source's unspecified dims
         // No allocation at setup: every root is allocated, and its init applied, by its OWNER in
-        // run_pre_compute (r01 §4.4, D138 amendment). Roots only learn what to allocate from.
+        // run_pre_compute (r01 §4.4). Roots only learn what to allocate from.
         for (detail::IOEntry* e : order_)
             if (e->is_root()) e->bind_substrates(substrates);
         for (detail::IOEntry* e : order_) {
@@ -228,13 +228,13 @@ public:
         }
     }
 
-    /// Shape resolution only (D140 B2: a ChunkedSystem's full-range pass, host only, no allocation of
+    /// Shape resolution only (a ChunkedSystem's full-range pass, host only, no allocation of
     /// what it owns beyond what a FromInput read needs, and no pre_forward): the tie aliases this
     /// Component owns, then every input, then every output.
     void resolve_shapes() {
         diag::count_resolve_shapes();
         ev_.resolving_ = nullptr;
-        // Tie aliases first (D139 part 2): the root's owner resolves an alias root's shape BEFORE
+        // Tie aliases first: the root's owner resolves an alias root's shape BEFORE
         // the entries below read it (and before allocation); a connected alias is checked once.
         resolve_alias_shapes();
         std::unordered_set<const detail::IOEntry*> done, active;
@@ -259,11 +259,11 @@ public:
             detail::FlagScope scope{in_pre_forward_};
             pre_forward();
         }
-        // REVIVE every root this Component touches (D141): a root out of scope comes into scope with the
+        // REVIVE every root this Component touches: a root out of scope comes into scope with the
         // answers of its partners; an in-scope root is left alone. Before any allocation.
         for (detail::IOEntry* e : order_) detail::revive(*e->root(), *this);
         // ALLOCATE every root this Component OWNS (inputs and outputs) that has no storage, and
-        // apply a free input root's init at the allocation (r01 §4.4, D138 amendment). A root it
+        // apply a free input root's init at the allocation (r01 §4.4). A root it
         // does not own is only pointed at, below.
         for (detail::IOEntry* e : order_) allocate_owned(*e->root());
         // A free input root whose owner has stopped (its run counter is 0) has no one left to allocate it:
@@ -279,12 +279,12 @@ public:
                 }
             }
         }
-        // D140: a ragged root's device index arrays follow its (possibly changed) description.
+        // a ragged root's device index arrays follow its (possibly changed) description.
         if (!replay_)
             for (detail::IOEntry* e : order_)
                 if (e->root()->owner() == this && e->root()->has_storage()) e->root()->upload_ragged(queue_ref());
         for (detail::IOEntry* e : order_) {
-            if (!replay_ && !e->is_root()) e->check_constraints(false);  // D142: specified dims against their supplier
+            if (!replay_ && !e->is_root()) e->check_constraints(false);  // specified dims against their supplier
             if (!replay_ && e->kind() == IOKind::input && !e->is_root() &&
                 (e->is_dynamic() || e->root()->is_dynamic()))
                 e->validate_connection();
@@ -295,7 +295,7 @@ public:
     /// Refresh the other-placement copies of every output root this Component
     /// produces (routed copies: device<->host, cross-device), ordered after the
     /// launch by the stream; then DECREMENT every root it touches and RELEASE the
-    /// ones that reached 0: one stream wait for the batch (synchronous frees, D135, D141).
+    /// ones that reached 0: one stream wait for the batch (synchronous frees).
     void run_post_compute(ExecCtx& owner_ctx) override {
         // Write epochs: every launch path ends here, with this Component's kernels submitted. Each OUTPUT's
         // root advances once per call (tied members of one root are separate Components, so N writers give +N).
@@ -315,7 +315,7 @@ public:
                 e->sync_other_placements(*owner_ctx.queue);
 
         // DECREMENT once per distinct root (deferred inside a ChunkedSystem's chunk loop), then free the
-        // roots whose count reached 0 behind ONE queue wait (D141).
+        // roots whose count reached 0 behind ONE queue wait.
         std::vector<detail::IOEntry*> seen, batch;
         for (detail::IOEntry* e : order_) {
             detail::IOEntry* r = e->root();
@@ -395,7 +395,7 @@ private:
         register_entry(std::make_unique<detail::OutputEntry<DT, Rank>>(name, dims, &m), &m, "declare_output");
     }
 
-    /// D140: a DENSE wrapper cannot hold per-index dims (PerIndex, FromInputValues).
+    /// a DENSE wrapper cannot hold per-index dims (PerIndex, FromInputValues).
     template <std::size_t N>
     void reject_per_index(const std::string& name, const std::array<detail::DimRecord, N>& dims) const {
         for (const detail::DimRecord& r : dims)
@@ -462,7 +462,7 @@ private:
         return false;
     }
 
-    /// The OWNER's allocation of a root (r01 §4.4, D139): through the one allocation routine (a
+    /// The OWNER's allocation of a root (r01 §4.4): through the one allocation routine (a
     /// size-0 root becomes present with empty storage). For a free input root (an input root: it
     /// has no source): if it was just allocated its init is applied (else zeros); else if an init
     /// is pending (Model::init_input) the init is applied to the existing storage. Either way the
@@ -501,7 +501,7 @@ private:
                                    std::string{e.name()} + "'");
         for (int d = 0; d < e.rank(); ++d) {
             detail::DimRecord& r = e.dims_[static_cast<std::size_t>(d)];
-            // Inside a ChunkedSystem dim 0 is the chunk length (D140 B3): its declared rule is not evaluated.
+            // Inside a ChunkedSystem dim 0 is the chunk length: its declared rule is not evaluated.
             if (d == 0 && e.dim0_override_) continue;
             if (r.how == detail::DimRecord::How::from_input_dim) {
                 detail::IOEntry& src = sibling_input(e, r.input);
@@ -510,7 +510,7 @@ private:
                     throw std::out_of_range("naga::cospan: '" + std::string{e.name()} +
                                             "' derives from a dimension past the rank of '" + r.input + "'");
                 r.extent = src.extents()[r.dim];
-                // D140: a per-index source dimension passes its array on (dim 0 is never per-index).
+                // a per-index source dimension passes its array on (dim 0 is never per-index).
                 if (d >= 1) {
                     r.per_index = src.per_index_raw(r.dim);
                     r.per       = src.dim(r.dim).per;
@@ -537,7 +537,7 @@ private:
         done.insert(&e);
     }
 
-    // ---- tie aliases (D139 part 2) ------------------------------------------------
+    // ---- tie aliases ------------------------------------------------
     /// For each tie alias one of this Component's entries belongs to: a connected tie_inputs alias
     /// is checked once against the output it joined. (A tie alias that is a ROOT is resolved by its
     /// owner, the System that declared it: System::materialize.)
@@ -548,7 +548,7 @@ private:
             if (a == nullptr || !a->alias_shape_ || std::find(seen.begin(), seen.end(), a) != seen.end()) continue;
             seen.push_back(a);
             const AliasShape& s = *a->alias_shape_;
-            if (a->is_root()) continue;  // a tie root is resolved and allocated by its owner, the declaring System (D141)
+            if (a->is_root()) continue;  // a tie root is resolved and allocated by its owner, the declaring System
             if (!a->alias_checked_) {
                 if (s.kind != AliasShape::Kind::unspecified) {
                     const detail::AliasEvaluator::AliasEval want = ev_.alias_eval(*a);

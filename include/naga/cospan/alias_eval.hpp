@@ -3,9 +3,9 @@
 // naga/cospan/alias_eval.hpp: detail::AliasEvaluator
 // =============================================================================
 //
-// What evaluates a tie alias's shape rule and reads the values and shapes a rule depends on (D139 part 2,
-// D140). A Component and a System each OWN one (a tie alias root is
-// owned and resolved by its declaring System, D141). It holds the queue it reads through, the recorders and
+// What evaluates a tie alias's shape rule and reads the values and shapes a rule depends on.
+// A Component and a System each OWN one (a tie alias root is
+// owned and resolved by its declaring System). It holds the queue it reads through, the recorders and
 // the read log a ChunkedSystem's full pass fills (its topology cache and dependency self-check), and the
 // chunk-pass state.
 //
@@ -35,7 +35,7 @@ class AliasEvaluator {
 public:
     sk::queue*                       queue_ = nullptr;      ///< set at prepare_exec by the owner
     std::function<void(IOEntry&)>    ensure_;               ///< a Component: allocate_owned; a System: none
-    bool                             chunk_pass_ = false;   ///< a ChunkedSystem's full-range pass is running (D140 B2)
+    bool                             chunk_pass_ = false;   ///< a ChunkedSystem's full-range pass is running
 
     /// One recorded read: the root read, the entry being resolved when it was read, and which kind of dependency.
     struct DepRead {
@@ -69,7 +69,7 @@ public:
         if (ensure_) ensure_(root);
     }
 
-    /// A tie alias's shape as its AliasShape gives it right now (D140: scalar extents, and per-index arrays
+    /// A tie alias's shape as its AliasShape gives it right now (scalar extents, and per-index arrays
     /// for dims >= 1 that are per-index; the extent of a per-index dim is 0).
     struct AliasEval {
         std::array<std::size_t, 3>              ext{1, 1, 1};
@@ -244,7 +244,7 @@ public:
     }
 
     /// The VALUES of an integer-dtype input of rank 1 [N] (column 0) or rank 2 [N, k] (column < k),
-    /// on the host: one per row (D140, FromInputValues). Negative values are an error.
+    /// on the host: one per row (FromInputValues). Negative values are an error.
     std::vector<std::size_t> read_values(detail::IOEntry& src, std::size_t column) {
         check_not_chunk_internal(src);
         note_value_dep(src.root());  // a VALUE dependency of the topology cache
@@ -289,7 +289,7 @@ public:
         return out;
     }
 
-    /// D140 B2: during a ChunkedSystem's full-range pass a shape may not be driven by a value of a root
+    /// during a ChunkedSystem's full-range pass a shape may not be driven by a value of a root
     /// that is internal to the chunked system (it would be computed per chunk).
     void check_not_chunk_internal(const detail::IOEntry& src) const {
         if (!chunk_pass_) return;

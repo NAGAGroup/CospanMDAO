@@ -172,7 +172,7 @@ public:
     // ---- HOOKS ---------------------------------------------------------------
     /// Structure and wiring (legal here only).
     virtual void setup() {}
-    // There is no init hook: initial values are declared with init_input (§4.4, D138).
+    // There is no init hook: initial values are declared with init_input (§4.4).
 
     // ---- adding children (legal inside setup() only) ---------------------------
     /// A REALIZED System or Component type. The child is constructed, named,
@@ -238,7 +238,7 @@ public:
     /// Kind-agnostic and always allowed: a PEER alias in this namespace with a
     /// snapshot of its root's flags; copies the promoted entry's view. DT must match the
     /// entry's value dtype and Rank its rank (a setup error otherwise). The alias MIRRORS the
-    /// entry: its shape is read live from it (D139 part 2).
+    /// entry: its shape is read live from it.
     template <DType DT, int Rank>
     void promote(std::string_view child_path, std::string promoted_name) {
         static_assert(Rank >= 1 && Rank <= 3, "cospan: rank is 1..3");
@@ -259,7 +259,7 @@ public:
     /// A NEW ROOT (target, not source); every member's set merges into it. The members are
     /// rank-only (cs::tied) entries of dtype DT and rank Rank; the alias OWNS the shape: its
     /// `shape` (cs::alias::fixed / from_output_shape / from_output_values) is
-    /// the root's shape, or, once an output is connected into the alias, that output's (D139 part 2).
+    /// the root's shape, or, once an output is connected into the alias, that output's.
     template <DType DT, int Rank>
     void tie_inputs(std::initializer_list<std::string_view> members, std::string name,
                     AliasShape shape = detail::unspecified_alias_shape()) {
@@ -398,7 +398,7 @@ public:
     EntryRefs get_inputs() const { return aliases_of(IOKind::input); }
     EntryRefs get_outputs() const { return aliases_of(IOKind::output); }
 
-    /// OPACITY (D140 amendment): a chunked system's only interface is its own promotions. A path that descends
+    /// OPACITY: a chunked system's only interface is its own promotions. A path that descends
     /// THROUGH an opaque system into its children is refused, unless the opaque system is the CALLER resolving its own
     /// subtree. Overridden by ChunkedSystem.
     virtual bool is_opaque() const noexcept { return false; }
@@ -435,7 +435,7 @@ public:
     /// whose root is chunked sees its promotions only. (Everything else is entry_at.)
     detail::IOEntry& entry_at_from_outside(std::string_view path) { return entry_at_impl(path, true); }
 
-    // ---- initial values (legal inside setup() only; r01 §4.4, D138) -------------------------
+    // ---- initial values (legal inside setup() only; r01 §4.4) -------------------------
     /// Declare the initial value of a free input root: `path` is a child input path, or one of
     /// this System's promoted or tied input aliases. The declaration is at THIS System's depth:
     /// it wins over any declaration below it and loses to any above it; two at one depth on one
@@ -537,7 +537,7 @@ public:
         for (std::size_t i = 0; i < children_.size(); ++i) {
             Subsystem& c  = *children_[i];
             ExecCtx&   cc = child_ctx_[i];
-            materialize_slot(i);                // the aliases whose first partner is child i (D141)
+            materialize_slot(i);                // the aliases whose first partner is child i
             if (c.run_counter_ == 0) continue;  // run policy: exhausted, no pre, compute or post
             c.run_pre_compute(cc);
             if (auto d = c.run_compute_forward()) {
@@ -558,12 +558,12 @@ public:
 
     /// The ROOT System's end-of-setup pass (§4.4, §11.2.1; run_setup runs it when this System has
     /// no owner). Per root it records: its OWNER (the first Component, in depth-first registration
-    /// order, that touches it; a re-rooted root's ChunkedSystem), its PARTNERS (D141: one per
+    /// order, that touches it; a re-rooted root's ChunkedSystem), its PARTNERS (one per
     /// distinct Component or alias-declaring System on its alias set), and the winning initial value
     /// (smallest declaring depth; two at one depth throw; an init on a root with a source is
     /// ignored). Counts are NOT set here: a root comes into scope when it is first revived.
     void resolve() {
-        classify_chunks();  // D140 B2: ChunkedSystems classify their roots and re-root boundary ones first
+        classify_chunks();  // ChunkedSystems classify their roots and re-root boundary ones first
         std::vector<detail::IOEntry*> roots;
         collect_roots(roots);
 
@@ -583,25 +583,25 @@ public:
             }
         for (detail::IOEntry* r : roots)
             if (r->chunk_rerooted_)
-                r->owner_ = r->declarer_;  // D140 B2: its ChunkedSystem allocates it, not a Component
+                r->owner_ = r->declarer_;  // its ChunkedSystem allocates it, not a Component
             else if (r->alias_shape_)
-                r->owner_ = r->declarer_;  // a tie alias root: owned, resolved and allocated by the declaring System (D141)
+                r->owner_ = r->declarer_;  // a tie alias root: owned, resolved and allocated by the declaring System
 
         for (detail::IOEntry* r : roots) {
             record_partners(*r);
             resolve_init(*r);
         }
         record_source_partners();
-        check_ties(comps);  // D139 part 2: rank-only entries are tied; alias shape sources are ordered
+        check_ties(comps);  // rank-only entries are tied; alias shape sources are ordered
         build_materialize_slots();
     }
 
 protected:
-    /// D140 B2: called on every System of the tree (children first) at the start of resolve(); a
+    /// called on every System of the tree (children first) at the start of resolve(); a
     /// ChunkedSystem classifies its roots here.
     virtual void chunk_classify() {}
 
-    /// Right before child i, every alias in slot i is brought into scope (D141). A flavor's runner calls
+    /// Right before child i, every alias in slot i is brought into scope. A flavor's runner calls
     /// this before each child's pre_compute, on the thread that drives the loop.
     void materialize_slot(std::size_t i) {
         if (i >= materialize_before_.size()) return;
@@ -618,7 +618,7 @@ private:
     bool                                       chunk_replay_ = false;  ///< set by a replaying ChunkedSystem on itself and its descendant Systems: no shape resolution
     static void rearm_subtree(Subsystem& self);
 
-    /// An alias comes into scope, right before the first child that uses its root (D141):
+    /// An alias comes into scope, right before the first child that uses its root:
     ///   1. its root is revived;
     ///   2. a root THIS System owns (a tie root, not an outside boundary root of a chunked system, which its chunked
     ///      system resolves and allocates): its shape rule is evaluated (not while a ChunkedSystem replays its cached
@@ -677,7 +677,7 @@ private:
         chunk_classify();
     }
 
-    /// The root's PARTNERS (D141): one per distinct holder on its alias set. A Component holder is a
+    /// The root's PARTNERS: one per distinct holder on its alias set. A Component holder is a
     /// writer when it has an OUTPUT entry on the root; the owner of a free input root writes it (applies
     /// its init) too.
     static void record_partners(detail::IOEntry& r) {
@@ -742,7 +742,7 @@ private:
 
     /// The winning init of a root: the declaration of the smallest depth among its alias set's.
     static void resolve_init(detail::IOEntry& r) {
-        if (r.model_init_) return;  // Model::init_input (D139) wins and is never overwritten
+        if (r.model_init_) return;  // Model::init_input wins and is never overwritten
         r.init_spec_.reset();
         if (r.kind() == IOKind::output) return;  // the root has a source: the inputs' inits are ignored
         const detail::IOEntry::InitDecl* best  = nullptr;
@@ -1016,7 +1016,7 @@ private:
         aliases_.emplace(std::string{p->name()}, std::move(a));
     }
 
-    // ---- alias shape (D139 part 2) ---------------------------------------------------------
+    // ---- alias shape ---------------------------------------------------------
     using Members = std::vector<std::pair<std::string_view, detail::IOEntry*>>;
 
     /// A promotion's dims. Its shape is read live from the entry (it mirrors it), so the dims are
@@ -1053,7 +1053,7 @@ private:
                 r.extent = s.dim_specs[static_cast<std::size_t>(d)].extent;
             } else {
                 r.how = detail::DimRecord::How::from_input;
-                if (s.kind == AliasShape::Kind::dims) {  // D140: statically per-index dims (resolved by the owner)
+                if (s.kind == AliasShape::Kind::dims) {  // statically per-index dims (resolved by the owner)
                     const AliasDim& sp = s.dim_specs[static_cast<std::size_t>(d)];
                     if (sp.how == AliasDim::How::per_index_host || sp.how == AliasDim::How::output_values) r.per = true;
                 }
@@ -1073,7 +1073,7 @@ private:
     }
 
     /// Every member is of dtype DT and rank Rank. A member may declare any dims: the unspecified ones come from the
-    /// tie, the specified ones are constraints on it (D142).
+    /// tie, the specified ones are constraints on it.
     template <DType DT, int Rank>
     void check_tie_members(const Members& ms, const char* what) const {
         for (const auto& [path, m] : ms) check_typed<DT, Rank>(*m, what, path);
@@ -1182,14 +1182,14 @@ private:
         return out;
     }
 
-    // ---- ties, checked once at the end of setup (D139 part 2) ------------------------------
+    // ---- ties, checked once at the end of setup ------------------------------
     void collect_aliases(std::vector<detail::IOEntry*>& out) {
         for (detail::IOEntry* a : alias_order_) out.push_back(a);
         for (Subsystem* c : child_ptrs_)
             if (auto* s = dynamic_cast<System*>(c)) s->collect_aliases(out);
     }
 
-    /// B3 (D142): an untied output with an unspecified dim, a free input with one and no initializer shape, and an
+    /// An untied output with an unspecified dim, a free input with one and no initializer shape, and an
     /// unspecified tie_inputs root nothing supplies are setup errors; a
     /// from_output_* alias reads an output whose producer runs BEFORE the tie's first member.
     void check_ties(const std::vector<ComponentBase*>& comps) {
@@ -1310,7 +1310,7 @@ private:
         if (!dtype_compatible(s.dtype(), d.dtype()) || !dtype_compatible(sr.dtype(), dr.dtype()))
             fail(what.c_str(), "the value dtypes differ");
 
-        // D140: a Slice cannot select a region of a ragged root (no rectangular geometry).
+        // a Slice cannot select a region of a ragged root (no rectangular geometry).
         if (slice && (sr.declared_ragged() || sr.is_ragged_port() || s.is_ragged_port() || d.is_ragged_port() ||
                       dr.is_ragged_port()))
             fail(what.c_str(), "'" + std::string{sr.name()} + "' is ragged; a Slice view onto a ragged root is not supported");
@@ -1417,7 +1417,7 @@ private:
 
 /// Resets every run counter of the subtree, then sends every root OWNED by the subtree back out of scope:
 /// one queue wait, the storage of those that have any is released, count and owed go to 0 (eternal ones
-/// included), so the next forward revives, allocates and initializes them again (D141).
+/// included), so the next forward revives, allocates and initializes them again.
 inline void Subsystem::rearm() { System::rearm_subtree(*this); }
 
 inline void System::rearm_subtree(Subsystem& self) {

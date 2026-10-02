@@ -1,13 +1,13 @@
 #pragma once
 
 // =============================================================================
-// naga/cospan/init.hpp — initial values of free input roots (r01 §4.4, D138)
+// naga/cospan/init.hpp — initial values of free input roots (r01 §4.4)
 // =============================================================================
 //
 // An initial value is METADATA on a free input root (an input root with no
 // source), declared during setup() with ComponentBase::init_input(name, init)
 // or System::init_input(path, init), or at any time after setup with
-// Model::init_input(path, init) (D139), which wins over both. The highest level
+// Model::init_input(path, init), which wins over both. The highest level
 // wins; the root's owner applies it when it allocates the root, and again when
 // Model::init_input leaves one pending. There is no host write API: outputs are
 // never initialized (§6.0).

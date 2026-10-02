@@ -67,7 +67,7 @@ inline const ComponentBase* stage_component(const Subsystem* s) {
     return c;
 }
 
-/// (D140) FusedSystem and ParallelSystem: a child with any ragged port (declared with RaggedInput /
+/// FusedSystem and ParallelSystem: a child with any ragged port (declared with RaggedInput /
 /// RaggedOutput, or with a per-index dimension spec) is a setup error.
 inline void check_no_ragged_ports(const std::string& owner, std::span<Subsystem* const> stages) {
     for (const Subsystem* s : stages) {
@@ -125,8 +125,7 @@ inline void check_tied_outputs(const std::string& owner, const char* what, std::
 /// (h) Both modes of a FusedSystem, at compile(): every entry of every stage with
 /// a value-driven dim (FromInput) is followed to its driving input, and the
 /// driving input's aliasing set must not hold an output of another stage.
-/// FromInputDim and unspecified dims (supplied through connections) are always allowed. A tied entry (D139
-/// part 2) with an unspecified dim is checked through its tie alias: a from_output_shape / from_output_values source must
+/// FromInputDim and unspecified dims (supplied through connections) are always allowed. A tied entry with an unspecified dim is checked through its tie alias: a from_output_shape / from_output_values source must
 /// not be an output of another stage of the same owner.
 inline void check_value_driven_sizes(const std::string& owner, std::span<Subsystem* const> stages) {
     for (const Subsystem* s : stages) {

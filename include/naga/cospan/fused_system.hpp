@@ -4,7 +4,7 @@
 // naga/cospan/fused_system.hpp — FusedSystem, sequential and parallel mode (r01 §5.4-§5.7, §7.5)
 // =============================================================================
 //
-// CHILDREN ARE COMPONENTS ONLY (the D74 pattern, as ParallelSystem). Their
+// CHILDREN ARE COMPONENTS ONLY (as ParallelSystem). Their
 // bodies run as the stages of ONE outer kernel, the "wave": a chained executor
 // walks a call sequence of the children's stage functions (kb_fn<KB>) with a
 // shared record cursor, so every stage function reads its own StageRecord by
@@ -86,7 +86,7 @@ public:
     /// The no-connections rule has no override. No effect in sequential mode.
     void allow_tied_outputs() { allow_tied_ = true; }
 
-    // ---- adding children: Components only, at compile time (D74) ----------------------------
+    // ---- adding children: Components only, at compile time ----------------------------
     template <class T, class... Args>
         requires(std::derived_from<T, ComponentBase> && !detail::leads_with_props_v<Args...>)
     T& add_subsystem(std::string name, Args&&... ctor_args) {
@@ -121,7 +121,7 @@ public:
                                             "; the stages of a wave share one rank");
         }
 
-        // (D140) no ragged ports in a fuse yet.
+        // no ragged ports in a fuse yet.
         detail::check_no_ragged_ports(describe(), children());
 
         // (h) a value-driven size may not be driven by a stage of this fuse (both modes).

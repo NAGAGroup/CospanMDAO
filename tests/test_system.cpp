@@ -83,7 +83,7 @@ template <class Sys>
 void expect_setup_throws(const std::string& needle) {
     cs::Model model = cs::create_model<Sys>(default_config());
     expect_throws([&] { model.setup(); }, needle);
-    model.wait();  // setup() may have submitted initializer work before it threw (D135)
+    model.wait();  // setup() may have submitted initializer work before it threw
 }
 
 constexpr std::size_t kLen = 8;
@@ -653,7 +653,7 @@ public:
 };
 
 /// A root holding one OpAxpb added with run_n{n}, named "op"; free input "op.a.x", output "op.a.y". A plain
-/// sink reads op.a.y: its eternal answer keeps the output alive after the last run (D141); op.a.x is freed then.
+/// sink reads op.a.y: its eternal answer keeps the output alive after the last run; op.a.x is freed then.
 class RunNTop : public cs::System {
     std::size_t n_;
 
@@ -736,7 +736,7 @@ public:
     std::string str() const { return ss_.str(); }
 };
 
-// ---- lifetime fixtures (D141) ---------------------------------------------------------------------
+// ---- lifetime fixtures ---------------------------------------------------------------------
 /// p (transient Src) -> t (transient Axpb, y = 2 x + 1) -> sink (plain Axpb): t.y is eternal (the sink answers -1);
 /// p.y and t.x come into scope and go out of it with every run.
 class TransChain : public cs::System {
@@ -877,7 +877,7 @@ class ConnectFromInput : public ThreeAxpb {
 public:
     void setup() override {
         ThreeAxpb::setup();
-        connect("b.x", "c.x");  // an input is never a source (D61)
+        connect("b.x", "c.x");  // an input is never a source
     }
 };
 
@@ -1259,7 +1259,7 @@ TEST_CASE("ties: tie_outputs", "[system][tie]") {
         tsys::expect_setup_throws<tsys::TieOutPlain>("not atomic");
         cs::Model model = cs::create_model<tsys::TieOutPlain>(default_config(), false);
         tsys::expect_throws([&] { model.setup(); }, "require_atomic");
-        model.wait();  // setup() may have submitted initializer work before it threw (D135)
+        model.wait();  // setup() may have submitted initializer work before it threw
     }
 
     SECTION("plain outputs with allow_plain are accepted") {
@@ -1318,7 +1318,7 @@ TEST_CASE("marks: recorded on the Model with paths and bounds; the last of a kin
         REQUIRE(f->scaling.ref.size() == 1);
         CHECK(f->scaling.ref[0] == 2.0);  // the second mark's scaling
     }
-    model.wait();  // setup() submitted initializer work; wait before the Model goes out of scope (D135)
+    model.wait();  // setup() submitted initializer work; wait before the Model goes out of scope
 }
 
 TEST_CASE("marks: ill-formed marks throw at setup", "[system][marks]") {
@@ -1401,7 +1401,7 @@ TEST_CASE("init: Model::init_input before the first forward beats the declared i
 }
 
 // =============================================================================================
-// 6. transient (registration metadata, r01 §4.4, D138)
+// 6. transient (registration metadata, r01 §4.4)
 // =============================================================================================
 namespace {
 std::vector<float> want_cons() { return tsys::iota_plus(1.0f, tsys::kLen, 2.0f, 3.0f); }  // 2 (i + 1) + 3
@@ -1411,7 +1411,7 @@ std::vector<float> want_sink() {
     return v;
 }
 std::size_t pool_in_use(cs::Model& m) { return cst::pool_in_use(m); }
-// An eternal root whose partners include a transient or finite one is not arena-eligible (D141): it lives in the
+// An eternal root whose partners include a transient or finite one is not arena-eligible: it lives in the
 // pool, one node here, for as long as the model.
 const std::size_t kEternalNode = cst::pooled_config().pool_node_size;
 }  // namespace
@@ -1558,7 +1558,7 @@ TEST_CASE("run-N: n = 1 runs once; a later init_input stays pending (the owner d
     tsys::set_x(model, "op.a.x", 5.0f);
     model.forward();
     model.wait();
-    // The owner applies a pending init in its own run (D139); it did not run, so nothing changed. Its input
+    // The owner applies a pending init in its own run; it did not run, so nothing changed. Its input
     // root was freed after the single run (no eternal partner); the output is kept by the sink.
     tsys::expect_throws([&] { (void)model.view_input<DType::f32, 1>("op.a.x"); },
                         "was released after its last use (by 'op.a')");
@@ -1824,7 +1824,7 @@ TEST_CASE("structural errors", "[system][errors]") {
         tsys::expect_throws([&] { sys.promote<DType::f32, 1>("a.y", "y"); }, "setup() only");
         tsys::expect_throws([&] { sys.tie_inputs<DType::f32, 1>({"a.x", "b.x"}, "t", cs::alias::fixed(1)); }, "setup() only");
         tsys::expect_throws([&] { sys.add_design_var("a.x"); }, "setup() only");
-        model.wait();  // setup() submitted initializer work (D135)
+        model.wait();  // setup() submitted initializer work
     }
     SECTION("an unknown path in view_output names the path") {
         cs::Model model = cs::create_model<tsys::ThreeAxpb>(default_config());
@@ -1834,7 +1834,7 @@ TEST_CASE("structural errors", "[system][errors]") {
         // The kind is checked too.
         tsys::expect_throws([&] { (void)model.view_output<DType::f32, 1>("a.x"); }, "is an input");
         tsys::expect_throws([&] { (void)model.view_input<DType::f32, 1>("a.y"); }, "is an output");
-        model.wait();  // setup() submitted initializer work (D135)
+        model.wait();  // setup() submitted initializer work
     }
 }
 
@@ -1911,7 +1911,7 @@ TEST_CASE("Sellar-shaped forward: ties of ties, promotions, a Slice, marks, init
 
 
 // =============================================================================================
-// 7. D139 part 2: ties own the shape; promotions mirror live; rank-templated aliases
+// 7. ties own the shape; promotions mirror live; rank-templated aliases
 // =============================================================================================
 namespace tsys2 {
 
@@ -2119,7 +2119,7 @@ TEST_CASE("D139-2: tie errors", "[system][alias][errors]") {
             },
             "rank");
     }
-    SECTION("a tied member whose fixed dim contradicts the tie") {  // D142: a member may declare dims; they are constraints
+    SECTION("a tied member whose fixed dim contradicts the tie") {  // a member may declare dims; they are constraints
         setup_throws(
             [&](cs::System& s) {
                 s.add_subsystem<tsys::Axpb>("a", 1.0f, 0.0f);  // x is fixed kLen
@@ -2356,7 +2356,7 @@ TEST_CASE("D139-2: a tie alias inside a transient subsystem is released and the 
 }
 
 // =============================================================================================
-// 6d. lifetime by counting (D141)
+// 6d. lifetime by counting
 // =============================================================================================
 TEST_CASE("lifetime: a bare transient producer and a transient reader are freed every run, values right on run 2", "[system][lifetime]") {
     cs::Model model = cs::create_model<tsys::TransChain>(cst::pooled_config());
@@ -2441,7 +2441,7 @@ TEST_CASE("lifetime: a tie_outputs root under a transient System is freed every 
         model.forward();
         model.wait();
         auto* t = model.root().entry_at("tr.t").root();
-        CHECK(t->owner() == &model.get_subsystem("tr"));  // a tie root is owned by its declaring System (D141)
+        CHECK(t->owner() == &model.get_subsystem("tr"));  // a tie root is owned by its declaring System
         CHECK(t->released());
         CHECK(t->lifetime_count() == 0);
         CHECK(to_vector(model.view_output<DType::f32, 1>("sink.y")) == tsys::iota_plus(1.0f, tsys::kLen));
@@ -2555,7 +2555,7 @@ TEST_CASE("lifetime: a value-driven alias shape keeps a finite producer's output
 }
 
 // =============================================================================================
-// 6e. shape authority (D142): unspecified dims are supplied from outside; specified dims are constraints
+// 6e. shape authority: unspecified dims are supplied from outside; specified dims are constraints
 // =============================================================================================
 namespace tshape {
 

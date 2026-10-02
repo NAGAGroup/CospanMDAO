@@ -1,4 +1,4 @@
-// Ragged tie aliases (D140): a tie alias takes the same per-index shape rules as a port.
+// Ragged tie aliases: a tie alias takes the same per-index shape rules as a port.
 //
 //   alias::dims(spec0, spec1, ...) with an integer, per_index, output_value, output_values, output_dim;
 //   from_output_shape copies a ragged shape, and so does a connection (an unspecified dim takes its source's).
@@ -1069,7 +1069,7 @@ TEST_CASE("Ragged ties: a tie inside a ChunkedSystem, bitwise equal to unchunked
             const std::size_t before = t.allocation_count();
             const auto        out    = trt::forward_out(m);
             CHECK(out == pout);
-            CHECK(t.allocation_count() - before == (rep == 0 ? 1u : 0u));  // eternal (D141): the first forward allocates it
+            CHECK(t.allocation_count() - before == (rep == 0 ? 1u : 0u));  // eternal: the first forward allocates it
             CHECK_FALSE(t.held());
         }
     }
@@ -1182,7 +1182,7 @@ TEST_CASE("Ragged ties: errors", "[ragged][tie]") {
         cs::Model m = cs::create_model<trt::ErrTop>(default_config(), 2);
         m.setup();
         trt::expect_throws([&] { m.forward(); }, {"has 2 extents", "dimension 0 has 4"});
-        m.wait();  // earlier components of the failed forward were submitted: wait before the Model is destroyed (D135)
+        m.wait();  // earlier components of the failed forward were submitted: wait before the Model is destroyed
     }
     SECTION("input_values naming an output") {
         cs::Model m = cs::create_model<trt::ErrTop>(default_config(), 3);
@@ -1269,7 +1269,7 @@ TEST_CASE("Topology cache: a changed SHAPE of an outside boundary root rebuilds 
 }
 
 
-// ---- aliases declared DIRECTLY in a ChunkedSystem's own setup() (C2c) -----------------------------------------------------
+// ---- aliases declared DIRECTLY in a ChunkedSystem's own setup() -----------------------------------------------------
 namespace trt {
 /// The variant-0 shape of GV, but the promote and the tie live in the chunked system itself (no child system g).
 class DirectChunk : public cs::ChunkedSystem {
@@ -1334,7 +1334,7 @@ TEST_CASE("Chunked: a tie declared in the chunked system's own setup is internal
     cs::Model  m    = cs::create_model<trt::DirectTop<trt::DirectChunk>>(default_config(), counts, std::size_t{200});
     m.setup();
     CHECK(trt::forward_out(m) == want);
-    // internal and eternal (its holders answer -1, D141): the tie stays allocated, at a chunk's capacity
+    // internal and eternal (its holders answer -1): the tie stays allocated, at a chunk's capacity
     CHECK(trt::inner_entry(m, "t").has_storage());
     CHECK(trt::inner_entry(m, "t").held() == false);
 }
@@ -1355,7 +1355,7 @@ TEST_CASE("Chunked vs plain: a tie declared in the chunked system's own setup", 
 }
 
 // =============================================================================================================================
-// OPACITY (C2e): a chunked system's only interface is its own promotions.
+// OPACITY: a chunked system's only interface is its own promotions.
 // =============================================================================================================================
 namespace trt {
 

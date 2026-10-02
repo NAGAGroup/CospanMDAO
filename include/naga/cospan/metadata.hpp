@@ -74,7 +74,7 @@ struct Placement {
 // Dimension specification — DimSpec is a CONCEPT, not a type.
 // -----------------------------------------------------------------------------
 
-/// UNSPECIFIED (D142, shape authority): this dimension is supplied from outside: by the connection (or slice) an input
+/// UNSPECIFIED (shape authority): this dimension is supplied from outside: by the connection (or slice) an input
 /// is connected to, by the tie the entry belongs to, or, for a free input, by its initializer's shape. A SPECIFIED
 /// dimension (an integer, FromInputDim, FromInput, PerIndex, FromInputValues) is a constraint on what supplies it.
 struct Unspecified {};
@@ -87,7 +87,7 @@ struct FromInputDim { std::string_view input; uint8_t dim; };
 /// input `input`, which SHALL have an integer value dtype.
 struct FromInput { std::string_view input; std::size_t index; };
 
-/// RAGGED DIMENSIONS (D140). A dimension d >= 1 of a ragged port may have a different extent for every
+/// RAGGED DIMENSIONS. A dimension d >= 1 of a ragged port may have a different extent for every
 /// index of dimension 0: PerIndex gives the extents as a host array at declaration (its length must equal
 /// dimension 0's extent), FromInputValues takes them from the VALUES of an integer sibling input of rank 1
 /// [N] (column 0) or rank 2 [N, k] (column < k). Negative values are an error. Neither is allowed on dim 0.
@@ -123,7 +123,7 @@ constexpr std::array<FromInputDim, Rank> from_input_shape(std::string_view input
 
 constexpr FromInputArray from_input_array(std::string_view input) { return {input}; }
 
-/// The per-dimension specs of cs::alias::dims (D140: tie aliases take the shape rules of ports). An integer
+/// The per-dimension specs of cs::alias::dims (tie aliases take the shape rules of ports). An integer
 /// or cs::per_index(...) is also a spec; these name an upstream OUTPUT, in the declaring System's namespace.
 namespace alias {
 /// The extent is the VALUE of element `index` (flat) of an upstream integer output.
@@ -197,7 +197,7 @@ AliasDim make_alias_dim(const S& s) {
     return r;
 }
 
-/// How a tie alias gets its shape (D139 part 2); build one with the cs::alias factories.
+/// How a tie alias gets its shape; build one with the cs::alias factories.
 struct AliasShape {
     enum class Kind : uint8_t { fixed, unspecified, from_output_shape, from_output_values, dims, from_input_shape };
     Kind                       kind = Kind::fixed;
@@ -208,7 +208,7 @@ struct AliasShape {
 };
 
 namespace detail {
-/// tie_inputs' default shape (D142): the shape of whatever supplies the tie (a connected output, else an initializer on it).
+/// tie_inputs' default shape: the shape of whatever supplies the tie (a connected output, else an initializer on it).
 inline AliasShape unspecified_alias_shape() {
     AliasShape s;
     s.kind = AliasShape::Kind::unspecified;
@@ -217,7 +217,7 @@ inline AliasShape unspecified_alias_shape() {
 }  // namespace detail
 
 namespace alias {
-/// The per-dimension form (D140): one spec per dim, count = the alias's Rank. A spec is an integer (fixed),
+/// The per-dimension form: one spec per dim, count = the alias's Rank. A spec is an integer (fixed),
 /// cs::per_index(values) (dims >= 1), alias::output_value(path, index), alias::output_values(path, column)
 /// (dims >= 1) or alias::output_dim(path, d).
 template <AliasDimSpec... S>
@@ -319,10 +319,10 @@ struct MarkRecord {
 
 // MemorySubstrate / Substrates live in subsystem.hpp (D7).
 
-/// The initial value of a free input root (r01 §4.4, D138): type-erased, made
+/// The initial value of a free input root (r01 §4.4): type-erased, made
 /// by the cs::init factories (init.hpp). apply() runs on a root that has just
 /// been allocated from nothing; the caller refreshes the other placements.
-/// The shape an initializer carries (D142): extents 1-padded, and the rank they were given for. Each dim >= 1 is a
+/// The shape an initializer carries: extents 1-padded, and the rank they were given for. Each dim >= 1 is a
 /// scalar (extents[d]) or a per-index vector (per[d], per_index[d]: one extent per index of dim 0, extents[d] = 0);
 /// dim 0 is always a scalar. `flat`: the shape of bare data (from_host(vec)): rank 1, it only describes a rank-1 root.
 struct InitShape {
@@ -369,9 +369,9 @@ namespace detail {
 
 /// Per-dimension storage form of a declared DimSpec.
 struct DimRecord {
-    /// unspecified (D142): supplied by the root (a connection, a slice, a tie) or, on a free input root, by its
+    /// unspecified: supplied by the root (a connection, a slice, a tie) or, on a free input root, by its
     /// initializer's shape.
-    /// per_index_host / per_index_from_input (D140): dimension d >= 1 has one extent per index of dim 0.
+    /// per_index_host / per_index_from_input: dimension d >= 1 has one extent per index of dim 0.
     enum class How : uint8_t { fixed, unspecified, from_input_dim, from_input, per_index_host,
                                per_index_from_input };
     How         how = How::fixed;
@@ -379,13 +379,13 @@ struct DimRecord {
     std::string input;       ///< from_input_*: sibling input name (owned)
     uint8_t     dim = 0;     ///< from_input_dim
     std::size_t value_index = 0;  ///< from_input; per_index_from_input: the column
-    /// The resolved per-index extents of a dimension d >= 1 (D140); EMPTY means the dimension is scalar
+    /// The resolved per-index extents of a dimension d >= 1; EMPTY means the dimension is scalar
     /// (its extent is `extent`). Filled by per_index_host at declaration, by per_index_from_input when the
     /// owning Component resolves it, and copied from the source dimension by from_source_dim /
     /// from_input_dim / from_root when that dimension is per-index.
     std::vector<std::size_t> per_index;
     /// per_index_host: the declared full-length array. Inside a ChunkedSystem `per_index` is the chunk's slice of it
-    /// ([0, dim0), D140 B3); outside, `per_index` is this array itself.
+    /// ([0, dim0)); outside, `per_index` is this array itself.
     std::vector<std::size_t> host_full;
     /// The dimension is per-index (even when `per_index` is empty because N is 0): true from
     /// declaration for per_index_host / per_index_from_input, copied with the array by the derived hows.
@@ -474,7 +474,7 @@ public:
     int              rank() const noexcept { return rank_; }    ///< AUTHORITATIVE (§3.1)
 
     // ---- shape -------------------------------------------------------------
-    /// A promoted alias mirrors its member: its shape is read live from it (D139 part 2).
+    /// A promoted alias mirrors its member: its shape is read live from it.
     sycl::range<3> extents() const {
         const auto& e = shape_ref();
         return sycl::range<3>{e[0], e[1], e[2]};
@@ -484,7 +484,7 @@ public:
         const Geometry g = geometry();
         return sycl::range<3>{g.stride[0], g.stride[1], g.stride[2]};
     }
-    /// A ragged entry (D140): the TOTAL number of elements (block_offsets().back()). A promoted alias
+    /// A ragged entry: the TOTAL number of elements (block_offsets().back()). A promoted alias
     /// mirrors its member.
     std::size_t flat_size() const noexcept {
         if (mirror_of_ != nullptr) return mirror_of_->flat_size();
@@ -492,7 +492,7 @@ public:
         return extents_[0] * extents_[1] * extents_[2];
     }
 
-    // ---- ragged dimensions (D140) ------------------------------------------
+    // ---- ragged dimensions ------------------------------------------
     /// Any dimension d >= 1 is resolved per-index. extents() reports N on dim 0 and 0 on every per-index
     /// dim; geometry() throws (a ragged entry has no rectangular geometry).
     bool is_ragged() const noexcept { return mirror_of_ != nullptr ? mirror_of_->is_ragged() : ragged_; }
@@ -533,9 +533,9 @@ public:
         for (int d = 1; d < rank_; ++d) block *= extents_[static_cast<std::size_t>(d)];
         return i * block;
     }
-    /// The runtime leading range [a, b) this connected input sees of its root (D140 B1); none = whole.
+    /// The runtime leading range [a, b) this connected input sees of its root; none = whole.
     std::optional<std::pair<std::size_t, std::size_t>> leading_range() const { return lead_; }
-    /// A root a ChunkedSystem made at its own level (D140 B2).
+    /// A root a ChunkedSystem made at its own level.
     bool is_rerooted() const noexcept { return chunk_rerooted_; }
     /// The raw per-index array of dimension d (empty: scalar). Internal.
     const std::vector<std::size_t>& per_index_raw(int d) const { return dims_[static_cast<std::size_t>(d)].per_index; }
@@ -562,7 +562,7 @@ public:
             if (r.how != DimRecord::How::fixed) return true;
         return false;
     }
-    /// Some dimension is unspecified (supplied from outside, D142).
+    /// Some dimension is unspecified (supplied from outside).
     bool has_unspecified() const noexcept {
         for (const DimRecord& r : dims_)
             if (r.how == DimRecord::How::unspecified) return true;
@@ -641,11 +641,11 @@ public:
     /// The kind of USM this root's storage is: device, or host for a host
     /// component's I/O (D3).
     sk::kind storage_kind() const noexcept { return storage_kind_; }
-    // ---- registration metadata (ROOTS; recorded by System::resolve, r01 §4.4, D138, D141) ----
+    // ---- registration metadata (ROOTS; recorded by System::resolve, r01 §4.4) ----
     /// The root's storage was dropped by a count reaching 0 (its last partner finished). Host access
     /// to a released root throws.
     bool released() const noexcept { return root_->released_; }
-    /// Lifetime by counting (D141): 0 out of scope, -1 eternal, > 0 decrements owed.
+    /// Lifetime by counting: 0 out of scope, -1 eternal, > 0 decrements owed.
     long lifetime_count() const noexcept { return root_->count_; }
     /// Path of the subsystem whose decrement released the root last; empty if never released.
     std::string_view released_by() const noexcept { return root_->released_by_; }
@@ -657,7 +657,7 @@ public:
 
     /// Roots: the memory substrates allocation draws on (bound at prepare_exec).
     void bind_substrates(Substrates& s) noexcept { substrates_ = &s; }
-    /// PRESENT (D139): the root's storage state. True once its owner has run the allocation path
+    /// PRESENT: the root's storage state. True once its owner has run the allocation path
     /// (even for a size-0 root, whose storage is empty) until a transient root is released. Host
     /// views of a root that is not present throw.
     bool present() const noexcept { return root_->present_; }
@@ -667,7 +667,7 @@ public:
     /// allocated from nothing, and by Model::init_input. It stays set while the root has no elements.
     bool init_pending() const noexcept { return root_->init_pending_; }
     void clear_init_pending() noexcept { root_->init_pending_ = false; }
-    /// Model::init_input (D139): the model's initial value replaces any declared one, wins over
+    /// Model::init_input: the model's initial value replaces any declared one, wins over
     /// them, cannot be overwritten by resolve(), and is applied at the owner's next run.
     void set_model_init(InitSpec spec) {
         root_->init_spec_    = std::move(spec);
@@ -688,7 +688,7 @@ public:
         if (r.io_kind_ == IOKind::input) r.init_pending_ = true;
         return true;
     }
-    /// D140 B3: this root's capacity is RESERVED by its ChunkedSystem for the chunk loop (capacity role only).
+    /// this root's capacity is RESERVED by its ChunkedSystem for the chunk loop (capacity role only).
     bool held() const noexcept { return root_->held_; }
     /// The elements the root's primary storage can hold without reallocating (0 when not present).
     std::size_t capacity_elems() const noexcept { return root_->capacity_elems_impl(); }
@@ -761,7 +761,7 @@ public:
     std::size_t          meta_shift() const noexcept { return meta_shift_; }
     const void*          probe_data() const noexcept { return probe_data_; }
     const std::uint64_t* probe_offsets() const noexcept { return probe_offs_; }
-    /// D140 B2: the path of the ChunkedSystem this root is internal to; empty otherwise.
+    /// the path of the ChunkedSystem this root is internal to; empty otherwise.
     std::string_view chunk_internal_by() const noexcept { return root_->chunk_internal_by_; }
     /// The Subsystem that registered this entry (a Component for I/O, a System for aliases).
     const Subsystem* declarer() const noexcept { return declarer_; }
@@ -811,7 +811,7 @@ public:
     /// for a slice, which must also lie inside the root). Throws.
     virtual void validate_connection() const = 0;
 
-    /// D142 (shape authority): the dimensions this entry SPECIFIES are constraints on what supplies its root's shape
+    /// Shape authority: the dimensions this entry SPECIFIES are constraints on what supplies its root's shape
     /// (the connection or slice, the tie, the initializer). Throws std::invalid_argument naming both sides. Non-roots
     /// only. `fixed_only`: setup time, only fixed dimensions against a fixed root.
     virtual void check_constraints(bool fixed_only) const = 0;
@@ -824,12 +824,12 @@ public:
     /// Write {data pointer, shape, stride} into the registered member wrapper.
     virtual void point_wrapper() = 0;
 
-    /// ROOTS ONLY (D140): bring every placement's device copies of the ragged index arrays (the offsets and
+    /// ROOTS ONLY: bring every placement's device copies of the ragged index arrays (the offsets and
     /// one array per per-index dimension) up to date with the host description; drops them when the root
     /// is not ragged. A no-op when nothing changed or the root is not present.
     virtual void upload_ragged(sk::queue& q) = 0;
 
-    /// ROOTS ONLY (D140): the device copy of the offsets (which == 0) or of the per-index array of
+    /// ROOTS ONLY: the device copy of the offsets (which == 0) or of the per-index array of
     /// dimension `which` (1..2) on placement `p`; null when there is none.
     virtual const std::uint64_t* ragged_ptr_on(const Placement& p, int which) const = 0;
 
@@ -839,7 +839,7 @@ public:
 
 
     /// ROOTS ONLY (no-op on peers): drop the storage of a transient root (§4.4). The CALLER
-    /// waits the stream first (synchronous frees, D135): a releasing Component waits once
+    /// waits the stream first (synchronous frees): a releasing Component waits once
     /// for its whole batch.
     virtual void release_storage() = 0;
     virtual std::size_t capacity_elems_impl() const noexcept = 0;
@@ -881,7 +881,7 @@ protected:
         w.data_   = data;
     }
 
-    /// The only writer of ragged wrapper fields (D140).
+    /// The only writer of ragged wrapper fields.
     template <class W, class P>
     static void write_ragged(W& w, std::size_t n, P* data, const std::uint64_t* offsets,
                              const std::array<std::size_t, 2>& ext, const std::array<const std::uint64_t*, 2>& per) {
@@ -921,14 +921,14 @@ protected:
         return mirror_of_ != nullptr ? mirror_of_->shape_ref() : extents_;
     }
 
-    std::array<std::size_t, 3> extents_{1, 1, 1};  ///< 1-padded; a per-index dim reports 0 (D140)
-    // ---- D140: the applied ragged description of THIS entry (host) ----
+    std::array<std::size_t, 3> extents_{1, 1, 1};  ///< 1-padded; a per-index dim reports 0
+    // ---- the applied ragged description of THIS entry (host) ----
     bool                       ragged_ = false;          ///< any dim >= 1 is per-index
     std::vector<std::uint64_t> offsets_;                 ///< ragged: N + 1 block offsets
     std::array<std::vector<std::size_t>, 3> applied_per_;  ///< the per-index arrays last applied
     std::uint64_t              ragged_version_ = 0;      ///< bumped whenever the ragged description changes
     bool                       ragged_port_ = false;     ///< declared with RaggedInput / RaggedOutput
-    // ---- D140 B3 (roots): kept across the chunks of a ChunkedSystem ----
+    // ---- roots: kept across the chunks of a ChunkedSystem ----
     bool                       held_          = false;   ///< set by the ChunkedSystem: the capacity is reserved for the chunk loop
     std::size_t                reserve_elems_ = 0;       ///< held: the capacity (elements) allocate() takes
     std::size_t                allocations_   = 0;       ///< storage allocations of this root (allocate, growth past capacity)
@@ -947,7 +947,7 @@ protected:
     std::optional<sycl::device> device_;
     sk::kind                   storage_kind_ = sk::kind::device;
     bool                       released_ = false;     ///< roots: storage dropped by a count reaching 0
-    bool                       present_  = false;     ///< roots: allocated (D139); cleared by release
+    bool                       present_  = false;     ///< roots: allocated; cleared by release
     std::string                released_by_;          ///< roots: the subsystem whose decrement released the root
 
 private:
@@ -961,7 +961,7 @@ private:
     friend struct LifetimeOps;
     friend class AliasEvaluator;
 
-    /// D140 B1, framework only (through LeadingRangeAccess). A NON-root input peer sees rows / blocks
+    /// Framework only (through LeadingRangeAccess). A NON-root input peer sees rows / blocks
     /// [a, b) of its root along dim 0. Dense root: its view becomes the SubarrayRef with dim-0 offset a
     /// and extent b - a (composed with a setup-time Slice, which is kept and restored by clear); the
     /// peer's extents follow through update_shape. Ragged root: N = b - a, the host per-index arrays are
@@ -1019,7 +1019,7 @@ private:
         if (root_->present_) point_wrapper();
     }
 
-    /// ChunkedSystem (D140 B2), on an alias ROOT at its level: take the full resolved shape of `m`, the
+    /// ChunkedSystem, on an alias ROOT at its level: take the full resolved shape of `m`, the
     /// inside entry that used to be the root (dense: its extents; ragged: N and the per-index arrays),
     /// and apply it (resizing storage when present). The alias dims are inert markers (how from_input),
     /// so the root is dynamic.
@@ -1067,13 +1067,13 @@ private:
     bool                  can_be_source_;
     bool                  can_be_target_;
     std::optional<SubarrayRef> view_;
-    std::optional<std::pair<std::size_t, std::size_t>> lead_;  ///< D140 B1: the runtime leading range
+    std::optional<std::pair<std::size_t, std::size_t>> lead_;  ///< the runtime leading range
     std::optional<SubarrayRef> pre_lead_view_;                 ///< the setup-time view saved while lead_ is set
     const Subsystem*      declarer_  = nullptr;
 
     std::optional<MarkRecord> design_var_, constraint_, objective_;
 
-    // ---- D139 part 2: ties own the shape; promotions mirror ----
+    // ---- ties own the shape; promotions mirror ----
     const IOEntry*            mirror_of_ = nullptr;  ///< a promoted alias: the entry it was made from
     IOEntry*                  tie_alias_ = nullptr;  ///< members of a tie (and their set): the tie alias
     std::optional<AliasShape> alias_shape_;          ///< a tie alias: where its shape comes from
@@ -1094,7 +1094,7 @@ private:
     bool                      model_init_   = false;  ///< roots: init_spec_ came from Model::init_input (resolve keeps it)
     bool                      init_pending_ = false;  ///< roots: the init is to be applied at the owner's next run
     const Subsystem*          owner_     = nullptr;  ///< roots, set by System::resolve: the first toucher
-    /// LIFETIME BY COUNTING (D141, roots only). count_: 0 out of scope (every root starts there), -1
+    /// LIFETIME BY COUNTING (roots only). count_: 0 out of scope (every root starts there), -1
     /// eternal, > 0 decrements owed. partners_: who holds the root (set by System::resolve); `owed` is the
     /// decrements this partner still owes while the root is in scope.
     struct Partner {
@@ -1105,8 +1105,8 @@ private:
     long                 count_ = 0;
     std::vector<Partner> partners_;
     bool                      chunk_outside_tie_ = false;  ///< a tie alias declared outside a ChunkedSystem whose inside members make it a boundary root: the chunked system resolves its shape
-    bool                      chunk_rerooted_ = false;  ///< D140 B2: a root made at a ChunkedSystem's level (its owner allocates it)
-    std::string               chunk_internal_by_;       ///< D140 B2: roots internal to the named ChunkedSystem
+    bool                      chunk_rerooted_ = false;  ///< a root made at a ChunkedSystem's level (its owner allocates it)
+    std::string               chunk_internal_by_;       ///< roots internal to the named ChunkedSystem
     Substrates*               substrates_ = nullptr; ///< roots, bound at prepare_exec
 };
 
@@ -1121,7 +1121,7 @@ public:
         std::array<std::size_t, 3> next = extents_;
         for (int d = 0; d < rank(); ++d) {
             DimRecord& r = dims_[static_cast<std::size_t>(d)];
-            if (d == 0 && dim0_override_) {  // inside a ChunkedSystem (D140 B3): dim 0 IS the chunk length,
+            if (d == 0 && dim0_override_) {  // inside a ChunkedSystem: dim 0 IS the chunk length,
                 next[0] = *dim0_override_;   // whatever rule declared it
                 continue;
             }
@@ -1129,7 +1129,7 @@ public:
                 case DimRecord::How::fixed: break;
                 case DimRecord::How::unspecified:
                     // a free input root, or the inside member of one a ChunkedSystem re-rooted: its initializer's shape
-                    // (B3 guarantees one exists at setup)
+                    // (setup guarantees one exists)
                     if (is_root() || (root()->is_rerooted() && root()->kind() == IOKind::input)) {
                         if (const auto& is = init_spec(); is && is->shape() && is->shape()->rank == rank()) {
                             const InitShape&  s = *is->shape();
@@ -1180,7 +1180,7 @@ public:
             next[static_cast<std::size_t>(d)] = (d >= 1 && r.per) ? 0 : r.extent;
         }
 
-        // ---- D140: the ragged description. Every per-index array must have one entry per index of dim 0.
+        // ---- the ragged description. Every per-index array must have one entry per index of dim 0.
         bool ragged = false;
         for (int d = 1; d < rank(); ++d)
             if (dims_[static_cast<std::size_t>(d)].per) ragged = true;
@@ -1308,7 +1308,7 @@ public:
     void validate_connection() const override {
         if (kind() != IOKind::input || is_root()) return;
         const IOEntry& r        = *root();
-        if (r.is_ragged() || is_ragged()) {  // D140: the per-index extents must match dim by dim, and the totals
+        if (r.is_ragged() || is_ragged()) {  // the per-index extents must match dim by dim, and the totals
             if (r.is_ragged() != is_ragged())
                 throw std::invalid_argument("naga::cospan: input '" + std::string{name()} + "' is " +
                                             (is_ragged() ? "ragged" : "dense") + " but is connected to '" +
@@ -1316,7 +1316,7 @@ public:
             if (view())
                 throw std::invalid_argument("naga::cospan: '" + std::string{name()} + "' sees a subarray of the ragged '" +
                                             std::string{r.name()} + "'; ragged roots cannot be sliced");
-            const auto        lr = leading_range();  // D140 B1: compare against the root's [a, b)
+            const auto        lr = leading_range();  // compare against the root's [a, b)
             const std::size_t a  = lr ? lr->first : 0;
             const std::size_t rn = lr ? lr->second - lr->first : r.extents()[0];
             if (extents()[0] != rn)
@@ -1368,7 +1368,7 @@ public:
         subs_ = &subs;
         for (const Placement& p : placements_) {
             if (find_slot(p) != nullptr) continue;
-            // A size-0 root gets an empty vector (usm_vector(0, ...) allocates nothing). A HELD root (D140 B3)
+            // A size-0 root gets an empty vector (usm_vector(0, ...) allocates nothing). A HELD root
             // takes its reserved capacity: per chunk it is resized within it, which never reallocates.
             const std::size_t n = held_ ? reserve_elems_ : flat_size();
             slots_.push_back(std::make_unique<Slot>(p, sk::usm_vector<T>(n, route(q, subs, p, n))));
@@ -1436,7 +1436,7 @@ public:
 
     void release_storage() override {
         if (!is_root() || !present_) return;
-        // Synchronous frees (D135): the stream's kernels may still read these roots and a usm_vector waits
+        // Synchronous frees: the stream's kernels may still read these roots and a usm_vector waits
         // only for its own tasks, so the CALLER has waited the stream (once per releasing Component's
         // batch); the vectors free here.
         diag::count_frees(slots_.size());
@@ -1516,7 +1516,7 @@ protected:
         return s->data.data();
     }
 
-    /// Host access to a released root: the error names the root and who released it (D141).
+    /// Host access to a released root: the error names the root and who released it.
     [[noreturn]] void throw_released() const {
         throw std::logic_error("naga::cospan: '" + full_path() + "' was released after its last use (by '" +
                                released_by_ + "'); it exists only while something that uses it runs");
@@ -1527,14 +1527,14 @@ private:
         Slot(Placement p, sk::usm_vector<T> v) : pl{std::move(p)}, data{std::move(v)} {}
         Placement         pl;
         sk::usm_vector<T> data;
-        // D140: the device copies of the ragged index arrays, allocated with this slot's placement and
+        // the device copies of the ragged index arrays, allocated with this slot's placement and
         // released with it. `version` is the ragged_version_ they were built for (0 = none).
         std::optional<sk::usm_vector<std::uint64_t>>               offs;
         std::array<std::optional<sk::usm_vector<std::uint64_t>>, 2> per;  // dims 1 and 2
         std::uint64_t                                              version = 0;
     };
 
-    /// Resize the root's storage to flat_size(); growing waits the stream first (synchronous frees, D135).
+    /// Resize the root's storage to flat_size(); growing waits the stream first (synchronous frees).
     void resize_storage() {
         if (!is_root()) return;
         if (!slots_.empty()) diag::count_resizes();
@@ -1554,7 +1554,7 @@ private:
         if (is_root()) return {};  // source_extent throws for it before this is reached
         if (view()) return {};
         const std::vector<std::size_t>& full = root()->per_index_raw(d);
-        if (const auto lr = leading_range(); lr && source_per_flag(d)) {  // D140 B1: the root's [a, b) slice
+        if (const auto lr = leading_range(); lr && source_per_flag(d)) {  // the root's [a, b) slice
             if (lr->second > full.size())
                 throw std::out_of_range("naga::cospan: '" + std::string{name()} + "': leading range [" +
                                         std::to_string(lr->first) + ", " + std::to_string(lr->second) +
@@ -1575,7 +1575,7 @@ private:
     }
     bool root_per_flag(uint8_t d) const { return source_per_flag(d); }
 
-    /// A tied entry's per-index array of dimension d: its root's. Under a runtime leading range (D140 B1/B2:
+    /// A tied entry's per-index array of dimension d: its root's. Under a runtime leading range (
     /// an inside peer of a boundary root in a ChunkedSystem) it is the root's [a, b) slice, exactly as
     /// source_per_index gives it.
     std::vector<std::size_t> root_per_index(uint8_t d) const {
@@ -1610,7 +1610,7 @@ private:
         if (is_root())
             throw std::logic_error("naga::cospan: '" + full_path() + "' is tied (cs::tied) but is not in a tie");
         if (const auto v = view()) return v->extents[d];
-        if (const auto lr = leading_range(); lr && d == 0) return lr->second - lr->first;  // under a range (D140 B1)
+        if (const auto lr = leading_range(); lr && d == 0) return lr->second - lr->first;  // under a range
         return root()->extents()[d];
     }
 
@@ -1623,7 +1623,7 @@ private:
         }
         if (d >= root()->rank())
             throw std::out_of_range("naga::cospan: an unspecified dimension is past its supplier's rank");
-        if (const auto lr = leading_range(); lr && d == 0) return lr->second - lr->first;  // a ragged root (D140 B1)
+        if (const auto lr = leading_range(); lr && d == 0) return lr->second - lr->first;  // a ragged root
         return root()->extents()[d];
     }
 
@@ -1634,7 +1634,7 @@ private:
     /// device has one, else the OS.
     sk::allocator<T> route(sk::queue& q, Substrates& subs, const Placement& p, std::size_t elems) const {
         if (p.kind != sk::kind::device) return sk::allocator<T>{q, p.kind, p.device};
-        // An empty root (D139) allocates nothing, so it needs no arena or pool: a fixed size-0 root is
+        // An empty root allocates nothing, so it needs no arena or pool: a fixed size-0 root is
         // arena-eligible but its device has no arena (the arena is sized from the non-empty roots).
         if (elems == 0) return sk::allocator<T>{q, sk::kind::device, p.device};
         const sycl::device& d = p.device;
@@ -1697,7 +1697,7 @@ protected:
         IOEntry::write_wrapper(w, g, base != nullptr ? base + g.offset : nullptr);
     }
 
-    /// A ragged wrapper (D140): the root's data, the block count, and the device copies of the index
+    /// A ragged wrapper: the root's data, the block count, and the device copies of the index
     /// arrays; a DENSE entry is accepted too (offsets null: block i is row i of the rectangle).
     template <class W>
     void point_ragged(W& w) const {
@@ -1707,7 +1707,7 @@ protected:
         std::array<const std::uint64_t*, 2> per{nullptr, nullptr};
         if (this->is_ragged()) {
             const Placement pl = this->placement();
-            // D140 B1: under a leading range [a, b) the device arrays are the root's, shifted by a (the
+            // under a leading range [a, b) the device arrays are the root's, shifted by a (the
             // wrapper addresses blocks relative to offsets[0]); the data starts at the root's offsets[a].
             const auto        lr = this->leading_range();
             const std::size_t a  = lr ? lr->first : 0;
@@ -1783,7 +1783,7 @@ private:
     Output<DT, Rank>* member_;
 };
 
-/// RaggedInputEntry holds RaggedInput<DT,Rank>* (D140). Same flags as InputEntry.
+/// RaggedInputEntry holds RaggedInput<DT,Rank>*. Same flags as InputEntry.
 template <DType DT, int Rank>
     requires(!is_atomic_v<DT>)
 class RaggedInputEntry final : public TypedEntry<DT, Rank> {
@@ -1800,7 +1800,7 @@ private:
     RaggedInput<DT, Rank>* member_;
 };
 
-/// RaggedOutputEntry holds RaggedOutput<DT,Rank>* (D140). Same flags as OutputEntry.
+/// RaggedOutputEntry holds RaggedOutput<DT,Rank>*. Same flags as OutputEntry.
 template <DType DT, int Rank>
 class RaggedOutputEntry final : public TypedEntry<DT, Rank> {
 public:
@@ -1893,7 +1893,7 @@ struct EntryAccess {
     }
 };
 
-/// INTERNAL (D140 B1). The one runtime-changeable view: the framework (the chunked system, later) and
+/// INTERNAL. The one runtime-changeable view: the framework (the chunked system, later) and
 /// the tests set the leading range [a, b) a connected input sees of its root along dim 0.
 struct LeadingRangeAccess {
     static void set(IOEntry& e, std::size_t a, std::size_t b) { e.set_leading_range(a, b); }

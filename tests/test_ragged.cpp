@@ -1,4 +1,4 @@
-// Ragged dimensions (D140 part 1): the full test set.
+// Ragged dimensions: the full test set.
 //
 //   Counts   u32 [N] counts (a copy of a free input)
 //   Fill     RaggedOutput<f32,3> "pts": N x counts[i] x 3, extents from the VALUES of `counts`

@@ -1,6 +1,6 @@
 #pragma once
 // =============================================================================
-// naga/cospan/lifetime.hpp: variable lifetime by counting (D141)
+// naga/cospan/lifetime.hpp: variable lifetime by counting
 // =============================================================================
 //
 // Every ROOT carries a count: 0 = out of scope (every root starts there), -1 = eternal, n > 0 =

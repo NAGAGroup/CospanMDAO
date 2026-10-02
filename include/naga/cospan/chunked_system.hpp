@@ -1,7 +1,7 @@
 #pragma once
 
 // =============================================================================
-// naga/cospan/chunked_system.hpp — ChunkedSystem (D140 section 2, r01 "Chunked systems")
+// naga/cospan/chunked_system.hpp — ChunkedSystem (r01 "Chunked systems")
 // =============================================================================
 //
 // A System that runs its subtree once per CHUNK of the leading dimension, so the memory its internal
@@ -11,7 +11,7 @@
 //
 //   classification (once, at the end of setup, System::resolve):
 //     INTERNAL  every member of the root's aliasing set is declared inside the subtree: the root lives by
-//               its partners' counts like any other (D141); inside the chunk loop their decrements are
+//               its partners' counts like any other; inside the chunk loop their decrements are
 //               deferred to after the last chunk.
 //     BOUNDARY  the set has members inside and outside (a producer outside, a consumer outside, a
 //               promotion at this level or above). A boundary root that is itself INSIDE (an inside
@@ -111,7 +111,7 @@ class ChunkedSystem : public System {
     std::function<void(std::size_t)>     chunk_hook_, chunk_post_hook_;
     std::vector<System*>                 systems_;       ///< this system and every descendant System (chunk_replay_ is set on them)
     std::vector<std::pair<detail::IOEntry*, ComponentBase*>> internal_ties_;  ///< internal tie roots, with the first Component that uses each
-    detail::DeferSink                    sink_;  ///< decrements and run-counter moves, deferred to after the last chunk (D141)
+    detail::DeferSink                    sink_;  ///< decrements and run-counter moves, deferred to after the last chunk
 
 public:
     /// `budget_bytes` bounds the sum, over one chunk, of the bytes of the INTERNAL ports.
@@ -120,7 +120,7 @@ public:
     }
 
     std::size_t budget() const noexcept { return budget_; }
-    /// OPAQUE (D140 amendment): from outside, only this system's own promotions are visible.
+    /// OPAQUE: from outside, only this system's own promotions are visible.
     bool is_opaque() const noexcept override { return true; }
     /// TEST HOOKS. `before_launch`: called for every chunk after its shapes are applied from the cache and before
     /// its Components run. `after_chunk`: called after the chunk's Components have run (wrappers pointed): this is
@@ -501,7 +501,7 @@ private:
     /// Before the first chunk every INTERNAL root is present with capacity for its largest chunk (the sum
     /// of its block sizes over the chunk's indices); its capacity is RESERVED (held_, reserve_elems_), and per
     /// chunk it is resized within it (a usm_vector resize within capacity, up or down, never reallocates). An
-    /// eternal root that is still present from an earlier forward is kept when it is big enough (D141); one
+    /// eternal root that is still present from an earlier forward is kept when it is big enough; one
     /// that is too small is freed behind one wait and allocated again.
     void hold_internal(const std::vector<std::pair<std::size_t, std::size_t>>& chunks) {
         if (chunks.empty()) return;
@@ -626,7 +626,7 @@ private:
             c->ev_.shape_recorder_ = nullptr;
             reads_.insert(reads_.end(), c->ev_.read_log_.begin(), c->ev_.read_log_.end());
             c->ev_.read_log_.clear();
-            // D142: a SPECIFIED dim 0 is a constraint, checked here once against the full length, never per chunk.
+            // a SPECIFIED dim 0 is a constraint, checked here once against the full length, never per chunk.
             for (detail::IOEntry* e : c->order_)
                 if (e->dim0_override_ && e->dims_[0].how == detail::DimRecord::How::fixed &&
                     e->dims_[0].extent != *e->dim0_override_)
@@ -679,8 +679,7 @@ private:
         return n;
     }
 
-    /// Dim 0 of every port of every inside component is N, the length of the whole run, during the full pass (D140
-    /// B3). An INTERNAL tie alias root (declared by a descendant, owning no port) has no Component entry to carry the
+    /// Dim 0 of every port of every inside component is N, the length of the whole run, during the full pass. An INTERNAL tie alias root (declared by a descendant, owning no port) has no Component entry to carry the
     /// override: it gets it too.
     void set_dim0(std::size_t n) {
         for (ComponentBase* c : comps_)

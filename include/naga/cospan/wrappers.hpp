@@ -227,7 +227,7 @@ private:
     friend struct detail::ScratchLayout;
 };
 
-// ---- ragged wrappers (D140) -------------------------------------------------------------
+// ---- ragged wrappers -------------------------------------------------------------
 
 /// A dense row-major view of one block of a ragged port: rank R (= the port's rank - 1), shape per
 /// block. `T` is const-qualified for an input. Trivially copyable; made by RaggedInput/RaggedOutput::block.
@@ -281,7 +281,7 @@ struct RaggedAccess {
             b.shape_[d - 1]     = e;
             size *= e;
         }
-        // Relative to offsets[0]: under a leading range (D140 B1) `offsets` points at the root's offsets[a]
+        // Relative to offsets[0]: under a leading range `offsets` points at the root's offsets[a]
         // and `data` at the root's block a. An unshifted port has offsets[0] == 0.
         b.data_ = data + (offsets != nullptr ? static_cast<std::size_t>(offsets[i] - offsets[0]) : i * size);
         return b;

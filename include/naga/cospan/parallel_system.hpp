@@ -77,7 +77,7 @@ public:
     /// A ParallelSystem has no untyped children to add.
     System& add_subsystem(std::string, const property_list& = {}) = delete;
 
-    /// D140: ragged ports are not supported in a ParallelSystem yet (a setup error).
+    /// ragged ports are not supported in a ParallelSystem yet (a setup error).
     void compile() override {
         System::compile();  // the children compile first
         detail::check_no_ragged_ports(describe(), children());

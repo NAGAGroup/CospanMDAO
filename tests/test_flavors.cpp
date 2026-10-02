@@ -19,8 +19,8 @@
 //   Equivalence    four stages as a plain System and as a sequential
 //                  FusedSystem give bitwise-equal outputs
 //
-// The components live in namespace tfl (D118). No case is tagged [os-free]: since
-// the free lane (D121) every case runs on CUDA, the value-driven case whose root
+// The components live in namespace tfl. No case is tagged [os-free]: since
+// the free lane every case runs on CUDA, the value-driven case whose root
 // grows included.
 
 #include <array>
@@ -649,7 +649,7 @@ TEST_CASE("parallel: rejections at setup", "[flavors][parallel][errors]") {
             }});
         });
         tfl::expect_throws([&] { model.setup(); }, {"takes property::device only"});
-        model.wait();  // setup() may have submitted initializer work before it threw (D135)
+        model.wait();  // setup() may have submitted initializer work before it threw
     }
     SECTION("parallel and fused together") {
         cs::Model model = tfl::make([](cs::System& s) {
@@ -657,7 +657,7 @@ TEST_CASE("parallel: rejections at setup", "[flavors][parallel][errors]") {
                             s.child<tfl::Src1>("s", std::array<int, 1>{4}));
         });
         tfl::expect_throws([&] { model.setup(); }, {"two flavors"});
-        model.wait();  // setup() may have submitted initializer work before it threw (D135)
+        model.wait();  // setup() may have submitted initializer work before it threw
     }
     // Compile-time rejection of System children is the static_asserts at the top of the file.
 }
@@ -935,7 +935,7 @@ TEST_CASE("fused: a value-driven size driven by a stage of the same fuse throws 
             s.connect("f.a.n", "f.b.n");  // b's output size is the VALUE of a's output
         });
         tfl::expect_throws([&] { model.setup(); }, {"f.b", "f.a", "VALUE"});
-        model.wait();  // setup() may have submitted initializer work before it threw (D135)
+        model.wait();  // setup() may have submitted initializer work before it threw
     };
     SECTION("sequential") { refused(cs::FusedSystem::Mode::sequential); }
     SECTION("parallel") { refused(cs::FusedSystem::Mode::parallel); }
@@ -1034,17 +1034,17 @@ TEST_CASE("fused: a custom-op child, a host child and mixed ranks throw at setup
     SECTION("custom-op child") {
         cs::Model model = bad_wave(std::type_identity<tfl::NopCustom>{}, true);
         tfl::expect_throws([&] { model.setup(); }, {"f.bad", "custom-op", "cannot be fused"});
-        model.wait();  // setup() may have submitted initializer work before it threw (D135)
+        model.wait();  // setup() may have submitted initializer work before it threw
     }
     SECTION("host child") {
         cs::Model model = bad_wave(std::type_identity<tfl::NopHost>{}, true);
         tfl::expect_throws([&] { model.setup(); }, {"f.bad", "host", "cannot be fused"});
-        model.wait();  // setup() may have submitted initializer work before it threw (D135)
+        model.wait();  // setup() may have submitted initializer work before it threw
     }
     SECTION("children of different ranks") {
         cs::Model model = bad_wave(std::type_identity<tfl::Src2>{}, false);
         tfl::expect_throws([&] { model.setup(); }, {"f.bad", "share one rank"});
-        model.wait();  // setup() may have submitted initializer work before it threw (D135)
+        model.wait();  // setup() may have submitted initializer work before it threw
     }
 }
 
@@ -1105,7 +1105,7 @@ TEST_CASE("fused vs unfused: four stages as a plain System and as a sequential F
 
 
 // =============================================================================================
-// Transient flavors (D138): the children release after the group or wave
+// Transient flavors: the children release after the group or wave
 // =============================================================================================
 TEST_CASE("transient: ParallelSystem and FusedSystem children release after the group or wave",
           "[flavors][transient]") {
@@ -1120,7 +1120,7 @@ TEST_CASE("transient: ParallelSystem and FusedSystem children release after the 
         s.connect("src.y", "grp.b.x");
     }});
     model.setup();
-    // A FusedSystem keeps its wave staging in member usm_vectors drawn from the pool (D93), so the
+    // A FusedSystem keeps its wave staging in member usm_vectors drawn from the pool, so the
     // baseline is taken after the FIRST forward: what the group's roots held is then gone, what the
     // fuse stages stays. The roots themselves are checked directly after that first forward.
     model.forward();

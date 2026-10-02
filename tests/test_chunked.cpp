@@ -1,4 +1,4 @@
-// ChunkedSystem (D140 B2). Every case builds the same subsystem twice, once as a plain System and once as
+// ChunkedSystem. Every case builds the same subsystem twice, once as a plain System and once as
 // a ChunkedSystem, and compares the outputs bitwise; host references check both.
 //
 //   dense:   Prod [N,3] (outside) -> chunked{ A: [N,3] -> internal t [N,4]; B: t -> y [N] } -> Cons (outside)
@@ -587,7 +587,7 @@ TEST_CASE("Chunked: memory after the forward is the durable roots only", "[chunk
     const std::size_t after2 = cst::pool_in_use(m);
     CHECK(tch::chunks_of(m) == 8);
     CHECK(after1 == after2);          // nothing accumulates across forwards
-    CHECK(after1 < plain_after);      // the internal root is only a chunk big (D141: eternal, kept across forwards)
+    CHECK(after1 < plain_after);      // the internal root is only a chunk big (eternal, kept across forwards)
     cs::detail::IOEntry& t = tch::inner_entry(m, "a.t");
     CHECK(t.has_storage());
     CHECK(t.capacity_elems() * sizeof(float) <= 16 * 32);  // its capacity is the largest chunk, never the whole run
@@ -617,7 +617,7 @@ public:
 };
 
 /// An internal root declared with a fixed leading length (13, unrelated to N): inside a chunked system the
-/// framework sets dim 0, so it works (D140 B3).
+/// framework sets dim 0, so it works.
 class OddInner : public cs::ChunkedSystem {
 public:
     explicit OddInner(std::size_t budget) : cs::ChunkedSystem(budget) {}
@@ -822,7 +822,7 @@ TEST_CASE("Chunked: errors", "[chunked][errors]") {
 }
 
 
-// ---- D140 B3: internal roots are kept across the chunks -------------------------------------------------
+// ---- internal roots are kept across the chunks -------------------------------------------------
 namespace tch {
 
 /// Src1: x[i] = i / 2, fixed [n].
@@ -918,7 +918,7 @@ TEST_CASE("Chunked: internal roots are allocated once and kept across the chunks
         for (int rep = 0; rep < 3; ++rep) {
             const std::size_t before = t.allocation_count();
             const auto        out    = tch::forward_out(m);
-            CHECK(t.allocation_count() - before == (rep == 0 ? 1u : 0u));  // eternal (D141): allocated by the first forward only
+            CHECK(t.allocation_count() - before == (rep == 0 ? 1u : 0u));  // eternal: allocated by the first forward only
             CHECK(tch::chunks_of(m) == 10);
             CHECK(out == pout);
             CHECK_FALSE(t.held());
@@ -963,7 +963,7 @@ TEST_CASE("Chunked: an internal free input takes its init again in every chunk",
             const float bias = static_cast<float>(i / 3 + 1);  // the call number of its chunk
             CHECK(out[i] == 2.0f * (0.5f * static_cast<float>(i) + bias) + 1.0f);
         }
-        CHECK(tch::inner_entry(m, "ab.bias").allocation_count() == 1);  // once, with the first forward (eternal, D141)
+        CHECK(tch::inner_entry(m, "ab.bias").allocation_count() == 1);  // once, with the first forward (eternal)
     }
 }
 
@@ -996,7 +996,7 @@ TEST_CASE("Chunked: the init of an internal free input runs once per chunk per f
 }
 
 
-// ---- D140 B3: the framework sets dim 0 of every inside port ---------------------------------------------------
+// ---- the framework sets dim 0 of every inside port ---------------------------------------------------
 namespace tch {
 
 /// MixFixed: t[i,k] = in[i] * (k + 1). `t` is declared with a FIXED dim 0 (`rows`).
@@ -1134,7 +1134,7 @@ TEST_CASE("Chunked: the framework sets dim 0 of every inside port (fixed, FromIn
     for (std::size_t i = 0; i < n; ++i) want[i] = 2.0f * (0.5f * static_cast<float>(i) * 6.0f) + 1.0f;
     for (const int mode : {0, 1}) {
         INFO("mode " << mode << (mode == 0 ? " (dim 0 declared FIXED, = N)" : " (dim 0 declared FromInput{n,0})"));
-        // D142: a specified dim 0 is a constraint checked at the full length, so both declare N (a wrong one is an error: [shape] tests)
+        // a specified dim 0 is a constraint checked at the full length, so both declare N (a wrong one is an error: [shape] tests)
         cs::Model plain = cs::create_model<tch::MixTop<tch::MixPlain>>(default_config(), n, std::size_t{0}, mode, n);
         plain.setup();
         const auto pout = tch::forward_out(plain);
@@ -1148,7 +1148,7 @@ TEST_CASE("Chunked: the framework sets dim 0 of every inside port (fixed, FromIn
         }
     }
     // a chunked system whose internal port has a fixed dim 0 that is not N, with no consumer
-    // D142: that is a constraint violation, reported at the full length
+    // that is a constraint violation, reported at the full length
     cs::Model odd = cs::create_model<tch::OddTop>(default_config());
     odd.setup();
     tch::expect_throws([&] { (void)tch::forward_out(odd); }, {"shape mismatch", "dimension 0 of 'inner.g.out'", "fixed = 13", "full length 8"});
@@ -1323,7 +1323,7 @@ TEST_CASE("Topology cache: the window of an internal free input with an init", "
     }
 }
 
-// ---- D141: lifetime by counting inside a ChunkedSystem ----------------------------------------------------------------
+// ---- lifetime by counting inside a ChunkedSystem ----------------------------------------------------------------
 namespace tch {
 
 /// DenseTop with the chunked system added as a TRANSIENT subsystem.

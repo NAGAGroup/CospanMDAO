@@ -354,7 +354,7 @@ enum class Fwd { first, steady, rebuilt };
 void check_wired(const Row& r, std::uint64_t expected_full_passes, Fwd which) {
     CHECK(r.chunks >= 2);
     CHECK(r.whole.queue_waits >= 1);
-    // The internal roots are eternal (D141): the first forward allocates them, later forwards neither allocate nor free.
+    // The internal roots are eternal: the first forward allocates them, later forwards neither allocate nor free.
     if (which == Fwd::first) {
         CHECK(r.whole.allocations >= 1);
     } else if (which == Fwd::steady) {
