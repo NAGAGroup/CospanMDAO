@@ -17,9 +17,9 @@
 //   marks         design vars / constraints / objective recorded with their
 //                 paths and bounds; the last mark of a kind replaces; the
 //                 ill-formed ones throw
-//   init          init_input metadata: the highest level wins; Model::init_input on a
-//                 durable free input between forwards
-//   transient     registration metadata: release after the last user, kept
+//   init          init_input metadata: the highest level wins; Model::init_input on an
+//                 eternal free input between forwards
+//   transient     run policy: freed when the count reaches 0, kept
 //                 outputs, transient Components, promotion, nesting, a free
 //                 input re-initialized each forward, back-to-back forwards
 //   run-N         n runs; transient subtree allocated/initialized per run
@@ -131,7 +131,7 @@ class Src : public cs::Component<SrcBody> {
     bool                      tied_;
 
 public:
-    /// `tied`: y is rank-only (a tie_outputs member; the tie alias owns the shape).
+    /// `tied`: y has all dims unspecified (a tie_outputs member; the tie alias owns the shape).
     explicit Src(bool tied = false) : tied_{tied} {}
     void setup() override {
         if (tied_)
@@ -156,7 +156,7 @@ struct AxpbBody {
     void operator()(sycl::id<1> i, Inputs in, Outputs out) const { out.y[i] = a * in.x[i] + b; }
 };
 
-/// Selects the Axpb whose input x is rank-only (a tie_inputs member).
+/// Selects the Axpb whose input x has all dims unspecified (a tie_inputs member).
 struct TiedX {};
 inline constexpr TiedX tied_x{};
 
@@ -570,13 +570,13 @@ public:
     void setup() override { add_subsystem<Axpb>("a", 2.0f, 1.0f); }  // free x, no init: zeros
 };
 
-/// A durable free input with a logged init (x = 5): the init is applied by the owner on its first run.
+/// An eternal free input with a logged init (x = 5): the init is applied by the owner on its first run.
 class OneAxpbLog : public cs::System {
 public:
     void setup() override { add_subsystem<Axpb>("a", 2.0f, 1.0f, 5.0f, std::string{"a"}); }
 };
 
-/// a (transient Src) -> b (transient Axpb) -> c (plain Axpb): a.y is transient, b.y is durable.
+/// a (transient Src) -> b (transient Axpb) -> c (plain Axpb): a.y is transient, b.y is eternal.
 class TransComps : public cs::System {
 public:
     void setup() override {
@@ -678,7 +678,7 @@ public:
     }
 };
 
-/// op (OpTrans, run_n{n}) -> sink (y = x + 0.5): the consumer's output feeds the sink outside (an eternal partner), so it is durable.
+/// op (OpTrans, run_n{n}) -> sink (y = x + 0.5): the consumer's output feeds the sink outside (an eternal partner), so it is eternal.
 class RunNTransTop : public cs::System {
     std::size_t n_;
 
@@ -1356,7 +1356,7 @@ TEST_CASE("init: the highest level wins (System init_input beats the Component's
     CHECK(to_vector(model.view_output<DType::f32, 1>("c3.y")) == std::vector<float>(tsys::kLen, tsys::kSysInit));
 }
 
-TEST_CASE("init: init_input on a durable free input between forwards", "[system][init]") {
+TEST_CASE("init: init_input on an eternal free input between forwards", "[system][init]") {
     cs::Model model = cs::create_model<tsys::OneAxpb>(default_config());
     model.setup();
     // No init declared: zeros, so y = 2 * 0 + 1.
@@ -1373,7 +1373,7 @@ TEST_CASE("init: init_input on a durable free input between forwards", "[system]
     CHECK(to_vector(model.view_output<DType::f32, 1>("a.y")) == tsys::filled(9.0f));
 }
 
-TEST_CASE("init: a durable free input is initialized by its owner on the first forward only", "[system][init]") {
+TEST_CASE("init: an eternal free input is initialized by its owner on the first forward only", "[system][init]") {
     tsys::g_inits.clear();
     cs::Model model = cs::create_model<tsys::OneAxpbLog>(default_config());
     model.setup();
@@ -1416,7 +1416,7 @@ std::size_t pool_in_use(cs::Model& m) { return cst::pool_in_use(m); }
 const std::size_t kEternalNode = cst::pooled_config().pool_node_size;
 }  // namespace
 
-TEST_CASE("transient: release after the last user, kept outputs, back-to-back forwards", "[system][transient]") {
+TEST_CASE("transient: freed when the count reaches 0, kept outputs, back-to-back forwards", "[system][transient]") {
     cs::Model model = cs::create_model<tsys::TopC>(cst::pooled_config());
     model.setup();
     auto&             tr   = dynamic_cast<cs::System&>(model.get_subsystem("tr"));
@@ -1437,7 +1437,7 @@ TEST_CASE("transient: release after the last user, kept outputs, back-to-back fo
                             "was released after its last use (by 'tr.mid')");
     }
 
-    SECTION("an output connected outside the subtree stays durable") {
+    SECTION("an output connected outside the subtree stays eternal") {
         model.forward();
         model.wait();
         auto* cons = sys.entry_at("tr.cons.y").root();
@@ -1488,7 +1488,7 @@ TEST_CASE("transient: sequential Components A then B share a root, released afte
     CHECK(to_vector(model.view_output<DType::f32, 1>("c.y")) == tsys::iota_plus(1.0f, tsys::kLen, 2.0f, 1.5f));
 }
 
-TEST_CASE("transient: a root read by a transient and a non-transient Component stays durable", "[system][transient]") {
+TEST_CASE("transient: a root read by a transient and a non-transient Component stays eternal", "[system][transient]") {
     cs::Model model = cs::create_model<tsys::SharedRead>(cst::pooled_config());
     model.setup();
     model.forward();
@@ -1497,7 +1497,7 @@ TEST_CASE("transient: a root read by a transient and a non-transient Component s
     CHECK(to_vector(model.view_output<DType::f32, 1>("p.y")) == tsys::iota_plus(1.0f, tsys::kLen));
 }
 
-TEST_CASE("transient: promotion inside a transient stays transient; re-promoted above it is durable",
+TEST_CASE("transient: promotion inside a transient stays transient; re-promoted above it is eternal",
           "[system][transient]") {
     SECTION("promoted inside the transient subsystem only") {
         cs::Model model = cs::create_model<tsys::PromoInTrans>(cst::pooled_config(), false);
@@ -1809,7 +1809,7 @@ TEST_CASE("structural errors", "[system][errors]") {
         tsys::expect_setup_throws<tsys::TieAfterConnect>("tie_inputs");
         tsys::expect_setup_throws<tsys::TieAfterConnect>("not a free input");
     }
-    SECTION("connect from an input (D61)") {
+    SECTION("connect from an input") {
         tsys::expect_setup_throws<tsys::ConnectFromInput>("cannot be a source");
     }
     SECTION("an unknown path in connect names the path") {
@@ -1963,7 +1963,7 @@ public:
     }
 };
 
-// TScale: y = 2 x; x is rank-only (a tie member), y follows x's shape.
+// TScale: y = 2 x; x has all dims unspecified (a tie member), y follows x's shape.
 struct TScaleBody {
     struct Inputs {
         cs::Input<DType::f32, 1> x;
@@ -1987,7 +1987,7 @@ public:
     }
 };
 
-// TIota: o[i] = i + 1; o is rank-only (a tie_outputs member).
+// TIota: o[i] = i + 1; o has all dims unspecified (a tie_outputs member).
 struct TIotaBody {
     struct Inputs {};
     struct Outputs {
@@ -2045,7 +2045,7 @@ public:
 
 }  // namespace tsys2
 
-TEST_CASE("D139-2: a promoted value-driven output shows its member's current shape", "[system][alias][promote]") {
+TEST_CASE("alias: a promoted value-driven output shows its member's current shape", "[system][alias][promote]") {
     auto model = tsys2::make([](cs::System& s) {
         s.add_subsystem<tsys2::VBins>("v");
         s.promote<DType::f32, 1>("v.b", "b");
@@ -2065,7 +2065,7 @@ TEST_CASE("D139-2: a promoted value-driven output shows its member's current sha
     }
 }
 
-TEST_CASE("D139-2: views of an alias before its root's owner has run throw", "[system][alias]") {
+TEST_CASE("alias: views of an alias before its root's owner has run throw", "[system][alias]") {
     cs::Model model = cs::create_model<tsys2::TieTwoScales>(default_config());
     model.setup();
     tsys::expect_throws([&] { (void)model.view_input<DType::f32, 1>("x"); }, "no data until its owner");
@@ -2076,7 +2076,7 @@ TEST_CASE("D139-2: views of an alias before its root's owner has run throw", "[s
     CHECK(model.view_input<DType::f32, 1>("a.x").shape()[0] == tsys::kLen);
 }
 
-TEST_CASE("D139-2: tie errors", "[system][alias][errors]") {
+TEST_CASE("alias: tie errors", "[system][alias][errors]") {
     const auto setup_throws = [](std::function<void(cs::System&)> build, const std::string& needle) {
         tsys::expect_throws(
             [&] {
@@ -2179,7 +2179,7 @@ TEST_CASE("D139-2: tie errors", "[system][alias][errors]") {
     }
 }
 
-TEST_CASE("D139-2: tie_inputs shapes: fixed, from_output_shape, from_output_values", "[system][alias][tie]") {
+TEST_CASE("alias: tie_inputs shapes: fixed, from_output_shape, from_output_values", "[system][alias][tie]") {
     SECTION("fixed") {
         auto model = tsys2::make([](cs::System& s) {
             s.add_subsystem<tsys2::TScale>("a");
@@ -2232,7 +2232,7 @@ TEST_CASE("D139-2: tie_inputs shapes: fixed, from_output_shape, from_output_valu
     }
 }
 
-TEST_CASE("D139-2: tie_outputs shapes: fixed and from_output_values", "[system][alias][tie]") {
+TEST_CASE("alias: tie_outputs shapes: fixed and from_output_values", "[system][alias][tie]") {
     SECTION("fixed") {
         auto model = tsys2::make([](cs::System& s) {
             s.add_subsystem<tsys2::TIota>("w1");
@@ -2269,7 +2269,7 @@ TEST_CASE("D139-2: tie_outputs shapes: fixed and from_output_values", "[system][
     }
 }
 
-TEST_CASE("D139-2: a connected tie_inputs alias joins the producer's root", "[system][alias][tie]") {
+TEST_CASE("alias: a connected tie_inputs alias joins the producer's root", "[system][alias][tie]") {
     const auto build = [](std::optional<cs::AliasShape> shape) {  // nullopt: tie_inputs without a shape (unspecified)
         return [shape](cs::System& s) {
             s.add_subsystem<tsys2::VBins>("v");
@@ -2337,7 +2337,7 @@ TEST_CASE("D139-2: a connected tie_inputs alias joins the producer's root", "[sy
     }
 }
 
-TEST_CASE("D139-2: a tie alias inside a transient subsystem is released and the pool returns to its baseline",
+TEST_CASE("alias: a tie alias inside a transient subsystem is released and the pool returns to its baseline",
           "[system][alias][transient]") {
     cs::Model model = cs::create_model<tsys2::TransTieTop>(cst::pooled_config());
     model.setup();

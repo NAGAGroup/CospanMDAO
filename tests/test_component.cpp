@@ -7,7 +7,7 @@
 // retrieval (root().entry_at, get_subsystem).
 //
 //   plain body, rank 1/2/3        y = 2x + 1, ragged sizes (1000, 40x30, 7x9x11)
-//   WeightedHistogram             atomic output, FromSourceDim, value-driven
+//   WeightedHistogram             atomic output, unspecified dims, value-driven
 //                                 n_bins; ZeroBins + tie_outputs; two forwards, n_bins changed by
 //                                 init_input between them
 //   TiledTranspose                group body, Local scratch, wg override; 37x53
@@ -580,7 +580,7 @@ TEST_CASE("plain body: y = 2x + 1 at ranks 1, 2 and 3", "[component][plain]") {
 // =============================================================================================
 // WeightedHistogram
 // =============================================================================================
-TEST_CASE("WeightedHistogram: atomic output, FromSourceDim, value-driven n_bins", "[component][histogram]") {
+TEST_CASE("WeightedHistogram: atomic output, unspecified dims, value-driven n_bins", "[component][histogram]") {
     auto model = cs::create_model<tc::TopHist>(default_config());
     model.setup();
 
@@ -697,7 +697,7 @@ TEST_CASE("initial values: fill / zero / from_host / custom / custom_host, and z
         CHECK(tc::g_custom_calls.load() == 1);
         CHECK(tc::g_custom_size.load() == 4);
         CHECK(to_vector(model.view_input<DType::f32, 1>("ini.m")) == std::vector<float>({10.0f, 11.0f, 12.0f, 13.0f}));
-        CHECK(tc::g_host_calls.load() == 1);  // a durable root is initialized at setup, not per forward
+        CHECK(tc::g_host_calls.load() == 1);  // an eternal root is initialized once, at its owner's first run, not per forward
     }
     SECTION("the kernel sees the initialized inputs") {
         // y = 10 x + w + v + d = 20 + {1,2,3,4} + {100,200,300,400} + 0

@@ -4,7 +4,7 @@
 //   Fill     RaggedOutput<f32,3> "pts": N x counts[i] x 3, extents from the VALUES of `counts`
 //            (FromInputValues); pts.block(i)[j,k] = i*1000 + j*10 + k
 //   Scale    RaggedInput -> RaggedOutput (inherits the input's per-index dims with FromInputDim): x2
-//   Sum      RaggedInput (inherits with FromSourceDim) -> a dense [N] output of block sums
+//   Sum      RaggedInput (inherits through an unspecified dim) -> a dense [N] output of block sums
 //
 // Everything is checked against host references, through view_output (dense) and view_ragged_*.
 
@@ -327,7 +327,7 @@ public:
     }
 };
 
-/// make -> sum<2> (inherits with FromSourceDim), the Slice of `slice` between them.
+/// make -> sum<2> (inherits through an unspecified dim), the Slice of `slice` between them.
 class SliceTop : public cs::System {
 public:
     void setup() override {
@@ -396,7 +396,7 @@ public:
         return create_launch_config(sycl::range<1>{4}, {}, {m_}, {});
     }
 };
-/// A dense INPUT that inherits a ragged source (FromSourceDim).
+/// A dense INPUT that inherits a ragged source (through an unspecified dim).
 struct DenseInBody {
     struct Inputs {
         cs::Input<DType::f32, 2> in;

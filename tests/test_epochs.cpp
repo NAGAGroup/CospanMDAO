@@ -529,7 +529,7 @@ TEST_CASE("Host cache: a released transient root still throws on read", "[epoch]
         CHECK(what != "<no exception>");
         CHECK(what.find("released") != std::string::npos);
     }
-    // the durable sink is still readable (and cached)
+    // the eternal sink is still readable (and cached)
     const auto v = m.view_output<DType::f32, 1>("sink.z");
     for (std::size_t i = 0; i < tep::kN; ++i) CHECK(v.span()[i] == 4.0f * static_cast<float>(i + 1));
 }

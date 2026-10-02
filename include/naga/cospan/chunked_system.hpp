@@ -599,7 +599,7 @@ private:
 
     /// Host only: the inside peers of OUTSIDE boundary roots see their whole root; every inside Component
     /// resolves its shapes in registration order; a re-rooted root adopts the full shape of the entry
-    /// that used to be its root as soon as that entry's Component has resolved.
+    /// it re-rooted as soon as that entry's Component has resolved.
     void full_pass() {
         diag::count_full_passes();
         for (Boundary& b : boundary_)

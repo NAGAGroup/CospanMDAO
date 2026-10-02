@@ -115,7 +115,7 @@ struct RagSumBody {
         o.sums[id] = s;
     }
 };
-/// mode 0: x unspecified in both dims (a connection or an init shapes it).  mode 1: x rank-only, for a tie.
+/// mode 0: x unspecified in both dims (a connection or an init shapes it).  mode 1: x has all dims unspecified, for a tie.
 /// mode 2: x declared with n = sizes.size() and per_index(sizes).
 class RagSum : public cs::Component<RagSumBody> {
     int                            mode_;

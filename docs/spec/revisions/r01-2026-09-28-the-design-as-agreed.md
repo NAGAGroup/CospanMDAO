@@ -1873,8 +1873,7 @@ private:
   - `e` is an output peer (only a tied output is one): `root(e)`'s
     placement must equal this placement, else ERROR naming the tie —
     producers cannot write one storage from two placements.
-  (Every root is processed before any peer of it: Systems process their alias entries before their children, and
-  producers precede consumers. Models are acyclic.)
+  - Every root is processed before any peer of it: Systems process their alias entries before their children, and producers precede consumers (models are acyclic).
   - Return `{device: bytes}`.
 - **`prepare_exec`**: capture the queue and substrates, bind the substrates
   to every own root, point the wrapper of every member whose root has
@@ -1896,7 +1895,7 @@ work and never sees a queue except through the owner's ctx.
    carrying a `FromInput` spec, read the driving input's value
    on the host, whichever storage holds it (the
    one forced sync, so this turn's launch geometry is known; integer
-    dtypes only, a negative value throws), allocate the entry''s root first if this
+    dtypes only, a negative value throws), allocate the entry's root first if this
     Component owns it and it is still unallocated, call
    `root.resize(shape)`, then `point_wrapper`; no staging
    copy, nothing submitted for the resize, no reallocation inside a
@@ -1985,7 +1984,7 @@ public:
         declare_input (values_, "values",  unspecified);
         declare_input (weights_,"weights", from_input_shape<1>("values"));
         declare_input (n_bins_, "n_bins",  unspecified_shape<1>());   // connected from NBins
-        declare_output(bins_,   "bins",    unspecified_shape<1>());                      // a tie_outputs member: the tie supplies the shape
+        declare_output(bins_,   "bins",    unspecified_shape<1>());   // a tie_outputs member: the tie supplies the shape
     }
     std::unique_ptr<LaunchDescription> compute_forward() override {
         return create_launch_config(values_.shape(),

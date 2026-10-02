@@ -257,9 +257,9 @@ public:
     }
 
     /// A NEW ROOT (target, not source); every member's set merges into it. The members are
-    /// rank-only (cs::tied) entries of dtype DT and rank Rank; the alias OWNS the shape: its
-    /// `shape` (cs::alias::fixed / from_output_shape / from_output_values) is
-    /// the root's shape, or, once an output is connected into the alias, that output's.
+    /// entries of dtype DT and rank Rank; their unspecified dims come from the tie and their specified dims are constraints on it (§3.6). The alias OWNS the shape: its
+    /// `shape` (fixed / dims / from_output_shape / from_output_values / from_input_shape), or, when left unspecified,
+    /// the output connected into the alias, else the tie's initializer.
     template <DType DT, int Rank>
     void tie_inputs(std::initializer_list<std::string_view> members, std::string name,
                     AliasShape shape = detail::unspecified_alias_shape()) {
@@ -291,7 +291,7 @@ public:
     }
 
     /// A NEW ROOT (source, not target); atomic member dtypes unless allow_plain. The members are
-    /// rank-only (cs::tied) outputs of dtype DT and rank Rank; the alias owns the shape (an output
+    /// outputs of dtype DT and rank Rank (unspecified dims come from the tie, specified ones are constraints); the alias owns the shape (an output
     /// alias defines the shape of its connections, so it cannot take its shape from one).
     template <DType DT, int Rank>
     void tie_outputs(std::initializer_list<std::string_view> members, std::string name, AliasShape shape,
@@ -592,7 +592,7 @@ public:
             resolve_init(*r);
         }
         record_source_partners();
-        check_ties(comps);  // rank-only entries are tied; alias shape sources are ordered
+        check_ties(comps);  // entries with unspecified dims are tied or supplied; alias shape sources are ordered
         build_materialize_slots();
     }
 
@@ -1020,7 +1020,7 @@ private:
     using Members = std::vector<std::pair<std::string_view, detail::IOEntry*>>;
 
     /// A promotion's dims. Its shape is read live from the entry (it mirrors it), so the dims are
-    /// only classification: fixed and from_root kept (rank-only stays rank-only), derived ones
+    /// only classification: fixed and from_root kept (unspecified stays unspecified), derived ones
     /// become inert markers.
     static std::vector<detail::DimRecord> promoted_dims(const detail::IOEntry& e) {
         std::vector<detail::DimRecord> out;
@@ -1157,7 +1157,7 @@ private:
     }
 
     /// Records the tie on the alias, merges the members' sets into it, and marks every entry of
-    /// the merged set as tied (resolve() requires each rank-only entry to be in a tie's set).
+    /// the merged set as tied (an entry whose dims the tie supplies must be in a tie's set).
     void finish_tie(detail::IOEntry& a, AliasShape shape, detail::IOEntry* upstream, const Members& ms) {
         a.declarer_    = this;
         a.alias_shape_ = std::move(shape);

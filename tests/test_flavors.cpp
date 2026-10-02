@@ -3,7 +3,7 @@
 //   Parallel       helper form (plain + group with scratch + host, fed by a
 //                  producer, read by a consumer); typed form with a device
 //                  child; an input connected to a sibling's output throws
-//                  (FromSourceDim and fixed-shape); tied outputs throw unless
+//                  (unspecified and fixed-shape); tied outputs throw unless
 //                  allow_tied_outputs(); rejections; a Parallel nested under
 //                  a plain System
 //   Fused, seq.    three plain stages; two group+scratch stages (B's own
@@ -589,7 +589,7 @@ TEST_CASE("parallel: typed ParallelSystem, a child on property::device equal to 
 
 TEST_CASE("parallel: an input connected to a sibling's output throws at forward, naming both",
           "[flavors][parallel][errors]") {
-    SECTION("a FromSourceDim input") {
+    SECTION("an input with an unspecified dim") {
         cs::Model model = tfl::make([](cs::System& s) {
             s.add_subsystem("par", cs::property_list{cs::property::parallel{}},
                             s.child<tfl::Src1>("a", std::array<int, 1>{4}), s.child<tfl::Elem<0>>("b"));
@@ -924,7 +924,7 @@ TEST_CASE("fused: tied outputs throw in parallel mode unless allow_tied_outputs(
 // =============================================================================================
 TEST_CASE("fused: a value-driven size driven by a stage of the same fuse throws at setup, in both modes",
           "[flavors][fused][errors]") {
-    // (FromInputDim and FromSourceDim through connections are allowed: the chains above use both.)
+    // (FromInputDim and unspecified dims through connections are allowed: the chains above use both.)
     const auto refused = [](cs::FusedSystem::Mode mode) {
         cs::Model model = tfl::make([mode](cs::System& s) {
             s.add_subsystem<tfl::Wave>("f", mode, std::optional<sycl::range<3>>{},

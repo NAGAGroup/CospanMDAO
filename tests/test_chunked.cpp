@@ -571,7 +571,7 @@ TEST_CASE("Chunked: ragged scratch, counts with zeros, several budgets, two forw
     CHECK(tch::chunks_of(m) == 1);
 }
 
-TEST_CASE("Chunked: memory after the forward is the durable roots only", "[chunked][memory]") {
+TEST_CASE("Chunked: memory after the forward is the eternal roots only", "[chunked][memory]") {
     constexpr std::size_t n = 256;  // t is 16 B per row: 4 KiB internal
     cs::Model plain = cs::create_model<tch::DenseTop<tch::InnerPlain>>(cst::pooled_config(), n, std::size_t{0});
     plain.setup();

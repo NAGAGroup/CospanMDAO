@@ -901,7 +901,7 @@ TEST_CASE("Two devices: a producer on one, its consumer on the other", "[model][
 // =============================================================================================
 // 8. Initializer-only inputs and empty roots
 // =============================================================================================
-TEST_CASE("D139: a size-0 root is present and empty; its consumer runs as a no-op", "[model][init][empty]") {
+TEST_CASE("empty: a size-0 root is present and empty; its consumer runs as a no-op", "[model][init][empty]") {
     auto model = cs::create_model<tmod::EmptyTop>(default_config());
     model.setup();
     // Before the owner has run, a view throws.
@@ -927,7 +927,7 @@ TEST_CASE("D139: a size-0 root is present and empty; its consumer runs as a no-o
     CHECK(to_vector(model.view_output<DType::f32, 1>("sc.y")) == std::vector<float>{2, 4, 6, 8});
 }
 
-TEST_CASE("D139: init_input before the first forward is applied", "[model][init]") {
+TEST_CASE("init: init_input before the first forward is applied", "[model][init]") {
     auto model = cs::create_model<tmod::OneAxTop>(default_config());
     model.setup();
     std::vector<float> x(tmod::kLen);
@@ -939,7 +939,7 @@ TEST_CASE("D139: init_input before the first forward is applied", "[model][init]
     CHECK(to_vector(model.view_output<DType::f32, 1>("a.y")) == x);
 }
 
-TEST_CASE("D139: init_input between runs re-initializes once", "[model][init]") {
+TEST_CASE("init: init_input between runs re-initializes once", "[model][init]") {
     auto model = cs::create_model<tmod::OneAxTop>(default_config());
     model.setup();
     const auto host_init = [](float v) {
@@ -967,7 +967,7 @@ TEST_CASE("D139: init_input between runs re-initializes once", "[model][init]") 
     CHECK(tmod::g_host_inits == 2);
 }
 
-TEST_CASE("D139: Model init beats the Component's and the System's declared init", "[model][init]") {
+TEST_CASE("init: Model init beats the Component's and the System's declared init", "[model][init]") {
     {
         auto model = cs::create_model<tmod::DeclaredTop>(default_config());
         model.setup();
@@ -987,7 +987,7 @@ TEST_CASE("D139: Model init beats the Component's and the System's declared init
     }
 }
 
-TEST_CASE("D139: init_input on a connected input warns and is not applied; on an output it throws",
+TEST_CASE("init: init_input on a connected input warns and is not applied; on an output it throws",
           "[model][init]") {
     auto model = cs::create_model<tmod::ChainTop>(default_config());
     model.setup();

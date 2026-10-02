@@ -11,7 +11,7 @@
 // (its owner has not run yet, or a transient root was released) throws; a
 // present size-0 root gives an empty view with the right shape.
 //
-// There is NO host write API: initial values go through init_input
+// Host data reaches an input only as an initial value, through init_input
 // (cs::init::* factories). HostViewMut survives only as the argument type of
 // cs::init::custom_host: the framework builds one over a root it is
 // initializing, hands it to the user's function and commits it on return.
@@ -258,7 +258,7 @@ private:
 
 /// HostViewMut<DT, Rank> — the writable host copy handed to a cs::init::custom_host function.
 /// Built by the framework only (the constructor is private); the framework commits it when the
-/// function returns. It is NOT a host write API: there is none.
+/// function returns.
 template <DType DT, int Rank>
 class HostViewMut {
 public:

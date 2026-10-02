@@ -3,7 +3,7 @@
 //   alias::dims(spec0, spec1, ...) with an integer, per_index, output_value, output_values, output_dim;
 //   from_output_shape copies a ragged shape, and so does a connection (an unspecified dim takes its source's).
 //
-// Members are RaggedOutput / RaggedInput declared with cs::tied. Plain members use TieOutputsPolicy::allow_plain
+// Members are RaggedOutput / RaggedInput declared with all dims unspecified. Plain members use TieOutputsPolicy::allow_plain
 // (the producers run in order, they do not race); atomic ragged members take the require_atomic default.
 // Alias sources may also be INPUTS of the declaring System (input_value / input_values / input_dim /
 // from_input_shape), and a ChunkedSystem refuses only VALUE reads from its internal roots.
@@ -103,7 +103,7 @@ public:
     }
 };
 
-// ---- tie members: a rank-3 ragged output declared cs::tied -------------------------------------------------------------
+// ---- tie members: a rank-3 ragged output with all dims unspecified -------------------------------------------------------------
 /// Op: 0 zero, 1 accumulate (t += (i+1)(q+1)), 2 build (t = (i+1)(q+1)), 3 factor (t = 2 t + 1, reads its own output).
 template <int Op>
 struct TieBody {
@@ -1469,7 +1469,7 @@ TEST_CASE("Opaque chunked system: a tie declared above, with members inside, fai
     trt::expect_throws([&] { m.setup(); }, {"lives inside chunked system 'inner'", "promote it to use it here"});
 }
 
-// ---- an outside tie over PROMOTIONS of inside cs::tied ports ----------------------------------------------------------------
+// ---- an outside tie over PROMOTIONS of inside ports with unspecified dims ----------------------------------------------------------------
 namespace trt {
 
 /// AccIn: t += in[i] (q + 1); `t` is a tied ragged output, `in` a plain input.
@@ -1502,7 +1502,7 @@ public:
 void fill_ot(cs::System& s) {
     s.add_subsystem<AccIn>("q");
     s.promote<DType::f32, 1>("q.in", "in");
-    s.promote<DType::f32, 3>("q.t", "qt");  // a promotion of an inside cs::tied output: the outside tie's member
+    s.promote<DType::f32, 3>("q.t", "qt");  // a promotion of an inside output with unspecified dims: the outside tie's member
 }
 class OtPlain : public cs::System {
 public:

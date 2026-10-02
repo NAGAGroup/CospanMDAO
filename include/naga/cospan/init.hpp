@@ -9,7 +9,7 @@
 // or System::init_input(path, init), or at any time after setup with
 // Model::init_input(path, init), which wins over both. The highest level
 // wins; the root's owner applies it when it allocates the root, and again when
-// Model::init_input leaves one pending. There is no host write API: outputs are
+// Model::init_input leaves one pending. Data reaches an input from the host only this way; outputs are
 // never initialized (§6.0).
 //
 //   cs::init::fill(v)           every element = v (converted to the root's dtype)

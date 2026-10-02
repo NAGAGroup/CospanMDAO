@@ -695,7 +695,7 @@ public:
     /// How many times the root's storage was allocated or grew past its capacity (a test hook).
     std::size_t allocation_count() const noexcept { return root_->allocations_; }
     /// The ROOT's write epoch: a counter that advances whenever the root's data may have changed (a
-    /// component that writes it has been submitted, an init was applied, a host write, an allocation, a
+    /// component that writes it has been submitted, an init was applied, an allocation, a
     /// release or a size change). It is what a host-copy cache compares against; it never decreases.
     /// Not bumped by sync_other_placements (same logical content) nor by ragged-metadata uploads (shape,
     /// not data). Single-threaded submission is assumed, as everywhere in CoSpan.
@@ -798,9 +798,7 @@ public:
 
     // ---- capabilities --------------------------------------------------------
 
-    /// Automatic shape update: applies the DimRecords. FromSourceDim is
-    /// resolved here; FromInputDim / FromInput extents are resolved by the
-    /// owning Component first (set_resolved_extent) and applied here.
+    /// Automatic shape update: applies the DimRecords. An unspecified dim is resolved here from its supplier (§3.6); FromInputDim / FromInput extents are resolved by the entry's Component first (set_resolved_extent) and applied here.
     virtual void update_shape() = 0;
 
     /// Resize. Growing past capacity reallocates through the root's allocator
@@ -1020,7 +1018,7 @@ private:
     }
 
     /// ChunkedSystem, on an alias ROOT at its level: take the full resolved shape of `m`, the
-    /// inside entry that used to be the root (dense: its extents; ragged: N and the per-index arrays),
+    /// inside entry it re-rooted (dense: its extents; ragged: N and the per-index arrays),
     /// and apply it (resizing storage when present). The alias dims are inert markers (how from_input),
     /// so the root is dynamic.
     void adopt_shape(const IOEntry& m) {
@@ -1549,7 +1547,7 @@ private:
         if (size_changes) bump_write();
     }
 
-    /// A per-index array of the SOURCE's dimension d (empty: scalar), for FromSourceDim.
+    /// A per-index array of the SOURCE's dimension d (empty: scalar), for an unspecified dim.
     std::vector<std::size_t> source_per_index(uint8_t d) const {
         if (is_root()) return {};  // source_extent throws for it before this is reached
         if (view()) return {};
@@ -1608,7 +1606,7 @@ private:
     /// the root's owner resolved before this entry's Component runs.
     std::size_t root_extent(uint8_t d) const {
         if (is_root())
-            throw std::logic_error("naga::cospan: '" + full_path() + "' is tied (cs::tied) but is not in a tie");
+            throw std::logic_error("naga::cospan: '" + full_path() + "' takes a dimension from a tie but is not in a tie");
         if (const auto v = view()) return v->extents[d];
         if (const auto lr = leading_range(); lr && d == 0) return lr->second - lr->first;  // under a range
         return root()->extents()[d];
@@ -1893,7 +1891,7 @@ struct EntryAccess {
     }
 };
 
-/// INTERNAL. The one runtime-changeable view: the framework (the chunked system, later) and
+/// INTERNAL. The one runtime-changeable view: the framework (a chunked system) and
 /// the tests set the leading range [a, b) a connected input sees of its root along dim 0.
 struct LeadingRangeAccess {
     static void set(IOEntry& e, std::size_t a, std::size_t b) { e.set_leading_range(a, b); }
