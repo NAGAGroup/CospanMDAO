@@ -79,3 +79,19 @@ Found while porting LRPIM onto opaque chunked systems (C2b to C2e) and measuring
 - [ ] Investigate: wave kernels JIT only in the translation unit that defines the stages. Why: a FusedSystem of kernels defined in another TU aborts with "Could not find function call specialization target".
 - [ ] Housekeeping: tests/smoke is stale against the D139/D140 APIs (HostViewMut semantics changed in C2c). Why: it is unbuilt and no longer matches the API.
 - [ ] Housekeeping: a clean gemver timing rerun, not concurrent with other GPU work. Why: earlier timings may have been disturbed by other GPU jobs.
+
+## Orchestration redesign (rough shape; specifics settled item by item)
+
+CoSpan's differentiator is orchestration on top of AdaptiveCpp's JIT and fusion. This phase makes CoSpan model anything, fast and accurate, with good ergonomics, and everything after builds on the principles settled here.
+
+- [ ] SlabKit queue: one queue, one mental model. In-order items (single kernels, single host items, parallel task graphs) form the backbone. A parallel task graph's members run concurrently and may themselves be task graphs of sequential and parallel steps (nesting). Why: users shouldn't manage several streams with different ordering guarantees.
+- [ ] SlabKit out-of-order lane: async_host is fully asynchronous again (unordered except by the events passed in; async_host_in_order is the ordered form), and the lane also takes device (non-host) work. In-order items accept extra event dependencies, and the global wait covers the lane. Why: the primitive for the push hooks below.
+- [ ] SlabKit: remove the async_host keep-alive task in from_host. Why: it puts a host callback in the stream only to keep a buffer alive.
+- [ ] usm_vector operations (assignment, move, copy, resize, from_host) accept dependent events. Why: containers take part in the event graph instead of forcing waits.
+- [ ] Push pattern: consumer-side work is registered on a root at setup (cross-device copies for connections, initializers, a device-side scan for chunked topology) and is submitted from the producer's event as soon as the producer is submitted. Why: that work finishes long before the consumer is reached.
+- [ ] Remove ParallelSystem: independent sibling subsystems (including whole Systems) are detected and submitted as a parallel task graph. FusedSystem stays as the one special flavor (components only, sequential and parallel waves). Why: concurrency follows from the dependency graph, not from a user-chosen flavor.
+- [ ] Lifetime is scope: eternal by default; do-once / do-N (transient) subsystems are the special cases, and when one goes out of scope everything it produced that nothing downstream uses is freed. Frees stay synchronous on the main loop and should be rare. Reviving re-creates memory; if that happens often the modeler makes the subsystem eternal. Why: free timing must be deterministic, and the memory/compute trade-off is the modeler's decision.
+- [ ] Visibility for those trade-offs: a user-facing per-forward report of allocations, frees and waits per subsystem (from memory_report and the diag counters). Why: the modeler can only choose scopes from a profile.
+- [ ] Design guidance to document: prefer shapes inherited from connections, keep connected components on one device, and treat repeatedly resizing value-driven shapes as a cost. Why: these avoid reallocation churn.
+- [ ] Ergonomics pass over model building (declaration forms, aliases, task-graph construction). Why: the demo has to look as good to write as it runs.
+- [ ] Demo target: meshless LBM fluid (LRPIM) with moving mesh boundaries at large node counts. Why: it shows the framework and the method together.
