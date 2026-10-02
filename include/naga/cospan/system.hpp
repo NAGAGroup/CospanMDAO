@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <functional>
 #include <initializer_list>
+#include <iostream>
 #include <memory>
 #include <optional>
 #include <span>
@@ -50,6 +51,8 @@ namespace naga::cospan {
 namespace property {
 struct device { sycl::device dev; };  ///< placement; inherited when absent
 struct parallel {};                   ///< flavor: the helper form builds a ParallelSystem (§7.5)
+struct run_n { std::size_t n; };       ///< run policy: the child runs on the first n forwards of its owner, then is skipped (n >= 1)
+struct do_once {};                    ///< run policy: run_n{1}
 struct transient {};                  ///< given by an OWNER at registration (Component or System): a transient registration (§4.4)
 struct fused {                        ///< flavor: the helper form builds a FusedSystem (§7.5)
     enum class Mode : uint8_t { sequential, parallel };
@@ -64,6 +67,8 @@ inline constexpr bool is_property_v =
     std::is_same_v<std::remove_cvref_t<P>, property::device> ||
     std::is_same_v<std::remove_cvref_t<P>, property::parallel> ||
     std::is_same_v<std::remove_cvref_t<P>, property::transient> ||
+    std::is_same_v<std::remove_cvref_t<P>, property::run_n> ||
+    std::is_same_v<std::remove_cvref_t<P>, property::do_once> ||
     std::is_same_v<std::remove_cvref_t<P>, property::fused>;
 }  // namespace detail
 
@@ -76,6 +81,10 @@ public:
         requires(sizeof...(Ps) >= 1 && (detail::is_property_v<Ps> && ...))
     property_list(Ps... ps) {  // NOLINT: implicit by design, SYCL idiom
         (set(std::move(ps)), ...);
+        if (has_property<property::run_n>() && get_property<property::run_n>().n == 0)
+            throw std::invalid_argument("naga::cospan: run_n needs n >= 1");
+        if (has_property<property::run_n>() && has_property<property::do_once>())
+            throw std::invalid_argument("naga::cospan: run_n and do_once are two run policies; give one");
     }
 
     template <class P>
@@ -98,7 +107,8 @@ private:
     }
 
     std::tuple<std::optional<property::device>, std::optional<property::parallel>,
-               std::optional<property::transient>, std::optional<property::fused>>
+               std::optional<property::transient>, std::optional<property::fused>,
+               std::optional<property::run_n>, std::optional<property::do_once>>
         props_;
 };
 
@@ -445,7 +455,10 @@ public:
             detail::FlagScope scope{declaring_};
             setup();
         }
-        if (owner() == nullptr) resolve();
+        if (owner() == nullptr) {
+            derive_run_counters(-1);  // top-down, before resolve
+            resolve();
+        }
     }
 
     /// ctx.device = the placed device or `parent_device` (the owner passes the
@@ -520,12 +533,14 @@ public:
         for (std::size_t i = 0; i < children_.size(); ++i) {
             Subsystem& c  = *children_[i];
             ExecCtx&   cc = child_ctx_[i];
+            if (c.run_counter_ == 0) continue;  // run policy: exhausted, no pre, compute or post
             c.run_pre_compute(cc);
             if (auto d = c.run_compute_forward()) {
                 SubmitTarget t = cc.target();
                 d->submit(t);
             }
             c.run_post_compute(cc);
+            if (c.run_counter_ > 0) --c.run_counter_;
         }
         return nullptr;
     }
@@ -583,6 +598,25 @@ protected:
 private:
     friend class ChunkedSystem;
     friend struct detail::SystemAccess;
+
+    /// Top-down: each child's effective run value from its parent's effective value P and its own
+    /// requested value C (-1 eternal, -2 transient, n > 0). Sets setup_run_ = run_counter_.
+    void derive_run_counters(long P) {
+        auto show = [](long v) { return v == -2 ? std::string{"transient (every run, revived)"} : std::to_string(v); };
+        for (Subsystem* c : child_ptrs_) {
+            const long C = c->requested_run_;
+            long       r = C;
+            if (P == -2)
+                r = -2;
+            else if (P > 0)
+                r = C == -2 ? -2 : (C == -1 ? P : std::min(P, C));
+            if (r != C && c->run_explicit_)
+                std::cerr << "naga::cospan: warning: '" << c->path() << "' asks to run " << C << " time(s) but '"
+                          << path() << "' allows " << show(P) << "; clamped to " << show(r) << "\n";
+            c->setup_run_ = c->run_counter_ = r;
+            if (auto* s = dynamic_cast<System*>(c)) s->derive_run_counters(r);
+        }
+    }
 
     void classify_chunks() {
         for (Subsystem* c : child_ptrs_)
@@ -859,6 +893,10 @@ private:
         b.name_      = name;
         b.owner_     = this;
         b.transient_ = tr;
+        const bool has_n = props.has_property<property::run_n>();
+        const bool once  = props.has_property<property::do_once>();
+        b.run_explicit_  = has_n || once;
+        b.requested_run_ = has_n ? static_cast<long>(props.get_property<property::run_n>().n) : once ? 1 : tr ? -2 : -1;
         placed_.push_back(props.has_property<property::device>()
                               ? std::optional<sycl::device>{props.get_property<property::device>().dev}
                               : std::nullopt);
@@ -1257,6 +1295,12 @@ private:
     sk::queue*                                                         queue_ = nullptr;
     Substrates*                                                        subs_  = nullptr;
 };
+
+inline void Subsystem::rearm() {
+    run_counter_ = setup_run_;
+    if (auto* s = dynamic_cast<System*>(this))
+        for (Subsystem* c : s->children()) c->rearm();
+}
 
 namespace detail {
 /// INTERNAL: the root System's own ExecCtx (its device, the Model's queue, that device's

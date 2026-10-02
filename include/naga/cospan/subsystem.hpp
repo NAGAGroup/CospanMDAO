@@ -107,6 +107,14 @@ public:
     /// a System, and everything under it are transient registrations (r01 §4.4).
     bool transient() const noexcept { return transient_; }
 
+    /// Run policy (given by the owner at registration): the LIVE counter (-1 eternal, -2 transient,
+    /// n > 0 runs left, 0 skipped) and the value the owner asked for.
+    long run_counter() const noexcept { return run_counter_; }
+    long requested_run() const noexcept { return requested_run_; }
+
+    /// Resets run_counter_ to its setup value for this subsystem and every descendant.
+    void rearm();
+
 protected:
     Subsystem() = default;
 
@@ -118,6 +126,10 @@ private:
     std::string   path_;
     const System* owner_ = nullptr;
     bool          transient_ = false;
+    long          requested_run_ = -1;     ///< -1 eternal, -2 transient, n > 0 (as asked at registration)
+    bool          run_explicit_  = false;  ///< run_n / do_once was given
+    long          setup_run_     = -1;     ///< the effective value, derived at setup
+    long          run_counter_   = -1;     ///< the live value
 };
 
 namespace detail {

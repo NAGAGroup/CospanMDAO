@@ -646,26 +646,24 @@ public:
 };
 
 // ---- run-N ----------------------------------------------------------------------------------
-/// One Axpb under a RunNSystem: y = 2 x, x a free input ("a.x").
-class RunNAxpb : public cs::RunNSystem {
+/// One Axpb in a plain System: y = 2 x, x a free input ("a.x"). Its parent adds it with run_n.
+class OpAxpb : public cs::System {
 public:
-    explicit RunNAxpb(std::size_t n) : cs::RunNSystem{n} {}
     void setup() override { add_subsystem<Axpb>("a", 2.0f, 0.0f); }
 };
 
-/// A root holding one RunNAxpb of n runs, named "op"; free input "op.a.x", output "op.a.y".
+/// A root holding one OpAxpb added with run_n{n}, named "op"; free input "op.a.x", output "op.a.y".
 class RunNTop : public cs::System {
     std::size_t n_;
 
 public:
     explicit RunNTop(std::size_t n) : n_{n} {}
-    void setup() override { add_subsystem<RunNAxpb>("op", n_); }
+    void setup() override { add_subsystem<OpAxpb>("op", cs::property_list{cs::property::run_n{n_}}); }
 };
 
 /// The transient run-N subtree: prod (free input x = 4, logged) -> mid -> cons, y = 2 x + 3 end to end.
-class RunNTrans : public cs::RunNSystem {
+class OpTrans : public cs::System {
 public:
-    explicit RunNTrans(std::size_t n) : cs::RunNSystem{n} {}
     void setup() override {
         add_subsystem<Axpb>("prod", 1.0f, 0.0f, 4.0f, std::string{"op.prod"});
         add_subsystem<Axpb>("mid", 2.0f, 0.0f);
@@ -675,17 +673,62 @@ public:
     }
 };
 
-/// op (RunNTrans, transient) -> sink (y = x + 0.5): the consumer's output feeds the sink outside, so it is durable.
+/// op (OpTrans, transient, run_n{n}) -> sink (y = x + 0.5): the consumer's output feeds the sink outside, so it is durable.
 class RunNTransTop : public cs::System {
     std::size_t n_;
 
 public:
     explicit RunNTransTop(std::size_t n) : n_{n} {}
     void setup() override {
-        add_subsystem<RunNTrans>("op", kTransient, n_);
+        add_subsystem<OpTrans>("op", cs::property_list{cs::property::transient{}, cs::property::run_n{n_}});
         add_subsystem<Axpb>("sink", 1.0f, 0.5f);
         connect("op.cons.y", "sink.x");
     }
+};
+
+// ---- run policy fixtures: a System that logs its tag each time its owner runs it ------------------
+std::vector<std::string> g_runs;
+
+std::size_t runs_of(const std::string& tag) {
+    return static_cast<std::size_t>(std::count(g_runs.begin(), g_runs.end(), tag));
+}
+
+class RunCounted : public cs::System {
+    std::string                      tag_;
+    std::function<void(cs::System&)> kids_;  ///< adds children inside this System's own setup()
+
+public:
+    explicit RunCounted(std::string tag, std::function<void(cs::System&)> kids = {})
+        : tag_{std::move(tag)}, kids_{std::move(kids)} {}
+    void setup() override {
+        if (kids_) kids_(*this);
+    }
+    std::unique_ptr<cs::LaunchDescription> run_compute_forward() override {
+        g_runs.push_back(tag_);
+        return System::run_compute_forward();
+    }
+};
+
+/// A root whose structure is given by a callable run inside its setup().
+class PolicyTop : public cs::System {
+    std::function<void(cs::System&)> build_;
+
+public:
+    explicit PolicyTop(std::function<void(cs::System&)> build) : build_{std::move(build)} {}
+    void setup() override { build_(*this); }
+};
+
+/// Everything written to std::cerr while it lives.
+class CerrCapture {
+    std::ostringstream ss_;
+    std::streambuf*    old_;
+
+public:
+    CerrCapture() : old_{std::cerr.rdbuf(ss_.rdbuf())} {}
+    ~CerrCapture() { std::cerr.rdbuf(old_); }
+    CerrCapture(const CerrCapture&)            = delete;
+    CerrCapture& operator=(const CerrCapture&) = delete;
+    std::string str() const { return ss_.str(); }
 };
 
 std::vector<float> filled(float v) { return std::vector<float>(kLen, v); }
@@ -1390,7 +1433,7 @@ TEST_CASE("transient: a free input inside a transient subtree is re-initialized 
 }
 
 // =============================================================================================
-// 6b. run-N (RunNSystem; do-once is n = 1)
+// 6b. run-N (property::run_n on add_subsystem; do-once is n = 1)
 // =============================================================================================
 TEST_CASE("run-N: n = 1 runs once; a later init_input stays pending (the owner does not run again)", "[system][runn]") {
     cs::Model model = cs::create_model<tsys::RunNTop>(default_config(), std::size_t{1});
@@ -1481,8 +1524,152 @@ TEST_CASE("run-N + transient: n = 3, the pool returns to its baseline after ever
 }
 
 TEST_CASE("run-N: n = 0 throws at construction", "[system][runn]") {
-    CHECK_THROWS_AS(tsys::RunNAxpb{0}, std::invalid_argument);
-    tsys::expect_throws([] { tsys::RunNAxpb op{0}; }, "RunNSystem needs n >= 1");
+    CHECK_THROWS_AS(cs::property_list{cs::property::run_n{0}}, std::invalid_argument);
+    tsys::expect_throws([] { cs::property_list p{cs::property::run_n{0}}; }, "run_n needs n >= 1");
+}
+
+// =============================================================================================
+// 6c. run policy as an add_subsystem property (run_n, do_once; clamping; rearm)
+// =============================================================================================
+namespace {
+/// A model of a PolicyTop built by `build`; set up (stderr captured into `err`) and returned.
+cs::Model policy_model(std::function<void(cs::System&)> build, std::string& err) {
+    tsys::g_runs.clear();
+    cs::Model model = cs::create_model<tsys::PolicyTop>(default_config(), std::move(build));
+    tsys::CerrCapture cap;
+    model.setup();
+    err = cap.str();
+    return model;
+}
+/// A System "p" (props `pp`) holding one System "c" (props `cp`).
+void add_pair(cs::System& s, const cs::property_list& pp, const cs::property_list& cp) {
+    s.add_subsystem<tsys::RunCounted>("p", pp, std::string{"p"}, [cp](cs::System& p) {
+        p.add_subsystem<tsys::RunCounted>("c", cp, std::string{"c"});
+    });
+}
+void forwards(cs::Model& model, int n) {
+    for (int k = 0; k < n; ++k) model.forward();
+    model.wait();
+}
+}  // namespace
+
+TEST_CASE("run_policy: run_n(3) runs exactly 3 forwards, then is skipped", "[system][run_policy]") {
+    std::string err;
+    cs::Model   model = policy_model(
+        [](cs::System& s) {
+            s.add_subsystem<tsys::RunCounted>("a", cs::property_list{cs::property::run_n{3}}, std::string{"a"});
+        },
+        err);
+    CHECK(err.empty());
+    for (int k = 1; k <= 5; ++k) {
+        INFO("forward " << k);
+        forwards(model, 1);
+        CHECK(tsys::runs_of("a") == static_cast<std::size_t>(k <= 3 ? k : 3));
+    }
+    CHECK(model.get_subsystem("a").run_counter() == 0);
+    CHECK(model.get_subsystem("a").requested_run() == 3);
+}
+
+TEST_CASE("run_policy: do_once runs once", "[system][run_policy]") {
+    std::string err;
+    cs::Model   model = policy_model(
+        [](cs::System& s) {
+            s.add_subsystem<tsys::RunCounted>("a", cs::property_list{cs::property::do_once{}}, std::string{"a"});
+        },
+        err);
+    forwards(model, 4);
+    CHECK(tsys::runs_of("a") == 1);
+    CHECK(model.get_subsystem("a").requested_run() == 1);
+}
+
+TEST_CASE("run_policy: run_n{0} throws invalid_argument", "[system][run_policy]") {
+    CHECK_THROWS_AS(cs::property_list{cs::property::run_n{0}}, std::invalid_argument);
+    CHECK_THROWS_AS((cs::property_list{cs::property::run_n{0}, cs::property::transient{}}), std::invalid_argument);
+}
+
+TEST_CASE("run_policy: run_n together with do_once throws", "[system][run_policy]") {
+    CHECK_THROWS_AS((cs::property_list{cs::property::run_n{2}, cs::property::do_once{}}), std::invalid_argument);
+    CHECK_THROWS_AS((cs::property_list{cs::property::do_once{}, cs::property::run_n{2}}), std::invalid_argument);
+}
+
+TEST_CASE("run_policy: the clamp table", "[system][run_policy]") {
+    using cs::property::do_once;
+    using cs::property::run_n;
+    using cs::property::transient;
+    std::string err;
+
+    SECTION("an eternal child under run_n(3) runs 3 times, no warning") {
+        cs::Model model = policy_model(
+            [](cs::System& s) {
+                add_pair(s, cs::property_list{run_n{3}}, cs::property_list{});
+            },
+            err);
+        CHECK(err.empty());
+        forwards(model, 5);
+        CHECK(tsys::runs_of("p") == 3);
+        CHECK(tsys::runs_of("c") == 3);
+    }
+    SECTION("run_n(5) under run_n(2) runs 2 times and warns") {
+        cs::Model model = policy_model(
+            [](cs::System& s) {
+                add_pair(s, cs::property_list{run_n{2}}, cs::property_list{run_n{5}});
+            },
+            err);
+        INFO("stderr: " << err);
+        CHECK_THAT(err, Catch::Matchers::ContainsSubstring(
+                            "naga::cospan: warning: 'p.c' asks to run 5 time(s) but 'p' allows 2; clamped to 2"));
+        forwards(model, 5);
+        CHECK(tsys::runs_of("c") == 2);
+        CHECK(model.get_subsystem("p.c").requested_run() == 5);
+    }
+    SECTION("run_n(5) under transient becomes transient: every forward, and warns") {
+        cs::Model model = policy_model(
+            [](cs::System& s) {
+                add_pair(s, cs::property_list{transient{}}, cs::property_list{run_n{5}});
+            },
+            err);
+        INFO("stderr: " << err);
+        CHECK_THAT(err, Catch::Matchers::ContainsSubstring("'p.c' asks to run 5 time(s) but 'p' allows transient "
+                                                           "(every run, revived); clamped to"));
+        CHECK(model.get_subsystem("p.c").run_counter() == -2);
+        forwards(model, 7);
+        CHECK(tsys::runs_of("p") == 7);
+        CHECK(tsys::runs_of("c") == 7);
+    }
+    SECTION("transient under run_n(3) stays transient and stops when the parent stops") {
+        cs::Model model = policy_model(
+            [](cs::System& s) {
+                add_pair(s, cs::property_list{run_n{3}}, cs::property_list{transient{}});
+            },
+            err);
+        CHECK(err.empty());
+        CHECK(model.get_subsystem("p.c").run_counter() == -2);
+        forwards(model, 6);
+        CHECK(tsys::runs_of("p") == 3);
+        CHECK(tsys::runs_of("c") == 3);
+        CHECK(model.get_subsystem("p.c").run_counter() == -2);
+    }
+}
+
+TEST_CASE("run_policy: rearm re-enables an exhausted run_n parent and its descendants", "[system][run_policy]") {
+    std::string err;
+    cs::Model   model = policy_model(
+        [](cs::System& s) {
+            add_pair(s, cs::property_list{cs::property::run_n{2}}, cs::property_list{});
+        },
+        err);
+    CHECK(err.empty());
+    forwards(model, 4);
+    CHECK(tsys::runs_of("p") == 2);
+    CHECK(tsys::runs_of("c") == 2);
+    CHECK(model.get_subsystem("p").run_counter() == 0);
+
+    model.get_subsystem("p").rearm();
+    CHECK(model.get_subsystem("p").run_counter() == 2);
+    CHECK(model.get_subsystem("p.c").run_counter() == 2);
+    forwards(model, 4);
+    CHECK(tsys::runs_of("p") == 4);
+    CHECK(tsys::runs_of("c") == 4);
 }
 
 // =============================================================================================

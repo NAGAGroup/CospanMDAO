@@ -67,7 +67,8 @@ public:
         requires std::derived_from<T, ComponentBase>
     T& add_subsystem(std::string name, const property_list& props, Args&&... ctor_args) {
         if (props.has_property<property::parallel>() || props.has_property<property::transient>() ||
-            props.has_property<property::fused>())
+            props.has_property<property::fused>() || props.has_property<property::run_n>() ||
+            props.has_property<property::do_once>())
             throw std::invalid_argument("naga::cospan: " + describe() + ": add_subsystem('" + name +
                                         "'): a ParallelSystem child takes property::device only");
         return System::add_subsystem<T>(std::move(name), props, std::forward<Args>(ctor_args)...);
