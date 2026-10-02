@@ -53,6 +53,7 @@ class Subsystem;
 namespace detail {
 class IOEntry;
 struct LifetimeOps;  // lifetime.hpp: the one place a root's count is changed
+class AliasEvaluator;  // alias_eval.hpp
 struct EntryAccess;
 }  // namespace detail
 
@@ -927,6 +928,7 @@ private:
     friend struct LeadingRangeAccess;
     friend class naga::cospan::ChunkedSystem;
     friend struct LifetimeOps;
+    friend class AliasEvaluator;
 
     /// D140 B1, framework only (through LeadingRangeAccess). A NON-root input peer sees rows / blocks
     /// [a, b) of its root along dim 0. Dense root: its view becomes the SubarrayRef with dim-0 offset a

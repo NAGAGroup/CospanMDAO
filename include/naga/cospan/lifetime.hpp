@@ -81,8 +81,7 @@ struct LifetimeOps {
     static void decrement(IOEntry& root, const Subsystem& partner, std::vector<IOEntry*>& batch) {
         if (root.count_ <= 0) return;
         for (IOEntry::Partner& p : root.partners_) {
-            if (p.holder != &partner) continue;
-            if (p.owed == 0) return;
+            if (p.holder != &partner || p.owed == 0) continue;  // a holder may appear once per use of the root
             --p.owed;
             --root.count_;
             if (root.count_ == 0) {

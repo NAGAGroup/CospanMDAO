@@ -2437,6 +2437,7 @@ TEST_CASE("lifetime: a tie_outputs root under a transient System is freed every 
         model.forward();
         model.wait();
         auto* t = model.root().entry_at("tr.t").root();
+        CHECK(t->owner() == &model.get_subsystem("tr"));  // a tie root is owned by its declaring System (D141)
         CHECK(t->released());
         CHECK(t->lifetime_count() == 0);
         CHECK(to_vector(model.view_output<DType::f32, 1>("sink.y")) == tsys::iota_plus(1.0f, tsys::kLen));
@@ -2449,6 +2450,7 @@ TEST_CASE("lifetime: a tie_inputs root is initialized by the tie; the members' o
     model.setup();
     model.forward();
     model.wait();
+    CHECK(model.root().entry_at("x").root()->owner() == &model.root());  // the tie root: owned by the declaring System
     CHECK(to_vector(model.view_output<DType::f32, 1>("a.y")) == tsys::filled(6.0f));  // 2 * 3, not 2 * 100
     CHECK(to_vector(model.view_output<DType::f32, 1>("b.y")) == tsys::filled(9.0f));  // 3 * 3, not 3 * 200
 }
@@ -2516,4 +2518,34 @@ TEST_CASE("lifetime: transient together with run_n or do_once throws, naming the
                 err);
         },
         "add_subsystem('b'): transient cannot be combined with run_n or do_once");
+}
+
+namespace tsys2 {
+/// A transient System: nb (NCopy, do_once) gives the tie's extent by VALUE (alias::from_output_values), a and b are the members.
+class ValueSourceSys : public cs::System {
+public:
+    void setup() override {
+        add_subsystem<NCopy>("nb", cs::property_list{cs::property::do_once{}});
+        add_subsystem<TScale>("a");
+        add_subsystem<TScale>("b");
+        tie_inputs<DType::f32, 1>({"a.x", "b.x"}, "x", cs::alias::from_output_values("nb.n"));
+    }
+};
+}  // namespace tsys2
+
+TEST_CASE("lifetime: a value-driven alias shape keeps a finite producer's output alive until it has materialized",
+          "[system][lifetime][alias]") {
+    auto model = tsys2::make([](cs::System& s) { s.add_subsystem<tsys2::ValueSourceSys>("s", tsys::kTransient); },
+                             cst::pooled_config());
+    model.setup();
+    model.init_input("s.nb.v", cs::init::from_host(tsys2::one_u32(4)));
+    // nb.n is written by the do_once producer (answer 1) and read by the tie's declaring System (a non-writer partner, 1):
+    // the producer's own decrement does not free it, the alias's does, after the value was read.
+    CHECK_NOTHROW(model.forward());
+    model.wait();
+    auto* n = model.root().entry_at("s.nb.n").root();
+    CHECK(n->released());
+    CHECK(n->released_by() == "s");
+    CHECK(model.root().entry_at("s.x").root()->owner() == &model.get_subsystem("s"));
+    CHECK(model.root().entry_at("s.x").root()->extents()[0] == 4);
 }

@@ -110,8 +110,10 @@ class ChunkedSystem : public System {
     std::vector<detail::IOEntry*>        dep_roots_;
     std::vector<const detail::IOEntry*>  shape_roots_;
     mutable std::size_t                 dep_checks_ = 0;  ///< how many times the dependency self-check ran (a test hook)
-    std::vector<ComponentBase::DepRead> reads_;  ///< the reads of the recording pass with their readers (self-check)
+    std::vector<detail::AliasEvaluator::DepRead> reads_;  ///< the reads of the recording pass with their readers (self-check)
     std::function<void(std::size_t)>     chunk_hook_, chunk_post_hook_;
+    std::vector<System*>                 systems_;       ///< this system and every descendant System (chunk_replay_ is set on them)
+    std::vector<std::pair<detail::IOEntry*, ComponentBase*>> internal_ties_;  ///< internal tie roots, with the first Component that uses each
     detail::DeferSink                    sink_;  ///< decrements and run-counter moves, deferred to after the last chunk (D141)
 
     /// The process-wide default of set_replay: true, unless the environment has COSPAN_CHUNK_LEGACY=1 (the
@@ -223,10 +225,11 @@ public:
         } catch (...) {
             topo_.valid = false;  // whatever failed, the next forward builds the topology again
             recording_  = false;
+            set_replay_flags(false);
             for (ComponentBase* c : comps_) {
                 c->replay_         = false;
-                c->dep_recorder_   = nullptr;
-                c->shape_recorder_ = nullptr;
+                c->ev_.dep_recorder_   = nullptr;
+                c->ev_.shape_recorder_ = nullptr;
             }
             try {
                 for (detail::IOEntry* r : internal_) r->meta_shift_ = 0;
@@ -247,6 +250,7 @@ protected:
     void chunk_classify() override {
         boundary_.clear();
         internal_.clear();
+        internal_ties_.clear();
         comps_.clear();
         if (has_nested_chunked(*this))
             throw std::invalid_argument("naga::cospan: " + describe() + ": nested chunked systems are not supported");
@@ -255,6 +259,8 @@ protected:
         outside_ties_.clear();
         for (ComponentBase* c : comps_) c->chunk_inside_ = true;
         set_sinks(*this);
+        systems_.clear();
+        collect_systems(*this);
 
         std::vector<detail::IOEntry*>                    roots;
         std::unordered_set<const detail::IOEntry*>       seen;
@@ -269,6 +275,7 @@ protected:
             if (out == 0) {
                 r->chunk_internal_by_ = path();
                 internal_.push_back(r);
+                if (r->alias_shape_) internal_ties_.emplace_back(r, nullptr);
             } else if (inside(*r)) {
                 Boundary b;
                 b.member = r;
@@ -284,6 +291,15 @@ protected:
                 }
             }
         }
+        for (auto& [r, first] : internal_ties_)  // the first Component (registration order) that uses the tie root
+            for (ComponentBase* c : comps_) {
+                if (first != nullptr) break;
+                for (detail::IOEntry* e : c->order_)
+                    if (e->root() == r) {
+                        first = c;
+                        break;
+                    }
+            }
         for (Boundary& b : boundary_) {
             for (detail::IOEntry* p : b.root->peers_)
                 if (inside(*p) && p->mirror_of_ == nullptr && dynamic_cast<const ComponentBase*>(p->declarer()) != nullptr)
@@ -354,7 +370,7 @@ private:
         dep_roots_.clear();
         shape_roots_.clear();
         reads_.clear();
-        for (ComponentBase* c : comps_) c->read_log_.clear();
+        for (ComponentBase* c : comps_) c->ev_.read_log_.clear();
         resolve_outside_ties(recording_);  // again, recording what their rules read (value / shape dependencies)
         full_pass();
         for (Boundary& b : boundary_)  // an input root whose shape the pass changed takes its init again
@@ -369,13 +385,12 @@ private:
     /// the alias resolution of its owner, independent of which Component owns it.
     void resolve_outside_ties(bool record) {
         for (detail::IOEntry* a : outside_ties_) {
-            ComponentBase* owner = dynamic_cast<ComponentBase*>(const_cast<Subsystem*>(a->owner()));
-            if (owner == nullptr) owner = comps_.front();
-            owner->read_log_.clear();
-            owner->resolve_alias_root(*a, record ? &dep_roots_ : nullptr, record ? &shape_roots_ : nullptr);
+            System& owner = tie_owner(*a);
+            owner.ev_.read_log_.clear();
+            owner.ev_.resolve_alias_root(*a, record ? &dep_roots_ : nullptr, record ? &shape_roots_ : nullptr);
             // The reads of an outside tie's OWN rule are on its outside sources (opacity guarantees they are not inside):
             // dependencies of the cache, but not crossings of this system's boundary. They are not self-checked.
-            owner->read_log_.clear();
+            owner.ev_.read_log_.clear();
         }
     }
 
@@ -417,7 +432,7 @@ private:
     /// through a promotion, or an outside tie of this system). Anything else means something read across the boundary.
     void check_dependencies() const {
         ++dep_checks_;
-        for (const ComponentBase::DepRead& r : reads_) {
+        for (const detail::AliasEvaluator::DepRead& r : reads_) {
             const detail::IOEntry* root = r.root->root();
             bool                   ok   = std::find(internal_.begin(), internal_.end(), root) != internal_.end();
             for (const Boundary& b : boundary_) ok = ok || b.root == root;
@@ -483,6 +498,7 @@ private:
 
     void run_replay_loop(const Chunks& chunks) {
         for (ComponentBase* c : comps_) c->replay_ = true;
+        set_replay_flags(true);  // the Systems too: their alias materialization takes the cached shapes
         try {
             for (std::size_t ci = 0; ci < chunks.size(); ++ci) {
                 const auto [a, b] = chunks[ci];
@@ -500,9 +516,11 @@ private:
             }
         } catch (...) {
             for (ComponentBase* c : comps_) c->replay_ = false;
+            set_replay_flags(false);
             throw;
         }
         for (ComponentBase* c : comps_) c->replay_ = false;
+        set_replay_flags(false);
     }
 
     void run_legacy_loop(const Chunks& chunks) {
@@ -593,6 +611,32 @@ private:
         for (detail::IOEntry* r : internal_) detail::LifetimeOps::reset(*r);
     }
 
+    void collect_systems(System& s) {
+        systems_.push_back(&s);
+        for (Subsystem* c : s.child_ptrs_)
+            if (auto* sub = dynamic_cast<System*>(c)) collect_systems(*sub);
+    }
+    void set_replay_flags(bool on) {
+        for (System* s : systems_) s->chunk_replay_ = on;
+    }
+
+    /// The System that declared a tie alias evaluates its shape rule (it owns the root).
+    static System& tie_owner(const detail::IOEntry& a) {
+        auto* s = const_cast<System*>(dynamic_cast<const System*>(a.declarer()));
+        if (s == nullptr) throw std::logic_error("naga::cospan: internal error: tie alias '" + a.full_path() + "' has no declaring System");
+        return *s;
+    }
+
+    /// An internal tie root takes the shape its rule gives at the full range, through its declaring System's evaluator
+    /// (value and shape reads recorded for the topology cache, as a Component's are).
+    void resolve_internal_tie(detail::IOEntry& r) {
+        System& owner = tie_owner(r);
+        owner.ev_.read_log_.clear();
+        owner.ev_.resolve_alias_root(r, recording_ ? &dep_roots_ : nullptr, recording_ ? &shape_roots_ : nullptr);
+        reads_.insert(reads_.end(), owner.ev_.read_log_.begin(), owner.ev_.read_log_.end());
+        owner.ev_.read_log_.clear();
+    }
+
     /// Every descendant (Systems and Components) defers its decrements to this system's sink.
     void set_sinks(System& s) {
         s.defer_sink_ = &sink_;
@@ -625,24 +669,26 @@ private:
             if (b.member == nullptr)
                 for (detail::IOEntry* p : b.peers) detail::LeadingRangeAccess::set(*p, 0, b.root->extents()[0]);
         for (ComponentBase* c : comps_) {
-            c->chunk_pass_ = true;
+            for (const auto& [r, first] : internal_ties_)  // the internal tie roots this Component is the first user of (it was their owner)
+                if (first == c) resolve_internal_tie(*r);
+            c->ev_.chunk_pass_ = true;
             if (recording_) {
-                c->dep_recorder_   = &dep_roots_;
-                c->shape_recorder_ = &shape_roots_;
+                c->ev_.dep_recorder_   = &dep_roots_;
+                c->ev_.shape_recorder_ = &shape_roots_;
             }
             try {
                 c->resolve_shapes();
             } catch (...) {
-                c->chunk_pass_     = false;
-                c->dep_recorder_   = nullptr;
-                c->shape_recorder_ = nullptr;
+                c->ev_.chunk_pass_     = false;
+                c->ev_.dep_recorder_   = nullptr;
+                c->ev_.shape_recorder_ = nullptr;
                 throw;
             }
-            c->chunk_pass_     = false;
-            c->dep_recorder_   = nullptr;
-            c->shape_recorder_ = nullptr;
-            reads_.insert(reads_.end(), c->read_log_.begin(), c->read_log_.end());
-            c->read_log_.clear();
+            c->ev_.chunk_pass_     = false;
+            c->ev_.dep_recorder_   = nullptr;
+            c->ev_.shape_recorder_ = nullptr;
+            reads_.insert(reads_.end(), c->ev_.read_log_.begin(), c->ev_.read_log_.end());
+            c->ev_.read_log_.clear();
             for (Boundary& b : boundary_)
                 if (b.member != nullptr && b.member->declarer() == c) b.root->adopt_shape(*b.member);
         }

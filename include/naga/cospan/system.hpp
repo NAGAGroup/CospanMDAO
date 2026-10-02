@@ -36,6 +36,7 @@
 
 #include "naga/slabkit/slabkit.hpp"
 
+#include "naga/cospan/alias_eval.hpp"
 #include "naga/cospan/component.hpp"
 #include "naga/cospan/host_view.hpp"
 #include "naga/cospan/lifetime.hpp"
@@ -503,6 +504,7 @@ public:
     void prepare_exec(sk::queue& queue, Substrates& substrates) override {
         queue_ = &queue;
         subs_  = &substrates;
+        ev_.queue_     = &queue;
         ctx_.queue     = &queue;
         ctx_.group     = nullptr;
         ctx_.substrate = &substrates[ctx_.device];
@@ -579,12 +581,16 @@ public:
                 if (r->owner_ == nullptr) r->owner_ = c;  // the FIRST toucher owns the root
             }
         for (detail::IOEntry* r : roots)
-            if (r->chunk_rerooted_) r->owner_ = r->declarer_;  // D140 B2: its ChunkedSystem allocates it, not a Component
+            if (r->chunk_rerooted_)
+                r->owner_ = r->declarer_;  // D140 B2: its ChunkedSystem allocates it, not a Component
+            else if (r->alias_shape_)
+                r->owner_ = r->declarer_;  // a tie alias root: owned, resolved and allocated by the declaring System (D141)
 
         for (detail::IOEntry* r : roots) {
             record_partners(*r);
             resolve_init(*r);
         }
+        record_source_partners();
         check_ties(comps);  // D139 part 2: rank-only entries are tied; alias shape sources are ordered
         build_materialize_slots();
     }
@@ -607,14 +613,41 @@ private:
     friend struct detail::SystemAccess;
 
     std::vector<std::vector<detail::IOEntry*>> materialize_before_;  ///< size children + 1: aliases touched before child i
+    detail::AliasEvaluator                     ev_;                  ///< evaluates the shape rules of the tie roots this System owns
+    bool                                       chunk_replay_ = false;  ///< set by a replaying ChunkedSystem on itself and its descendant Systems: no shape resolution
     static void rearm_subtree(Subsystem& self);
 
-    /// An alias comes into scope: its root is revived and this System, one of its partners, decrements at once.
+    /// An alias comes into scope, right before the first child that uses its root (D141):
+    ///   1. its root is revived;
+    ///   2. a root THIS System owns (a tie root, not an outside boundary root of a chunked system, which its chunked
+    ///      system resolves and allocates): its shape rule is evaluated (not while a ChunkedSystem replays its cached
+    ///      topology), the root is allocated, a free input root applies its pending init (Model::init_input too), and
+    ///      the ragged index arrays are uploaded;
+    ///   3. (an alias carries no member wrapper: there is nothing to point, AliasEntry::point_wrapper is empty);
+    ///   4. this System, a partner, decrements at once: for the alias, and for each root its shape rule read;
+    ///   5. the roots that reached 0 are freed behind one wait.
+    /// Host views and Model::init_input do not come here: it only runs inside a forward.
     void materialize(detail::IOEntry& a) {
         detail::IOEntry& root = *a.root();
         detail::revive(root, *this);
+        const bool owns = root.owner() == this && &a == &root && root.alias_shape_ && !root.chunk_outside_tie_;
+        if (owns) {
+            if (!chunk_replay_ && !(root.alias_shape_->kind == AliasShape::Kind::fixed && !root.dim0_override_))
+                ev_.apply_alias_root(root);
+            root.allocate_if_absent(queue_ref());
+            if (root.kind() == IOKind::input && root.init_pending()) {
+                detail::apply_root_init(root, queue_ref());
+                root.clear_init_pending();
+            }
+            if (!chunk_replay_) root.upload_ragged(queue_ref());
+        }
         std::vector<detail::IOEntry*> batch;
         detail::decrement_or_defer(root, *this, batch, defer_sink());
+        if (owns)
+            for (const auto& [path, up] : root.alias_sources()) {
+                (void)path;
+                detail::decrement_or_defer(*const_cast<detail::IOEntry*>(up->root()), *this, batch, defer_sink());
+            }
         detail::release(batch, queue_ref());
     }
 
@@ -661,6 +694,23 @@ private:
         };
         add(r);
         for (const detail::IOEntry* p : r.peers_) add(*p);
+    }
+
+    /// A tie alias root's shape rule READS other roots (from_output_shape / _values, from_input_shape, the dims
+    /// list): the declaring System is a non-writer partner of each, so a finite producer's output stays alive until
+    /// the alias has materialized. One partner entry per reference. Not for a tie that is an OUTSIDE boundary root
+    /// of a chunked system (that system reads its sources itself, before its pass).
+    void record_source_partners() {
+        std::vector<detail::IOEntry*> aliases;
+        collect_aliases(aliases);
+        for (detail::IOEntry* a : aliases) {
+            if (!a->alias_shape_ || !a->is_root() || a->chunk_outside_tie_ || a->chunk_rerooted_) continue;
+            for (const auto& [path, up] : a->alias_sources()) {
+                (void)path;
+                detail::IOEntry* sr = const_cast<detail::IOEntry*>(up->root());
+                sr->partners_.push_back(detail::IOEntry::Partner{a->declarer_, false, 0});
+            }
+        }
     }
 
     /// Per System: the aliases touched right before child i (slot i): the first child whose subtree
