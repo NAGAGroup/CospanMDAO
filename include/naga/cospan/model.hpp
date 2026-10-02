@@ -137,8 +137,14 @@ public:
         s.ready = true;
     }
 
-    /// root.run_compute_forward(): enqueue one forward and return.
-    void forward() { (void)ready("forward").root->run_compute_forward(); }
+    /// The root's run_pre_compute, run_compute_forward, run_post_compute: enqueue one forward and return.
+    void forward() {
+        System&  root = *ready("forward").root;
+        ExecCtx& ctx  = detail::SystemAccess::root_ctx(root);
+        root.run_pre_compute(ctx);
+        (void)root.run_compute_forward();
+        root.run_post_compute(ctx);
+    }
 
     /// queue.wait_and_throw(): the caller's choice, never implicit.
     void wait() {

@@ -149,6 +149,10 @@ struct fused_of {
 // System
 // -----------------------------------------------------------------------------
 
+namespace detail {
+struct SystemAccess;
+}
+
 class System : public Subsystem {
 public:
     ~System() override = default;
@@ -578,6 +582,7 @@ protected:
 
 private:
     friend class ChunkedSystem;
+    friend struct detail::SystemAccess;
 
     void classify_chunks() {
         for (Subsystem* c : child_ptrs_)
@@ -1252,5 +1257,13 @@ private:
     sk::queue*                                                         queue_ = nullptr;
     Substrates*                                                        subs_  = nullptr;
 };
+
+namespace detail {
+/// INTERNAL: the root System's own ExecCtx (its device, the Model's queue, that device's
+/// substrate), which Model::forward passes to the root's pre/post hooks.
+struct SystemAccess {
+    static ExecCtx& root_ctx(System& s) { return s.ctx_; }
+};
+}  // namespace detail
 
 }  // namespace naga::cospan
