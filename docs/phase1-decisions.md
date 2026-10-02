@@ -511,12 +511,15 @@ One of four CUDA runs of the full suite at this commit hit the 600 s timeout in 
 A later CUDA run (run 1 of a repeat set) passed the whole suite (543 assertions in 44 test cases) and then the process dumped core (SIGSEGV, exit 245) after Catch2's summary, i.e. at teardown. Undiagnosed. Both symptoms (the hang and the exit crash) were seen on naga-acpp 2026.09.29 before the fork fix, and both may be the known fork bug (a value-driven root growing in a no-pool fused wave means an OS free plus SlabKit async_host copies). The next step is to move the lock to the fixed 2026.09.29 build and see what is left.
 
 ## D135 — Synchronous frees
+(Amended by D141: a root is freed when its count reaches 0, and the roots freed by one Component or System turn are freed behind ONE queue wait, not one wait per releasing component.)
+
 SlabKit a484713 removes the frees lane: `deallocate` waits the events it is given, then frees on the calling thread (pool slot or sycl::free), and a usm_vector passes its own last task. CoSpan's kernels over a root are CoSpan's to wait for, so `StorageEntry::release_storage` (transient release) waits the stream before dropping its slots, and `reshape` waits the stream once before growing a stored root past its capacity. `~Model` and move-assignment do not wait, as a sycl::queue's destructor does not: work the user submitted through the Model's verbs (setup's initializers, set_input/set_output, a view_output_mut write-back, forward) is theirs to wait for with `Model::wait()` before the Model is destroyed or reassigned; a Model dropped with work in flight is undefined. The pin moves to a484713, and the lock stays on fork build 4, which carries the async_host fix. Accepted costs: a transient System's forward blocks until its subtree finishes, and a value-driven grow blocks once. Per-root events were considered and not taken: the primary lane is in order, so a subtree's last launch follows everything before it. r01 §4.4, §9.4.
 
 ## D136 — Paths are relative to the root System; host-access errors name the full dotted path.
 The Model's root System has no name or path (as in OpenMDAO): a user addresses `d1.y2`, never `top.d1.y2`, and every path in an error message is relative to the root the same way. `Model::setup` places the root with an empty name and path; child paths join as the name alone under the root. Host-access errors (`set_input`/`set_output`, `view_*`, write-back, released or unstored roots) name the entry by `IOEntry::full_path()`: its declarer's path plus its name, or the name alone at the root (`'d1.y2'`, `'z'`). Supersedes D132, and the `top.` forms quoted in D119 and D123.
 
 ## D137 — RunNSystem; do-once is n = 1
+**Superseded by D141** (run policy is an add_subsystem property; RunNSystem and include/naga/cospan/run_n_system.hpp are removed; n == 0 still throws std::invalid_argument, now when the property_list is constructed).
 
 RunNSystem(n) runs its subtree on the first n forwards and then returns early
 (nullptr, nothing submitted). There is no RunOnceSystem: do-once is n = 1
@@ -527,6 +530,7 @@ revive(), so the subtree stays released. Roots with a consumer outside persist.
 Lives in include/naga/cospan/run_n_system.hpp, included by cospan.hpp.
 
 ## D138 — Initialization and transientness are root metadata; components allocate, init and release (Jack, 2026-09-30)
+**Partly superseded by D141:** parts C (a root is transient iff every registration is), D and E (release by the last user, RunNSystem) and F (the transient/last_user record, transient marks being an error) are replaced by run policy and lifetime by counting; the init and owner parts stand (a tie root's owner is now the declaring System).
 
 A. Functional model (r01 §6.0). Outputs are always computed fresh from inputs: no component may assume an initial output value, and outputs are not initializable. There is no global scratch; multi-step work is several components, producer to consumer. Accumulation is either group work with local memory inside one kernel, or a zeroing producer component followed by the accumulating components, all joined by tie_outputs, whose default stays require_atomic with the allow_plain opt-out. Atomic accesses are relaxed; kernels that need acquire/release ordering use sycl::atomic_fence(memory_order::acq_rel, memory_scope::device), which SYCL 2020 guarantees on every device.
 
@@ -572,6 +576,7 @@ E. REMOVED: `System::shape_source` (the "first fixed member" rule), inert alias 
 F. Supersedes: D62's shape rule (a tie alias takes its shape from a fixed member); D66 (alias extents are inert); the D138 amendment's consequence that tie_outputs accepts value-driven members and the alias root follows them (the ZeroBins + Histogram sample now reads the bin count from an upstream output, `alias::from_output_values`). Where tests needed a component both tied and untied they got a parameter or a tied-only variant: gemver-chain's `Gemv` and `GemvTPartial` take a `tied_b` flag (BiCGK's B tie); `ZeroCounters` and `GridBarrier` outputs are always tied (BarrierTop ties them with `alias::fixed(1)`); test components `Axpb`, `Src` (flag or tag constructor), `InitAffine` (flag), and always-tied `Adder`, `ZeroAcc`, the Sellar `D1`/`D2`/`Obj` and `Comb`. Nested ties (a tie of a tie alias) became ties of promotions.
 
 ## D140 — Ragged dimensions and chunked systems (approved by Jack, 2026-10-01)
+**Partly superseded:** by D141 the internal roots of a chunked system are no longer forced transient (they live by counts, decrements deferred to after the last chunk, the capacity reserved by `held_`); by D142 `FromSourceDim` and `from_connection` are unspecified dims, and a specified dim 0 is a constraint checked at the full length.
 
 1. Ragged dimensions, available to any component. Dim 0 (leading) is always a single value, set by any existing rule (fixed, FromInput value, FromSourceDim, FromInputDim). Dims ≥ 1 accept any existing rule plus per-index (array-valued) rules: a host array given at construction (cs::per_index); the values of an input that is an array (cs::FromInputValues, rank 1 [N] or a column of rank 2 [N,k]); inheriting dim d of another input's shape where that dim is per-index; wholesale inheritance from a connection. Outputs never take a shape from a connection; they take it from an input of the same component (which may itself come from an upstream connection). A port is ragged when any dim ≥ 1 is per-index; per-index and fixed dims mix freely (e.g. [N, c_i, 3], [N, Q_i, c_i]). Every per-index array has length = dim 0. Layout: blocks end to end; block i size = Π_{d≥1} extent_d(i); block offsets by an exclusive scan computed on the host (per-index arrays are snapshotted like FromInput) and uploaded. Kernels use RaggedInput/RaggedOutput (block(i) → a small dense view), which also read dense ports; binding a ragged port to a dense Input/Output is an error. No separate code path for uniform shapes.
 
@@ -581,3 +586,37 @@ F. Supersedes: D62's shape rule (a tie alias takes its shape from a fixed member
    Amendment: tie aliases take the same per-index shape rules as ports: alias::dims with per_index / output_values / output_dim; from_output_shape and from_connection copy ragged shapes. Alias shape sources may also be inputs of the declaring system (alias::input_value / input_values / input_dim / from_input_shape), read from the input's root; inside a chunked system only value reads from internal roots are refused (shape inheritance from internal entries is allowed); RaggedOutput accepts atomic dtypes (AtomicBlock).
 
 3. Future, not in D140: memoryless functional ports (chunk-shaped inputs computed on the fly by a functor), and sparse matrix bundles (CSR, block CSR, SELL) over ragged ports.
+
+## D141 — Run policy as an add_subsystem property; variable lifetime by counting (Jack, 2026-10-02)
+
+1. RUN POLICY. `property::run_n{n}` (n >= 1; n == 0 throws `std::invalid_argument`, "run_n needs n >= 1"), `property::do_once{}` (= run_n{1}) and `property::transient{}` on `add_subsystem`. run_n with do_once is an error; transient with either is an error (`add_subsystem('x'): transient cannot be combined with run_n or do_once`). RunNSystem is removed.
+
+2. COUNTERS. Per subsystem: requested_run (-1 eternal, -2 transient, n > 0), run_explicit, setup_run, run_counter (live: -1, -2, n, 0). The root's `run_setup` derives the effective values top-down before resolve(): parent -1 gives the child's request; parent -2 gives -2; a finite parent p gives -2 for a transient child, p for an eternal one, min(p, n) otherwise. An explicit request that changes prints a warning to std::cerr. A System loop skips a child at 0 (no pre, compute or post) and decrements a positive counter after its post; a ChunkedSystem moves the counters once per forward, after the last chunk. `rearm()` resets the counters of a subtree and sends every root it owns back out of scope (one wait).
+
+3. LIFETIME BY COUNTING. Every root has a count: 0 out of scope (the start), -1 eternal, n > 0 decrements owed. Its partners (Components with an entry on the set, Systems with an alias entry, and a tie's declaring System for each root its shape rule reads) answer from the holder's LIVE counter at revival (-1 -> -1, -2 -> 1, n -> n, 0 -> 0). Revival sets the count to the sum, any -1 making it eternal, and records the per-partner owed decrements. A partner decrements once after each run it takes part in; at 0 the root is freed, the batch behind one queue wait. Reviving a non-input root none of whose writers will run is an error naming the root, the reviver and the producer. Marked roots and model-level promotions are eternal; a mark under a transient System is no longer an error. Arena eligibility: fixed, device kind, not chunk-internal, and marked or every partner eternal.
+
+4. TIE ROOTS AND ALIASES. A tie root is owned by its declaring System (shape rule, allocation, init, ragged upload). Aliases materialize just in time, right before the first child whose subtree holds a Component partner of the root; the System then decrements at once. Value-driven shape sources keep a finite producer's output alive until the alias has materialized. Alias evaluation lives in detail::AliasEvaluator (alias_eval.hpp), owned by each Component and each System.
+
+5. CHUNKED SYSTEMS. Internal roots are no longer forced transient: they are revived once per forward, kept at the capacity of the largest chunk (`held_` reserves capacity only), eternal ones are kept across forwards, and decrements are deferred to after the last chunk. The full-range pass does not resize an internal root that stays allocated.
+
+6. HOST ACCESS to a released root names the root and the subsystem whose decrement freed it.
+
+Supersedes D137, the per-component wait of D135, the transient/last_user parts of D138 and the forced-transient internal roots of D140. Migration notes: docs/migration-2026-10-02.md.
+
+## D142 — Shape authority (Jack, 2026-10-02)
+
+Whatever supplies a root's value also supplies its shape: a connection (or slice), a tie, or an initializer. A component declares shapes as if it stood alone.
+
+1. PER DIMENSION. `cs::unspecified` (and `cs::unspecified_shape<R>()`): supplied from outside. A specified dim (fixed, FromInputDim, FromInput, from_input_array, PerIndex, FromInputValues) is a CONSTRAINT, never silently overridden: fixed is checked at setup against a fixed supplier, the others whenever the entry resolves. A mismatch throws `std::invalid_argument` naming the entry, the dim, its declared rule and value, and the root with what supplies it. The rank must always match.
+
+2. SETUP ERRORS (raised by resolve()): an untied output with an unspecified dim; a free input with an unspecified dim and no initializer that gives a shape.
+
+3. INITIALIZERS carry shapes: `fill(v, shape)`, `zero(shape)`, `from_host(data)` (rank 1, its size), `from_host(data, shape)`, `custom(fn, shape)`, `custom_host(fn, shape)`. The shape-less forms stay valid when every dim is specified.
+
+4. TIES. Members may declare any dims (unspecified ones come from the tie, specified ones are constraints). tie_inputs' shape is optional and defaults to unspecified: the connected output's shape, else an initializer on the tie, else the free-input error. tie_outputs still requires a shape.
+
+5. REMOVED: `FromSourceDim`, `from_source_shape`, `cs::tied`, `alias::from_connection`. Rewrites: FromSourceDim{d} and cs::tied -> `cs::unspecified`; from_source_shape<R>() and tied on a rank-R wrapper -> `cs::unspecified_shape<R>()`; from_connection() -> omit the argument. (A `FromSourceDim{d}` that named a dim other than its own position has no equivalent.)
+
+6. RAGGED AND CHUNKED. A specified per-index trailing dim is a constraint on the supplier's arrays; unspecified ragged dims take them. Inside a ChunkedSystem dim 0 is supplied by the chunked system; a fixed dim 0 is checked once against the full length on the full pass, never per chunk (an unequal one, silently overridden before, is now an error).
+
+Supersedes the shape-declaration parts of D139 part 2 (rank-only `cs::tied` members, `from_connection`) and D140 item 1 (FromSourceDim as a dim 0 rule).

@@ -51,7 +51,7 @@ components · atomic element types (explicit).
 
 **I/O & execution topology:** connection / tie / promote semantics ·
 aliasing correctness · slice connections · marks · index-
-map-valued I/O · transient subtrees · initialization · host access ·
+map-valued I/O · run policy and lifetimes · initialization · host access ·
 enumerability of I/O (the one hard requirement of every tool built over the
 model).
 
@@ -148,15 +148,16 @@ are their own components, composed in systems.
   (neighbour searches, sort permutations, sparse operator structure) and
   consumed by gathers and scatters. Connectivity is
   computable by the model.
-- **Transient subtrees** — a property an owner gives a subsystem at
-  registration: the roots that live only inside it are allocated by the
-  components that touch them and released after their last user (§4.4).
+- **Run policy and variable lifetime** — a property an owner gives a subsystem at
+  registration (eternal, transient, run_n, do_once): a variable lives from the
+  revival that brings it into scope to the last decrement of the subsystems
+  that use it, then its storage is freed (§4.4, D141).
 - **Chunked execution over bounded scratch** — N independent instances
   whose per-instance intermediate scratch would cap problem size if
   materialized at once (per-node dense solves, operator fits): run in
-  chunks over reused transient scratch, results landing in the
+  chunks over reused scratch, results landing in the
   full-shaped output. A first-class pattern with its own ergonomics;
-  touches shapes and transient subtrees (§4.4). (Not specified in this revision;
+  touches shapes and lifetimes (§4.4). (Not specified in this revision;
   see the roadmap.)
 - **Initialization** — free input roots receive initial values without a
   component existing to produce them; the value is metadata on the root,
@@ -478,9 +479,13 @@ enum class IOKind   : uint8_t { input, output };
 // Why: §1 need 2.1 shape source.
 // -----------------------------------------------------------------------------
 
-/// This dimension = dim `dim` of the upstream connection's shape.
-/// Inputs only (outputs have no upstream).
-struct FromSourceDim { uint8_t dim; };
+/// UNSPECIFIED (D142, shape authority): this dimension is supplied from
+/// outside, by whatever supplies the root's VALUE: a connection (or slice), a
+/// tie, or, for a free input, its initializer's shape. A SPECIFIED dimension
+/// (an integer, FromInputDim, FromInput, PerIndex, FromInputValues) is a
+/// CONSTRAINT on the supplier (§3.6).
+struct Unspecified {};
+inline constexpr Unspecified unspecified{};
 
 /// This dimension = dim `dim` of sibling input `input`'s shape.
 struct FromInputDim  { std::string_view input; uint8_t dim; };
@@ -497,12 +502,12 @@ struct FromInput { std::string_view input; size_t index; };
 
 template <class T>
 concept DimSpec = std::integral<T>
-               || std::same_as<T, FromSourceDim>
+               || std::same_as<T, Unspecified>
                || std::same_as<T, FromInputDim>
                || std::same_as<T, FromInput>;
 
 /// Sugar helpers.
-///   from_source_shape<R>()        — FromSourceDim{0} .. {R-1}
+///   unspecified_shape<R>()        — R unspecified dims
 ///   from_input_shape<R>(input)    — FromInputDim{input,0} .. {input,R-1}
 ///   from_input_array(input)       — whole-shape value-driven marker:
 ///     on a rank-R declaration expands to FromInput{input,0}..{input,R-1}.
@@ -510,7 +515,7 @@ concept DimSpec = std::integral<T>
 ///     shape resolution per the validity-timing rule. Accepted ALONE by
 ///     the declaration overloads; expansion against the member's Rank
 ///     happens inside the declaration.
-template <int Rank> constexpr auto from_source_shape();
+template <int Rank> constexpr auto unspecified_shape();
 template <int Rank> constexpr auto from_input_shape(std::string_view input);
 constexpr auto from_input_array(std::string_view input);
 
@@ -531,7 +536,7 @@ void declare_input(Input<DT, Rank>& member, std::string name,
                    Specs... specs);
                    // why: §1 need 2.3 connection, §1 need 2.3 initialization · P8
 
-/// FromSourceDim is ill-formed for outputs.
+/// An output with an unspecified dim that no tie_outputs owns is a setup error (§3.6).
 template <DType DT, int Rank, DimSpec... Specs>
     requires(sizeof...(Specs) == Rank)
 void declare_output(Output<DT, Rank>& member, std::string name,
@@ -565,12 +570,12 @@ namespace detail {
 
 /// Per-dimension storage form of a declared DimSpec.
 struct DimRecord {
-    enum class How : uint8_t { fixed, from_source_dim, from_input_dim,
+    enum class How : uint8_t { fixed, unspecified, from_input_dim,
                                from_input };
     How      how;
     size_t   extent;        ///< fixed: declared; derived: last resolved
     std::string_view input; ///< from_input_*: sibling input name
-    uint8_t  dim;           ///< from_source_dim / from_input_dim
+    uint8_t  dim;           ///< from_input_dim
     size_t   value_index;   ///< from_input
 };
 
@@ -615,10 +620,10 @@ public:
     /// placement(), storage_on(), storage_placements() — are declared in §4.
 
     // ---- registration metadata (ROOTS; recorded by the resolution pass, §4.4) --
-    bool transient() const;                          ///< every registration in the set is transient
+    long lifetime_count() const;                     ///< 0 out of scope, -1 eternal, n > 0 decrements owed (D141)
     const std::optional<InitSpec>& init_spec() const;  ///< free input roots: the winning initial value, if any
-    const Subsystem* last_user() const;              ///< transient roots: the last component that touches it
-    bool released() const;                           ///< transient roots: storage currently dropped
+    std::string_view released_by() const;            ///< the subsystem whose decrement freed the root last
+    bool released() const;                           ///< storage dropped by a count reaching 0
     const Subsystem* declarer() const;               ///< every entry: the Subsystem that registered it
 
     // ---- capabilities ---------------------------------------------------
@@ -643,12 +648,12 @@ public:
     /// after update_shape.
     virtual void validate_connection() const = 0;
 
-    /// Allocation: ROOTS ONLY. Every root, durable or transient, is allocated
+    /// Allocation: ROOTS ONLY. Every root is allocated
     /// by its OWNER Component in run_pre_compute (§4.4), or by a host write.
     /// Builds the root's
     /// slabkit::usm_vector for each placement the set spans. A device
     /// placement takes its device's substrate (§7.1): a device-kind root
-    /// that is fully fixed and not transient → the arena
+    /// that is fully fixed and marked, or whose every partner is eternal → the arena
     /// route (its bytes are what get_exec_info counted); everything else →
     /// the pool route when the device has a pool, else the OS. A host-kind
     /// placement takes the OS route on its device and counts no arena bytes.
@@ -691,7 +696,7 @@ template <DType DT, int Rank> class OutputEntry final : public IOEntry { /* ... 
 ```cpp
 // A 25x100 source consumed as 100x5x5:
 Input<DType::f32, 3> reshaped;
-declare_input(reshaped, "reshaped_input", FromSourceDim{1}, 5, 5);
+declare_input(reshaped, "reshaped_input", unspecified, 5, 5);   // dim 0 from the connection; 5 and 5 are constraints on it
 
 // Whole-shape value-driven: "dims" is a rank-1 u64 input of size 3.
 Input<DType::f32, 3> grid;
@@ -704,14 +709,14 @@ declare_input(grid, "grid", from_input_array("dims"));
 
 A ragged port has rank 2 or 3 and, for every index i of dimension 0 (N indices), its own extent on each trailing dimension. Dimension 0 is always scalar.
 
-**Ragged tie aliases.** A tie alias (section 4.3) takes the same per-index rules: `cs::alias::dims` with `per_index`, `output_values`, `output_dim`; `from_output_shape` and `from_connection` copy ragged shapes.
+**Ragged tie aliases.** A tie alias (section 4.3) takes the same per-index rules: `cs::alias::dims` with `per_index`, `output_values`, `output_dim`; `from_output_shape` and an unspecified tie_inputs (the connected output) copy ragged shapes.
 
-**Spec forms.** `cs::PerIndex{values}` / `cs::per_index(vec)` (a host array, one extent per index, fixed at declaration) and `cs::FromInputValues{input, column}` (the extents are the values of an integer sibling input of rank 1 [N] or rank 2 [N, k]; negative values are an error). They are `DimSpec`s on dimensions >= 1 only, mixed freely with scalar specs. `FromSourceDim`, `FromInputDim` and `cs::tied` on a per-index dimension copy its array.
+**Spec forms.** `cs::PerIndex{values}` / `cs::per_index(vec)` (a host array, one extent per index, fixed at declaration) and `cs::FromInputValues{input, column}` (the extents are the values of an integer sibling input of rank 1 [N] or rank 2 [N, k]; negative values are an error). They are `DimSpec`s on dimensions >= 1 only, mixed freely with scalar specs. `cs::unspecified` and `FromInputDim` on a per-index dimension copy its array; a specified per-index dimension is a constraint on the supplier'"'"'s array (§3.6).
 
 ```cpp
 cs::Input<DType::u32, 1>        counts_;
 cs::RaggedOutput<DType::f32, 3> pts_;
-declare_input(counts_, "counts", cs::FromSourceDim{0});
+declare_input(counts_, "counts", cs::unspecified);
 declare_output(pts_, "pts", cs::FromInputDim{"counts", 0}, cs::FromInputValues{"counts"}, 3);
 // kernel: auto b = out.pts.block(i); b[sycl::id<2>{j, k}] = ...;
 ```
@@ -727,6 +732,40 @@ declare_output(pts_, "pts", cs::FromInputDim{"counts", 0}, cs::FromInputValues{"
 **Errors.** A per-index spec on dim 0; a dense wrapper declared with a per-index spec (setup); a dense wrapper whose entry inherits a per-index dim, a per-index length different from N, a negative extent, mismatching per-index extents or totals on a connection (forward); a Slice onto a ragged port (setup).
 
 **Not supported yet.** Ragged ports in a FusedSystem or ParallelSystem (a setup error).
+
+### 3.6 Shape authority (D142)
+
+WHATEVER SUPPLIES A ROOT'S VALUE ALSO SUPPLIES ITS SHAPE: a connection (or a
+slice of one), a tie, or an initializer. A component declares its shapes as if
+it stood alone.
+
+Per dimension of an entry:
+
+- **Unspecified** (`cs::unspecified`, `cs::unspecified_shape<R>()`): the dim is
+  supplied from outside. A connected input takes it from the output (or the
+  slice view) it is connected to, per-index arrays included; a tie member
+  takes it from the tie root; a free input takes it from its initializer's
+  shape.
+- **Specified**: the dim is a CONSTRAINT, never silently overridden:
+  fixed (checked at setup against a fixed supplier, else at the first
+  resolution), inherited (`FromInputDim`, checked once both resolve), and
+  value-driven (`FromInput`, `from_input_array`, `FromInputValues`,
+  `PerIndex`, checked once the value is read). A mismatch throws
+  `std::invalid_argument` naming the entry, the dim, its declared rule and
+  value, and the root with what supplies it.
+- **Rank** always matches: a connected, sliced or tied entry of another rank than
+  its supplier throws.
+
+Setup errors (raised by `resolve()`): an OUTPUT with an unspecified dim that
+no `tie_outputs` owns; a FREE INPUT with an unspecified dim and no
+initializer that gives a shape. Initializers carry shapes:
+`fill(v, shape)`, `zero(shape)`, `from_host(data)` (rank 1: its size),
+`from_host(data, shape)`, `custom(fn, shape)`, `custom_host(fn, shape)`; the
+shape-less forms stay valid when every dim is specified.
+
+Inside a ChunkedSystem dim 0 is supplied by the chunked system (§7.7). A
+SPECIFIED dim 0 is not an error in itself: a fixed one is a constraint checked
+once, against the full length, on the full pass, never per chunk.
 
 ## 4. Aliasing
 
@@ -835,7 +874,7 @@ private:
 
 ### 4.3 The structural operations, as set operations
 
-**Ragged aliases (D140).** A tie alias takes the same per-index shape rules as a port. `cs::alias::dims(spec0, spec1, ...)` gives one spec per dimension (count = Rank): an integer (fixed), `cs::per_index(vec)` (dims >= 1), `cs::alias::output_value(path, index)` (a scalar from an upstream output's value), `cs::alias::output_values(path, column = 0)` (per-index extents from the values of an upstream integer output of rank 1 [N] or rank 2 [N,k]; dims >= 1) and `cs::alias::output_dim(path, d)` (dim d of an upstream output's shape, per-index if that dim is). `from_output_shape` copies the upstream shape including per-index dims, and `from_connection` inherits a ragged source wholesale. The same ordering rules and Fused/Parallel refusal apply to every upstream output a shape reads. The root's owner resolves per-index dims on the host, computes the block offsets, resizes and uploads the device copies like any ragged root; members (cs::tied, from_root) copy the arrays from the root and must be declared RaggedInput / RaggedOutput (`declare_*(w, name, cs::tied)` overloads exist for them; a dense wrapper is the existing error). Ragged wrappers are non-atomic, so a ragged tie_outputs takes `TieOutputsPolicy::allow_plain`. Inside a ChunkedSystem an internal ragged alias root is priced like any internal root, dim 0 is set by the framework, a `per_index` host array is sliced per chunk, and a per-index source computed inside is the "computed inside" error. **Alias sources may also be INPUTS** of the declaring System (a promoted input or a tie_inputs alias, connected from upstream or free): `cs::alias::input_value(path, index)`, `input_values(path, column = 0)`, `input_dim(path, d)` (per-index if that dim is) in `alias::dims`, and the whole-shape `cs::alias::from_input_shape(path)` (ragged-aware). Values and shapes are read from the input's ROOT on the host (snapshot), like the output forms. Ordering: a root with an upstream producer must be produced before the alias owner runs; a FREE input root's owner must be registered no later than the alias's owner (error otherwise); the Fused/Parallel refusal covers every source.
+**Ragged aliases (D140).** A tie alias takes the same per-index shape rules as a port. `cs::alias::dims(spec0, spec1, ...)` gives one spec per dimension (count = Rank): an integer (fixed), `cs::per_index(vec)` (dims >= 1), `cs::alias::output_value(path, index)` (a scalar from an upstream output's value), `cs::alias::output_values(path, column = 0)` (per-index extents from the values of an upstream integer output of rank 1 [N] or rank 2 [N,k]; dims >= 1) and `cs::alias::output_dim(path, d)` (dim d of an upstream output's shape, per-index if that dim is). `from_output_shape` copies the upstream shape including per-index dims, and an unspecified tie_inputs inherits a ragged source wholesale. The same ordering rules and Fused/Parallel refusal apply to every upstream output a shape reads. The root's owner resolves per-index dims on the host, computes the block offsets, resizes and uploads the device copies like any ragged root; members (unspecified dims) copy the arrays from the root and must be declared RaggedInput / RaggedOutput (`declare_*(w, name, cs::unspecified_shape<R>())` overloads exist for them; a dense wrapper is the existing error). Ragged wrappers are non-atomic, so a ragged tie_outputs takes `TieOutputsPolicy::allow_plain`. Inside a ChunkedSystem an internal ragged alias root is priced like any internal root, dim 0 is set by the framework, a `per_index` host array is sliced per chunk, and a per-index source computed inside is the "computed inside" error. **Alias sources may also be INPUTS** of the declaring System (a promoted input or a tie_inputs alias, connected from upstream or free): `cs::alias::input_value(path, index)`, `input_values(path, column = 0)`, `input_dim(path, d)` (per-index if that dim is) in `alias::dims`, and the whole-shape `cs::alias::from_input_shape(path)` (ragged-aware). Values and shapes are read from the input's ROOT on the host (snapshot), like the output forms. Ordering: a root with an upstream producer must be produced before the alias owner runs; a FREE input root's owner must be registered no later than the alias's owner (error otherwise); the Fused/Parallel refusal covers every source.
 
 `merge(into, from)`: append `from`'s peers and `from` itself to `into`'s
 peer list; set every moved entry's root to `into`. O(|set|); models are
@@ -877,14 +916,14 @@ an input root with `can_be_target == true` — a member whose set is
 already connected fails here ("tie before connecting"). (D139 part 2: the
 call is `tie_inputs<DT, Rank>({m...}, name, AliasShape)`. Fewer than two
 members is an error ("a tie needs two or more members; use promote for
-one"). Every member is a RANK-ONLY entry (declared `cs::tied`, or a
-promotion of one) of dtype DT and rank Rank; a member that declares any
-shape is an error naming it. A tie alias carries a shape, so it cannot be a
+one"). Every member is an entry (or a promotion of one) of dtype DT and rank Rank;
+it may declare any dims: its unspecified dims come from the tie and its
+specified dims are constraints on it (§3.6). A tie alias carries a shape, so it cannot be a
 member of another tie: pass members up by promotion.) Merge every member's
 set into the alias. THE ALIAS OWNS THE SHAPE, given by its AliasShape:
-`cs::alias::fixed(e0[, e1, e2])`; `cs::alias::from_connection()` (tie_inputs
-only: the shape of the output connected into the alias; an error at setup
-if nothing is); `cs::alias::from_output_shape(path)` (the shape of an
+`cs::alias::fixed(e0[, e1, e2])`; an OMITTED shape (tie_inputs only, and the default: the shape of the
+output connected into the alias, else of an initializer declared on the tie,
+else the free-input setup error of §3.6); `cs::alias::from_output_shape(path)` (the shape of an
 upstream output of the alias's rank); `cs::alias::from_output_values(path)`
 (the extents are the VALUES of elements 0..Rank-1 of an upstream output of
 integer dtype, read on the host as FromInput reads a value). The paths are in
@@ -896,9 +935,8 @@ the shape in `run_pre_compute` before allocation. Once an output is
 connected into the alias it joins that output's root (the producer owns and
 allocates it) and the members take that output's shape; a fixed or
 from_output_* AliasShape is checked against it on the first run
-(`invalid_argument` on a mismatch). Members' shapes are "from the root"
-(`DimRecord::How::from_root`, resolved in update_shape). After resolve() every
-rank-only entry must belong to a tie's set. THE EXCEPTION: mark each member
+(`invalid_argument` on a mismatch). A member's unspecified dims are "from the root"
+(`DimRecord::How::unspecified`, resolved in update_shape). THE EXCEPTION: mark each member
 `can_be_target = false`, so a later connect *through a member name*
 fails at the direct check. Data-wise it would be identical to connecting
 through the alias; the mark exists so a tie is visible at every use
@@ -913,11 +951,10 @@ set contains NO input-kind peer — a downstream connection already exists
 otherwise ("tie before connecting, or connect from the alias"); output-
 kind peers (promotions) ride along. Merge. THE EXCEPTION, mirrored: mark
 each member `can_be_source = false`. SHAPE (D139 part 2): the call is
-`tie_outputs<DT, Rank>({m...}, name, AliasShape, policy)`; the members are
-rank-only outputs, and the alias is ALWAYS the root and owns the shape by
-its AliasShape (fixed, from_output_shape, from_output_values;
-`from_connection` is an error, "an output alias defines the shape of its
-connections"). The root's owner resolves the shape before allocation, so
+`tie_outputs<DT, Rank>({m...}, name, AliasShape, policy)`; the alias is ALWAYS the root and owns the shape by
+its AliasShape (fixed, dims, from_output_shape, from_output_values,
+from_input_shape; tie_outputs REQUIRES one: an output with unspecified dims is an
+error). Members may declare dims; those are constraints on it (§3.6). The root's owner resolves the shape before allocation, so
 the root is sized and (re)allocated from it each run. This is what the
 zeroing producer plus accumulator of §6.7 (ZeroBins + Histogram) uses: the
 bin count is the value of an upstream output. (Removed: shape_source, the
@@ -935,34 +972,83 @@ including unconnected inputs and unconnected `tie_inputs` aliases: that
 is how top-level design variables and shared inputs get memory with no
 IndepVarComp (why: §1 need 2.3 initialization, §1 need 2.4 design
 variables). Route (§7.1 `MemorySubstrate`): a device placement of a device-kind root
-that is static and not transient takes its device's
+that is static, and marked or whose every partner runs eternally, takes its device's
 arena; any other device placement takes that device's pool when it has one,
 else the OS; a host-kind placement takes the OS route on its device (a
 host-kind slot counts no arena bytes, and a host-primary root has no
 static bytes) — all at first need and on growth. Peers own nothing, ever:
 a root holds one allocation per placement its set spans (§4.2).
 
-TRANSIENTNESS IS REGISTRATION METADATA. Only an OWNER declares a subsystem
-transient, by passing `property::transient` to `add_subsystem` (§7.4); the
-subsystem may be a Component or a System. (A ParallelSystem's children
-still take only `property::device`, §7.5.) A REGISTRATION is a Component's
-entry, or a promoted or tied alias made by a System; every registration
-records the Subsystem that made it (`declarer()`). A registration is
-transient if its registering subsystem, or any ancestor of it, was added
-transient: the highest level wins, and an inner level cannot undo an outer
-transient. A ROOT is transient if and only if EVERY registration in its
-alias set is transient. A promotion or tie made at a non-transient level,
-or any non-transient component touching the root, makes it durable — which
-is how an output consumed from outside a transient subtree, or promoted by
-an owner above it, keeps its storage. The decision is recorded once per
-root by the RESOLUTION PASS, at the END of the ROOT System's setup (the
-System with no owner), not per System, because registrations made later by
-an outer System decide whether a root is transient. The pass also records,
-per root, its initial value (below), its OWNER (the first Component, in
-depth-first registration order, that touches the root) and its LAST USER
-(the last such Component). A transient root is never arena-eligible and
-counts no static bytes: it takes the pool route, or the OS route when the
-device has no pool. A mark (§8.4) on a transient root is an error at setup.
+RUN POLICY IS A PROPERTY OF THE REGISTRATION (D141, superseding the transient
+flag of D138). An OWNER gives a subsystem (a Component or a System) a run policy
+with a property on `add_subsystem` (§7.4):
+
+| property | requested run | meaning |
+|---|---|---|
+| none | -1 | ETERNAL: runs every forward |
+| `property::transient{}` | -2 | runs every forward; its variables are revived each time |
+| `property::run_n{n}` | n >= 1 | runs the first n forwards (n = 0 throws `invalid_argument`) |
+| `property::do_once{}` | 1 | run_n{1} |
+
+`run_n` with `do_once` is an error; so is `transient` with either
+(`add_subsystem('x'): transient cannot be combined with run_n or do_once`). Each Subsystem
+keeps `requested_run`, whether it was explicit, its effective value at setup
+(`setup_run`) and its live `run_counter`: -1, -2, n or 0.
+
+THE EFFECTIVE VALUE is derived top-down in the root System's `run_setup`,
+before `resolve()`: the root is -1; for a child with requested C under a parent
+with effective P:
+
+| P \ C | -1 | -2 | n |
+|---|---|---|---|
+| -1 | -1 | -2 | n |
+| -2 | -2 | -2 | -2 |
+| finite p | p | -2 | min(p, n) |
+
+An explicit request that is changed prints, to `std::cerr`: `naga::cospan:
+warning: '<child>' asks to run <C> time(s) but '<parent>' allows <P>; clamped
+to <result>` (a transient parent is written "transient (every run, revived)").
+A System loop skips a child entirely (no pre, compute or post) when its counter is 0, and
+decrements a positive counter after the child's post. `rearm()` on a
+subsystem resets the counters of its subtree to their setup values AND re-runs the
+lifetime part of setup: every root the subtree owns goes back out of scope
+(one queue wait, storage released), so the next forward revives, allocates
+and initializes it again.
+
+A VARIABLE'S LIFETIME IS A COUNT. Every ROOT carries a count: 0 = out of scope
+(every root starts there), -1 = eternal, n > 0 = decrements owed. A root's
+PARTNERS are the Components with an entry on its alias set, the Systems with
+an alias entry on it, and the declaring System of a tie alias whose shape rule
+READS it (a non-writer partner, so a finite producer's output lives until the
+alias has materialized). A partner ANSWERS, at revival, from its holder's LIVE
+counter: -1 -> -1, -2 -> 1, n -> n, 0 -> 0.
+
+- **Revival.** When a root is first needed with count 0 (a Component's
+  pre_compute, a System materializing an alias) it is revived: its count is
+  the SUM of its partners' answers, and any -1 makes it eternal (-1). Each partner
+  records what it owes: its answer.
+- **Marked roots** (design variable, constraint, objective) and **roots
+  promoted at the model level** are always eternal (the root System's counter is -1).
+- **Decrement.** After each run a partner takes part in it decrements the
+  root once (per-partner owed decrements; an exhausted partner owes none). The
+  decrement that takes the count to 0 frees the root; the roots freed by one
+  Component or System turn are freed behind ONE queue wait (D135: one wait per
+  freed batch, not per component).
+- **No-writer error.** Reviving a non-input root none of whose writers will run
+  (they have stopped) throws, naming the root, the reviver and the producer:
+  promote it, or don't mark its holder transient.
+- **Tie roots are owned by the declaring System.** It evaluates the shape
+  rule, allocates the root, applies a free tie's initializer and uploads
+  ragged arrays; members only point.
+- **Aliases materialize just in time.** Right before the first child of the
+  declaring System whose subtree holds a Component partner of the alias's root,
+  the System revives the root, resolves its shape, allocates and initializes
+  it, and then, being a partner, DECREMENTS IMMEDIATELY (for the alias and for
+  each root its shape rule read).
+- **Chunked systems** (§7.7) defer decrements and run-counter moves of
+  everything inside to AFTER the last chunk; a chunk-internal root is revived once per
+  forward, kept at the capacity of the largest chunk, and, if eternal, kept across
+  forwards.
 
 INITIAL VALUES ARE METADATA ON FREE INPUT ROOTS. A FREE INPUT ROOT is an
 input root with no source. Its initial value is declared during `setup()`
@@ -993,33 +1079,31 @@ InitSpec custom_host(std::function<void(HostViewMut<DT, Rank>&)> fn);         //
 - **No init, zeros.** A free input root with no init is zero-filled.
 - **When it applies.** The framework applies a root's init when the root's
   OWNER allocates it from nothing, in its `run_pre_compute`: on the owner's
-  first run for a durable root, at each (re)allocation for a transient one.
+  first revival, and again after every release.
   Nothing is applied at setup. A value-driven resize preserves the existing
   content and does not re-init. (Superseded by D139: a host write no longer
   exists; `Model::init_input` leaves a pending init that the owner applies
   at its next run, once per call.)
 
-THE LIFECYCLE IS THE COMPONENT'S, and the component is always the leaf, and
-ALLOCATION AND INIT HAVE ONE PATH, the owning component's, for durable and
-transient roots alike. Every root has an OWNER, recorded by the resolution
-pass: the FIRST Component, in depth-first registration order, that touches
-it. In `run_pre_compute`, after shape resolution and `pre_forward`, a
-Component goes over the roots it OWNS (inputs and outputs); any owned root
-without storage is allocated (the route above), and if it is a free input
-root its init from metadata is applied (zeros when none). A Component never
-allocates or inits a root it does not own; non-owners only point their
-wrappers, as peers do. A DURABLE root is allocated once, on its owner's
-first run, and never released. A TRANSIENT root is released after its last
-user and allocated again on its owner's next run. In `run_post_compute`,
-after the other-placement sync, a Component releases the transient roots
-for which it is the LAST USER: each root waits on the stream, then is freed
-(synchronous frees, D135), with one stream wait for the component's batch.
-Children of a ParallelSystem or FusedSystem are ordered within their flavor
-(for owner and last user alike), and their `post_compute` runs after the
-group or wave returns, so a root's release follows the work of every child
-in it. A Component that does not run in a forward (a RunNSystem that is
-exhausted, a gate not taken) neither allocates nor releases; its roots
-simply wait. An exception thrown mid-forward leaves roots unreleased (D84).
+ALLOCATION AND INIT HAVE ONE PATH, the OWNER's, for every root. Every root has an
+OWNER, recorded by the resolution pass: the FIRST Component, in depth-first
+registration order, that touches it; for a tie root, the declaring System; for a
+re-rooted chunked root, its ChunkedSystem. In `run_pre_compute`, after shape
+resolution and `pre_forward`, a Component REVIVES every root it touches, then goes
+over the roots it OWNS (inputs and outputs); any owned root without storage is
+allocated (the route above), and if it is a free input root its init from
+metadata is applied (zeros when none). A Component never allocates or inits a
+root it does not own, except that a free input whose owner has stopped is
+allocated and initialized by the next Component that needs it; non-owners point
+their wrappers. In `run_post_compute`, after the other-placement sync, a Component
+decrements every root it touches (once per root) and the roots that reach 0 are
+freed behind one stream wait. Children of a ParallelSystem or FusedSystem are
+ordered within their flavor, and their `post_compute` runs after the group or
+wave returns, so a root's release follows the work of every child in it. A
+Component that does not run in a forward (its counter is 0, a gate not taken)
+neither revives, allocates nor decrements. An exception thrown mid-forward leaves
+counts as they were (D84); a failed chunked forward sends its internal roots back
+out of scope.
 
 SUPERSEDED by D139 (the host-write part of this paragraph): there is no host
 write. `Model::init_input(path, init)` sets the root's init (it beats the
@@ -1035,12 +1119,11 @@ allocation routine the owner uses (one function, called by both), and the
 written value is its initial value: when the owner later runs it finds
 storage and does nothing, so `set_input` before the first forward beats the
 init. Reading a root that has no storage (`view_*`) throws, saying it has no
-data until its owner runs; for a RELEASED transient root the error names the
-root and the transient subsystem whose registration made it transient, and
-says the storage exists only while that subsystem's components run (a
-silent empty view would read as valid data). A host write to a transient
-root throws the same way. The one cost is a host stream wait per releasing
-component per forward. Why: §1 need 2.1 transient subtrees, §1 need 2.3
+data until its owner runs; for a RELEASED root the error names the
+root and the subsystem whose decrement freed it ("was released after its last use
+(by '<path>')"), and says it exists only while something that uses it runs (a
+silent empty view would read as valid data). A host write to a released
+root throws the same way. The one cost is a host stream wait per freed batch. Why: §1 need 2.1 run policy and lifetimes, §1 need 2.3
 initialization · P3 · P6 (declaration is one phase; the resolution pass is
 its end).
 
@@ -1050,7 +1133,7 @@ Aliasing is complete the moment each structural call returns. Storage
 follows in the setup chain (§11) and the first forward: `get_exec_info`
 registers on each root the placements its set spans (the root's own
 placement first) and counts the root's bytes once per such device-kind
-placement, none for a host-kind one or a transient root, which sizes the
+placement, none for a host-kind one or a root that is not arena-eligible, which sizes the
 arena; `prepare_exec` allocates nothing, it only binds the substrates and
 sets what can be set. Each root is allocated by its OWNER in the owner's
 `run_pre_compute` (§4.4), and the wrappers of every member of an allocated
@@ -1504,7 +1587,7 @@ q.submit([&](sycl::handler& cgh){
   whose driving input aliases an output of another stage of the same fuse
   is therefore an impossibility, not a trust question: `compile()` throws,
   naming the entry, the driving input and the stage that produces it, in
-  both modes. Shape-from-shape links (`FromInputDim`, `FromSourceDim`,
+  both modes. Shape-from-shape links (`FromInputDim`, an unspecified dim,
   through connections) are always allowed: they read an extent, which is
   known when the stage's turn comes, not a value a stage computes.
   USERS SPLIT THEIR FUSEDSYSTEMS WHERE A VALUE MUST BE COMPUTED FIRST.
@@ -1532,7 +1615,7 @@ is one step of it:
   a free input root has an initial value (§4.4).
 - **There is no global scratch.** Multi-step work is several components,
   producer to consumer; an intermediate is one component's output and the
-  next one's input, transient (§4.4) when it should not outlive its last
+  next one's input, given a finite run policy (§4.4) when it should not outlive its last
   user.
 - **Accumulation takes one of two forms.** Either group work with local
   memory inside one kernel (§5.2), or a zeroing producer component
@@ -1578,7 +1661,7 @@ public:
     /// Allocate the DURABLE roots that can be allocated now and point their
     /// wrappers at the storage (own allocation, else root()->data() — roots
     /// are allocated before their peers); Systems complete their ExecCtx.
-    /// Transient roots are the components' to allocate, in a forward (§4.4).
+    /// Every root is allocated by its owner in a forward and freed when its count reaches 0 (§4.4).
     virtual void prepare_exec(sk::queue& queue, Substrates& substrates) = 0;
     /// Compile bodies (Components); recurse (Systems). A FusedSystem also
     /// checks its structure here (children, ranks, value-driven sizes);
@@ -1768,11 +1851,11 @@ private:
   - `e` is root: register this placement as its primary
     (`set_primary_placement`: it goes first even when an input peer's
     owner registered before it); count its static bytes here (zero for a
-    transient root, and zero for a host-kind primary).
+    root that is not arena-eligible, and zero for a host-kind primary).
   - `e` is an input peer: if `root(e)` already has storage registered at
     this placement → nothing; else register this placement on `root(e)`
     and count the root's static bytes here — a device-kind placement adds
-    them once per device, a host-kind one or a transient root adds none
+    them once per device, a host-kind one or a root that is not arena-eligible adds none
     (the root owns one copy per placement its set spans — §4.2).
   - `e` is an output peer (only a tied output is one): `root(e)`'s
     placement must equal this placement, else ERROR naming the tie —
@@ -1786,7 +1869,7 @@ private:
   to every own root, point the wrapper of every member whose root has
   storage, and validate static input peers against their roots. NOTHING IS
   ALLOCATED here: the owner of each root allocates it in its own
-  `run_pre_compute` (§6.5). An unconnected input with a `FromSourceDim`
+  `run_pre_compute` (§6.5). An unconnected input with an unspecified dim
   dimension errors here.
 - **`compile`**: the device function at the body's own rank (`kernel_rank_v<KB>`);
   the individual config; a custom-op or host body compiles nothing. A
@@ -1827,10 +1910,9 @@ work and never sees a queue except through the owner's ctx.
    submission: for each output root with storage at other placements, for
    each other placement `copy_d = root` — one assignment resizes to match
    and copies, routed by SlabKit. Ordered after the work it depends on by
-   the stream (§7.3). Then RELEASE every transient root for which this
-   Component is the last user (§4.4): each root waits on the stream, then
-   is freed (synchronous frees, D135), with one stream wait for this
-   Component's batch.
+   the stream (§7.3). Then DECREMENT every root this Component touches
+   (§4.4); the roots that reach 0 are freed behind ONE stream wait
+   (synchronous frees, D135, D141).
 
 ### 6.6 Provided kernels — v1
 
@@ -1892,9 +1974,9 @@ class WeightedHistogram : public Component<HistBody> {
 public:
     WeightedHistogram(float lo, float hi) : lo_{lo}, hi_{hi} {}
     void setup() override {
-        declare_input (values_, "values",  FromSourceDim{0});
+        declare_input (values_, "values",  unspecified);
         declare_input (weights_,"weights", from_input_shape<1>("values"));
-        declare_input (n_bins_, "n_bins",  from_source_shape<1>());   // connected from NBins
+        declare_input (n_bins_, "n_bins",  unspecified_shape<1>());   // connected from NBins
         declare_output(bins_,   "bins",    tied);                      // a tie_outputs member (D139 part 2)
     }
     std::unique_ptr<LaunchDescription> compute_forward() override {
@@ -1960,7 +2042,7 @@ class TiledTranspose : public Component<TransposeBody> {
     Input<DType::f32,2> in_;  Output<DType::f32,2> out_;  static constexpr size_t WG = 16;
 public:
     void setup() override {
-        declare_input (in_,  "in",  from_source_shape<2>());
+        declare_input (in_,  "in",  unspecified_shape<2>());
         declare_output(out_, "out", FromInputDim{"in",1}, FromInputDim{"in",0});
     }
     std::unique_ptr<LaunchDescription> compute_forward() override {
@@ -1983,7 +2065,7 @@ class Gemv : public Component<GemvBody> {
     Input<DType::f32,2> A_;  Input<DType::f32,1> x_;  Output<DType::f32,1> y_;
 public:
     void setup() override {
-        declare_input (A_, "A", from_source_shape<2>());
+        declare_input (A_, "A", unspecified_shape<2>());
         declare_input (x_, "x", FromInputDim{"A", 1});
         declare_output(y_, "y", FromInputDim{"A", 0});
     }
@@ -2102,12 +2184,12 @@ protected:
     /// THE DEFAULT LOOP (§7.3).
     std::unique_ptr<LaunchDescription> run_compute_forward() override;
 
-    /// Transientness is registration metadata, not System state (§4.4): a
-    /// System neither revives nor releases anything. The Components under
-    /// it allocate and release their own roots in their own turns (§6.5), so
-    /// every System flavor and any custom type runs its children's turns
-    /// and nothing more.
-    bool transient_ = false;   ///< a Subsystem field (Components carry it too): set by add_subsystem from property::transient; read by the resolution pass
+    /// Run policy and lifetime are registration metadata (§4.4, D141). A System
+    /// skips a child whose run_counter() is 0 and decrements a positive counter
+    /// after the child's post; it materializes the aliases it declares just
+    /// before their first participating child. The Components under it revive,
+    /// allocate and decrement their own roots in their own turns (§6.5).
+    /// Subsystem fields: requested_run_, run_explicit_, setup_run_, run_counter_.
 
     ExecCtx ctx_;
     std::vector<std::unique_ptr<Subsystem>> children_;   ///< declared order = exec order
@@ -2141,7 +2223,7 @@ for (child : children_) {
     if (d) d->submit(ctx_.target());          // WE submit, routed on d->is_custom_op() / d->is_host()
     child->run_post_compute(ctx_);            // copies AFTER the work they depend on —
                                               //   by the stream, not by an event; a Component
-                                              //   releases the roots it is the last user of here
+                                              //   decrements the roots it touches here (§4.4)
 }
 return nullptr;                               // "I submitted"
 ```
@@ -2168,7 +2250,9 @@ namespace naga::cospan {
 namespace property {
     struct device        { sycl::device dev; };            // placement; inherited when absent
     struct parallel      {};                               // flavor
-    struct transient     {};   // given by an OWNER at registration (a Component or a System): the subsystem and its descendants are transient registrations (§4.4)
+    struct transient     {};   // run policy -2: runs every forward, its variables revived each time (§4.4)
+    struct run_n         { std::size_t n; };   // run policy n >= 1 (n == 0 throws std::invalid_argument)
+    struct do_once       {};   // run policy 1; with run_n an error; transient with either is an error
     struct fused         { FusedSystem::Mode mode; std::optional<sycl::range<3>> wg; };
 }
 // Gating, counting and change detection are custom System TYPES (§10),
@@ -2187,7 +2271,7 @@ public:
     template <class T, class... Args> requires std::derived_from<T, ComponentBase>
     auto child(std::string name, Args&&... ctor_args);
     /// The HELPER FORM: a System configured by properties (device and/or ONE
-    /// flavor — parallel | fused; both on one call is an error, and/or transient), populated
+    /// flavor — parallel | fused; both on one call is an error, and/or a run policy: transient | run_n | do_once), populated
     /// with the given Components in order. No class is written for it. The
     /// children are Components by construction (child<T> requires
     /// ComponentBase), which is what Parallel and Fused require; a helper-
@@ -2228,7 +2312,7 @@ connection; connecting through any name of a set is the same connection;
 `promote` is kind-agnostic and always allowed; ties must precede
 connections ("tie before connecting, or connect from the alias");
 `tie_outputs` requires atomic member dtypes unless `allow_plain`; both
-ties take rank-only (`cs::tied`) members and an AliasShape that owns the
+ties take members whose unspecified dims the tie supplies, and an AliasShape (optional for tie_inputs) that owns the
 shape (§4.3); `init_input` names an input (an init on an output is an error at setup) and
 is ignored when the input's root ends up with a source.
 
@@ -2249,7 +2333,7 @@ namespace naga::cospan {
 /// each child's description submitted with its own device (the Parallel's
 /// unless placed) through a SubmitTarget carrying the group } →
 /// post_compute ALL after the group returns (so a child's allocation is in
-/// its pre_compute and its release, as a last user, in its post_compute,
+/// its pre_compute and its decrement in its post_compute,
 /// both outside the group, §4.4). The group is ONE item of the
 /// stream (§7.3): its children are unordered among themselves and ordered
 /// both ways against everything outside. ctx.group is set for the extent
@@ -2283,7 +2367,7 @@ public:
 /// device; every child's kernel rank (`kernel_rank_v`, from the body's
 /// signature) equal; and no value-driven size (`FromInput`) whose driving
 /// input aliases another stage's output in the same fuse, in either mode
-/// (shape-from-shape links, `FromInputDim` and `FromSourceDim`, are always
+/// (shape-from-shape links, `FromInputDim` and an unspecified dim, are always
 /// allowed, §5.8). The sequence config is then built once, at the wave's
 /// rank, from the children's definition ids in child order.
 /// run_compute_forward: pre-compute ALL children → compute ALL (collect
@@ -2354,15 +2438,15 @@ class Top : public System {
 
 `class ChunkedSystem : public System`, constructor `explicit ChunkedSystem(std::size_t budget_bytes)` (0 throws `std::invalid_argument`); users derive and override `setup()` like any System. It runs its subtree once per CHUNK of the leading dimension, so the memory of its internal ports is bounded by the budget. `last_chunk_count()` reports the chunks of the last forward.
 
-**The leading-dimension rule.** The chunked dimension is the leading dimension of every port and is never named. INSIDE a chunked system the FRAMEWORK sets dim 0 of EVERY port of every inside component (inputs and outputs, roots and peers) to the current chunk length (N in the full-range pass, b - a per chunk), whatever rule the component declared for dim 0 (fixed, FromInput, FromInputDim, FromSourceDim, cs::tied): the declared rule still applies when the component is used outside a chunked system, inside one it is overridden (`IOEntry::dim0_override_`, consulted by `update_shape` and by the Component's `resolve`, which does not even evaluate a declared FromInput / FromInputDim for dim 0) and the component never knows. N is known before the pass: it is the leading length of the boundary roots that exist outside, or the declared (fixed) leading length of a promoted free input; they must all agree ("boundary roots ... disagree"), and at least one must exist. Dims >= 1 are unchanged: they are resolved from their declared rules, and every dim >= 1 must be resolvable before the chunked system runs, from things crossing its boundary: only VALUE reads from roots computed inside are refused: a FromInput / FromInputValues / alias `output_value(s)` / `input_value(s)` read whose driving root is computed inside the chunked system (an INTERNAL root, or an inside output re-rooted at this level) is an error ("'x' is sized by a value computed inside chunked system '...'; chunked sizes must come from outside"). A value read from a BOUNDARY root (one that exists outside, including through a promoted input of the chunked subtree) is allowed; a per-index array that covers the whole run is cut to the chunk by the internal alias that reads it. SHAPE inheritance from internal entries is allowed (FromInputDim, FromSourceDim, connection inheritance, alias `output_dim` / `from_output_shape` / `input_dim` / `from_input_shape`): pricing evaluates those rules, since no value is read. A per-index array driving a dim >= 1 still has length = dim 0, since it is read over the same range.
+**The leading-dimension rule.** The chunked dimension is the leading dimension of every port and is never named. INSIDE a chunked system the FRAMEWORK sets dim 0 of EVERY port of every inside component (inputs and outputs, roots and peers) to the current chunk length (N in the full-range pass, b - a per chunk), whatever rule the component declared for dim 0 (fixed, FromInput, FromInputDim, unspecified; a fixed one is checked once against the full length, D142): the declared rule still applies when the component is used outside a chunked system, inside one it is overridden (`IOEntry::dim0_override_`, consulted by `update_shape` and by the Component's `resolve`, which does not even evaluate a declared FromInput / FromInputDim for dim 0) and the component never knows. N is known before the pass: it is the leading length of the boundary roots that exist outside, or the declared (fixed) leading length of a promoted free input; they must all agree ("boundary roots ... disagree"), and at least one must exist. Dims >= 1 are unchanged: they are resolved from their declared rules, and every dim >= 1 must be resolvable before the chunked system runs, from things crossing its boundary: only VALUE reads from roots computed inside are refused: a FromInput / FromInputValues / alias `output_value(s)` / `input_value(s)` read whose driving root is computed inside the chunked system (an INTERNAL root, or an inside output re-rooted at this level) is an error ("'x' is sized by a value computed inside chunked system '...'; chunked sizes must come from outside"). A value read from a BOUNDARY root (one that exists outside, including through a promoted input of the chunked subtree) is allowed; a per-index array that covers the whole run is cut to the chunk by the internal alias that reads it. SHAPE inheritance from internal entries is allowed (FromInputDim, unspecified dims, connection inheritance, alias `output_dim` / `from_output_shape` / `input_dim` / `from_input_shape`): pricing evaluates those rules, since no value is read. A per-index array driving a dim >= 1 still has length = dim 0, since it is read over the same range.
 
-**Boundary vs internal (classified once, at the end of setup, in `System::resolve`).** For every root touched by an entry declared in the subtree: INTERNAL when every member of its aliasing set is declared inside (a strict descendant) and no promotion or connection reaches it from outside; the root is forced transient, so its last user inside releases it, per chunk. BOUNDARY when it has members inside and outside (a producer outside, a consumer outside, a promotion at this level or above).
+**Boundary vs internal (classified once, at the end of setup, in `System::resolve`).** For every root touched by an entry declared in the subtree: INTERNAL when every member of its aliasing set is declared inside (a strict descendant) and no promotion or connection reaches it from outside; the root lives by its partners' counts like any other (D141), their decrements deferred to after the last chunk. BOUNDARY when it has members inside and outside (a producer outside, a consumer outside, a promotion at this level or above).
 
-**Re-rooting.** A boundary root whose root entry is itself inside (an inside output consumed outside; an inside free input promoted out) is re-rooted: a new alias root is inserted at this system's level (the way `tie_*` aliases are made: `make_alias_entry`, then `IOEntry::merge`), so every inside member becomes a non-root peer and the outside members are peers of the new root. Its dims are inert markers, so it is dynamic; its shape is adopted (`adopt_shape`: dense extents, or N and the per-index arrays) from the entry that used to be the root, each forward, after that entry's Component has resolved over the full range. Its owner is the ChunkedSystem (not a Component): it allocates the root at full size before the first chunk and applies a free input's init there (`Model::init_input` on the promoted name lands on it, once per call); it is never transient. Marks move to the new root. A boundary root that is already outside needs nothing.
+**Re-rooting.** A boundary root whose root entry is itself inside (an inside output consumed outside; an inside free input promoted out) is re-rooted: a new alias root is inserted at this system's level (the way `tie_*` aliases are made: `make_alias_entry`, then `IOEntry::merge`), so every inside member becomes a non-root peer and the outside members are peers of the new root. Its dims are inert markers, so it is dynamic; its shape is adopted (`adopt_shape`: dense extents, or N and the per-index arrays) from the entry that used to be the root, each forward, after that entry's Component has resolved over the full range. Its owner is the ChunkedSystem (not a Component): it allocates the root at full size before the first chunk and applies a free input's init there (`Model::init_input` on the promoted name lands on it, once per call); it is owned by the chunked system. Marks move to the new root. A boundary root that is already outside needs nothing.
 
-**Per forward.** (1) Full-range pass, host only, no allocation of owned roots, no `pre_forward`: the inside peers of outside boundary roots see their whole root (`LeadingRangeAccess::set(0, N)`), and every inside Component runs `resolve_shapes()` (the shape resolution factored out of `run_pre_compute`) in depth-first registration order. (2) N is the common leading length; every inside entry must agree. (3) Pricing: cost[i] = sum over INTERNAL roots of `sizeof(dtype)` times the block size at i (a ragged root's block, or the product of the dims >= 1), from the declared shape rules only. A greedy scan cuts maximal contiguous chunks with sum <= budget; one index over budget is an error naming the index and its bytes; N = 0 runs nothing (re-rooted outputs are allocated empty). `pre_forward` reshapes inside a chunked system are NOT priced (pre_forward is not run for pricing) and should not be done. (4) Re-rooted roots are allocated (and free-input inits applied). (5) Per chunk [a, b): every inside peer of every boundary root, inputs and the output peers of re-rooted roots, is pointed at [a, b), then the default loop runs the subtree once: children never see a or b; internal roots are allocated by their owners and released by their last users. (6) The ranges are cleared and the shapes restored to the full range, so views from the host see whole roots.
+**Per forward.** (1) Full-range pass, host only, no allocation of owned roots, no `pre_forward`: the inside peers of outside boundary roots see their whole root (`LeadingRangeAccess::set(0, N)`), and every inside Component runs `resolve_shapes()` (the shape resolution factored out of `run_pre_compute`) in depth-first registration order. (2) N is the common leading length; every inside entry must agree. (3) Pricing: cost[i] = sum over INTERNAL roots of `sizeof(dtype)` times the block size at i (a ragged root's block, or the product of the dims >= 1), from the declared shape rules only. A greedy scan cuts maximal contiguous chunks with sum <= budget; one index over budget is an error naming the index and its bytes; N = 0 runs nothing (re-rooted outputs are allocated empty). `pre_forward` reshapes inside a chunked system are NOT priced (pre_forward is not run for pricing) and should not be done. (4) Re-rooted roots are allocated (and free-input inits applied). (5) Per chunk [a, b): every inside peer of every boundary root, inputs and the output peers of re-rooted roots, is pointed at [a, b), then the default loop runs the subtree once: children never see a or b; internal roots are allocated by their owners and freed when their counts reach 0 after the last chunk. (6) The ranges are cleared and the shapes restored to the full range, so views from the host see whole roots.
 
-**Lifetimes.** Before the first chunk every INTERNAL root is allocated ONCE, with capacity for its largest chunk (the maximum over chunks of the sum of its block sizes), marked present and HELD. While held, a last user's `run_post_compute` does not release it and its owner finds it present; per chunk it is resized to that chunk's size within the capacity (a `usm_vector` resize within its capacity, up or down, never reallocates; growing zero-fills the new tail on the stream), and a ragged root's small device offset / extent copies are rewritten per chunk in the held slot. An internal FREE INPUT root takes its init again at the start of every chunk (each chunk is a fresh computation; an init must therefore not depend on the root's full-run shape). After the last chunk: one queue wait, every held root is released and HELD cleared, so after a forward the pool holds only the durable roots. `IOEntry::allocation_count()` (a test hook) counts a root's storage allocations.
+**Lifetimes.** Before the first chunk every INTERNAL root is allocated ONCE, with capacity for its largest chunk (the maximum over chunks of the sum of its block sizes), marked present and HELD. HELD only reserves the capacity (the lifetime is by counts, D141); its owner finds it present; per chunk it is resized to that chunk's size within the capacity (a `usm_vector` resize within its capacity, up or down, never reallocates; growing zero-fills the new tail on the stream), and a ragged root's small device offset / extent copies are rewritten per chunk in the held slot. An internal FREE INPUT root takes its init again at the start of every chunk (each chunk is a fresh computation; an init must therefore not depend on the root's full-run shape). After the last chunk: one queue wait, every held root is released and HELD cleared, so after a forward the pool holds only the durable roots. `IOEntry::allocation_count()` (a test hook) counts a root's storage allocations.
 
 **Opacity (C2e).** A chunked system's only interface is its own PROMOTIONS. Inside / outside is decided by where something is DECLARED: everything declared by the chunked system itself or any descendant is inside (its ties, the ties in its own `setup()` included, are internal and transient; its promotions are the boundary ports: promoted inputs are its inputs, each chunk reading its [a, b) slice of whatever is connected or tied outside; promoted outputs are full-size roots written chunk by chunk, still read by their inside consumers as chunk slices); everything declared above it is outside. The single path resolver (`System::entry_at` / `locate`) refuses a path that descends THROUGH a chunked system X into X's children unless X is the caller resolving its own subtree: `'<full path>' lives inside chunked system '<X path>'; only its promotions are visible outside it; promote it to use it here`. This covers connect, tie member paths, alias source paths, promote, init_input, marks and the Model's verbs (a Model resolves from its root as an OUTSIDE caller, via `System::entry_at_from_outside`, so a Model whose root is a chunked system sees its promotions only). A tie declared ABOVE the chunked system whose members are promotions of inside `cs::tied` ports is an outside boundary root: the chunked system evaluates its alias rule (outside sources by construction) before the chunk length and the pass, records the reads as topology dependencies, and its inside members see [a, b). After recording, every dependency of the cache is checked to be an internal root or a boundary root (internal error otherwise). An outside boundary root with an unresolved dimension >= 1 is a setup error.
 
@@ -2436,7 +2520,7 @@ public:
     /// output's set, and the mark is gone with the old root: a consumed
     /// System's marks never bind the System that consumes it. Recorded
     /// on the root's IOEntry (§3.3 design_var()/…), enumerated by
-    /// Model. A mark on a transient root is an error at setup (§4.4): a
+    /// Model. A marked root is eternal (§4.4): a
     /// marked root must outlive a forward. `region` restricts a mark to a subarray (root rank) via
     /// the same view machinery. Why: §1 need
     /// 2.4 design variables, constraints, objectives.
@@ -2559,7 +2643,7 @@ public:
     ///      queue_ = sk::queue{ctx_, default_device, cfg.async_handler} — ONE queue,
     ///      one in-order stream (§7.3), existing for everything below
     ///   1. root.run_setup(); root.resolve()       — declare (§6/§7), ending with the resolution pass
-    ///      that records, per root, transient, init and last_user (§4.4)
+    ///      that records, per root, partners, owner and init (§4.4)
     ///   2. bytes = root.get_exec_info(default_device)   — device -> bytes (arena bytes: durable static device roots only)
     ///   3. substrates[d] = { DeviceArena{queue_, d, kind::device, bytes[d] + slack} iff bytes[d] > 0,
     ///      DevicePool iff configured for d } — every subsystem allocates
@@ -2703,33 +2787,18 @@ every owner above it stays ignorant. **No framework primitive exists for
 gating, counting, or change detection**: those are ordinary System
 subclasses — provided in the library where common, written by users
 where not — and their entire mechanism is an early return from
-`run_compute_forward`. RunNSystem, the setup-step pattern, lives inside
-the framework; do-once is RunNSystem with n = 1, not a separate type.
+`run_compute_forward`. The setup-step pattern is a run policy, not a type (D141): `property::run_n{n}` and
+`property::do_once{}` on `add_subsystem` (§4.4, §7.4); RunNSystem is removed.
 Why: §1 need 2.2 possibility floor (do once / run N / run when changed /
 run if) · P5.
 
 ```cpp
 namespace naga::cospan {
 
-/// Run the subtree on the first n forwards, then never (n >= 1; n == 0
-/// throws std::invalid_argument). Do-once is n = 1: construction-time
-/// operators (LBVH, LRPIM, nonlocal-operator assembly). Users derive from it,
-/// pass n to its constructor and override setup() like any System. An early
-/// return means its components neither allocate nor release (§4.4): when the
-/// subtree is transient, its roots are allocated and released in the runs,
-/// and after the n-th run its transient roots stay released. Roots kept by a
-/// consumer outside persist.
-class RunNSystem : public System {
-    std::size_t remaining_;
-public:
-    explicit RunNSystem(std::size_t n);
-protected:
-    std::unique_ptr<LaunchDescription> run_compute_forward() override {
-        if (remaining_ == 0) return nullptr;   // nothing submitted
-        --remaining_;
-        return System::run_compute_forward();  // the default loop
-    }
-};
+// (RunNSystem is gone. `add_subsystem<Operators>("operators", property_list{property::run_n{n}})` runs
+// the subtree on the first n forwards; do_once is n = 1. A skipped subtree neither revives, allocates
+// nor decrements, and its variables follow their counts: freed after the last run unless
+// an eternal partner keeps them.)
 
 /// Predicate-gated on COMPUTED state: the System names one of its own
 /// (promoted) inputs; each forward it reads that input's root on the
@@ -2765,7 +2834,7 @@ protected:
 } // namespace naga::cospan
 ```
 
-These are added like any realized type: `add_subsystem<Operators>("operators")` (Operators derives from RunNSystem and passes n),
+These are added like any realized type: `add_subsystem<Operators>("operators")` (add it with `property::run_n{n}` for a run-N subtree),
 `add_subsystem<ConditionalSystem>("regime", "regime_flag")`. They compose by
 nesting.
 
@@ -2851,18 +2920,17 @@ singleton sets; flags by kind; DimRecords); `init_input` records an init
 declaration on one of its own inputs. Zero
 allocation; no device anywhere in this step.
 
-**The resolution pass.** Once the root System's `setup()` returns, the root
-runs `resolve()` over the final tree and sets (§4.4). Per root it records
-its `transient` flag (a root is transient iff EVERY registration in its
-alias set is), its `init` (highest declaring level wins; a tie at one depth
-is an error; an init on an output is an error; an init on a root with a
-source is ignored; none means zeros), and, for a transient root, its
-`last_user` (the last Component, in depth-first registration order, that
-touches it). A mark on a transient root is an error here. It replaces the
-transient marking of earlier drafts.
+**The resolution pass.** The root's `run_setup` first derives the effective run
+counters top-down (§4.4: the clamp table). Once the root System's `setup()`
+returns, the root runs `resolve()` over the final tree and sets (§4.4). Per
+root it records its OWNER, its PARTNERS (including the declaring System of each
+tie whose shape rule reads it), and its `init` (highest declaring level wins; a tie at
+one depth is an error; an init on an output is an error; an init on a root with a source is
+ignored; none means zeros). It checks the shape-authority setup errors of §3.6. Counts are
+not set here: a root comes into scope when it is first revived. A mark makes a root eternal.
 
-**State:** final tree and exec order; final sets; marks; each root's
-transient flag, init and last user. No storage.
+**State:** final tree and exec order; effective run counters; final sets; marks; each root's
+owner, partners and init; every count 0. No storage.
 
 #### 11.2.2 Exec info — `bytes = root.get_exec_info(default_device)`
 
@@ -2875,12 +2943,12 @@ maps (sum on key).
 (`parent_device`, the Component's default storage kind — host kind for a
 host body); per own entry `e`:
 - root → register this placement as `e`'s primary; count its static bytes
-  here (zero for a transient root, and for a host-kind primary);
+  here (zero unless it is marked or all its partners are eternal, and for a host-kind primary);
 - input peer, `root(e)` already has storage registered at this placement →
   nothing;
 - input peer, it does not → register this placement on `root(e)` and count
   the root's static bytes here when the placement is device kind and the
-  root is not transient (the root will own a copy at this placement; §4.2);
+  root is arena-eligible (the root will own a copy at this placement; §4.2);
 - output peer (only a tied output is one) whose root's placement ≠ this
   placement → ERROR naming the tie: producers cannot write one storage
   from two placements.
@@ -2913,11 +2981,11 @@ empty until the owners run.
 
 `Component`: capture the queue and substrates, bind the substrates to each
 own root (so the one allocation routine, §4.4, can draw on them), apply the
-shape updates that need no value (`FromSourceDim` of a connected input),
+shape updates that need no value (an unspecified dim of a connected input),
 point the wrapper of every member whose root happens to have storage, and
-validate static input peers against their roots. An unconnected input
-carrying a `FromSourceDim` dimension has no source to derive from: ERROR here
-("source-derived dimension on an unconnected input").
+validate static input peers against their roots, and check the fixed dims of connected and tied
+entries against fixed suppliers (§3.6). A free input with an unspecified dim and no shape-giving
+initializer is a setup error (raised by resolve()).
 
 #### 11.2.5 Compile — `root.compile()`
 
@@ -2928,7 +2996,7 @@ children in order; a FusedSystem also checks its structure and builds its
 sequence config: it has children, none a custom-op or host body, all on its
 device and of one kernel rank, and no value-driven size (`FromInput`) whose
 driving input aliases another stage's output in the same fuse
-(`FromInputDim` and `FromSourceDim` are always allowed; §5.8, §7.5). The
+(`FromInputDim` and an unspecified dim are always allowed; §5.8, §7.5). The
 rest of the Fused and Parallel legality is checked each forward on the
 descriptions the children return (cheap, host-side, and it is where the
 information is).
@@ -2960,7 +3028,7 @@ for child in children:
     if d:  d->submit(ctx.target())            // this System submits;
                                               //   routed on d->is_custom_op() / d->is_host()
     child.run_post_compute(ctx)               // a Component: other-placement sync, then release the
-                                              //   transient roots it is the last user of
+                                              //   roots it touches (decrement; free at 0)
 return null
 ```
 
@@ -3001,13 +3069,13 @@ is the Components' own, in their pre- and post-compute (§11.3.2).
 3. `run_post_compute(ctx)`: for each output root with storage at other
    placements, for each other placement `copy_d = root` — one assignment
    resizes to match and copies, routed by SlabKit — after the owner's
-   submission, ordered by the stream. Then RELEASE the transient roots for
-   which this Component is the last user: each waits on the stream and is
-   freed (D135), with one stream wait for the batch.
+   submission, ordered by the stream. Then DECREMENT every root this Component
+   touches (deferred inside a chunked system's loop); the roots whose count reaches 0 are freed
+   behind ONE stream wait (D135, D141).
 
 **State:** every output root holds this forward's values; dynamic roots
-sized to this forward; a transient root exists only between its first
-user's pre-compute and its last user's post-compute.
+sized to this forward; a root exists from the revival that brings it into scope to the decrement that
+takes its count to 0 (an eternal root: for the model's life).
 
 ### 11.4 Host access
 
@@ -3018,7 +3086,7 @@ on the host and does `from_host` on destruction and on `commit()`),
 `memory_report()`, `get_subsystem(path)` chaining and
 `get_inputs()/get_outputs()` enumeration (§10.3). Host access is §9.2. Host
 access to a released root (§4.4) is an error naming the root and the
-transient subsystem whose registration made it transient.
+subsystem whose decrement released it.
 
 ### 11.5 End of life
 

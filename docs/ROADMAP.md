@@ -67,10 +67,10 @@ Topics learned while building the light-transport forcing case (2026-09-30). Eac
 
 Found while porting LRPIM onto opaque chunked systems (C2b to C2e) and measuring it. Notes dated 2026-10-01.
 
-- [ ] Hold internal roots across forwards when the topology is unchanged. Why: removes the one release wait per chunked forward.
-- [ ] D135's one stream wait per releasing component in plain systems. Why: pipeline stalls outside chunked systems.
+- [x] Hold internal roots across forwards when the topology is unchanged. Why: removes the one release wait per chunked forward. Done: D141 (eternal internal roots are kept across forwards; the full pass no longer resizes them).
+- [ ] D135's one stream wait per releasing component in plain systems. Why: pipeline stalls outside chunked systems. State: reduced by D141 to one wait per freed batch (none when nothing is freed); a wait-free release remains open.
 - [ ] Registration-order diagnostics that name the offending registration. Why: today's errors say what is wrong, not which registration caused it.
-- [ ] Audit of alias kinds and declaration forms for overlap. Why: several forms now express nearly the same sharing; one should be canonical.
+- [x] Audit of alias kinds and declaration forms for overlap. Done: D142 (FromSourceDim, cs::tied and alias::from_connection collapse into unspecified dims). Why: several forms now express nearly the same sharing; one should be canonical.
 - [ ] Ragged ports in FusedSystem and ParallelSystem. Why: ragged data is limited to plain systems and chunked systems.
 - [ ] Device-side scan for extents known only on the device. Why: value-driven sizes currently need a host read.
 - [ ] SlabKit `from_host` without the `async_host` keep-alive task (a general fix). Why: host tasks fence the stream.
