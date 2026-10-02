@@ -689,6 +689,14 @@ private:
             c->ev_.shape_recorder_ = nullptr;
             reads_.insert(reads_.end(), c->ev_.read_log_.begin(), c->ev_.read_log_.end());
             c->ev_.read_log_.clear();
+            // D142: a SPECIFIED dim 0 is a constraint, checked here once against the full length, never per chunk.
+            for (detail::IOEntry* e : c->order_)
+                if (e->dim0_override_ && e->dims_[0].how == detail::DimRecord::How::fixed &&
+                    e->dims_[0].extent != *e->dim0_override_)
+                    throw std::invalid_argument("naga::cospan: shape mismatch: dimension 0 of '" + e->full_path() +
+                                                "' is fixed = " + std::to_string(e->dims_[0].extent) + " but chunked system '" +
+                                                path() + "' supplies the full length " + std::to_string(*e->dim0_override_) +
+                                                " for it (a specified dimension 0 is checked at the full length)");
             for (Boundary& b : boundary_)
                 if (b.member != nullptr && b.member->declarer() == c) b.root->adopt_shape(*b.member);
         }

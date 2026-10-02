@@ -181,10 +181,10 @@ class WeightedHistogram : public cs::Component<HistBody> {
 public:
     WeightedHistogram(float lo, float hi) : lo_{lo}, hi_{hi} {}
     void setup() override {
-        declare_input(values_, "values", cs::FromSourceDim{0});
+        declare_input(values_, "values", cs::unspecified);
         declare_input(weights_, "weights", cs::from_input_shape<1>("values"));
-        declare_input(n_bins_, "n_bins", cs::from_source_shape<1>());  // connected from the NBins producer
-        declare_output(bins_, "bins", cs::tied);  // a tie_outputs member: the alias takes its shape from NBins' value
+        declare_input(n_bins_, "n_bins", cs::unspecified_shape<1>());  // connected from the NBins producer
+        declare_output(bins_, "bins", cs::unspecified_shape<1>());  // a tie_outputs member: the alias takes its shape from NBins' value
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return create_launch_config(values_.shape(), {values_, weights_, n_bins_}, {bins_}, {lo_, hi_});
@@ -205,7 +205,7 @@ class ZeroBins : public cs::Component<ZeroBody> {
     cs::Output<DType::atomic_f32, 1> bins_;
 
 public:
-    void setup() override { declare_output(bins_, "bins", cs::tied); }  // shape: the tie alias's
+    void setup() override { declare_output(bins_, "bins", cs::unspecified_shape<1>()); }  // shape: the tie alias's
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return create_launch_config(bins_.shape(), {}, {bins_}, {});
     }
@@ -309,7 +309,7 @@ class TiledTranspose : public cs::Component<TransposeBody> {
 
 public:
     void setup() override {
-        declare_input(in_, "in", cs::from_source_shape<2>());
+        declare_input(in_, "in", cs::unspecified_shape<2>());
         declare_output(out_, "out", cs::FromInputDim{"in", 1}, cs::FromInputDim{"in", 0});
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
@@ -365,7 +365,7 @@ class Plus1 : public cs::Component<Plus1Body> {
 
 public:
     void setup() override {
-        declare_input(z_, "z", cs::from_source_shape<1>());
+        declare_input(z_, "z", cs::unspecified_shape<1>());
         declare_output(w_, "w", cs::from_input_shape<1>("z"));
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
@@ -397,7 +397,7 @@ class PrefixSum : public cs::Component<PrefixBody> {
 
 public:
     void setup() override {
-        declare_input(y_, "y", cs::from_source_shape<1>());
+        declare_input(y_, "y", cs::unspecified_shape<1>());
         declare_output(z_, "z", cs::from_input_shape<1>("y"));
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
@@ -440,7 +440,7 @@ class Recorder : public cs::Component<RecordBody> {
 public:
     std::atomic<const void*> in_rec{nullptr}, out_rec{nullptr};
     void setup() override {
-        declare_input(x_, "x", cs::from_source_shape<1>());
+        declare_input(x_, "x", cs::unspecified_shape<1>());
         declare_output(y_, "y", cs::from_input_shape<1>("x"));
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
@@ -544,7 +544,7 @@ public:
         : init_{std::move(init)}, mode_{mode}, tied_x_{tied_x} {}
     void setup() override {
         if (tied_x_)
-            declare_input(x_, "x", cs::tied);  // a tie_inputs member: the tie alias owns the shape
+            declare_input(x_, "x", cs::unspecified_shape<1>());  // a tie_inputs member: the tie alias owns the shape
         else
             declare_input(x_, "x", 4);
         declare_output(y_, "y", cs::from_input_shape<1>("x"));

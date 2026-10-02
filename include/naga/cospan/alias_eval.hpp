@@ -170,8 +170,18 @@ public:
                     }
                 }
                 break;
-            case AliasShape::Kind::from_connection:
-                throw std::logic_error("naga::cospan: '" + a.full_path() + "' takes its shape from a connection, which it does not have");
+            case AliasShape::Kind::unspecified: {  // a free tie root: the shape of its initializer
+                const auto& is = a.init_spec();
+                if (!is || !is->shape())
+                    throw std::logic_error("naga::cospan: tie alias '" + a.full_path() +
+                                           "' has an unspecified shape and nothing supplies it (no connected output, no initializer with a shape)");
+                if (is->shape()->rank != a.rank())
+                    throw std::invalid_argument("naga::cospan: shape mismatch: tie alias '" + a.full_path() + "' has rank " +
+                                                std::to_string(a.rank()) + " but its initializer gives a rank-" +
+                                                std::to_string(is->shape()->rank) + " shape");
+                out.ext = is->shape()->extents;
+                break;
+            }
         }
         // A per-index dim has no scalar extent, whichever spec made it (copy_alias_dim sets 0 as well).
         for (std::size_t u = 0; u < 3; ++u)

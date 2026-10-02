@@ -109,7 +109,7 @@ class DenseSum : public cs::Component<DenseSumBody> {
 
 public:
     void setup() override {
-        declare_input(in_, "in", cs::FromSourceDim{0}, cs::FromSourceDim{1});
+        declare_input(in_, "in", cs::unspecified, cs::unspecified);
         declare_output(sums_, "sums", cs::FromInputDim{"in", 0});
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
@@ -140,9 +140,9 @@ class RSum : public cs::Component<RSumBody<R>> {
 public:
     void setup() override {
         if constexpr (R == 3)
-            this->declare_input(in_, "in", cs::FromSourceDim{0}, cs::FromSourceDim{1}, cs::FromSourceDim{2});
+            this->declare_input(in_, "in", cs::unspecified, cs::unspecified, cs::unspecified);
         else
-            this->declare_input(in_, "in", cs::FromSourceDim{0}, cs::FromSourceDim{1});
+            this->declare_input(in_, "in", cs::unspecified, cs::unspecified);
         this->declare_output(sums_, "sums", cs::FromInputDim{"in", 0});
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
@@ -299,7 +299,7 @@ class Copy : public cs::Component<CopyBody> {
 
 public:
     void setup() override {
-        declare_input(in_, "in", cs::FromSourceDim{0});
+        declare_input(in_, "in", cs::unspecified);
         declare_output(out_, "out", cs::FromInputDim{"in", 0});
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {

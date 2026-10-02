@@ -71,8 +71,8 @@ public:
     explicit W2(bool tied = false) : tied_{tied} {}
     void setup() override {
         if (tied_) {
-            declare_output(y1_, "y1", cs::tied);
-            declare_output(y2_, "y2", cs::tied);
+            declare_output(y1_, "y1", cs::unspecified_shape<1>());
+            declare_output(y2_, "y2", cs::unspecified_shape<1>());
         } else {
             declare_output(y1_, "y1", kN);
             declare_output(y2_, "y2", kN);
@@ -99,7 +99,7 @@ class Rd : public cs::Component<RdBody> {
 
 public:
     void setup() override {
-        declare_input(x_, "x", cs::FromSourceDim{0});
+        declare_input(x_, "x", cs::unspecified);
         declare_output(z_, "z", cs::FromInputDim{"x", 0});
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(z_.shape(), {x_}, {z_}, {}); }
@@ -124,7 +124,7 @@ class TieMember : public cs::Component<TieBody<Zero>> {
     cs::Output<DType::f32, 1> t_;
 
 public:
-    void setup() override { this->declare_output(t_, "t", cs::tied); }
+    void setup() override { this->declare_output(t_, "t", cs::unspecified_shape<1>()); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return this->create_launch_config(t_.shape(), {}, {t_}, {});
     }
@@ -300,7 +300,7 @@ class RSum : public cs::Component<RSumBody> {
 
 public:
     void setup() override {
-        declare_input(in_, "in", cs::FromSourceDim{0}, cs::FromSourceDim{1}, cs::FromSourceDim{2});
+        declare_input(in_, "in", cs::unspecified, cs::unspecified, cs::unspecified);
         declare_output(sums_, "sums", cs::FromInputDim{"in", 0});
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(sums_.shape(), {in_}, {sums_}, {}); }

@@ -137,7 +137,7 @@ public:
         : n_{n}, R_{R}, resident_{resident_items}, tied_b_{tied_b} {}
     void setup() override {
         if (tied_b_)
-            declare_input(B_, "B", cs::tied);
+            declare_input(B_, "B", cs::unspecified_shape<2>());
         else
             declare_input(B_, "B", n_, n_);
         declare_input(y_, "y", n_);
@@ -255,7 +255,7 @@ public:
         : n_{n}, scale_{scale}, resident_{resident_items}, tied_b_{tied_b} {}
     void setup() override {
         if (tied_b_)
-            declare_input(B_, "B", cs::tied);
+            declare_input(B_, "B", cs::unspecified_shape<2>());
         else
             declare_input(B_, "B", n_, n_);
         declare_input(x_, "x", n_);
@@ -406,8 +406,8 @@ class GridBarrier : public cs::Component<GridBarrierBody> {
 public:
     GridBarrier(std::size_t groups, std::uint32_t spin_limit) : groups_{groups}, spin_limit_{spin_limit} {}
     void setup() override {
-        declare_output(count_, "count", cs::tied);  // BarrierTop's tie_outputs owns the shape (D139)
-        declare_output(timeout_, "timeout", cs::tied);
+        declare_output(count_, "count", cs::unspecified_shape<1>());  // BarrierTop's tie_outputs owns the shape (D139)
+        declare_output(timeout_, "timeout", cs::unspecified_shape<1>());
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         // The counters were zeroed at the start of this forward: one crossing waits for count >= G.
@@ -451,20 +451,20 @@ class ZeroCounters : public cs::Component<ZeroCountersBody> {
 
 public:
     void setup() override {
-        declare_output(count1_, "count1", cs::tied);
-        declare_output(count2_, "count2", cs::tied);
-        declare_output(count3_, "count3", cs::tied);
-        declare_output(count4_, "count4", cs::tied);
-        declare_output(count5_, "count5", cs::tied);
-        declare_output(count6_, "count6", cs::tied);
-        declare_output(count7_, "count7", cs::tied);
-        declare_output(timeout1_, "timeout1", cs::tied);
-        declare_output(timeout2_, "timeout2", cs::tied);
-        declare_output(timeout3_, "timeout3", cs::tied);
-        declare_output(timeout4_, "timeout4", cs::tied);
-        declare_output(timeout5_, "timeout5", cs::tied);
-        declare_output(timeout6_, "timeout6", cs::tied);
-        declare_output(timeout7_, "timeout7", cs::tied);
+        declare_output(count1_, "count1", cs::unspecified_shape<1>());
+        declare_output(count2_, "count2", cs::unspecified_shape<1>());
+        declare_output(count3_, "count3", cs::unspecified_shape<1>());
+        declare_output(count4_, "count4", cs::unspecified_shape<1>());
+        declare_output(count5_, "count5", cs::unspecified_shape<1>());
+        declare_output(count6_, "count6", cs::unspecified_shape<1>());
+        declare_output(count7_, "count7", cs::unspecified_shape<1>());
+        declare_output(timeout1_, "timeout1", cs::unspecified_shape<1>());
+        declare_output(timeout2_, "timeout2", cs::unspecified_shape<1>());
+        declare_output(timeout3_, "timeout3", cs::unspecified_shape<1>());
+        declare_output(timeout4_, "timeout4", cs::unspecified_shape<1>());
+        declare_output(timeout5_, "timeout5", cs::unspecified_shape<1>());
+        declare_output(timeout6_, "timeout6", cs::unspecified_shape<1>());
+        declare_output(timeout7_, "timeout7", cs::unspecified_shape<1>());
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return create_launch_config(sycl::range<1>{1}, {}, {count1_, count2_, count3_, count4_, count5_, count6_, count7_, timeout1_, timeout2_, timeout3_, timeout4_, timeout5_, timeout6_, timeout7_}, {});

@@ -81,7 +81,7 @@ public:
                              std::array<detail::DimRecord, Rank>{detail::make_dim_record(specs)...});
     }
 
-    /// The array forms: from_source_shape<R>() and from_input_shape<R>(name).
+    /// The array forms: unspecified_shape<R>() and from_input_shape<R>(name).
     template <DType DT, int Rank, DimSpec S>
     void declare_input(Input<DT, Rank>& m, std::string name,
                        const std::array<S, static_cast<std::size_t>(Rank)>& specs) {
@@ -103,30 +103,14 @@ public:
         add_output<DT, Rank>(m, std::move(name), detail::expand_from_input_array<Rank>(marker));
     }
 
-    /// The rank-only form (D139 part 2): the entry has a dtype and a rank (the wrapper's) and no
-    /// shape; its shape is its root's, and its root must be a tie alias (System::tie_inputs /
-    /// tie_outputs). An untied rank-only entry is a setup error.
-    template <DType DT, int Rank>
-    void declare_input(Input<DT, Rank>& m, std::string name, Tied) {
-        add_input<DT, Rank>(m, std::move(name), detail::tied_dims<Rank>());
+    /// Ragged ports (D140) take the array form too: cs::unspecified_shape<R>() (every dimension supplied from outside).
+    template <DType DT, int Rank, DimSpec S>
+    void declare_input(RaggedInput<DT, Rank>& m, std::string name, const std::array<S, static_cast<std::size_t>(Rank)>& specs) {
+        register_entry(std::make_unique<detail::RaggedInputEntry<DT, Rank>>(name, records_of<Rank>(specs), &m), &m, "declare_input");
     }
-    template <DType DT, int Rank>
-    void declare_output(Output<DT, Rank>& m, std::string name, Tied) {
-        add_output<DT, Rank>(m, std::move(name), detail::tied_dims<Rank>());
-    }
-
-    /// The rank-only form of a ragged port (D140): a member of a tie whose alias gives per-index dims
-    /// (cs::alias::dims with per_index / output_values / output_dim, or a ragged from_output_shape /
-    /// from_connection) must be declared with RaggedInput / RaggedOutput.
-    template <DType DT, int Rank>
-    void declare_input(RaggedInput<DT, Rank>& m, std::string name, Tied) {
-        register_entry(std::make_unique<detail::RaggedInputEntry<DT, Rank>>(name, detail::tied_dims<Rank>(), &m), &m,
-                       "declare_input");
-    }
-    template <DType DT, int Rank>
-    void declare_output(RaggedOutput<DT, Rank>& m, std::string name, Tied) {
-        register_entry(std::make_unique<detail::RaggedOutputEntry<DT, Rank>>(name, detail::tied_dims<Rank>(), &m), &m,
-                       "declare_output");
+    template <DType DT, int Rank, DimSpec S>
+    void declare_output(RaggedOutput<DT, Rank>& m, std::string name, const std::array<S, static_cast<std::size_t>(Rank)>& specs) {
+        register_entry(std::make_unique<detail::RaggedOutputEntry<DT, Rank>>(name, records_of<Rank>(specs), &m), &m, "declare_output");
     }
 
     /// Ragged ports (D140): RaggedInput / RaggedOutput members, Rank 2..3, with the same DimSpec
@@ -229,13 +213,14 @@ public:
         ev_.queue_  = &queue;
         ev_.ensure_ = [this](detail::IOEntry& r) { allocate_owned(r); };
         for (detail::IOEntry* e : order_)
-            if (e->kind() == IOKind::input && !e->is_root() && has_source_dim(*e))
-                e->update_shape();  // throws for an unconnected input with a FromSourceDim
+            if (e->kind() == IOKind::input && !e->is_root() && e->tie_alias_ == nullptr && e->has_unspecified())
+                e->update_shape();  // takes the connected source's unspecified dims
         // No allocation at setup: every root is allocated, and its init applied, by its OWNER in
         // run_pre_compute (r01 §4.4, D138 amendment). Roots only learn what to allocate from.
         for (detail::IOEntry* e : order_)
             if (e->is_root()) e->bind_substrates(substrates);
         for (detail::IOEntry* e : order_) {
+            if (!e->is_root() && !e->root()->is_dynamic()) e->check_constraints(true);  // fixed dims, at setup
             if (e->kind() == IOKind::input && !e->is_root() && !e->is_dynamic() &&
                 !e->root()->is_dynamic())
                 e->validate_connection();
@@ -299,6 +284,7 @@ public:
             for (detail::IOEntry* e : order_)
                 if (e->root()->owner() == this && e->root()->has_storage()) e->root()->upload_ragged(queue_ref());
         for (detail::IOEntry* e : order_) {
+            if (!replay_ && !e->is_root()) e->check_constraints(false);  // D142: specified dims against their supplier
             if (!replay_ && e->kind() == IOKind::input && !e->is_root() &&
                 (e->is_dynamic() || e->root()->is_dynamic()))
                 e->validate_connection();
@@ -476,12 +462,6 @@ private:
         return false;
     }
 
-    static bool has_source_dim(const detail::IOEntry& e) {
-        for (int d = 0; d < e.rank(); ++d)
-            if (e.dim(d).how == detail::DimRecord::How::from_source_dim) return true;
-        return false;
-    }
-
     /// The OWNER's allocation of a root (r01 §4.4, D139): through the one allocation routine (a
     /// size-0 root becomes present with empty storage). For a free input root (an input root: it
     /// has no source): if it was just allocated its init is applied (else zeros); else if an init
@@ -570,7 +550,7 @@ private:
             const AliasShape& s = *a->alias_shape_;
             if (a->is_root()) continue;  // a tie root is resolved and allocated by its owner, the declaring System (D141)
             if (!a->alias_checked_) {
-                if (s.kind != AliasShape::Kind::from_connection) {
+                if (s.kind != AliasShape::Kind::unspecified) {
                     const detail::AliasEvaluator::AliasEval want = ev_.alias_eval(*a);
                     const detail::IOEntry& root = *a->root();
                     bool                   same = true;

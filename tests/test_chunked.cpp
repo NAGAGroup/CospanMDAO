@@ -92,7 +92,7 @@ public:
         if (n_fixed_ > 0)
             declare_input(in_, "in", n_fixed_, 3);
         else
-            declare_input(in_, "in", cs::FromSourceDim{0}, cs::FromSourceDim{1});
+            declare_input(in_, "in", cs::unspecified, cs::unspecified);
         declare_output(t_, "t", cs::FromInputDim{"in", 0}, 4);
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
@@ -120,7 +120,7 @@ class B : public cs::Component<BBody> {
 
 public:
     void setup() override {
-        declare_input(in_, "in", cs::FromSourceDim{0}, cs::FromSourceDim{1});
+        declare_input(in_, "in", cs::unspecified, cs::unspecified);
         declare_output(y_, "y", cs::FromInputDim{"in", 0});
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
@@ -144,7 +144,7 @@ class Cons : public cs::Component<ConsBody> {
 
 public:
     void setup() override {
-        declare_input(in_, "in", cs::FromSourceDim{0});
+        declare_input(in_, "in", cs::unspecified);
         declare_output(out_, "out", cs::FromInputDim{"in", 0});
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
@@ -282,7 +282,7 @@ class CoordGen : public cs::Component<CoordBody> {
 
 public:
     void setup() override {
-        declare_input(counts_, "counts", cs::FromSourceDim{0});
+        declare_input(counts_, "counts", cs::unspecified);
         declare_output(pts_, "pts", cs::FromInputDim{"counts", 0}, cs::FromInputValues{"counts"}, 3);
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
@@ -315,7 +315,7 @@ class S : public cs::Component<SBody> {
 
 public:
     void setup() override {
-        declare_input(pts_, "pts", cs::FromSourceDim{0}, cs::FromSourceDim{1}, cs::FromSourceDim{2});
+        declare_input(pts_, "pts", cs::unspecified, cs::unspecified, cs::unspecified);
         declare_output(gram_, "gram", cs::FromInputDim{"pts", 0}, cs::FromInputDim{"pts", 1}, cs::FromInputDim{"pts", 1});
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
@@ -344,7 +344,7 @@ class R : public cs::Component<RBody> {
 
 public:
     void setup() override {
-        declare_input(gram_, "gram", cs::FromSourceDim{0}, cs::FromSourceDim{1}, cs::FromSourceDim{2});
+        declare_input(gram_, "gram", cs::unspecified, cs::unspecified, cs::unspecified);
         declare_output(out_, "out", cs::FromInputDim{"gram", 0});
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
@@ -731,7 +731,7 @@ class CopyU32 : public cs::Component<CopyU32Body> {
 
 public:
     void setup() override {
-        declare_input(in_, "in", cs::FromSourceDim{0});
+        declare_input(in_, "in", cs::unspecified);
         declare_output(cnt_, "cnt", cs::FromInputDim{"in", 0});
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
@@ -866,7 +866,7 @@ class AddBias : public cs::Component<AddBiasBody> {
 public:
     explicit AddBias(std::shared_ptr<int> calls) : calls_{std::move(calls)} {}
     void setup() override {
-        declare_input(in_, "in", cs::FromSourceDim{0});
+        declare_input(in_, "in", cs::unspecified);
         declare_input(bias_, "bias", cs::FromInputDim{"in", 0});
         init_input("bias", cs::init::custom_host<DType::f32, 1>([c = calls_](cs::HostViewMut<DType::f32, 1>& v) {
                        ++*c;
@@ -989,7 +989,7 @@ class MixFixed : public cs::Component<MixBody> {
 public:
     explicit MixFixed(std::size_t rows) : rows_{rows} {}
     void setup() override {
-        declare_input(in_, "in", cs::FromSourceDim{0});
+        declare_input(in_, "in", cs::unspecified);
         declare_output(t_, "t", rows_, 3);
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
@@ -1014,8 +1014,8 @@ class MixFromInput : public cs::Component<MixFromInputBody> {
 
 public:
     void setup() override {
-        declare_input(n_, "n", cs::FromSourceDim{0});
-        declare_input(in_, "in", cs::FromSourceDim{0});
+        declare_input(n_, "n", cs::unspecified);
+        declare_input(in_, "in", cs::unspecified);
         declare_output(t_, "t", cs::FromInput{"n", 0}, 3);
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
@@ -1043,7 +1043,7 @@ class Sum3 : public cs::Component<Sum3Body> {
 
 public:
     void setup() override {
-        declare_input(in_, "in", cs::FromSourceDim{0}, cs::FromSourceDim{1});
+        declare_input(in_, "in", cs::unspecified, cs::unspecified);
         declare_output(y_, "y", cs::FromInputDim{"in", 0});
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
@@ -1099,20 +1099,20 @@ public:
 
 }  // namespace tch
 
-TEST_CASE("Chunked: the framework sets dim 0 of every inside port (fixed, FromInput)", "[chunked][dim0]") {
+TEST_CASE("Chunked: the framework sets dim 0 of every inside port (fixed, FromInput)", "[chunked][dim0][shape]") {
     constexpr std::size_t n = 10;
     // t is 12 bytes per index (internal [N,3] f32); budget 36: chunks of 3
     std::vector<float> want(n);
     for (std::size_t i = 0; i < n; ++i) want[i] = 2.0f * (0.5f * static_cast<float>(i) * 6.0f) + 1.0f;
     for (const int mode : {0, 1}) {
-        INFO("mode " << mode << (mode == 0 ? " (dim 0 declared FIXED, 7)" : " (dim 0 declared FromInput{n,0})"));
-        // the plain System declares the right N; the chunked one a dim 0 that has nothing to do with it
+        INFO("mode " << mode << (mode == 0 ? " (dim 0 declared FIXED, = N)" : " (dim 0 declared FromInput{n,0})"));
+        // D142: a specified dim 0 is a constraint checked at the full length, so both declare N (a wrong one is an error: [shape] tests)
         cs::Model plain = cs::create_model<tch::MixTop<tch::MixPlain>>(default_config(), n, std::size_t{0}, mode, n);
         plain.setup();
         const auto pout = tch::forward_out(plain);
         CHECK(pout == want);
         for (const std::size_t budget : {std::size_t{36}, std::size_t{12}, std::size_t{1000}}) {
-            cs::Model m = cs::create_model<tch::MixTop<tch::MixChunk>>(default_config(), n, budget, mode, std::size_t{7});
+            cs::Model m = cs::create_model<tch::MixTop<tch::MixChunk>>(default_config(), n, budget, mode, n);
             m.setup();
             CHECK(tch::forward_out(m) == pout);
             CHECK(tch::chunks_of(m) == (budget == 36 ? 4u : budget == 12 ? 10u : 1u));
@@ -1120,11 +1120,11 @@ TEST_CASE("Chunked: the framework sets dim 0 of every inside port (fixed, FromIn
         }
     }
     // a chunked system whose internal port has a fixed dim 0 that is not N, with no consumer
+    // D142: that is a constraint violation now, reported at the full length (it used to be overridden silently)
     cs::Model odd = cs::create_model<tch::OddTop>(default_config());
     odd.setup();
-    const auto oout = tch::forward_out(odd);
-    REQUIRE(oout.size() == 8);
-    for (std::size_t i = 0; i < 8; ++i) CHECK(oout[i] == 2.0f * tch::yval(i) + 1.0f);
+    tch::expect_throws([&] { (void)tch::forward_out(odd); }, {"shape mismatch", "dimension 0 of 'inner.g.out'", "fixed = 13", "full length 8"});
+    odd.wait();
 }
 
 TEST_CASE("Chunked: a component reused outside a chunked system keeps its declared dim 0", "[chunked][dim0]") {
@@ -1197,7 +1197,7 @@ TEST_CASE("Replay oracle: dim 0 rules (fixed, FromInput)", "[chunked][replay]") 
     for (const int mode : {0, 1})
         for (const std::size_t budget : {std::size_t{36}, std::size_t{12}, std::size_t{1000}}) {
             INFO("mode " << mode << ", budget " << budget);
-            tor::oracle("inner", [&] { return cs::create_model<tch::MixTop<tch::MixChunk>>(default_config(), n, budget, mode, std::size_t{7}); },
+            tor::oracle("inner", [&] { return cs::create_model<tch::MixTop<tch::MixChunk>>(default_config(), n, budget, mode, n); },
                         tch::out_cons);
         }
 }
@@ -1389,5 +1389,22 @@ TEST_CASE("Chunked: a run_n child counts forwards, not chunks", "[chunked][lifet
         (void)tch::forward_out(m);
         CHECK(tch::chunks_of(m) == 10);  // ten chunks every forward, b skipped in all of them once it has run twice
         CHECK(b->run_counter() == expected[rep]);
+    }
+}
+
+TEST_CASE("shape: a specified dim 0 inside a ChunkedSystem is a constraint checked at the full length", "[chunked][dim0][shape]") {
+    constexpr std::size_t n = 10;
+    SECTION("a fixed dim 0 that is not N: reported once, at the full length, naming both sides") {
+        cs::Model m = cs::create_model<tch::MixTop<tch::MixChunk>>(default_config(), n, std::size_t{36}, 0, std::size_t{7});
+        m.setup();
+        tch::expect_throws([&] { (void)tch::forward_out(m); },
+                           {"shape mismatch", "dimension 0 of \'inner.m.t\' is fixed = 7", "full length 10"});
+        m.wait();
+    }
+    SECTION("a fixed dim 0 equal to N is accepted, whatever the chunk length") {
+        cs::Model m = cs::create_model<tch::MixTop<tch::MixChunk>>(default_config(), n, std::size_t{36}, 0, n);
+        m.setup();
+        CHECK_NOTHROW((void)tch::forward_out(m));
+        CHECK(tch::chunks_of(m) == 4);  // chunks of 3: the declared 10 was checked at the full length, not per chunk
     }
 }

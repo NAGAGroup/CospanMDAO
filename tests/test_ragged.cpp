@@ -100,7 +100,7 @@ class Fill : public cs::Component<FillBody> {
 
 public:
     void setup() override {
-        declare_input(counts_, "counts", cs::FromSourceDim{0});
+        declare_input(counts_, "counts", cs::unspecified);
         declare_output(pts_, "pts", cs::FromInputDim{"counts", 0}, cs::FromInputValues{"counts"}, 3);
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
@@ -128,7 +128,7 @@ class Scale : public cs::Component<ScaleBody> {
 
 public:
     void setup() override {
-        declare_input(in_, "in", cs::FromSourceDim{0}, cs::FromSourceDim{1}, cs::FromSourceDim{2});
+        declare_input(in_, "in", cs::unspecified, cs::unspecified, cs::unspecified);
         declare_output(out_, "out", cs::FromInputDim{"in", 0}, cs::FromInputDim{"in", 1}, cs::FromInputDim{"in", 2});
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
@@ -160,9 +160,9 @@ class Sum : public cs::Component<SumBody<R>> {
 public:
     void setup() override {
         if constexpr (R == 3)
-            this->declare_input(pts_, "pts", cs::FromSourceDim{0}, cs::FromSourceDim{1}, cs::FromSourceDim{2});
+            this->declare_input(pts_, "pts", cs::unspecified, cs::unspecified, cs::unspecified);
         else
-            this->declare_input(pts_, "pts", cs::FromSourceDim{0}, cs::FromSourceDim{1});
+            this->declare_input(pts_, "pts", cs::unspecified, cs::unspecified);
         this->declare_output(sums_, "sums", cs::FromInputDim{"pts", 0});
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
@@ -408,7 +408,7 @@ class DenseIn : public cs::Component<DenseInBody> {
     cs::Input<DType::f32, 2> in_;
 
 public:
-    void setup() override { declare_input(in_, "in", cs::FromSourceDim{0}, cs::FromSourceDim{1}); }
+    void setup() override { declare_input(in_, "in", cs::unspecified, cs::unspecified); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return create_launch_config(sycl::range<1>{4}, {in_}, {}, {});
     }
@@ -429,7 +429,7 @@ class DenseOut : public cs::Component<DenseOutBody> {
 
 public:
     void setup() override {
-        declare_input(in_, "in", cs::FromSourceDim{0}, cs::FromSourceDim{1});
+        declare_input(in_, "in", cs::unspecified, cs::unspecified);
         declare_output(o_, "o", cs::FromInputDim{"in", 0}, cs::FromInputDim{"in", 1});
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
@@ -619,19 +619,19 @@ TEST_CASE("Ragged: a ragged output connected to a ragged input with matching ext
     CHECK(z.offsets == std::vector<std::uint64_t>{0});
 }
 
-TEST_CASE("Ragged: mismatching declared per-index arrays error at forward", "[ragged][errors]") {
+TEST_CASE("Ragged: mismatching declared per-index arrays error at forward", "[ragged][errors][shape]") {
     SECTION("same total, different extents") {
         cs::Model model = cs::create_model<trag::PerIndexTop>(default_config(), std::size_t{4}, trag::Sizes{1, 0, 3, 2},
                                                               trag::Sizes{2, 1, 2, 1});
         model.setup();
-        trag::expect_throws([&] { model.forward(); }, {"'pts'", "per-index extents of dimension 1"});
+        trag::expect_throws([&] { model.forward(); }, {"'take.pts'", "dimension 1 is PerIndex", "'make.m'"});
         model.wait();  // the source already launched
     }
     SECTION("a different total") {
         cs::Model model = cs::create_model<trag::PerIndexTop>(default_config(), std::size_t{4}, trag::Sizes{1, 0, 3, 2},
                                                               trag::Sizes{1, 1, 1, 1});
         model.setup();
-        trag::expect_throws([&] { model.forward(); }, {"'pts'", "per-index extents"});
+        trag::expect_throws([&] { model.forward(); }, {"'take.pts'", "per-index", "'make.m'"});
         model.wait();
     }
 }

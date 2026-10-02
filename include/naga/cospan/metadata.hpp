@@ -74,8 +74,11 @@ struct Placement {
 // Dimension specification — DimSpec is a CONCEPT, not a type.
 // -----------------------------------------------------------------------------
 
-/// This dimension = dim `dim` of the upstream connection's shape. Inputs only.
-struct FromSourceDim { uint8_t dim; };
+/// UNSPECIFIED (D142, shape authority): this dimension is supplied from outside: by the connection (or slice) an input
+/// is connected to, by the tie the entry belongs to, or, for a free input, by its initializer's shape. A SPECIFIED
+/// dimension (an integer, FromInputDim, FromInput, PerIndex, FromInputValues) is a constraint on what supplies it.
+struct Unspecified {};
+inline constexpr Unspecified unspecified{};
 
 /// This dimension = dim `dim` of sibling input `input`'s shape.
 struct FromInputDim { std::string_view input; uint8_t dim; };
@@ -95,7 +98,7 @@ inline PerIndex per_index(std::vector<std::size_t> values) { return PerIndex{std
 struct FromInputValues { std::string_view input; std::size_t column = 0; };
 
 template <class T>
-concept DimSpec = std::integral<T> || std::same_as<T, FromSourceDim> ||
+concept DimSpec = std::integral<T> || std::same_as<T, Unspecified> ||
                   std::same_as<T, FromInputDim> || std::same_as<T, FromInput> ||
                   std::same_as<T, PerIndex> || std::same_as<T, FromInputValues>;
 
@@ -107,10 +110,8 @@ struct FromInputArray { std::string_view input; };
 /// Sugar. The two shape helpers return arrays of specs (spread them with
 /// std::apply); from_input_array returns the marker.
 template <int Rank>
-constexpr std::array<FromSourceDim, Rank> from_source_shape() {
-    std::array<FromSourceDim, Rank> a{};
-    for (int d = 0; d < Rank; ++d) a[d] = FromSourceDim{static_cast<uint8_t>(d)};
-    return a;
+constexpr std::array<Unspecified, Rank> unspecified_shape() {
+    return std::array<Unspecified, Rank>{};
 }
 
 template <int Rank>
@@ -121,13 +122,6 @@ constexpr std::array<FromInputDim, Rank> from_input_shape(std::string_view input
 }
 
 constexpr FromInputArray from_input_array(std::string_view input) { return {input}; }
-
-/// The rank-only declaration marker (D139 part 2): `declare_input(w, "x", cs::tied)`. The entry
-/// names a dtype and a rank (from its wrapper type) and no shape: its shape is whatever its ROOT's
-/// shape is, and the root of a tied entry is a tie alias (System::tie_inputs / tie_outputs), which
-/// owns the shape.
-struct Tied {};
-inline constexpr Tied tied{};
 
 /// The per-dimension specs of cs::alias::dims (D140: tie aliases take the shape rules of ports). An integer
 /// or cs::per_index(...) is also a spec; these name an upstream OUTPUT, in the declaring System's namespace.
@@ -205,13 +199,22 @@ AliasDim make_alias_dim(const S& s) {
 
 /// How a tie alias gets its shape (D139 part 2); build one with the cs::alias factories.
 struct AliasShape {
-    enum class Kind : uint8_t { fixed, from_connection, from_output_shape, from_output_values, dims, from_input_shape };
+    enum class Kind : uint8_t { fixed, unspecified, from_output_shape, from_output_values, dims, from_input_shape };
     Kind                       kind = Kind::fixed;
     int                        rank = 0;            ///< fixed / dims: how many extents / specs were given
     std::array<std::size_t, 3> extents{1, 1, 1};    ///< fixed
     std::string                path;                ///< from_output_* / from_input_shape: an entry, in the declaring System's namespace
     std::vector<AliasDim>      dim_specs;           ///< dims: one per dimension
 };
+
+namespace detail {
+/// tie_inputs' default shape (D142): the shape of whatever supplies the tie (a connected output, else an initializer on it).
+inline AliasShape unspecified_alias_shape() {
+    AliasShape s;
+    s.kind = AliasShape::Kind::unspecified;
+    return s;
+}
+}  // namespace detail
 
 namespace alias {
 /// The per-dimension form (D140): one spec per dim, count = the alias's Rank. A spec is an integer (fixed),
@@ -243,12 +246,6 @@ inline AliasShape fixed(std::size_t e0, std::size_t e1, std::size_t e2) {
     AliasShape s;
     s.rank = 3;
     s.extents = {e0, e1, e2};
-    return s;
-}
-/// tie_inputs only: the shape of whatever output is connected into the alias.
-inline AliasShape from_connection() {
-    AliasShape s;
-    s.kind = AliasShape::Kind::from_connection;
     return s;
 }
 /// The shape of an upstream output (it must have the alias's rank).
@@ -325,12 +322,20 @@ struct MarkRecord {
 /// The initial value of a free input root (r01 §4.4, D138): type-erased, made
 /// by the cs::init factories (init.hpp). apply() runs on a root that has just
 /// been allocated from nothing; the caller refreshes the other placements.
+/// The shape an initializer carries (D142): extents 1-padded, and the rank they were given for.
+struct InitShape {
+    std::array<std::size_t, 3> extents{1, 1, 1};
+    int                        rank = 0;
+};
+
 class InitSpec {
 public:
     using Fn = std::function<void(detail::IOEntry& root, sk::queue& q)>;
 
     InitSpec() = default;
-    explicit InitSpec(Fn f) : fn_{std::move(f)} {}
+    explicit InitSpec(Fn f, std::optional<InitShape> shape = std::nullopt) : fn_{std::move(f)}, shape_{shape} {}
+    /// The shape this initializer supplies to a free input's unspecified dimensions, if it has one.
+    const std::optional<InitShape>& shape() const noexcept { return shape_; }
 
     void apply(detail::IOEntry& root, sk::queue& q) const {
         if (fn_) fn_(root, q);
@@ -338,21 +343,23 @@ public:
     explicit operator bool() const noexcept { return static_cast<bool>(fn_); }
 
 private:
-    Fn fn_;
+    Fn                       fn_;
+    std::optional<InitShape> shape_;
 };
 
 namespace detail {
 
 /// Per-dimension storage form of a declared DimSpec.
 struct DimRecord {
-    /// from_root: the entry's shape is its root's shape (cs::tied, D139 part 2).
+    /// unspecified (D142): supplied by the root (a connection, a slice, a tie) or, on a free input root, by its
+    /// initializer's shape.
     /// per_index_host / per_index_from_input (D140): dimension d >= 1 has one extent per index of dim 0.
-    enum class How : uint8_t { fixed, from_source_dim, from_input_dim, from_input, from_root, per_index_host,
+    enum class How : uint8_t { fixed, unspecified, from_input_dim, from_input, per_index_host,
                                per_index_from_input };
     How         how = How::fixed;
     std::size_t extent = 0;  ///< fixed: declared; derived: last resolved (0 = unknown)
     std::string input;       ///< from_input_*: sibling input name (owned)
-    uint8_t     dim = 0;     ///< from_source_dim / from_input_dim
+    uint8_t     dim = 0;     ///< from_input_dim
     std::size_t value_index = 0;  ///< from_input; per_index_from_input: the column
     /// The resolved per-index extents of a dimension d >= 1 (D140); EMPTY means the dimension is scalar
     /// (its extent is `extent`). Filled by per_index_host at declaration, by per_index_from_input when the
@@ -376,9 +383,8 @@ DimRecord make_dim_record(const S& s) {
         }
         r.how    = DimRecord::How::fixed;
         r.extent = static_cast<std::size_t>(s);
-    } else if constexpr (std::same_as<S, FromSourceDim>) {
-        r.how = DimRecord::How::from_source_dim;
-        r.dim = s.dim;
+    } else if constexpr (std::same_as<S, Unspecified>) {
+        r.how = DimRecord::How::unspecified;
     } else if constexpr (std::same_as<S, FromInputDim>) {
         r.how   = DimRecord::How::from_input_dim;
         r.input = std::string{s.input};
@@ -413,13 +419,7 @@ std::array<DimRecord, Rank> expand_from_input_array(const FromInputArray& m) {
     return a;
 }
 
-/// cs::tied against a member's Rank.
-template <int Rank>
-std::array<DimRecord, Rank> tied_dims() {
-    std::array<DimRecord, Rank> a{};
-    for (int d = 0; d < Rank; ++d) a[d].how = DimRecord::How::from_root;
-    return a;
-}
+
 
 /// Row-major strides of a 1-padded extents triple. For a rank-R entry the
 /// first R strides are exactly rank-R row-major strides.
@@ -528,12 +528,11 @@ public:
             if (r.how != DimRecord::How::fixed) return true;
         return false;
     }
-    /// Declared with cs::tied: every dimension is "from the root" (a promotion of such an entry
-    /// carries its dims, so it is rank-only too).
-    bool is_rank_only() const noexcept {
+    /// Some dimension is unspecified (supplied from outside, D142).
+    bool has_unspecified() const noexcept {
         for (const DimRecord& r : dims_)
-            if (r.how != DimRecord::How::from_root) return false;
-        return !dims_.empty();
+            if (r.how == DimRecord::How::unspecified) return true;
+        return false;
     }
     /// The tie alias this entry was tied into (members, and their promotions); null if untied.
     const IOEntry* tie_alias() const noexcept { return tie_alias_; }
@@ -778,6 +777,11 @@ public:
     /// for a slice, which must also lie inside the root). Throws.
     virtual void validate_connection() const = 0;
 
+    /// D142 (shape authority): the dimensions this entry SPECIFIES are constraints on what supplies its root's shape
+    /// (the connection or slice, the tie, the initializer). Throws std::invalid_argument naming both sides. Non-roots
+    /// only. `fixed_only`: setup time, only fixed dimensions against a fixed root.
+    virtual void check_constraints(bool fixed_only) const = 0;
+
     /// ROOTS ONLY (no-op on peers): one usm_vector per placement in
     /// storage_placements(), each from that placement's device substrate
     /// (host-kind placements take the OS host route on the device).
@@ -826,12 +830,7 @@ protected:
             if (d == 0 && (r.how == DimRecord::How::per_index_host || r.how == DimRecord::How::per_index_from_input))
                 throw std::invalid_argument("naga::cospan: '" + name_ +
                                             "': a per-index extent (PerIndex / FromInputValues) is not allowed on dimension 0");
-            if (r.how == DimRecord::How::from_source_dim && k == IOKind::output)
-                throw std::invalid_argument("naga::cospan: '" + name_ +
-                                            "': FromSourceDim is ill-formed for an output");
-            if ((r.how == DimRecord::How::from_source_dim ||
-                 r.how == DimRecord::How::from_input_dim) &&
-                r.dim > 2)
+            if (r.how == DimRecord::How::from_input_dim && r.dim > 2)
                 throw std::invalid_argument("naga::cospan: '" + name_ +
                                             "': a dimension index is out of range");
             extents_[static_cast<std::size_t>(d)] = r.extent;  // derived dims start at 0
@@ -1096,18 +1095,17 @@ public:
             }
             switch (r.how) {
                 case DimRecord::How::fixed: break;
-                case DimRecord::How::from_source_dim:
-                    r.extent = source_extent(r.dim);
-                    if (d >= 1) {
-                        r.per_index = source_per_index(r.dim);
-                        r.per       = source_per_flag(r.dim);
-                    }
-                    break;
-                case DimRecord::How::from_root:
-                    r.extent = root_extent(static_cast<uint8_t>(d));
-                    if (d >= 1) {
-                        r.per_index = root_per_index(static_cast<uint8_t>(d));
-                        r.per       = root_per_flag(static_cast<uint8_t>(d));
+                case DimRecord::How::unspecified:
+                    if (is_root()) {  // a free input root: its initializer's shape (B3 guarantees one exists at setup)
+                        if (const auto& is = init_spec(); is && is->shape() && is->shape()->rank == rank())
+                            r.extent = is->shape()->extents[static_cast<std::size_t>(d)];
+                    } else {  // supplied by the connection, the slice or the tie
+                        check_rank();
+                        r.extent = source_extent(static_cast<uint8_t>(d));
+                        if (d >= 1) {
+                            r.per_index = source_per_index(static_cast<uint8_t>(d));
+                            r.per       = source_per_flag(static_cast<uint8_t>(d));
+                        }
                     }
                     break;
                 case DimRecord::How::from_input_dim:    // resolved by the Component (which also copies a
@@ -1193,6 +1191,87 @@ public:
         if (next != extents_ && is_root()) ++shape_version_;
         extents_ = next;
         resize_storage();
+    }
+
+    /// How this entry's dimension d was declared, for an error message.
+    std::string declared_rule(int d) const {
+        const DimRecord& r = dims_[static_cast<std::size_t>(d)];
+        switch (r.how) {
+            case DimRecord::How::fixed: return "fixed";
+            case DimRecord::How::unspecified: return "unspecified";
+            case DimRecord::How::from_input_dim: return "FromInputDim{'" + r.input + "', " + std::to_string(r.dim) + "}";
+            case DimRecord::How::from_input: return "FromInput{'" + r.input + "', " + std::to_string(r.value_index) + "}";
+            case DimRecord::How::per_index_host: return "PerIndex";
+            case DimRecord::How::per_index_from_input:
+                return "FromInputValues{'" + r.input + "', " + std::to_string(r.value_index) + "}";
+        }
+        return "?";
+    }
+    /// What supplies the shape of this entry's root, for an error message.
+    std::string supplier_str() const {
+        const IOEntry& r = *root();
+        return "'" + r.full_path() + "' (" +
+               (r.alias_shape() ? std::string{"a tie"} : r.kind() == IOKind::output ? std::string{"the connected output"}
+                                                                                       : std::string{"its initializer"}) +
+               ")";
+    }
+    static std::string per_str(const std::vector<std::size_t>& v) {
+        std::string out = "per-index [";
+        for (std::size_t i = 0; i < v.size() && i < 8; ++i) out += (i ? ", " : "") + std::to_string(v[i]);
+        if (v.size() > 8) out += ", ...";
+        return out + "]";
+    }
+
+    /// The rank must always match the supplier's (a view has its root's rank).
+    void check_rank() const {
+        if (is_root()) return;
+        const auto v   = view();
+        const int  sup = v ? v->rank : root()->rank();
+        if (sup != rank())
+            throw std::invalid_argument("naga::cospan: shape mismatch: '" + full_path() + "' has rank " + std::to_string(rank()) +
+                                        " but its shape is supplied by " + supplier_str() + ", which has rank " +
+                                        std::to_string(sup) + " (the rank must match)");
+    }
+
+    void check_constraints(bool fixed_only) const override {
+        if (is_root()) return;
+        check_rank();
+        const IOEntry&  r   = *root();
+        const auto      v   = view();
+        const std::string who = "naga::cospan: shape mismatch: '" + full_path() + "'";
+        const auto lr = leading_range();
+        for (int d = 0; d < rank(); ++d) {
+            const DimRecord& rec = dims_[static_cast<std::size_t>(d)];
+            if (rec.how == DimRecord::How::unspecified) continue;
+            if (fixed_only && rec.how != DimRecord::How::fixed) continue;
+            if (d == 0 && dim0_override_) continue;  // inside a ChunkedSystem dim 0 is the chunk length (checked at the full length)
+            const auto u = static_cast<std::size_t>(d);
+            const bool want_per = d >= 1 && rec.per;
+            const bool sup_per  = d >= 1 && source_per_flag(static_cast<uint8_t>(d));
+            const std::string lead = who + " dimension " + std::to_string(d) + " is " + declared_rule(d);
+            if (want_per || sup_per) {
+                if (fixed_only) continue;
+                if (want_per != sup_per)
+                    throw std::invalid_argument(lead + (want_per ? " (per-index)" : " = " + std::to_string(extents_[u])) +
+                                                " but its shape is supplied by " + supplier_str() + ", whose dimension " +
+                                                std::to_string(d) + (sup_per ? " is per-index" : " is dense"));
+                const auto have = per_index_extents(d);
+                const auto want = source_per_index(static_cast<uint8_t>(d));
+                if (have != want)
+                    throw std::invalid_argument(lead + " = " + per_str(have) + " but its shape is supplied by " + supplier_str() +
+                                                ", whose dimension " + std::to_string(d) + " is " + per_str(want));
+                continue;
+            }
+            std::size_t supplied = r.extents()[u];
+            if (lr && d == 0)
+                supplied = lr->second - lr->first;
+            else if (v)
+                supplied = v->extents[u];
+            if (extents_[u] != supplied)
+                throw std::invalid_argument(lead + " = " + std::to_string(extents_[u]) + " but its shape is supplied by " +
+                                            supplier_str() + ", whose dimension " + std::to_string(d) + " is " +
+                                            std::to_string(supplied));
+        }
     }
 
     void validate_connection() const override {
@@ -1506,14 +1585,13 @@ private:
 
     std::size_t source_extent(uint8_t d) const {
         if (is_root())
-            throw std::logic_error("naga::cospan: source-derived dimension on the unconnected input '" +
-                                   std::string{name()} + "'");
+            throw std::logic_error("naga::cospan: unspecified dimension on the root '" + std::string{name()} + "'");
         if (const auto v = view()) {
-            if (d >= v->rank) throw std::out_of_range("naga::cospan: FromSourceDim past the source's rank");
+            if (d >= v->rank) throw std::out_of_range("naga::cospan: an unspecified dimension is past its supplier's rank");
             return v->extents[d];
         }
         if (d >= root()->rank())
-            throw std::out_of_range("naga::cospan: FromSourceDim past the source's rank");
+            throw std::out_of_range("naga::cospan: an unspecified dimension is past its supplier's rank");
         if (const auto lr = leading_range(); lr && d == 0) return lr->second - lr->first;  // a ragged root (D140 B1)
         return root()->extents()[d];
     }

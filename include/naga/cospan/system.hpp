@@ -258,10 +258,11 @@ public:
 
     /// A NEW ROOT (target, not source); every member's set merges into it. The members are
     /// rank-only (cs::tied) entries of dtype DT and rank Rank; the alias OWNS the shape: its
-    /// `shape` (cs::alias::fixed / from_connection / from_output_shape / from_output_values) is
+    /// `shape` (cs::alias::fixed / from_output_shape / from_output_values) is
     /// the root's shape, or, once an output is connected into the alias, that output's (D139 part 2).
     template <DType DT, int Rank>
-    void tie_inputs(std::initializer_list<std::string_view> members, std::string name, AliasShape shape) {
+    void tie_inputs(std::initializer_list<std::string_view> members, std::string name,
+                    AliasShape shape = detail::unspecified_alias_shape()) {
         static_assert(Rank >= 1 && Rank <= 3, "cospan: rank is 1..3");
         require_declaring("tie_inputs");
         check_new_name(name, "alias");
@@ -1026,7 +1027,7 @@ private:
         std::vector<detail::DimRecord> out;
         for (int d = 0; d < e.rank(); ++d) {
             detail::DimRecord r = e.dim(d);
-            if (r.how != detail::DimRecord::How::fixed && r.how != detail::DimRecord::How::from_root) {
+            if (r.how != detail::DimRecord::How::fixed && r.how != detail::DimRecord::How::unspecified) {
                 r.how         = detail::DimRecord::How::from_input;
                 r.input.clear();
                 r.dim         = 0;
@@ -1072,15 +1073,11 @@ private:
                            std::to_string(Rank));
     }
 
-    /// Every member is of dtype DT and rank Rank, and rank-only (declared cs::tied).
+    /// Every member is of dtype DT and rank Rank. A member may declare any dims: the unspecified ones come from the
+    /// tie, the specified ones are constraints on it (D142).
     template <DType DT, int Rank>
     void check_tie_members(const Members& ms, const char* what) const {
-        for (const auto& [path, m] : ms) {
-            check_typed<DT, Rank>(*m, what, path);
-            if (!m->is_rank_only())
-                fail(what, "'" + std::string{path} + "' declares a shape; a tie member is rank-only (declare it with cs::tied) "
-                           "because the tie alias owns the shape");
-        }
+        for (const auto& [path, m] : ms) check_typed<DT, Rank>(*m, what, path);
     }
 
     /// Validates an AliasShape against the alias's Rank; returns the upstream output a
@@ -1130,9 +1127,10 @@ private:
                     fail(what, "alias::fixed gives " + std::to_string(s.rank) + " extents but the alias is rank " +
                                    std::to_string(Rank));
                 return nullptr;
-            case AliasShape::Kind::from_connection:
+            case AliasShape::Kind::unspecified:
                 if (!is_input)
-                    fail(what, "an output alias defines the shape of its connections; alias::from_connection is for tie_inputs");
+                    fail(what, "an output alias needs a shape (alias::fixed, dims, from_output_shape, from_output_values or from_input_shape): "
+                               "an output with unspecified dims is an error");
                 return nullptr;
             case AliasShape::Kind::from_input_shape: {
                 detail::IOEntry& up = entry_at(s.path);
@@ -1192,20 +1190,35 @@ private:
             if (auto* s = dynamic_cast<System*>(c)) s->collect_aliases(out);
     }
 
-    /// Every rank-only entry is in a tie's set; a from_connection alias is connected; a
+    /// B3 (D142): an untied output with an unspecified dim, a free input with one and no initializer shape, and an
+    /// unspecified tie_inputs root nothing supplies are setup errors; a
     /// from_output_* alias reads an output whose producer runs BEFORE the tie's first member.
     void check_ties(const std::vector<ComponentBase*>& comps) {
         for (ComponentBase* c : comps)
             for (detail::IOEntry* e : c->order_) {
-                if (!e->is_rank_only()) continue;
-                const detail::IOEntry* r    = e->root();
-                bool                   tied = r->tie_alias_ != nullptr;
-                for (const detail::IOEntry* p : r->peers_) tied = tied || p->tie_alias_ != nullptr;
-                if (!tied)
-                    throw std::invalid_argument("naga::cospan: '" + e->full_path() +
-                                                "' is rank-only (cs::tied) but is not a member of a tie "
-                                                "(tie_inputs / tie_outputs, directly or through promotions): "
-                                                "only a tie alias can give it a shape");
+                if (!e->is_root() || !e->has_unspecified()) continue;
+                if (e->kind() == IOKind::output)
+                    throw std::invalid_argument("naga::cospan: output '" + e->full_path() +
+                                                "' has an unspecified dimension but is not a member of a tie_outputs: nothing "
+                                                "supplies its shape (declare the dimension, or tie it)");
+                const auto& is = e->init_spec();
+                if (!is || !is->shape())
+                    throw std::invalid_argument("naga::cospan: free input '" + e->full_path() +
+                                                "' has an unspecified dimension and no initializer that gives it a shape "
+                                                "(connect it, tie it, or declare init_input with a shape: fill(v, shape), "
+                                                "zero(shape), from_host(data) for rank 1 or from_host(data, shape), custom(fn, shape))");
+                if (is->shape()->rank != e->rank())
+                    throw std::invalid_argument("naga::cospan: shape mismatch: free input '" + e->full_path() + "' has rank " +
+                                                std::to_string(e->rank()) + " but its initializer gives a rank-" +
+                                                std::to_string(is->shape()->rank) + " shape");
+                for (int d = 0; d < e->rank(); ++d) {
+                    const detail::DimRecord& r = e->dim(d);
+                    if (r.how == detail::DimRecord::How::fixed && r.extent != is->shape()->extents[static_cast<std::size_t>(d)])
+                        throw std::invalid_argument("naga::cospan: shape mismatch: dimension " + std::to_string(d) + " of '" +
+                                                    e->full_path() + "' is fixed = " + std::to_string(r.extent) +
+                                                    " but its initializer gives " +
+                                                    std::to_string(is->shape()->extents[static_cast<std::size_t>(d)]));
+                }
             }
 
         std::unordered_map<const Subsystem*, std::size_t> index;
@@ -1215,10 +1228,10 @@ private:
         for (detail::IOEntry* a : aliases) {
             if (!a->alias_shape_) continue;
             const AliasShape& s = *a->alias_shape_;
-            if (s.kind == AliasShape::Kind::from_connection && a->is_root())
+            if (s.kind == AliasShape::Kind::unspecified && a->is_root() && !(a->init_spec() && a->init_spec()->shape()))
                 throw std::invalid_argument("naga::cospan: tie alias '" + a->full_path() +
-                                            "' takes its shape from a connection (alias::from_connection) but nothing is "
-                                            "connected to it");
+                                            "' has an unspecified shape and nothing supplies it: connect an output to it, or "
+                                            "declare init_input on it with a shape");
             if (s.kind != AliasShape::Kind::from_output_shape && s.kind != AliasShape::Kind::from_output_values &&
                 s.kind != AliasShape::Kind::dims && s.kind != AliasShape::Kind::from_input_shape)
                 continue;

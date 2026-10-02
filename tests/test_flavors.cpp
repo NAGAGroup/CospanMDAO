@@ -181,7 +181,7 @@ class ElemND : public cs::Component<ElemBody<R, Op>> {
 
 public:
     void setup() override {
-        this->declare_input(x_, "x", cs::from_source_shape<R>());
+        this->declare_input(x_, "x", cs::unspecified_shape<R>());
         this->declare_output(y_, "y", cs::from_input_shape<R>("x"));
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
@@ -217,7 +217,7 @@ class Half : public cs::Component<HalfBody> {
 
 public:
     void setup() override {
-        declare_input(x_, "x", cs::from_source_shape<1>());
+        declare_input(x_, "x", cs::unspecified_shape<1>());
         declare_output(y_, "y", cs::from_input_shape<1>("x"));
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
@@ -275,7 +275,7 @@ class GroupStage : public cs::Component<Body> {
 public:
     explicit GroupStage(std::size_t wg = 64) : wg_{wg} {}
     void setup() override {
-        this->declare_input(x_, "x", cs::from_source_shape<1>());
+        this->declare_input(x_, "x", cs::unspecified_shape<1>());
         this->declare_output(y_, "y", cs::from_input_shape<1>("x"));
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
@@ -307,7 +307,7 @@ class Prefix : public cs::Component<PrefixBody> {
 
 public:
     void setup() override {
-        declare_input(x_, "x", cs::from_source_shape<1>());
+        declare_input(x_, "x", cs::unspecified_shape<1>());
         declare_output(z_, "z", cs::from_input_shape<1>("x"));
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config({x_}, {z_}, {}); }
@@ -356,7 +356,7 @@ class Adder : public cs::Component<AdderBody> {
 
 public:
     explicit Adder(float v) : v_{v} {}
-    void setup() override { declare_output(acc_, "acc", cs::tied); }  // a tie_outputs member: the alias owns the shape
+    void setup() override { declare_output(acc_, "acc", cs::unspecified_shape<1>()); }  // a tie_outputs member: the alias owns the shape
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return create_launch_config(acc_.shape(), {}, {acc_}, {v_});
     }
@@ -375,7 +375,7 @@ class ZeroAcc : public cs::Component<ZeroAccBody> {
     cs::Output<DType::atomic_f32, 1> acc_;
 
 public:
-    void setup() override { declare_output(acc_, "acc", cs::tied); }
+    void setup() override { declare_output(acc_, "acc", cs::unspecified_shape<1>()); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return create_launch_config(acc_.shape(), {}, {acc_}, {});
     }
@@ -450,7 +450,7 @@ class BigStage : public cs::Component<BigBody> {
 public:
     explicit BigStage(std::size_t elems) : elems_{elems} {}
     void setup() override {
-        declare_input(x_, "x", cs::from_source_shape<1>());
+        declare_input(x_, "x", cs::unspecified_shape<1>());
         declare_output(y_, "y", cs::from_input_shape<1>("x"));
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
@@ -476,7 +476,7 @@ class NopCustom : public cs::Component<NopCustomBody> {
 
 public:
     void setup() override {
-        declare_input(x_, "x", cs::from_source_shape<1>());
+        declare_input(x_, "x", cs::unspecified_shape<1>());
         declare_output(y_, "y", cs::from_input_shape<1>("x"));
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config({x_}, {y_}, {}); }
@@ -496,7 +496,7 @@ class NopHost : public cs::Component<NopHostBody> {
 
 public:
     void setup() override {
-        declare_input(x_, "x", cs::from_source_shape<1>());
+        declare_input(x_, "x", cs::unspecified_shape<1>());
         declare_output(y_, "y", cs::from_input_shape<1>("x"));
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config({x_}, {y_}, {}); }

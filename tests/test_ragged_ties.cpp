@@ -95,7 +95,7 @@ class Gen : public cs::Component<GenBody> {
 
 public:
     void setup() override {
-        declare_input(counts_, "counts", cs::FromSourceDim{0});
+        declare_input(counts_, "counts", cs::unspecified);
         declare_output(pts_, "pts", cs::FromInputDim{"counts", 0}, cs::FromInputValues{"counts"}, 3);
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
@@ -127,7 +127,7 @@ class TieMember : public cs::Component<TieBody<Op>> {
     cs::RaggedOutput<DType::f32, 3> t_;
 
 public:
-    void setup() override { this->declare_output(t_, "t", cs::tied); }
+    void setup() override { this->declare_output(t_, "t", cs::unspecified_shape<3>()); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return this->create_launch_config(sycl::range<1>{t_.size()}, {}, {t_}, {});
     }
@@ -153,7 +153,7 @@ class TieMemberA : public cs::Component<TieBodyA<Op>> {
     cs::RaggedOutput<DType::atomic_f32, 3> t_;
 
 public:
-    void setup() override { this->declare_output(t_, "t", cs::tied); }
+    void setup() override { this->declare_output(t_, "t", cs::unspecified_shape<3>()); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return this->create_launch_config(sycl::range<1>{t_.size()}, {}, {t_}, {});
     }
@@ -187,7 +187,7 @@ class SumT : public cs::Component<SumTBody> {
 
 public:
     void setup() override {
-        declare_input(pts_, "pts", cs::FromSourceDim{0}, cs::FromSourceDim{1}, cs::FromSourceDim{2});
+        declare_input(pts_, "pts", cs::unspecified, cs::unspecified, cs::unspecified);
         declare_output(sums_, "sums", cs::FromInputDim{"pts", 0});
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
@@ -299,7 +299,7 @@ class SumK : public cs::Component<SumKBody<K>> {
 
 public:
     void setup() override {
-        this->declare_input(pts_, "pts", cs::tied);
+        this->declare_input(pts_, "pts", cs::unspecified_shape<3>());
         this->declare_output(sums_, "sums", cs::FromInputDim{"pts", 0});
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
@@ -318,7 +318,7 @@ public:
         add_subsystem<SumK<1>>("sa");
         add_subsystem<SumK<2>>("sb");
         connect("sz.counts", "gen.counts");
-        tie_inputs<DType::f32, 3>({"sa.pts", "sb.pts"}, "pts", cs::alias::from_connection());
+        tie_inputs<DType::f32, 3>({"sa.pts", "sb.pts"}, "pts");
         connect("gen.pts", "pts");
     }
 };
@@ -370,7 +370,7 @@ class GenCols : public cs::Component<GenColsBody> {
 
 public:
     void setup() override {
-        declare_input(sizes_, "sizes", cs::FromSourceDim{0}, cs::FromSourceDim{1});
+        declare_input(sizes_, "sizes", cs::unspecified, cs::unspecified);
         declare_output(pts_, "pts", cs::FromInputDim{"sizes", 0}, cs::FromInputValues{"sizes", 1}, 3);
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
@@ -437,8 +437,8 @@ class BuildX : public cs::Component<BuildXBody> {
 
 public:
     void setup() override {
-        declare_input(in_, "in", cs::FromSourceDim{0});
-        declare_output(t_, "t", cs::tied);
+        declare_input(in_, "in", cs::unspecified);
+        declare_output(t_, "t", cs::unspecified_shape<3>());
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return create_launch_config(sycl::range<1>{t_.size()}, {in_}, {t_}, {});
@@ -460,7 +460,7 @@ class Cons : public cs::Component<ConsBody> {
 
 public:
     void setup() override {
-        declare_input(in_, "in", cs::FromSourceDim{0});
+        declare_input(in_, "in", cs::unspecified);
         declare_output(out_, "out", cs::FromInputDim{"in", 0});
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
@@ -569,7 +569,7 @@ class Copy3 : public cs::Component<Copy3Body> {
 
 public:
     void setup() override {
-        declare_input(pts_, "pts", cs::tied);
+        declare_input(pts_, "pts", cs::unspecified_shape<3>());
         declare_output(cp_, "cp", cs::FromInputDim{"pts", 0}, cs::FromInputDim{"pts", 1}, cs::FromInputDim{"pts", 2});
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
@@ -583,7 +583,7 @@ public:
         add_subsystem<SumK<1>>("sa");
         add_subsystem<Copy3>("cp");
         add_subsystem<SumT>("st");
-        tie_inputs<DType::f32, 3>({"sa.pts", "cp.pts"}, "pts", cs::alias::from_connection());
+        tie_inputs<DType::f32, 3>({"sa.pts", "cp.pts"}, "pts");
         connect("cp.cp", "st.pts");
     }
 };
@@ -649,9 +649,9 @@ class BuildS : public cs::Component<BuildSBody> {
 
 public:
     void setup() override {
-        declare_input(in_, "in", cs::FromSourceDim{0});
-        declare_input(sizes_, "sizes", cs::FromSourceDim{0});
-        declare_output(t_, "t", cs::tied);
+        declare_input(in_, "in", cs::unspecified);
+        declare_input(sizes_, "sizes", cs::unspecified);
+        declare_output(t_, "t", cs::unspecified_shape<3>());
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return create_launch_config(sycl::range<1>{t_.size()}, {in_, sizes_}, {t_}, {});
@@ -679,9 +679,9 @@ class BuildP : public cs::Component<BuildPBody> {
 
 public:
     void setup() override {
-        declare_input(in_, "in", cs::FromSourceDim{0});
-        declare_input(pts_, "pts", cs::FromSourceDim{0}, cs::FromSourceDim{1}, cs::FromSourceDim{2});
-        declare_output(t_, "t", cs::tied);
+        declare_input(in_, "in", cs::unspecified);
+        declare_input(pts_, "pts", cs::unspecified, cs::unspecified, cs::unspecified);
+        declare_output(t_, "t", cs::unspecified_shape<3>());
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return create_launch_config(sycl::range<1>{t_.size()}, {in_, pts_}, {t_}, {});
@@ -707,7 +707,7 @@ class Mk : public cs::Component<MkBody> {
 
 public:
     void setup() override {
-        declare_input(sizes_, "sizes", cs::FromSourceDim{0});
+        declare_input(sizes_, "sizes", cs::unspecified);
         declare_output(r_, "r", cs::FromInputDim{"sizes", 0}, cs::FromInputValues{"sizes"}, 3);
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
@@ -734,8 +734,8 @@ class AccX : public cs::Component<AccXBody> {
 
 public:
     void setup() override {
-        declare_input(in_, "in", cs::FromSourceDim{0});
-        declare_output(t_, "t", cs::tied);
+        declare_input(in_, "in", cs::unspecified);
+        declare_output(t_, "t", cs::unspecified_shape<3>());
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return create_launch_config(sycl::range<1>{t_.size()}, {in_}, {t_}, {});
@@ -933,7 +933,7 @@ class CopyU : public cs::Component<CopyUBody> {
 
 public:
     void setup() override {
-        declare_input(in_, "in", cs::FromSourceDim{0});
+        declare_input(in_, "in", cs::unspecified);
         declare_output(counts_, "counts", cs::FromInputDim{"in", 0});
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
@@ -1488,8 +1488,8 @@ class AccIn : public cs::Component<AccInBody> {
 
 public:
     void setup() override {
-        declare_input(in_, "in", cs::FromSourceDim{0});
-        declare_output(t_, "t", cs::tied);
+        declare_input(in_, "in", cs::unspecified);
+        declare_output(t_, "t", cs::unspecified_shape<3>());
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return create_launch_config(sycl::range<1>{t_.size()}, {in_}, {t_}, {});
@@ -1567,7 +1567,7 @@ public:
         add_subsystem<Cons>("c1");
         add_subsystem<Cons>("c2");
         connect("sz.counts", "gen.counts");
-        tie_inputs<DType::f32, 3>({"inner.pts", "sb.pts"}, "tp", cs::alias::from_connection());
+        tie_inputs<DType::f32, 3>({"inner.pts", "sb.pts"}, "tp");
         connect("gen.pts", "tp");
         connect("inner.sums", "c1.in");
         connect("sb.sums", "c2.in");

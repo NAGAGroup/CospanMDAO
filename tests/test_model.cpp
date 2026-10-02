@@ -91,8 +91,8 @@ class D1 : public cs::Component<D1Body<DT>> {
 
 public:
     void setup() override {
-        this->declare_input(z_, "z", cs::tied);  // z and x are tie members: the tie alias owns their shape
-        this->declare_input(x_, "x", cs::tied);
+        this->declare_input(z_, "z", cs::unspecified_shape<1>());  // z and x are tie members: the tie alias owns their shape
+        this->declare_input(x_, "x", cs::unspecified_shape<1>());
         this->declare_input(y2_, "y2", 1);
         this->declare_output(y1_, "y1", 1);
     }
@@ -121,8 +121,8 @@ class D2 : public cs::Component<D2Body<DT>> {
 
 public:
     void setup() override {
-        this->declare_input(z_, "z", cs::tied);
-        this->declare_input(y1_, "y1", cs::from_source_shape<1>());
+        this->declare_input(z_, "z", cs::unspecified_shape<1>());
+        this->declare_input(y1_, "y1", cs::unspecified_shape<1>());
         this->declare_output(y2_, "y2", 1);
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
@@ -153,10 +153,10 @@ class Obj : public cs::Component<ObjBody<DT>> {
 
 public:
     void setup() override {
-        this->declare_input(x_, "x", cs::tied);
-        this->declare_input(z_, "z", cs::tied);
-        this->declare_input(y1_, "y1", cs::from_source_shape<1>());
-        this->declare_input(y2_, "y2", cs::from_source_shape<1>());
+        this->declare_input(x_, "x", cs::unspecified_shape<1>());
+        this->declare_input(z_, "z", cs::unspecified_shape<1>());
+        this->declare_input(y1_, "y1", cs::unspecified_shape<1>());
+        this->declare_input(y2_, "y2", cs::unspecified_shape<1>());
         this->declare_output(f_, "f", 1);
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
@@ -183,7 +183,7 @@ class G1 : public cs::Component<G1Body<DT>> {
 
 public:
     void setup() override {
-        this->declare_input(y1_, "y1", cs::from_source_shape<1>());
+        this->declare_input(y1_, "y1", cs::unspecified_shape<1>());
         this->declare_output(g_, "g", 1);
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
@@ -210,7 +210,7 @@ class G2 : public cs::Component<G2Body<DT>> {
 
 public:
     void setup() override {
-        this->declare_input(y2_, "y2", cs::from_source_shape<1>());
+        this->declare_input(y2_, "y2", cs::unspecified_shape<1>());
         this->declare_output(g_, "g", 1);
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
@@ -373,7 +373,7 @@ class Cvt : public cs::Component<CvtBody> {
 
 public:
     void setup() override {
-        declare_input(a_, "a", cs::from_source_shape<1>());
+        declare_input(a_, "a", cs::unspecified_shape<1>());
         declare_output(d_, "d", 64);
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
@@ -402,9 +402,9 @@ class Comb : public cs::Component<CombBody> {
 
 public:
     void setup() override {
-        declare_input(b_, "b", cs::tied);  // tied into the top alias "bc" (fixed 8)
-        declare_input(c_, "c", cs::tied);
-        declare_input(e_, "e", cs::from_source_shape<1>());
+        declare_input(b_, "b", cs::unspecified_shape<1>());  // tied into the top alias "bc" (fixed 8)
+        declare_input(c_, "c", cs::unspecified_shape<1>());
+        declare_input(e_, "e", cs::unspecified_shape<1>());
         declare_output(o_, "o", 16);
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
@@ -500,7 +500,7 @@ class Scale : public cs::Component<ScaleBody> {
 
 public:
     void setup() override {
-        declare_input(x_, "x", cs::from_source_shape<1>());
+        declare_input(x_, "x", cs::unspecified_shape<1>());
         declare_output(y_, "y", cs::from_input_shape<1>("x"));
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
@@ -626,7 +626,7 @@ class SumY : public cs::Component<SumBody> {
 
 public:
     void setup() override {
-        declare_input(y_, "y", cs::from_source_shape<1>());
+        declare_input(y_, "y", cs::unspecified_shape<1>());
         declare_output(s_, "s", 1);
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {

@@ -125,8 +125,8 @@ inline void check_tied_outputs(const std::string& owner, const char* what, std::
 /// (h) Both modes of a FusedSystem, at compile(): every entry of every stage with
 /// a value-driven dim (FromInput) is followed to its driving input, and the
 /// driving input's aliasing set must not hold an output of another stage.
-/// FromInputDim and FromSourceDim (through connections) are always allowed. A tied entry (D139
-/// part 2) is checked through its tie alias: a from_output_shape / from_output_values source must
+/// FromInputDim and unspecified dims (supplied through connections) are always allowed. A tied entry (D139
+/// part 2) with an unspecified dim is checked through its tie alias: a from_output_shape / from_output_values source must
 /// not be an output of another stage of the same owner.
 inline void check_value_driven_sizes(const std::string& owner, std::span<Subsystem* const> stages) {
     for (const Subsystem* s : stages) {
@@ -136,7 +136,7 @@ inline void check_value_driven_sizes(const std::string& owner, std::span<Subsyst
                 const IOEntry& e = ref.get();
                 for (int d = 0; d < e.rank(); ++d) {
                     const DimRecord& r = e.dim(d);
-                    if (r.how == DimRecord::How::from_root) {
+                    if (r.how == DimRecord::How::unspecified) {
                         // A tied entry's shape comes from its tie alias; a from_output_* alias reads an
                         // upstream output on the host, which must not belong to a stage of the same wave.
                         const IOEntry* alias = e.tie_alias();

@@ -68,7 +68,7 @@ class A : public cs::Component<ABody> {
 
 public:
     void setup() override {
-        declare_input(in_, "in", cs::FromSourceDim{0}, cs::FromSourceDim{1});
+        declare_input(in_, "in", cs::unspecified, cs::unspecified);
         declare_output(t_, "t", cs::FromInputDim{"in", 0}, 4);
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(t_.shape(), {in_}, {t_}, {}); }
@@ -93,7 +93,7 @@ class B : public cs::Component<BBody> {
 
 public:
     void setup() override {
-        declare_input(in_, "in", cs::FromSourceDim{0}, cs::FromSourceDim{1});
+        declare_input(in_, "in", cs::unspecified, cs::unspecified);
         declare_output(y_, "y", cs::FromInputDim{"in", 0});
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(y_.shape(), {in_}, {y_}, {}); }
@@ -114,7 +114,7 @@ class Cons : public cs::Component<ConsBody> {
 
 public:
     void setup() override {
-        declare_input(in_, "in", cs::FromSourceDim{0});
+        declare_input(in_, "in", cs::unspecified);
         declare_output(out_, "out", cs::FromInputDim{"in", 0});
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(out_.shape(), {in_}, {out_}, {}); }
@@ -210,9 +210,9 @@ class BuildS : public cs::Component<BuildSBody> {
 
 public:
     void setup() override {
-        declare_input(in_, "in", cs::FromSourceDim{0});
-        declare_input(sizes_, "sizes", cs::FromSourceDim{0});
-        declare_output(t_, "t", cs::tied);
+        declare_input(in_, "in", cs::unspecified);
+        declare_input(sizes_, "sizes", cs::unspecified);
+        declare_output(t_, "t", cs::unspecified_shape<3>());
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return create_launch_config(sycl::range<1>{t_.size()}, {in_, sizes_}, {t_}, {});
@@ -234,7 +234,7 @@ class Factor : public cs::Component<FactorBody> {
     cs::RaggedOutput<DType::f32, 3> t_;
 
 public:
-    void setup() override { declare_output(t_, "t", cs::tied); }
+    void setup() override { declare_output(t_, "t", cs::unspecified_shape<3>()); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return create_launch_config(sycl::range<1>{t_.size()}, {}, {t_}, {});
     }
@@ -260,7 +260,7 @@ class SumT : public cs::Component<SumTBody> {
 
 public:
     void setup() override {
-        declare_input(pts_, "pts", cs::FromSourceDim{0}, cs::FromSourceDim{1}, cs::FromSourceDim{2});
+        declare_input(pts_, "pts", cs::unspecified, cs::unspecified, cs::unspecified);
         declare_output(sums_, "sums", cs::FromInputDim{"pts", 0});
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {

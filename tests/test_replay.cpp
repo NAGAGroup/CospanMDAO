@@ -54,7 +54,7 @@ class A : public cs::Component<ABody> {
 
 public:
     void setup() override {
-        declare_input(in_, "in", cs::FromSourceDim{0}, cs::FromSourceDim{1});
+        declare_input(in_, "in", cs::unspecified, cs::unspecified);
         declare_output(t_, "t", cs::FromInputDim{"in", 0}, 4);
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(t_.shape(), {in_}, {t_}, {}); }
@@ -78,7 +78,7 @@ class B : public cs::Component<BBody> {
 
 public:
     void setup() override {
-        declare_input(in_, "in", cs::FromSourceDim{0}, cs::FromSourceDim{1});
+        declare_input(in_, "in", cs::unspecified, cs::unspecified);
         declare_output(y_, "y", cs::FromInputDim{"in", 0});
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(y_.shape(), {in_}, {y_}, {}); }
@@ -98,7 +98,7 @@ class Cons : public cs::Component<ConsBody> {
 
 public:
     void setup() override {
-        declare_input(in_, "in", cs::FromSourceDim{0});
+        declare_input(in_, "in", cs::unspecified);
         declare_output(out_, "out", cs::FromInputDim{"in", 0});
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(out_.shape(), {in_}, {out_}, {}); }
