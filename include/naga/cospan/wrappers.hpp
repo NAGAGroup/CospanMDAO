@@ -6,7 +6,7 @@
 //
 // Input, Output, Initializer and Local are pure device payload: {shape,
 // stride, data}, trivially copyable, no identity. Their fields are private and
-// written only by detail::IOEntry (friendship): user code never sees a pointer.
+// written only by detail::WrapperAccess (friendship): user code never sees a pointer.
 // Indexing is by sycl::id<Rank> or by a flat row-major index over shape();
 // stride() is the element step per dimension in the OWNING allocation.
 
@@ -25,7 +25,7 @@ struct CustomOp;  // the one place a raw device pointer is obtainable (r01 §5.1
 
 namespace detail {
 
-class IOEntry;
+struct WrapperAccess;
 template <class T, int Rank>
 struct RaggedAccess;
 struct ScratchLayout;
@@ -102,7 +102,7 @@ private:
     sycl::range<Rank> shape_  = detail::filled_range<Rank>(0);
     sycl::range<Rank> stride_ = detail::filled_range<Rank>(0);
     const value_type* data_   = nullptr;
-    friend class detail::IOEntry;
+    friend struct detail::WrapperAccess;
     friend struct CustomOp;
 };
 
@@ -149,7 +149,7 @@ private:
     sycl::range<Rank> shape_  = detail::filled_range<Rank>(0);
     sycl::range<Rank> stride_ = detail::filled_range<Rank>(0);
     value_type*       data_   = nullptr;
-    friend class detail::IOEntry;
+    friend struct detail::WrapperAccess;
     friend struct CustomOp;
 };
 
@@ -195,7 +195,7 @@ private:
     sycl::range<Rank> shape_  = detail::filled_range<Rank>(0);
     sycl::range<Rank> stride_ = detail::filled_range<Rank>(0);
     value_type*       data_   = nullptr;
-    friend class detail::IOEntry;
+    friend struct detail::WrapperAccess;
     friend struct CustomOp;
 };
 
@@ -312,7 +312,7 @@ private:
     const std::uint64_t*                offsets_ = nullptr;
     std::array<std::size_t, 2>          ext_{1, 1};
     std::array<const std::uint64_t*, 2> per_{nullptr, nullptr};
-    friend class detail::IOEntry;
+    friend struct detail::WrapperAccess;
 };
 
 /// RaggedOutput<DT, Rank> — the writable twin. With an atomic DT, block(i) is an AtomicBlock (operator[] gives a
@@ -343,7 +343,7 @@ private:
     const std::uint64_t*                offsets_ = nullptr;
     std::array<std::size_t, 2>          ext_{1, 1};
     std::array<const std::uint64_t*, 2> per_{nullptr, nullptr};
-    friend class detail::IOEntry;
+    friend struct detail::WrapperAccess;
 };
 
 static_assert(std::is_trivially_copyable_v<RaggedInput<DType::f32, 3>>);
