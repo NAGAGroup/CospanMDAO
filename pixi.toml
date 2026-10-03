@@ -11,7 +11,7 @@ preview   = ["pixi-build"]
 cospanmdao             = { path = "." }
 cospanmdao-tests       = { path = "tests" }
 cospanmdao-examples    = { path = "examples" }
-slabkit                = { git = "https://github.com/NAGAGroup/SlabKit.git", rev = "572b581c098e47a7f6b0a6b34da663d56d599b76" }
+slabkit                = { git = "https://github.com/NAGAGroup/SlabKit.git", rev = "171c3ab81472cce9c1c42d22abd4b5d776f50251" }
 cereal                 = ">=1.3"
 catch2                 = ">=3.8"
 naga-acpp-runtime-cuda = "*"
