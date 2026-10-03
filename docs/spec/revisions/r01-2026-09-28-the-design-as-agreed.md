@@ -894,7 +894,7 @@ private:
 
 ### 4.3 The structural operations, as set operations
 
-**Ragged aliases.** A tie alias takes the same per-index shape rules as a port. `cs::alias::dims(spec0, spec1, ...)` gives one spec per dimension (count = Rank): an integer (fixed), `cs::per_index(vec)` (dims >= 1), `cs::alias::output_value(path, index)` (a scalar from an upstream output's value), `cs::alias::output_values(path, column = 0)` (per-index extents from the values of an upstream integer output of rank 1 [N] or rank 2 [N,k]; dims >= 1) and `cs::alias::output_dim(path, d)` (dim d of an upstream output's shape, per-index if that dim is). `from_output_shape` copies the upstream shape including per-index dims, and an unspecified tie_inputs inherits a ragged source wholesale. The same ordering rules and Fused/Parallel refusal apply to every upstream output a shape reads. The declaring System resolves per-index dims on the host, computes the block offsets, resizes and uploads the device copies like any ragged root; members (unspecified dims) copy the arrays from the root and must be declared RaggedInput / RaggedOutput (`declare_*(w, name, cs::unspecified_shape<R>())` overloads exist for them; a dense wrapper is an error). Ragged wrappers are non-atomic, so a ragged tie_outputs takes `TieOutputsPolicy::allow_plain`. Inside a ChunkedSystem an internal ragged alias root is priced like any internal root, dim 0 is set by the framework, a `per_index` host array is sliced per chunk, and a per-index source computed inside is the "computed inside" error. **Alias sources may also be INPUTS** of the declaring System (a promoted input or a tie_inputs alias, connected from upstream or free): `cs::alias::input_value(path, index)`, `input_values(path, column = 0)`, `input_dim(path, d)` (per-index if that dim is) in `alias::dims`, and the whole-shape `cs::alias::from_input_shape(path)` (ragged-aware). Values and shapes are read from the input's ROOT on the host (snapshot), like the output forms. Ordering: a value a shape rule reads must be known when the alias is accessed, else the read throws there (shapes are reactive, §4.5); the Fused/Parallel refusal covers every source.
+**Ragged aliases.** A tie alias takes the same per-index shape rules as a port. `cs::alias::dims(spec0, spec1, ...)` gives one spec per dimension (count = Rank): an integer (fixed), `cs::per_index(vec)` (dims >= 1), `cs::alias::output_value(path, index)` (a scalar from an upstream output's value), `cs::alias::output_values(path, column = 0)` (per-index extents from the values of an upstream integer output of rank 1 [N] or rank 2 [N,k]; dims >= 1) and `cs::alias::output_dim(path, d)` (dim d of an upstream output's shape, per-index if that dim is). `from_output_shape` copies the upstream shape including per-index dims, and an unspecified tie_inputs inherits a ragged source wholesale. The same Fused/Parallel refusal applies to every upstream output a shape reads. The declaring System resolves per-index dims on the host, computes the block offsets, resizes and uploads the device copies like any ragged root; members (unspecified dims) copy the arrays from the root and must be declared RaggedInput / RaggedOutput (`declare_*(w, name, cs::unspecified_shape<R>())` overloads exist for them; a dense wrapper is an error). Ragged wrappers are non-atomic, so a ragged tie_outputs takes `TieOutputsPolicy::allow_plain`. Inside a ChunkedSystem an internal ragged alias root is priced like any internal root, dim 0 is set by the framework, a `per_index` host array is sliced per chunk, and a per-index source computed inside is the "computed inside" error. **Alias sources may also be INPUTS** of the declaring System (a promoted input or a tie_inputs alias, connected from upstream or free): `cs::alias::input_value(path, index)`, `input_values(path, column = 0)`, `input_dim(path, d)` (per-index if that dim is) in `alias::dims`, and the whole-shape `cs::alias::from_input_shape(path)` (ragged-aware). Values and shapes are read from the input's ROOT on the host (snapshot), like the output forms. Ordering: a value a shape rule reads must be known when the alias is accessed, else the read throws there (shapes are reactive, §4.5); the Fused/Parallel refusal covers every source.
 
 `merge(into, from)`: append `from`'s peers and `from` itself to `into`'s
 peer list; set every moved entry's root to `into`. O(|set|); models are
@@ -947,10 +947,10 @@ else the free-input setup error of §3.6); `cs::alias::from_output_shape(path)` 
 upstream output of the alias's rank); `cs::alias::from_output_values(path)`
 (the extents are the VALUES of elements 0..Rank-1 of an upstream output of
 integer dtype, read on the host as FromInput reads a value). The paths are in
-the declaring System's namespace and name an output whose producing
-component is registered BEFORE the tie's first member (checked in resolve();
-FusedSystem and ParallelSystem refuse a source from the same wave, as for
-value-driven sizes). The unconnected alias is the root; the declaring System resolves
+the declaring System's namespace and name an output. If that output has
+not been produced when the tie materializes, the read throws there with the
+reactive message of §4.5 (FusedSystem and ParallelSystem refuse a source from
+the same wave, as for value-driven sizes). The unconnected alias is the root; the declaring System resolves
 the shape when the alias is accessed, before materialization. Once an output is
 connected into the alias it joins that output's root (the producer's port holds
 its storage) and the members take that output's shape; a fixed or
@@ -1765,7 +1765,7 @@ private:
   - `e` is an output peer (only a tied output is one): `root(e)`'s
     placement must equal this placement, else ERROR naming the tie —
     producers cannot write one storage from two placements.
-  - Every root is processed before any peer of it: Systems process their alias entries before their children, and producers precede consumers (models are acyclic).
+  - Every root is processed before any peer of it: Systems process their alias entries before their children, and producers precede consumers in registration order. A cycle is expressible by registration order: without solvers it produces the setup warning of §4.5 and runs with the consumer reading the producer's previous value; solvers are future work.
   - Return `{device: bytes}`.
 - **`prepare_exec`**: capture the queue and substrates, bind the substrates
   to every own root, point the wrapper of every member whose root has
@@ -1786,31 +1786,35 @@ work and never sees a queue except through the owner's ctx.
    carrying a `FromInput` spec, read the driving input's value
    on the host, whichever storage holds it (the
    one forced sync, so this turn's launch geometry is known; integer
-    dtypes only, a negative value throws), allocate the entry's root first if this
-    Component owns it and it is still unallocated, call
+    dtypes only, a negative value throws), materialize the entry's variable first if it
+    is not yet live, call
    `root.resize(shape)`, then `point_wrapper`; no staging
    copy, nothing submitted for the resize, no reallocation inside a
    submitted task (why: §1 need 2.1 shape source · P3 — only value-driven entries pay
    it). Then shape-derived dims, `pre_forward()` hook (per-entry
    override, last write wins), dynamic connection validation, wrapper
    sync (a root that grew was reallocated by its own allocator route).
-    Then REVIVE every root this Component touches (§4.4). Then ALLOCATE every root this
-    Component OWNS (inputs and outputs) that has no storage (§4.4 route; current extents)
-    and, for a free input root, apply its init (zeros when none); a free input whose owner
-    has stopped is allocated and initialized here by the Component that needs it. The stream
-    orders the init before this turn's launch. A root it does not own is only pointed at.
-    A root that already has storage is left alone, so a value-driven resize keeps its
-    content; a pending `Model::init_input` is applied to the existing storage. Specified
-    dims of connected and tied entries are checked against their supplier (§3.6).
+    Then every variable this Component has a port on is MATERIALIZED if it is not yet live
+    (§4.4): the storage of every placement with ports is allocated at once (route and current
+    extents as in §4.4), filled by copying from a live placement when the variable is live
+    elsewhere, and otherwise initialized from its init when it is a free input (zeros when
+    none). The Component's ports share their placement's storage, and it points its wrappers at
+    it. A variable that is already live is left alone, so a value-driven resize keeps its
+    content; a pending `Model::init_input` is applied to the live storage at this variable's
+    next run. The queue orders the init before this turn's launch. A shape that is needed and
+    not yet known throws here, naming the entry, the dimension and what it was waiting on
+    (§4.5). Specified dims of connected and tied entries are checked against their supplier
+    (§3.6).
 2. **`run_compute_forward()`**: `compute_forward()` — returns the
    description. The owner submits it (§7.3).
 3. **`run_post_compute(ctx)`**: through `ctx`, after the owner's
-   submission: for each output root with storage at other placements, for
-   each other placement `copy_d = root` — one assignment resizes to match
-   and copies, routed by SlabKit. Ordered after the work it depends on by
-   the stream (§7.3). Then DECREMENT every root this Component touches
-   (§4.4); the roots that reach 0 are freed behind ONE stream wait
-   (synchronous frees).
+   submission and after the launch's kernel events have been registered on the
+   storage of every port this Component touched (§4.4): the producer push — for each
+   output variable with storage at other placements, for each other placement
+   `copy_d = root` — one assignment resizes to match and copies, routed by SlabKit.
+   Ordered after the work it depends on by the queue and the registered events
+   (§7.3). Nothing is released here: storage goes when the last port holding it is
+   deleted (§4.4).
 
 ### 6.6 Provided kernels — v1
 
@@ -2055,7 +2059,7 @@ public:
     template <DType DT, int Rank> Output<DT, Rank>& get_output(std::string_view path);
     auto get_inputs()  const;   ///< this System's alias entries
     auto get_outputs() const;
-    Subsystem& get_subsystem(std::string_view path);          ///< chains through children
+    Subsystem* get_subsystem(std::string_view path);          ///< dotted path from the top; null if declared but currently deleted, throws if never declared
     std::span<Subsystem* const> children() const;             ///< declaration order = exec order; Model's walks use this and nothing else
 
     // ---- runners (Subsystem verbs) — the DEFAULT orchestration ----------------
@@ -2078,15 +2082,16 @@ protected:
     /// THE DEFAULT LOOP (§7.3).
     std::unique_ptr<LaunchDescription> run_compute_forward() override;
 
-    /// Run policy and lifetime are registration metadata (§4.4). A System
-    /// skips a child whose run_counter() is 0 and decrements a positive counter
-    /// after the child's post; it materializes the aliases it declares just
-    /// before their first participating child. The Components under it revive,
-    /// allocate and decrement their own roots in their own turns (§6.5).
-    /// Subsystem fields: requested_run_, run_explicit_, setup_run_, run_counter_.
+    /// Run policy is registration metadata this System keeps for each child (§4.4):
+    /// the property from add_subsystem, the stored constructor arguments (for the
+    /// rebuild of a transient child and for rearm) and a run counter. This System
+    /// runs each existing child, rebuilds a transient child before its turn, moves
+    /// every counter once per forward and deletes a child whose counter reaches 0.
+    /// The Components under it materialize the variables they access in their own
+    /// turns (§6.5); a System materializes the aliases it declares when it reads them.
 
     ExecCtx ctx_;
-    std::vector<std::unique_ptr<Subsystem>> children_;   ///< declared order = exec order
+    std::vector<std::unique_ptr<Subsystem>> children_;   ///< declared order = exec order; a deleted child keeps its slot (null) and its stored arguments
     std::unordered_map<std::string, std::unique_ptr<detail::IOEntry>> aliases_;
 };
 
@@ -2112,25 +2117,28 @@ run_post_compute`; a child that submitted itself needs no owner action.
 
 ```
 for (child : children_) {
-    if (child->run_counter() == 0) continue;  // exhausted: no pre, compute or post
-    materialize the aliases whose first participating child is this one
-                                              //   (revive, shape, allocate, init, decrement; §4.4)
-    child->run_pre_compute(ctx_);             // a Component revives and allocates its roots here (§6.5)
+    if (child is deleted) continue;           // declared, currently deleted (§4.4)
+    if (child is transient) rebuild it;       // deleted and re-constructed from its stored arguments (§4.4)
+    child->run_pre_compute(ctx_);             // a Component materializes the variables it accesses here (§4.4, §6.5)
     auto d = child->run_compute_forward();
     if (d) d->submit(ctx_.target());          // WE submit, routed on d->is_custom_op() / d->is_host()
+    register the launch's kernel events on the storage of every port the child touched   // §4.4
     child->run_post_compute(ctx_);            // copies AFTER the work they depend on —
-                                              //   by the stream, not by an event; a Component
-                                              //   decrements the roots it touches here (§4.4)
-    if (child->run_counter() > 0) child->decrement_run_counter();
+                                              //   ordered by the queue and the registered events
 }
+for (child : children_)                       // once per forward, after the last child
+    if (child has a counter) { move it; if (it reaches 0) delete child; }   // §4.4
 return nullptr;                               // "I submitted"
 ```
 
 - **Ordering is the stream's, never passed.** Which queue a System submits
   to is the Model's one queue (`ctx.queue`); the ordering contract above
-  is what every submission, host task and copy relies on. No event, wait
-  list or dependency snapshot exists in CoSpan; a child that submitted
-  for itself, or skipped, leaves the owner nothing to refresh.
+  is what every submission, host task and copy relies on. The only events
+  CoSpan keeps are a launch's kernel events, registered on the storage of
+  the ports it touched so that later memory operations and frees are
+  ordered after them (§4.4); no wait list or dependency snapshot passes
+  between items; a child that submitted for itself, or is deleted, leaves
+  the parent nothing to refresh.
 - **Devices are per submission.** Every submission carries its
   `SubmitTarget::device`; the stream keeps its order across devices.
   Nobody creates queues but the Model.
@@ -2162,9 +2170,9 @@ public:
     /// A REALIZED System or Component type, optionally with properties
     /// (device).
     template <class T, class... Args> requires std::derived_from<T, Subsystem>
-    T& add_subsystem(std::string name, Args&&... ctor_args);
+    void add_subsystem(std::string name, Args&&... ctor_args);
     template <class T, class... Args> requires std::derived_from<T, Subsystem>
-    T& add_subsystem(std::string name, const property_list& props, Args&&... ctor_args);
+    void add_subsystem(std::string name, const property_list& props, Args&&... ctor_args);
     /// A child Component to add through the helper form: type, name, ctor args.
     template <class T, class... Args> requires std::derived_from<T, ComponentBase>
     auto child(std::string name, Args&&... ctor_args);
@@ -2174,15 +2182,20 @@ public:
     /// children are Components by construction (child<T> requires
     /// ComponentBase), which is what Parallel and Fused require; a helper-
     /// built plain System takes Components too — nest Systems through the
-    /// templated overload or a class. Returns the System (typed Parallel/
-    /// Fused underneath) for connect/promote by name. Why: §1 need 2.2
+    /// templated overload or a class. Returns nothing: connect/
+    /// promote reach the System (typed Parallel/Fused underneath) by name. Why: §1 need 2.2
     /// inline composition · P2 (placement without editing).
     template <class... Children>
-    System& add_subsystem(std::string name, const property_list& props, Children&&... children);
-    System& add_subsystem(std::string name, const property_list& props = {});   ///< empty; add children by the templated overload inside setup()
-    // add_subsystem constructs the child, registers the name, and runs the
-    // child's run_setup BEFORE returning, so later structural calls in this
-    // same setup() see it fully declared.
+    void add_subsystem(std::string name, const property_list& props, Children&&... children);
+    void add_subsystem(std::string name, const property_list& props = {});   ///< empty; add children by the templated overload inside setup()
+    // add_subsystem stores its constructor arguments (for the rebuild of a
+    // transient child and for rearm), constructs the child, registers the name,
+    // and runs the child's run_setup BEFORE returning, so later structural calls
+    // in this same setup() see it fully declared.
+    /// REARM (§4.4): re-construct the named child from the arguments stored at
+    /// add_subsystem, run its setup, replay this System's connect, promote, tie_*
+    /// and init_input declarations that touch it, and prepare it for execution.
+    void rearm(std::string_view child);
 
     void connect(std::string_view src, std::string_view dst);                 // identity
     void connect(std::string_view src, std::string_view dst, Slice view);   // §8.1: dst sees a rectangular region of src's root
@@ -2223,7 +2236,7 @@ namespace naga::cospan {
 /// with the same constraint FusedSystem uses (a System cannot discern
 /// children at runtime; why: §1 need 2.2 parallel · P5):
 ///   template <class T, class... A> requires std::derived_from<T, ComponentBase>
-///   T& add_subsystem(std::string, A&&...);
+///   void add_subsystem(std::string, A&&...);
 /// (property-list overload with `property::device` only: each child may sit
 /// on its own device; the group is one item of the stream whichever devices
 /// its members target). Nested Parallel is not a concept.
@@ -2254,7 +2267,7 @@ public:
 /// COMPONENTS ONLY — enforced by the type system at the add, since a
 /// System cannot discern children at runtime (why: §1 need 2.2 fuse · P5):
 ///   template <class T, class... A> requires std::derived_from<T, ComponentBase>
-///   T& add_subsystem(std::string, A&&...);
+///   void add_subsystem(std::string, A&&...);
 /// (no property-list overload). The wave has one work-group shape: the
 /// fuse's `wg`, else the stages' common request, else the rank's default.
 /// The wave's rank is its children's.
@@ -2308,10 +2321,10 @@ public:
 class SellarMDA : public System {
 public:
     void setup() override {
-        auto& d1 = add_subsystem<Discipline1>("d1");
-        auto& d2 = add_subsystem<Discipline2>("d2");
+        add_subsystem<Discipline1>("d1");
+        add_subsystem<Discipline2>("d2");
         connect("d1.y1", "d2.y1_in");
-        connect("d2.y2", "d1.y2_in");            // the cycle: needs a solver
+        connect("d2.y2", "d1.y2_in");            // the cycle: the setup warning (§4.5); a solver is future work
         tie_inputs<DType::f64, 1>({"d1.z", "d2.z"}, "z", alias::fixed(2));   // d1.z, d2.z declare unspecified dims
         promote<DType::f64, 1>("d1.y1", "y1");  promote<DType::f64, 1>("d2.y2", "y2");
         init_input("z", init::fill(1.0));        // this level is above d1 and d2: it wins over their defaults
@@ -2320,8 +2333,8 @@ public:
 
 class Top : public System {
     void setup() override {
-        auto& mda = add_subsystem<SellarMDA>("mda", property_list{property::device{gpu0}});
-        auto& obj = add_subsystem<Objective>("obj");
+        add_subsystem<SellarMDA>("mda", property_list{property::device{gpu0}});
+        add_subsystem<Objective>("obj");
         connect("mda.y1", "obj.y1");
         connect("mda.y2", "obj.y2_head", Slice{subarray<1>({0}, {1})});
 
@@ -2344,7 +2357,7 @@ class Top : public System {
 
 **Per forward.** (1) Full-range pass, host only, nothing materialized, no `pre_forward`: the inside peers of outside boundary roots see their whole root (`LeadingRangeAccess::set(0, N)`), and every inside Component runs `resolve_shapes()` (the shape resolution factored out of `run_pre_compute`) in depth-first registration order. (2) N is the common leading length; every inside entry must agree. (3) Pricing: cost[i] = sum over INTERNAL roots of `sizeof(dtype)` times the block size at i (a ragged root's block, or the product of the dims >= 1), from the declared shape rules only. A greedy scan cuts maximal contiguous chunks with sum <= budget; one index over budget is an error naming the index and its bytes; N = 0 runs nothing (re-rooted outputs are allocated empty). `pre_forward` reshapes inside a chunked system are NOT priced (pre_forward is not run for pricing) and should not be done. (4) Re-rooted roots are materialized (and free-input inits applied when the variable is live nowhere). (5) Per chunk [a, b): every inside peer of every boundary root, inputs and the output peers of re-rooted roots, is pointed at [a, b), then the default loop runs the subtree once: children never see a or b; internal roots are kept across the chunks (Lifetimes, below), and the run counters of everything inside move once, after the last chunk. (6) The ranges are cleared and the shapes restored to the full range, so views from the host see whole roots.
 
-**Lifetimes.** Before the first chunk every INTERNAL root is materialized ONCE, with capacity for its largest chunk (the maximum over chunks of the sum of its block sizes). The ports inside hold that storage, so it is kept across the chunks and across forwards for as long as the chunked system exists; nothing is freed at the end of a forward. Per chunk the root is resized to that chunk's size within the capacity (a `usm_vector` resize within its capacity, up or down, never reallocates; growing zero-fills the new tail on the stream), and a ragged root's small device offset / extent copies are rewritten per chunk in the same storage. On the next forward an internal root whose capacity covers the largest chunk is kept, and a smaller one is replaced by a larger allocation. Its initial value applies once, at materialization, like any variable's (§4.4): an internal free input is not re-initialized per chunk. The run counters of everything inside the chunked system move once per forward, after the last chunk; a child that reaches 0 is deleted by its parent then (§4.4), and when the chunked system itself is deleted its parent takes everything inside with it, and the storage goes with the last port. Ordering is as everywhere (§4.4): the kernel events of each chunk are registered on the storage of every port it touched, the queue orders the next chunk's memory operations after them, and a free waits on them itself; there is no queue-wide wait between chunks or at the end. `IOEntry::allocation_count()` (a test hook) counts a root's storage allocations.
+**Lifetimes.** An internal variable holds ONE CHUNK's slice: each chunk is new data in reused memory, so the variable is materialized fresh for every chunk, and an internal FREE INPUT is initialized at the start of every chunk (each chunk is a fresh computation; an init must therefore not depend on the variable's full-run shape). This does not conflict with §4.4's rule that a live variable is never re-initialized: the next chunk's slice is a different piece of data. The memory is reused, not reallocated: before the first chunk every INTERNAL root's storage is allocated ONCE, with capacity for its largest chunk (the maximum over chunks of the sum of its block sizes), and the ports inside hold it, so it is kept across the chunks and across forwards for as long as the chunked system exists; nothing is freed at the end of a forward. Per chunk the root is resized to that chunk's size within the capacity (a `usm_vector` resize within its capacity, up or down, never reallocates; growing zero-fills the new tail on the stream), and a ragged root's small device offset / extent copies are rewritten per chunk in the same storage. On the next forward an internal root whose capacity covers the largest chunk is kept, and a smaller one is replaced by a larger allocation. The run counters of everything inside the chunked system move once per forward, after the last chunk; a child that reaches 0 is deleted by its parent then (§4.4), and when the chunked system itself is deleted its parent takes everything inside with it, and the storage goes with the last port. Ordering is as everywhere (§4.4): the kernel events of each chunk are registered on the storage of every port it touched, the queue orders the next chunk's memory operations after them, and a free waits on them itself; there is no queue-wide wait between chunks or at the end. `IOEntry::allocation_count()` (a test hook) counts a root's storage allocations.
 
 **Opacity.** A chunked system's only interface is its own PROMOTIONS. Inside / outside is decided by where something is DECLARED: everything declared by the chunked system itself or any descendant is inside (its ties, the ties in its own `setup()` included, are internal; its promotions are the boundary ports: promoted inputs are its inputs, each chunk reading its [a, b) slice of whatever is connected or tied outside; promoted outputs are full-size roots written chunk by chunk, still read by their inside consumers as chunk slices); everything declared above it is outside. The single path resolver (`System::entry_at` / `locate`) refuses a path that descends THROUGH a chunked system X into X's children unless X is the caller resolving its own subtree: `'<full path>' lives inside chunked system '<X path>'; only its promotions are visible outside it; promote it to use it here`. This covers connect, tie member paths, alias source paths, promote, init_input, marks and the Model's verbs (a Model resolves from its root as an OUTSIDE caller, via `System::entry_at_from_outside`, so a Model whose root is a chunked system sees its promotions only). A tie declared ABOVE the chunked system whose members are promotions of inside ports with unspecified dims is an outside boundary root: the chunked system evaluates its alias rule (outside sources by construction) before the chunk length and the pass, records the reads as topology dependencies, and its inside members see [a, b). After recording, every dependency of the cache is checked to be an internal root or a boundary root (internal error otherwise). An outside boundary root with an unresolved dimension >= 1 is a setup error.
 
@@ -2800,17 +2813,19 @@ singleton sets; flags by kind; DimRecords); `init_input` records an init
 declaration on one of its own inputs. Zero
 allocation; no device anywhere in this step.
 
-**The resolution pass.** The root's `run_setup` first derives the effective run
-counters top-down (§4.4: the clamp table). Once the root System's `setup()`
-returns, the root runs `resolve()` over the final tree and sets (§4.4). Per
-root it records its OWNER, its PARTNERS (including the declaring System of each
-tie whose shape rule reads it), and its `init` (highest declaring level wins; a tie at
-one depth is an error; an init on an output is an error; an init on a root with a source is
-ignored; none means zeros). It checks the shape-authority setup errors of §3.6. Counts are
-not set here: a root comes into scope when it is first revived. A mark makes a root eternal.
+**The resolution pass.** Once the root System's `setup()` returns, the root runs
+`resolve()` over the final tree and sets (§4.4). Per variable it records its ports and
+its `init` (highest declaring level wins; a tie at one depth is an error; an init on an
+output is an error; an init on a variable with a source is ignored; none means zeros).
+It checks the shape-authority setup errors of §3.6, which are fully declared
+contradictions only (no ordering or cycle analysis for shapes, §4.5), and prints the
+cycle warning of §4.5 for each connection whose consumer runs before its producer.
+Nothing is materialized here, and no run counter is derived: each parent keeps the
+counter of each child from its `add_subsystem` property (§4.4). A mark does not affect
+lifetime.
 
-**State:** final tree and exec order; effective run counters; final sets; marks; each root's
-owner, partners and init; every count 0. No storage.
+**State:** final tree and exec order; each parent's run counters; final sets; marks; each
+variable's ports and init. No storage.
 
 #### 11.2.2 Exec info — `bytes = root.get_exec_info(default_device)`
 
@@ -2834,7 +2849,9 @@ host body); per own entry `e`:
   from two placements.
 
 Every root is processed before any peer of it: alias roots before
-children, producers before consumers (acyclic). A System processes its
+children, producers before consumers in registration order. A cycle is expressible by
+registration order: without solvers it produces the setup warning of §4.5 and runs with
+the consumer reading the producer's previous value; solvers are future work. A System processes its
 own alias entries the same way (a tie alias root registers the System's
 device as primary; a promotion alias is a peer and registers the
 System's device on its root — so `get_output("alias")` from that System
@@ -2903,17 +2920,17 @@ need not wait between them — the stream orders (§7.3).
 
 ```
 for (child : children_) {
-    if (child->run_counter() == 0) continue;  // exhausted: no pre, compute or post
-    materialize the aliases whose first participating child is this one
-                                              //   (revive, shape, allocate, init, decrement; §4.4)
-    child->run_pre_compute(ctx_);             // a Component revives and allocates its roots here (§6.5)
+    if (child is deleted) continue;           // declared, currently deleted (§4.4)
+    if (child is transient) rebuild it;       // deleted and re-constructed from its stored arguments (§4.4)
+    child->run_pre_compute(ctx_);             // a Component materializes the variables it accesses here (§4.4, §6.5)
     auto d = child->run_compute_forward();
     if (d) d->submit(ctx_.target());          // WE submit, routed on d->is_custom_op() / d->is_host()
+    register the launch's kernel events on the storage of every port the child touched   // §4.4
     child->run_post_compute(ctx_);            // copies AFTER the work they depend on —
-                                              //   by the stream, not by an event; a Component
-                                              //   decrements the roots it touches here (§4.4)
-    if (child->run_counter() > 0) child->decrement_run_counter();
+                                              //   ordered by the queue and the registered events
 }
+for (child : children_)                       // once per forward, after the last child
+    if (child has a counter) { move it; if (it reaches 0) delete child; }   // §4.4
 return null
 ```
 
@@ -2936,19 +2953,19 @@ connections between stages, and tied outputs only with
 stamp group and local slices, check the wave's local memory against the
 device's limit, one staging, ONE submission with the sequence config (the
 framework inserts no barriers) → post-compute ALL. **Custom System types** (§10): early-return from
-`run_compute_forward`; the components under an early return neither revive, allocate nor decrement. A System revives, allocates and decrements only the aliases it declares (materialization, §4.4); every other root is revived and decremented by the Components that touch it (§11.3.2).
+`run_compute_forward`; the components under an early return materialize and submit nothing. A System materializes only the aliases it declares, when it reads them (§4.4); every other variable is materialized by the Components that access it (§11.3.2).
 
 #### 11.3.2 A Component's turn (§6.5)
 
-1. `run_pre_compute(ctx)`: shape resolution — value-driven entries first (read the driving input's value on the host, the one forced sync, so the launch geometry is known; `root.resize(shape)`, `point_wrapper`; nothing submitted for the resize, no reallocation inside a submitted task), then shape-derived dims. Then `pre_forward()` → REVIVE every root this Component touches → ALLOCATE every root it OWNS that has no storage and apply its init when it is a free input root (a free input whose owner has stopped is allocated here by the Component that needs it) → constraint checks against suppliers (§3.6) → dynamic validation → wrapper sync (§4.4).
+1. `run_pre_compute(ctx)`: shape resolution — value-driven entries first (read the driving input's value on the host, the one forced sync, so the launch geometry is known; `root.resize(shape)`, `point_wrapper`; nothing submitted for the resize, no reallocation inside a submitted task), then shape-derived dims. Then `pre_forward()` → MATERIALIZE every variable this Component has a port on that is not yet live (its init applied when it is a free input and live nowhere; copied from a live placement otherwise) → constraint checks against suppliers (§3.6) → dynamic validation → wrapper sync (§4.4).
 2. `run_compute_forward()` → `compute_forward()` → description (kernel,
    custom op or host body). The owner submits it.
 3. `run_post_compute(ctx)`: for each output root with storage at other
    placements, for each other placement `copy_d = root` — one assignment
    resizes to match and copies, routed by SlabKit — after the owner's
-   submission, ordered by the stream. Then DECREMENT every root this Component
-   touches (deferred inside a chunked system's loop); the roots whose count reaches 0 are freed
-   behind ONE stream wait.
+   submission and the registration of its kernel events on the storage of every
+   port this Component touched (§4.4), ordered by the queue. Nothing is released
+   here: storage goes when the last port holding it is deleted.
 
 **State:** every output root holds this forward's values; dynamic roots
 sized to this forward; a variable is materialized when first accessed and lives as long as
