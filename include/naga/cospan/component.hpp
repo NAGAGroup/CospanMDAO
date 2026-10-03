@@ -34,6 +34,7 @@
 #include "naga/cospan/init.hpp"
 #include "naga/cospan/kernel.hpp"
 #include "naga/cospan/metadata.hpp"
+#include "naga/cospan/reactive_shape.hpp"
 #include "naga/cospan/subsystem.hpp"
 #include "naga/cospan/wrappers.hpp"
 
@@ -499,6 +500,7 @@ private:
                 if (r.dim >= src.rank())
                     throw std::out_of_range("naga::cospan: '" + std::string{e.name()} +
                                             "' derives from a dimension past the rank of '" + r.input + "'");
+                if (detail::dim_pending(src, r.dim)) throw detail::shape_needed(e.full_path(), "dimension " + std::to_string(d), src);
                 r.extent = src.extents()[r.dim];
                 // a per-index source dimension passes its array on (dim 0 is never per-index).
                 if (d >= 1) {

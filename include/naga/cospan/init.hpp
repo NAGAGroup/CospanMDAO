@@ -38,6 +38,7 @@
 #include "naga/cospan/dtype.hpp"
 #include "naga/cospan/host_view.hpp"
 #include "naga/cospan/metadata.hpp"
+#include "naga/cospan/reactive_shape.hpp"
 #include "naga/cospan/wrappers.hpp"
 
 namespace naga::cospan {
@@ -140,8 +141,7 @@ inline void Variable::materialize(sk::queue& q, Substrates* subs, bool full_rang
     if (subs == nullptr) throw std::logic_error("naga::cospan: '" + who + "' cannot be allocated before setup() completes");
     const bool none_live = !any_live();
     if (none_live && source_port == nullptr && !source_path.empty())
-        throw std::logic_error("naga::cospan: cannot materialize '" + who + "': it is fed by '" + source_path +
-                               "', which does not currently exist (its producer was deleted; rearm it first)");
+        throw shape_needed(who, "its shape and storage", *shadow);
     if (!r.placements_.empty()) {  // the shadow acts at the primary placement (an init writes there)
         r.device_       = r.placements_.front().device;
         r.storage_kind_ = r.placements_.front().kind;

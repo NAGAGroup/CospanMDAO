@@ -10,7 +10,7 @@
 // chunk-pass state.
 //
 // `ensure_storage`: a Component installs one that allocates a root it OWNS before a shape-driving read; a
-// System has none, so the source root must already have storage (else the 'has no storage yet' error).
+// System has none, so the source root must already have storage (else the reactive shape error, reactive_shape.hpp).
 
 #include <algorithm>
 #include <array>
@@ -23,6 +23,7 @@
 
 #include "naga/cospan/dtype.hpp"
 #include "naga/cospan/metadata.hpp"
+#include "naga/cospan/reactive_shape.hpp"
 
 namespace naga::cospan::detail {
 
@@ -104,6 +105,7 @@ public:
         }
         const detail::IOEntry& up = *src.shadow();  // the source's Variable: its shadow carries the adopted shape
         note_shape_dep(up.root());  // a SHAPE dependency of the topology cache
+        if (dim_pending(up, d)) throw shape_needed(a.full_path(), "dimension " + std::to_string(d), up);
         if (up.dim_is_per(d)) {
             if (to == 0)
                 throw std::invalid_argument("naga::cospan: a per-index dimension of '" + up.full_path() +
@@ -117,7 +119,7 @@ public:
     }
 
     /// What the alias's AliasShape gives right now. Every upstream output it reads is a producer that has
-    /// already run (checked at setup: it is earlier in registration order); the value reads happen on the
+    /// already run (not checked at setup: a read before it has run is the reactive shape error); the value reads happen on the
     /// host from a snapshot, as FromInputValues does.
     AliasEval alias_eval(const detail::IOEntry& a) {
         const IOEntry*    holder = a.shape_holder();  // the tie alias port (a may be its shadow)
@@ -246,6 +248,17 @@ public:
         reset();
     }
 
+    /// Part (a) of a reactive shape error: the entry being resolved (a port or a tie alias), else the source itself.
+    std::string needer(const detail::IOEntry& src) const {
+        return resolving_ != nullptr ? resolving_->full_path() : src.full_path();
+    }
+    /// A value is needed from a variable that has a producer and no data anywhere: that producer has not run (or is
+    /// gone), so the shape cannot be known now. A free input is materialized on need instead (ensure_storage).
+    void require_data(detail::IOEntry& src, const std::string& what) const {
+        const detail::Variable& v = src.variable();
+        if (!v.any_live() && has_producer(v)) throw shape_needed(needer(src), what, src);
+    }
+
     /// The VALUES of an integer-dtype input of rank 1 [N] (column 0) or rank 2 [N, k] (column < k),
     /// on the host: one per row (FromInputValues). Negative values are an error.
     std::vector<std::size_t> read_values(detail::IOEntry& src, std::size_t column) {
@@ -261,10 +274,9 @@ public:
         if (column >= k)
             throw std::out_of_range("naga::cospan: '" + std::string{src.name()} + "' has no column " +
                                     std::to_string(column));
+        require_data(src, "the per-index extents by value (column " + std::to_string(column) + ")");
         ensure_storage(*src.root());
-        if (!src.root()->has_storage())
-            throw std::logic_error("naga::cospan: '" + std::string{src.name()} +
-                                   "' drives per-index extents by value but has no storage yet");
+        if (!src.root()->has_storage()) throw shape_needed(needer(src), "the per-index extents by value (column " + std::to_string(column) + ")", src);
         std::vector<std::size_t> out(src.extents()[0]);
         detail::dispatch_dtype(src.dtype(), [&](auto tag) {
             using T = typename decltype(tag)::type;
@@ -317,10 +329,9 @@ public:
         if (!detail::is_integer_dtype(src.dtype()))
             throw std::invalid_argument("naga::cospan: '" + std::string{src.name()} +
                                         "' drives a shape by value and must have an integer dtype");
+        require_data(src, "the value of element " + std::to_string(index));
         ensure_storage(*src.root());  // a Component allocates the roots it owns; a System needs them present
-        if (!src.root()->has_storage())
-            throw std::logic_error("naga::cospan: '" + std::string{src.name()} +
-                                   "' drives a shape by value but has no storage yet");
+        if (!src.root()->has_storage()) throw shape_needed(needer(src), "the value of element " + std::to_string(index), src);
         std::size_t out = 0;
         detail::dispatch_dtype(src.dtype(), [&](auto tag) {
             using T = typename decltype(tag)::type;

@@ -60,6 +60,7 @@
 #include <utility>
 #include <vector>
 
+#include "naga/cospan/reactive_shape.hpp"
 #include "naga/cospan/system.hpp"
 
 namespace naga::cospan {
@@ -624,9 +625,7 @@ private:
                 for (int d = 1; d < b.root->rank(); ++d)
                     if (!b.root->dim_is_per(d) && b.root->extents()[static_cast<std::size_t>(d)] == 0 &&
                         b.root->dim(d).how != detail::DimRecord::How::fixed)
-                        throw std::invalid_argument("naga::cospan: " + describe() + ": the boundary root '" + b.root->full_path() +
-                                                    "' has an unresolved dimension " + std::to_string(d) +
-                                                    " (its producer must run before this chunked system and resolve it)");
+                        throw detail::shape_needed(path(), "dimension " + std::to_string(d), *b.root);
             } else if (b.root->kind() == IOKind::input && b.member->dim(0).how == detail::DimRecord::How::fixed) {
                 l = b.member->dim(0).extent;
             } else if (b.root->kind() == IOKind::input && b.member->dim(0).how == detail::DimRecord::How::unspecified &&

@@ -2061,6 +2061,29 @@ TEST_CASE("alias: views of an alias before its root's owner has run throw", "[sy
     CHECK(model.view_input<DType::f32, 1>("a.x").shape()[0] == tsys::kLen);
 }
 
+TEST_CASE("reactive shapes: a Component sized by a value of a producer that has not run fails at the forward, naming three parts",
+          "[system][errors][reactive]") {
+    // v is registered BEFORE nb, but v.n is connected to nb.n: v.b's size is the value of v.n, which nb has not produced yet.
+    auto model = tsys2::make([](cs::System& s) {
+        s.add_subsystem<tsys2::VBins>("v");
+        s.add_subsystem<tsys2::NCopy>("nb");
+        s.connect("nb.n", "v.n");
+    });
+    model.setup();  // nothing is checked against registration order
+    std::string what = "<no exception>";
+    try {
+        model.forward();
+    } catch (const std::exception& e) {
+        what = e.what();
+    }
+    model.wait();
+    INFO("thrown: " << what);
+    CHECK(what.find("shape not known yet") != std::string::npos);
+    CHECK(what.find("'v.b' needs the value of element 0") != std::string::npos);  // (a) what, (b) which
+    CHECK(what.find("of 'v.n'") != std::string::npos);                             // (c) the variable
+    CHECK(what.find("fed by 'nb.n', which has not run yet in this forward") != std::string::npos);  // (c) its producer
+}
+
 TEST_CASE("alias: tie errors", "[system][alias][errors]") {
     const auto setup_throws = [](std::function<void(cs::System&)> build, const std::string& needle) {
         tsys::expect_throws(
@@ -2135,23 +2158,40 @@ TEST_CASE("alias: tie errors", "[system][alias][errors]") {
             },
             "nothing supplies it");
     }
+    // Shapes are reactive (r01 4.5): a tie whose shape reads a producer registered AFTER its members is not a setup
+    // error. It fails at the forward, when the tie materializes before that producer has run, naming (a) the tie
+    // alias, (b) the dimension and (c) the variable by port path and its producer, which has not run yet.
+    const auto forward_throws = [](std::function<void(cs::System&)> build, const std::vector<std::string>& parts) {
+        auto model = tsys2::make(build);
+        model.setup();  // no registration-order error
+        std::string what = "<no exception>";
+        try {
+            model.forward();
+        } catch (const std::exception& e) {
+            what = e.what();
+        }
+        model.wait();
+        INFO("thrown: " << what);
+        for (const std::string& p : parts) CHECK(what.find(p) != std::string::npos);
+    };
     SECTION("from_output_values names a later-registered producer") {
-        setup_throws(
+        forward_throws(
             [&](cs::System& s) {
                 two_scales(s);
                 s.add_subsystem<tsys2::NCopy>("nb");  // registered AFTER the tie's members
                 s.tie_inputs<DType::f32, 1>({"a.x", "b.x"}, "t", cs::alias::from_output_values("nb.n"));
             },
-            "not registered before");
+            {"shape not known yet", "'t' needs the value of element 0", "of 'nb.n'", "fed by 'nb.n'",
+             "has not run yet in this forward"});
     }
     SECTION("from_output_shape names a later-registered producer") {
-        setup_throws(
+        forward_throws(
             [&](cs::System& s) {
                 two_scales(s);
                 s.add_subsystem<tsys2::VBins>("v");
                 s.tie_inputs<DType::f32, 1>({"a.x", "b.x"}, "t", cs::alias::from_output_shape("v.b"));
             },
-            "not registered before");
+            {"shape not known yet", "'t' needs dimension 0", "of 'v.b'", "fed by 'v.b'", "has not run yet in this forward"});
     }
     SECTION("an alias shape source that is not an output") {
         setup_throws(
@@ -2401,10 +2441,19 @@ TEST_CASE("lifetime: a do_once producer with a transient reader fails on run 2, 
     model.forward();  // run 1: both run, the root is freed after them
     model.wait();
     CHECK(model.get_subsystem("p") == nullptr);
-    const auto again = [&] { model.forward(); };
     // the transient reader is rebuilt, its variable is live nowhere and its producer no longer exists
-    tsys::expect_throws(again, "which does not currently exist");
+    std::string what = "<no exception>";
+    try {
+        model.forward();
+    } catch (const std::exception& e) {
+        what = e.what();
+    }
     model.wait();
+    INFO("thrown: " << what);
+    CHECK(what.find("shape not known yet") != std::string::npos);
+    CHECK(what.find("'t.x' needs its shape and storage") != std::string::npos);  // (a) what needed it, (b) what it needed
+    CHECK(what.find("of 't.x'") != std::string::npos);                          // (c) the variable, by port path
+    CHECK(what.find("fed by 'p.y', which does not currently exist") != std::string::npos);  // (c) its producer
 }
 
 TEST_CASE("lifetime: a tie_outputs root under a transient System is freed every run, values right", "[system][lifetime]") {

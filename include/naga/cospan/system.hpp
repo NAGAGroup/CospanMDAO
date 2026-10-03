@@ -1431,7 +1431,7 @@ private:
 
     /// An untied output with an unspecified dim, a free input with one and no initializer shape, and an
     /// unspecified tie_inputs root nothing supplies are setup errors; a
-    /// from_output_* alias reads an output whose producer runs BEFORE the tie's first member.
+    /// from_output_* alias reads an output some component produces (when it runs is reactive, not checked here).
     void check_ties(const std::vector<ComponentBase*>& comps) {
         for (ComponentBase* c : comps)
             for (detail::IOEntry* e : c->order_) {
@@ -1478,44 +1478,18 @@ private:
                 s.kind != AliasShape::Kind::dims && s.kind != AliasShape::Kind::from_input_shape)
                 continue;
 
-            // The tie's owner: the first member to run (members seen through their promotions).
-            std::size_t      first = comps.size();
-            std::string      first_path;
-            for (const AliasSrc& ms : a->tie_members_) {
-                const detail::IOEntry* m = ms.live_port();
-                while (m->mirror_of_ != nullptr) m = m->mirror_of_;
-                const auto it = index.find(m->declarer());
-                if (it != index.end() && it->second < first) {
-                    first      = it->second;
-                    first_path = m->declarer()->path();
-                }
-            }
-            // The producer of EACH upstream output the shape reads: the LAST component writing its root.
+            // Every upstream output the shape reads must have a component that produces it. WHEN that producer runs is
+            // not checked here: shapes are reactive (r01 4.5), and a tie that materializes before its producer has run
+            // fails at the forward with the shape-not-known error (reactive_shape.hpp).
             for (const auto& [src_path, up] : a->alias_sources()) {
-                const detail::IOEntry* root     = up->root();
-                bool                   found    = false;
-                std::size_t            producer = 0;
-                std::string            producer_path;
-                const auto             consider = [&](const detail::IOEntry* x) {
-                    if (x->kind() != IOKind::output) return;
-                    const auto it = index.find(x->declarer());
-                    if (it == index.end()) return;
-                    if (!found || it->second > producer) {
-                        producer      = it->second;
-                        producer_path = x->declarer()->path();
-                    }
-                    found = true;
-                };
-                for (const detail::IOEntry* p : root->peers()) consider(p);
+                const detail::IOEntry* root  = up->root();
+                bool                   found = false;
+                for (const detail::IOEntry* p : root->peers())
+                    if (p->kind() == IOKind::output && index.contains(p->declarer())) found = true;
                 if (!found && up->kind() == IOKind::input) continue;  // a free input: materialized on need, whoever touches it first
                 if (!found)
                     throw std::invalid_argument("naga::cospan: tie alias '" + a->full_path() + "' takes its shape from '" +
                                                 std::string{src_path} + "', which no component produces");
-                if (producer >= first)
-                    throw std::invalid_argument("naga::cospan: tie alias '" + a->full_path() + "' takes its shape from '" +
-                                                std::string{src_path} + "', produced by '" + producer_path +
-                                                "', which is not registered before the tie's first member ('" + first_path +
-                                                "'); the shape is read before the members run");
             }
         }
     }

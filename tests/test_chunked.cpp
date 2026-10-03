@@ -803,8 +803,11 @@ TEST_CASE("Chunked: errors", "[chunked][errors]") {
         }
         INFO("thrown: " << what);
         CHECK(what != "<no exception>");
-        CHECK(what.find("unresolved dimension 1") != std::string::npos);
-        CHECK(what.find("late.x") != std::string::npos);
+        CHECK(what.find("shape not known yet") != std::string::npos);
+        CHECK(what.find("needs dimension 1") != std::string::npos);  // (b) which dimension
+        CHECK(what.find("late.x") != std::string::npos);             // (c) the variable, by a port path
+        const bool says_why = what.find("has not run yet in this forward") != std::string::npos || what.find("no producer") != std::string::npos;
+        CHECK(says_why);  // the producer: not run yet, or none
     }
     SECTION("one index over budget") {
         cs::Model m = cs::create_model<tch::DenseTop<tch::InnerChunk>>(default_config(), std::size_t{10}, std::size_t{8});
