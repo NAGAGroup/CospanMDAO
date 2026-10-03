@@ -45,9 +45,10 @@ Topics learned while building the light-transport forcing case (2026-09-30). Eac
 - [ ] Namespaces, promotions and ties: subsystems get their own namespaces; Systems declare no I/O of their own; promote exposes one entry as a public alias (optional, only for what matters outside); ties are how inputs or outputs share a root; connect makes data links; names at one level are unique.
 - [ ] Registration order is execution order: add children in dataflow order.
 - [ ] Value-driven sizes: a size computed by an earlier sibling in the same forward drives a later sibling's shape (count → scan → fill); not inside Fused or Parallel systems.
-- [ ] Transient subsystems: transientness is registration metadata (the highest level wins); a root is released after its last user; durability comes from any non-transient user or a promotion at a non-transient level.
-- [ ] RunNSystem: do-once is n = 1; combined with transient for setup-time construction.
-- [ ] Initialization as metadata: init_input on free inputs, the highest level wins, ignored when the input is connected, zero by default.
+- [ ] Run policy as a property of add_subsystem: eternal (the default), run_n, do_once, or transient (it exists for one forward of its parent: built at the start, deleted at the end). A variable lives while something that uses it exists. rearm(name) on the parent rebuilds a child.
+- [ ] Rearm: the parent rebuilds a child by name; its wiring is replayed.
+- [ ] Initialization as metadata: init_input on free inputs, the highest level wins, ignored when the input is connected, zero by default; applied only when the variable is materialized; Model::init_input applies at the next run.
+- [ ] Cycles: expressed by registration order; they warn at setup until solvers exist.
 - [ ] Packaging a CoSpan consumer with pixi: depend on cospanmdao as a host AND run dependency (SlabKit's shared library comes with it).
 
 ## Later, wanted
@@ -62,15 +63,16 @@ Topics learned while building the light-transport forcing case (2026-09-30). Eac
 - [ ] README.md rewrite (it still describes the first-pass framework).
 - [x] Tests from the first code commit.
 - [ ] Clean up tests/smoke and tests/spike: standalone, unbuilt, and stale after D138 (they use init() hooks, initializers, EntryAccess/RootDriver). Fold anything still worth checking into the Catch2 suite, then remove them (Jack decides at cleanup time).
+- [ ] Internal naming: the code still calls a variable's storage record 'root' or 'shadow' (IOEntry::root_, is_root). Rename to variable terms in a dedicated pass.
 
 ## After the 2026-10-01 checkpoint (D140 rework)
 
 Found while porting LRPIM onto opaque chunked systems (C2b to C2e) and measuring it. Notes dated 2026-10-01.
 
-- [x] Hold internal roots across forwards when the topology is unchanged. Why: removes the one release wait per chunked forward. Done: D141 (eternal internal roots are kept across forwards; the full pass no longer resizes them).
-- [ ] D135's one stream wait per releasing component in plain systems. Why: pipeline stalls outside chunked systems. State: reduced by D141 to one wait per freed batch (none when nothing is freed); a wait-free release remains open.
-- [ ] Registration-order diagnostics that name the offending registration. Why: today's errors say what is wrong, not which registration caused it.
-- [x] Audit of alias kinds and declaration forms for overlap. Done: D142 (FromSourceDim, cs::tied and alias::from_connection collapse into unspecified dims). Why: several forms now express nearly the same sharing; one should be canonical.
+- [x] Hold internal roots across forwards when the topology is unchanged. Why: removes the one release wait per chunked forward. Done: chunked internal variables are kept across chunks and forwards while the chunked system exists; D141 is superseded by D143.
+- [x] D135's one stream wait per releasing component in plain systems. Why: pipeline stalls outside chunked systems. Superseded by D143: frees are ordered by events registered on the storage (SlabKit 572b581); no queue waits.
+- [x] Registration-order diagnostics that name the offending registration. Done (D143): shape errors are reactive and name the needer, the dimension and what it waited on; a connection that forms a cycle warns at setup.
+- [x] Audit of alias kinds and declaration forms for overlap. Done: D142 (FromSourceDim, cs::tied and alias::from_connection collapse into unspecified dims), and variables and ports under D143. Why: several forms now express nearly the same sharing; one should be canonical.
 - [ ] Ragged ports in FusedSystem and ParallelSystem. Why: ragged data is limited to plain systems and chunked systems.
 - [ ] Device-side scan for extents known only on the device. Why: value-driven sizes currently need a host read.
 - [ ] SlabKit `from_host` without the `async_host` keep-alive task (a general fix). Why: host tasks fence the stream.
@@ -87,10 +89,10 @@ CoSpan's differentiator is orchestration on top of AdaptiveCpp's JIT and fusion.
 - [ ] SlabKit queue: one queue, one mental model. In-order items (single kernels, single host items, parallel task graphs) form the backbone. A parallel task graph's members run concurrently and may themselves be task graphs of sequential and parallel steps (nesting). Why: users shouldn't manage several streams with different ordering guarantees.
 - [ ] SlabKit out-of-order lane: async_host is fully asynchronous again (unordered except by the events passed in; async_host_in_order is the ordered form), and the lane also takes device (non-host) work. In-order items accept extra event dependencies, and the global wait covers the lane. Why: the primitive for the push hooks below.
 - [ ] SlabKit: remove the async_host keep-alive task in from_host. Why: it puts a host callback in the stream only to keep a buffer alive.
-- [ ] usm_vector operations (assignment, move, copy, resize, from_host) accept dependent events. Why: containers take part in the event graph instead of forcing waits.
+- [x] usm_vector operations (assignment, move, copy, resize, from_host) accept dependent events. Done: SlabKit 572b581 (register_events and event-taking mutations).
 - [ ] Push pattern: consumer-side work is registered on a root at setup (cross-device copies for connections, initializers, a device-side scan for chunked topology) and is submitted from the producer's event as soon as the producer is submitted. Why: that work finishes long before the consumer is reached.
 - [ ] Remove ParallelSystem: independent sibling subsystems (including whole Systems) are detected and submitted as a parallel task graph. FusedSystem stays as the one special flavor (components only, sequential and parallel waves). Why: concurrency follows from the dependency graph, not from a user-chosen flavor.
-- [x] Lifetime is scope: eternal by default; do-once / do-N (transient) subsystems are the special cases, and when one goes out of scope everything it produced that nothing downstream uses is freed. Frees stay synchronous on the main loop and should be rare. Reviving re-creates memory; if that happens often the modeler makes the subsystem eternal. Why: free timing must be deterministic, and the memory/compute trade-off is the modeler's decision.
+- [x] Lifetime is scope: shared ownership of variables (a variable lives while some port that uses it exists); parents own their children, delete them when their run policy ends, and rebuild them by name (D143).
 - [ ] Visibility for those trade-offs: a user-facing per-forward report of allocations, frees and waits per subsystem (from memory_report and the diag counters). Why: the modeler can only choose scopes from a profile.
 - [ ] Design guidance to document: prefer shapes inherited from connections, keep connected components on one device, and treat repeatedly resizing value-driven shapes as a cost. Why: these avoid reallocation churn.
 - [ ] Ergonomics pass over model building (declaration forms, aliases, task-graph construction). Why: the demo has to look as good to write as it runs.
