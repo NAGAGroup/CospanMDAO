@@ -20,6 +20,7 @@
 #include <functional>
 #include <initializer_list>
 #include <iostream>
+#include <set>
 #include <memory>
 #include <optional>
 #include <span>
@@ -679,6 +680,7 @@ public:
         for (const Decl& d : decls_)
             if (std::find(d.refs.begin(), d.refs.end(), slots_[i].name) != d.refs.end()) d.replay(*this, i);
         refresh_inits(*children_[i]);
+        warn_cycles(children_[i].get());  // connections touching the rebuilt child (a pair already reported is not repeated)
         // setup's end-of-setup pass (the root's resolve) never ran for this subtree: classify its chunked systems and
         // order its tie aliases' materialization now, after the replay has joined its ports to the outside variables
         if (auto* sub = dynamic_cast<System*>(children_[i].get())) {
@@ -704,8 +706,39 @@ public:
         collect_components(comps);
         for (detail::IOEntry* r : roots) resolve_init(*r);
         check_ties(comps);  // entries with unspecified dims are tied or supplied; alias shape sources are ordered
+        warn_cycles();
         build_materialize_slots();
     }
+
+    /// THE SETUP CYCLE WARNING (r01 4.5, 11.2.1). A connection whose consumer Component comes BEFORE its producer
+    /// Component in depth-first registration (execution) order is a cycle: without a solver the consumer sees the
+    /// producer's previous value (its initial state on the first forward). One line on std::cerr per such
+    /// (consumer port, producer port) pair, never an error. Promotions and ties count through their ports: the pair is
+    /// the Component port that reads and the Component port that writes the same variable. `touching`: after a
+    /// rebuild, only the connections that involve that child. A pair already reported is not repeated.
+    void warn_cycles(const Subsystem* touching = nullptr) {
+        System&                     root = root_system();
+        std::vector<ComponentBase*> comps;
+        root.collect_components(comps);
+        std::unordered_map<const Subsystem*, std::size_t> pos;
+        for (std::size_t i = 0; i < comps.size(); ++i) pos.emplace(comps[i], i);
+        for (ComponentBase* cc : comps)
+            for (detail::IOEntry* in : cc->order_) {
+                if (in->kind() != IOKind::input) continue;
+                for (const detail::IOEntry* out : in->variable().ports) {
+                    if (out->kind() != IOKind::output) continue;
+                    const auto it = pos.find(out->declarer());  // an alias port (declared by a System) writes nothing
+                    if (it == pos.end() || it->second <= pos.at(cc)) continue;  // not a Component, or not a cycle
+                    if (touching != nullptr && !under(*in, touching) && !under(*out, touching)) continue;
+                    const std::string line = "'" + in->full_path() + "' reads '" + out->full_path() + "'";
+                    if (!root.warned_cycles_.insert(line).second) continue;
+                    std::cerr << "naga::cospan: warning: " << line
+                              << ", which runs after it: this is a cycle; without a solver the consumer sees the producer's "
+                                 "previous value (or its initial state on the first forward)\n";
+                }
+            }
+    }
+    std::set<std::string> warned_cycles_;  ///< the cycle warnings already printed (kept on the root)
 
 protected:
     /// called on every System of the tree (children first) at the start of resolve(); a

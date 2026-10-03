@@ -2084,6 +2084,58 @@ TEST_CASE("reactive shapes: a Component sized by a value of a producer that has 
     CHECK(what.find("fed by 'nb.n', which has not run yet in this forward") != std::string::npos);  // (c) its producer
 }
 
+/// std::cerr captured for the lifetime of the object (rdbuf swap).
+struct CerrCapture {
+    std::ostringstream buf;
+    std::streambuf*    old;
+    CerrCapture() : old{std::cerr.rdbuf(buf.rdbuf())} {}
+    ~CerrCapture() { std::cerr.rdbuf(old); }
+    std::string str() const { return buf.str(); }
+};
+
+TEST_CASE("cycle warning: a consumer registered before its producer warns once, naming both ports, and still runs",
+          "[system][cycle]") {
+    std::string text;
+    {
+        CerrCapture cap;
+        cs::Model   model = tsys2::make([](cs::System& s) {
+            s.add_subsystem<tsys::Axpb>("a", 2.0f, 0.0f);          // reads b.y, registered before b
+            s.add_subsystem<tsys::Axpb>("b", 1.0f, 0.0f, 3.0f);    // b.y = 3
+            s.connect("b.y", "a.x");
+        });
+        model.setup();
+        const std::size_t after_setup = cap.str().size();
+        CHECK_NOTHROW(model.forward());
+        model.forward();  // the consumer now sees the producer's previous value
+        model.wait();
+        CHECK(to_vector(model.view_output<DType::f32, 1>("b.y")) == tsys::filled(3.0f));
+        CHECK(to_vector(model.view_output<DType::f32, 1>("a.y")) == tsys::filled(6.0f));  // 2 * 3, one forward late
+        text = cap.str();
+        CHECK(text.find("naga::cospan: warning") < after_setup);  // printed at setup, not at the forwards
+    }
+    INFO("cerr: " << text);
+    const std::string line =
+        "naga::cospan: warning: 'a.x' reads 'b.y', which runs after it: this is a cycle; without a solver the consumer sees "
+        "the producer's previous value (or its initial state on the first forward)\n";
+    CHECK(text.find(line) != std::string::npos);
+    CHECK(text.find(line) == text.rfind(line));  // one line for the one connection
+}
+
+TEST_CASE("cycle warning: a correctly ordered model prints nothing", "[system][cycle]") {
+    CerrCapture cap;
+    cs::Model   model = tsys2::make([](cs::System& s) {
+        s.add_subsystem<tsys::Axpb>("b", 1.0f, 0.0f, 3.0f);
+        s.add_subsystem<tsys::Axpb>("a", 2.0f, 0.0f);
+        s.connect("b.y", "a.x");
+    });
+    model.setup();
+    model.forward();
+    model.wait();
+    CHECK(to_vector(model.view_output<DType::f32, 1>("a.y")) == tsys::filled(6.0f));
+    CHECK(cap.str().find("naga::cospan: warning") == std::string::npos);  // (the runtime's own warnings share std::cerr)
+    CHECK(cap.str().find("this is a cycle") == std::string::npos);
+}
+
 TEST_CASE("alias: tie errors", "[system][alias][errors]") {
     const auto setup_throws = [](std::function<void(cs::System&)> build, const std::string& needle) {
         tsys::expect_throws(
