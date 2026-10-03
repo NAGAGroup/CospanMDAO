@@ -395,11 +395,8 @@ public:
     std::optional<AliasShape> alias_shape;  ///< a tie's shape rule
     ResolvedShape             shape;
 
-    /// The initializer, and what the highest-level-wins rule needs to decide (in the calls that declare it,
-    /// a later phase): the depth of the declaring subsystem and its path.
+    /// The initializer: the last declaration wins (section 2), so it is simply replaced by each declaration.
     std::optional<InitSpec> init;
-    std::size_t             init_depth = 0;
-    std::string             init_by;
     /// Where the initialization runs (set by tie_inputs): else the device with the most instances.
     std::optional<sycl::device> init_device;
 

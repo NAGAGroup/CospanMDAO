@@ -7,7 +7,8 @@
 // An initializer is METADATA on a variable (docs/design-review-2026-10-03.md, sections 1, 5 and 6): it is
 // declared during setup() with ComponentBase::init_input(name, init) or System::init_input(path, init), and
 // replaced at run time by Model::update_input(path, init), which also marks the variable stale. Which
-// declaration wins is decided in the declaring call (highest level wins; two at one level is an error).
+// declaration wins is simple: the LAST one (a parent's setup runs after its children's, so a tie's, promotion's or
+// System's initializer replaces the members'; no conflict error).
 // materialize (variable.hpp) runs the initializer when the variable is stale: on a variable that is not
 // materialized, at its allocation; on a live one, in place. Outputs are never initialized.
 //
@@ -113,16 +114,6 @@ struct HostInitAccess {
         return HostInit<DT, Rank>{s};
     }
 };
-
-/// Depth of a subsystem in the tree: the root System is 0, its children 1, and so on.
-/// The declaring subsystem's depth decides which initial value wins (smallest depth).
-inline std::size_t depth_of(const Subsystem& s) {
-    if (s.path().empty()) return 0;
-    std::size_t d = 1;
-    for (const char c : s.path())
-        if (c == '.') ++d;
-    return d;
-}
 
 }  // namespace detail
 

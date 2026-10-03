@@ -190,13 +190,13 @@ public:
 
     // ---- initial values (legal inside setup() only) -----------------------
     /// Declare the initial value of one of this Component's OWN inputs, by name. Metadata on the input's variable
-    /// (section 1); the declaration of the highest level wins (decided in this call), it is ignored when the input
-    /// ends up with a source, and it is an error to name an output.
+    /// (section 1); the last declaration wins (a parent's setup runs after its children's, section 2), it is ignored when
+    /// the input ends up with a source, and it is an error to name an output.
     void init_input(std::string_view name, InitSpec init) {
         if (!declaring_)
             throw std::logic_error("naga::cospan: init_input is legal inside setup() only (" + describe() + ")");
         const std::shared_ptr<detail::Instance> inst = find_kind(name, IOKind::input);  // an output throws
-        detail::declare_init(detail::WiringSite{describe()}, inst, std::move(init), detail::depth_of(*this), path());
+        detail::declare_init(detail::WiringSite{describe()}, inst, std::move(init));
     }
 
     // ---- Subsystem verbs ---------------------------------------------------

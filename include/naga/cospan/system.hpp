@@ -250,19 +250,16 @@ public:
 
     // ---- initial values (legal inside setup() only) -----------------------------
     /// Declares the initial value of a free input's variable: `path` is a child input path or one of this System's
-    /// promoted or tied input aliases. The declaration is at THIS System's depth: it wins over any declaration below
-    /// it and loses to any above it; two at one depth from different declarers are an error, decided here. It is
-    /// ignored when the input ends up with a source, and naming an output throws.
+    /// promoted or tied input aliases. The last declaration wins: this System's setup runs after its children's, so it
+    /// replaces theirs (and a tie's or promotion's own). It is ignored when the input ends up with a source, and
+    /// naming an output throws.
     void init_input(std::string_view target, InitSpec init) {
         require_declaring("init_input");
-        const auto        inst  = instance_at(target);
-        const std::size_t depth = detail::depth_of(*this);
-        detail::declare_init(site(), inst, init, depth, path());
+        const auto        inst = instance_at(target);
+        detail::declare_init(site(), inst, init);
         const std::size_t k = decls_.size();
         record({first_seg(target)},
-               [k, t = std::string{target}, init, depth, by = path()](System& sys, std::size_t) {
-                   sys.replay_init(k, t, init, depth, by);
-               },
+               [k, t = std::string{target}, init](System& sys, std::size_t) { sys.replay_init(k, t, init); },
                inst->meta);
     }
 
@@ -778,9 +775,9 @@ private:
         decls_[k].var = alias->meta;
     }
 
-    void replay_init(std::size_t k, const std::string& target, const InitSpec& init, std::size_t depth, const std::string& by) {
+    void replay_init(std::size_t k, const std::string& target, const InitSpec& init) {
         const auto inst = instance_at(target);
-        detail::declare_init(site(), inst, init, depth, by);  // an equal depth from the same declarer replaces
+        detail::declare_init(site(), inst, init);  // replayed in declaration order: the last one wins again
         decls_[k].var = inst->meta;
     }
 

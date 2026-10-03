@@ -12,7 +12,7 @@
 //                 tie_outputs (atomic writers accumulate behind a declared depends_on; plain throws unless allow_plain)
 //   marks         design vars / constraints / objective recorded with their paths and bounds; the last mark of a kind
 //                 replaces; the ill-formed ones throw
-//   init          init_input metadata: the highest level wins; Model::update_input on an eternal free input between forwards
+//   init          init_input metadata: the last declaration wins; Model::update_input on an eternal free input between forwards
 //   transient     run policy: deleted after its turn, kept outputs, transient Components, promotion, nesting, a free input
 //                 re-initialized each forward, back-to-back forwards
 //   run-N         n runs; transient subtree allocated/initialized per run
@@ -509,9 +509,9 @@ public:
     }
 };
 
-// ---- init: the highest level wins -----------------------------------------------------------
+// ---- init: the last declaration wins -----------------------------------------------------------
 constexpr float kD1Init = 99.0f;   // c1's own init: overridden
-constexpr float kSysInit = 1.5f;   // the owner System's init_input: depth 1 beats depth 2
+constexpr float kSysInit = 1.5f;   // the owner System's init_input: declared after its children's setup, so it wins
 
 class InnerB : public cs::System {
 public:
@@ -804,7 +804,7 @@ public:
     }
 };
 
-/// Two tied members, only `a` with an init of its own (100); the tie declares x = 3 one level up, which wins (depth 0 < 1).
+/// Two tied members, only `a` with an init of its own (100); the tie declares x = 3 afterwards, which is the last declaration and wins.
 class TieInit : public cs::System {
 public:
     void setup() override {
@@ -815,13 +815,18 @@ public:
     }
 };
 
-/// Both tied members carry an init of their own (100, 200), at the same depth: the error is decided in tie_inputs.
+/// Both tied members carry an init of their own (100, 200). With `tie_level`, the System also declares x = 7 after the tie
+/// (the last declaration: it wins); without it the later merged member (b, 200) wins. The last declaration wins, section 2.
 class TieInitTwo : public cs::System {
+    bool tie_level_;
+
 public:
+    explicit TieInitTwo(bool tie_level) : tie_level_{tie_level} {}
     void setup() override {
         add_subsystem(cs::subsystem_desc<Axpb>("a", tied_x, 2.0f, 0.0f, 100.0f));
         add_subsystem(cs::subsystem_desc<Axpb>("b", tied_x, 3.0f, 0.0f, 200.0f));
         tie_inputs<DType::f32, 1>({"a.x", "b.x"}, "x", cs::alias::fixed(kLen));
+        if (tie_level_) init_input("x", cs::init::fill(7.0f));
     }
 };
 
@@ -1433,13 +1438,13 @@ TEST_CASE("marks: the Model's spans are unavailable before setup", "[system][mar
 // =============================================================================================
 // 5. init order
 // =============================================================================================
-TEST_CASE("init: the highest level wins (System init_input beats the Component's, children below owners)",
+TEST_CASE("init: the last declaration wins (System init_input beats the Component's, children below owners)",
           "[system][init]") {
     tsys::g_inits.clear();
     cs::Model model = cs::create_model<tsys::TopB>(default_config());
     model.setup();
 
-    // c1 declared 99 (depth 2); the owner System `inner` declared 1.5 (depth 1) and wins.
+    // c1 declared 99; the owner System `inner` declared 1.5 afterwards (its setup runs after its children's) and wins.
     // The init is applied by the owner (c1) in the first forward.
     // c2.x is connected, so nothing is declared on it and it is not initialized.
     model.forward();
@@ -2640,11 +2645,25 @@ TEST_CASE("lifetime: a tie_inputs variable is initialized by the tie; a member's
     CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "b.y")) == tsys::filled(9.0f));  // 3 * 3
 }
 
-TEST_CASE("lifetime: two tied members with inits at one depth: tie_inputs throws", "[system][lifetime][init]") {
-    // Changed expectation (design review, section 2): a declaration is decided in the declaring call, and two initializers
-    // at one level from different declarers are an error there (wiring.hpp, init_takes). The old test had both members
-    // carry an init and let a later tie-level init decide at materialization; that is no longer expressible.
-    tsys::expect_setup_throws<tsys::TieInitTwo>("two initializers for one variable at the same level");
+TEST_CASE("lifetime: two tied members with inits: the tie's init wins, else the later member's; nothing throws",
+          "[system][lifetime][init]") {
+    // Design review, section 2 (corrected by Jack, 2026-10-03): the last declaration wins. There is no same-level error.
+    SECTION("a tie-level init_input declared after the tie") {
+        cs::Model model = cs::create_model<tsys::TieInitTwo>(default_config(), true);
+        REQUIRE_NOTHROW(model.setup());
+        model.forward();
+        model.wait();
+        CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "a.y")) == tsys::filled(14.0f));  // 2 * 7
+        CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "b.y")) == tsys::filled(21.0f));  // 3 * 7
+    }
+    SECTION("no tie-level init: the later merged member (b) wins") {
+        cs::Model model = cs::create_model<tsys::TieInitTwo>(default_config(), false);
+        REQUIRE_NOTHROW(model.setup());
+        model.forward();
+        model.wait();
+        CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "a.y")) == tsys::filled(400.0f));  // 2 * 200
+        CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "b.y")) == tsys::filled(600.0f));  // 3 * 200
+    }
 }
 
 TEST_CASE("lifetime: a model-level promotion is eternal", "[system][lifetime]") {

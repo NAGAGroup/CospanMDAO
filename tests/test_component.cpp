@@ -739,7 +739,7 @@ TEST_CASE("initial values: fill / zero / from_host / custom / custom_host, and z
     }
 }
 
-TEST_CASE("initial values: metadata rules (connected, output, duplicates, highest level)", "[component][init][rules]") {
+TEST_CASE("initial values: metadata rules (connected, output, duplicates, last declaration wins)", "[component][init][rules]") {
     const auto top = [](std::function<void(cs::System&)> build) {
         return cs::create_model<tc::TopFn>(default_config(), std::move(build));
     };
@@ -764,25 +764,22 @@ TEST_CASE("initial values: metadata rules (connected, output, duplicates, highes
             },
             "is an output");
     }
-    SECTION("two inits at one depth on one root throw") {
-        tc::expect_throws(
-            [&] {
-                auto model = top([](cs::System& s) {
-                    s.add_subsystem(cs::subsystem_desc<tc::InitAffine>("a", std::optional<cs::InitSpec>{cs::init::fill(1.0f)}, 0, true));
-                    s.add_subsystem(cs::subsystem_desc<tc::InitAffine>("b", std::optional<cs::InitSpec>{cs::init::fill(2.0f)}, 0, true));
-                    s.tie_inputs<DType::f32, 1>({"a.x", "b.x"}, "x", cs::alias::fixed(4));
-                });
-                model.setup();
-            },
-            // The wording changed (wiring.hpp, init_takes); the error is still decided in the tie_inputs call (section 2).
-            "two initializers for one variable at the same level");
+    SECTION("two members' inits and no tie-level init: the later merged member wins (the last declaration wins, section 2)") {
+        auto model = top([](cs::System& s) {
+            s.add_subsystem(cs::subsystem_desc<tc::InitAffine>("a", std::optional<cs::InitSpec>{cs::init::fill(1.0f)}, 0, true));
+            s.add_subsystem(cs::subsystem_desc<tc::InitAffine>("b", std::optional<cs::InitSpec>{cs::init::fill(2.0f)}, 0, true));
+            s.tie_inputs<DType::f32, 1>({"a.x", "b.x"}, "x", cs::alias::fixed(4));
+        });
+        CHECK_NOTHROW(model.setup());
+        auto a = wait_and_view<DType::f32, 1>(model, "a.y");
+        CHECK(to_vector(a) == std::vector<float>(4, 5.0f));  // b's fill(2) is the later member: 2 * 2 + 1
     }
     SECTION("a System-level init beats the components' on a tied alias") {
         auto model = top([](cs::System& s) {
-            // Only member a carries a component-level init: two members' inits at one level now throw at tie_inputs (see the
-            // section above, and test_system's TieInitTwo). The System-level init on the tie still wins over a's.
+            // Both members carry a component-level init; the System-level init_input runs after their setups, so it is the
+            // last declaration and wins, with no throw (section 2).
             s.add_subsystem(cs::subsystem_desc<tc::InitAffine>("a", std::optional<cs::InitSpec>{cs::init::fill(1.0f)}, 0, true));
-            s.add_subsystem(cs::subsystem_desc<tc::InitAffine>("b", std::optional<cs::InitSpec>{}, 0, true));
+            s.add_subsystem(cs::subsystem_desc<tc::InitAffine>("b", std::optional<cs::InitSpec>{cs::init::fill(2.0f)}, 0, true));
             s.tie_inputs<DType::f32, 1>({"a.x", "b.x"}, "x", cs::alias::fixed(4));
             s.init_input("x", cs::init::fill(9.0f));
         });

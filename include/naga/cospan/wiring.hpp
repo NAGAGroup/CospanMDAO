@@ -152,36 +152,16 @@ inline void check_compatible(const WiringSite& site, const char* verb, const Var
 // Initializers
 // -----------------------------------------------------------------------------
 
-/// What the highest-level-wins rule needs to know of the declaration held so far.
-struct InitState {
-    bool        set   = false;
-    std::size_t depth = 0;
-    std::string by;
-};
+// THE LAST DECLARATION WINS (docs/design-review-2026-10-03.md, section 2). A parent's setup runs after its children's,
+// so a tie's, a promotion's or a System's initializer replaces the members'; tied members and promotions may carry their
+// own initializers. There is no level comparison and no conflict error: the incoming declaration always replaces what is
+// held.
 
-/// True when the incoming declaration (depth, by) replaces the one held: none held, a smaller depth, or the same depth
-/// from the same declarer (a replay: the newer replaces). Throws when the same depth comes from a different declarer.
-inline bool init_takes(const WiringSite& site, const char* verb, const InitState& held, std::size_t depth,
-                       const std::string& by) {
-    if (!held.set || depth < held.depth) return true;
-    if (depth > held.depth) return false;
-    if (by != held.by) {
-        auto text = [](const std::string& s) { return s.empty() ? std::string{"the root System"} : s; };
-        wiring_fail(site, verb, "two initializers for one variable at the same level ('" + text(held.by) + "' and '" +
-                                    text(by) + "'); the higher level wins, so declare it once, higher up");
-    }
-    return true;
-}
-
-/// Folds the initializer of `from` into `into` by the highest-level-wins rule (init_takes). A taken initializer
-/// brings its depth and declarer, and its device when `into` has none.
-inline void fold_init(const WiringSite& site, VarMeta& into, const VarMeta& from, const char* verb = "init_input") {
+/// Folds the initializer of `from` (a tie member) into `into` (the tie's alias): the member's replaces what is held, so
+/// later members replace earlier ones. Its device comes along when `into` has none.
+inline void fold_init(VarMeta& into, const VarMeta& from) {
     if (!from.init) return;
-    const InitState held{into.init.has_value(), into.init_depth, into.init_by};
-    if (!init_takes(site, verb, held, from.init_depth, from.init_by)) return;
-    into.init       = from.init;
-    into.init_depth = from.init_depth;
-    into.init_by    = from.init_by;
+    into.init = from.init;
     if (!into.init_device && from.init_device) into.init_device = from.init_device;
 }
 
@@ -459,9 +439,9 @@ std::shared_ptr<Instance> build_tie_alias(const TieMembers& ms, std::string name
 }
 
 /// Everything a tie checks about the merge itself, before the first one: each member against the alias, the members
-/// against each other, at most one side holding data, and (inputs) the initializers folding without a conflict.
+/// against each other, and at most one side holding data. (Initializers never conflict: the last declaration wins.)
 inline void check_tie_merge(const WiringSite& site, const char* verb, const std::shared_ptr<Instance>& alias,
-                            const TieMembers& ms, bool inputs) {
+                            const TieMembers& ms) {
     std::vector<const VarMeta*> metas;
     for (const auto& m : ms) {
         check_compatible(site, verb, *alias->meta, *m.second->meta, alias.get(), m.second.get());
@@ -471,22 +451,17 @@ inline void check_tie_merge(const WiringSite& site, const char* verb, const std:
         for (std::size_t j = 0; j < i; ++j)
             check_compatible(site, verb, *ms[j].second->meta, *ms[i].second->meta, ms[j].second.get(), ms[i].second.get());
     check_one_live(site, metas);
-    if (inputs) {
-        InitState held{};
-        for (const auto& m : ms) {
-            const VarMeta& v = *m.second->meta;
-            if (!v.init) continue;
-            if (init_takes(site, verb, held, v.init_depth, v.init_by)) held = InitState{true, v.init_depth, v.init_by};
-        }
-    }
 }
 
 /// The merge of a tie, after check_tie_merge: the alias's variable wins each time (`alias->meta` is read again at
 /// every step: it is the survivor of the one before).
-inline void apply_tie_merge(const WiringSite& site, const char* verb, const std::shared_ptr<Instance>& alias,
+inline void apply_tie_merge(const WiringSite& site, [[maybe_unused]] const char* verb, const std::shared_ptr<Instance>& alias,
                             const TieMembers& ms, bool inputs) {
+    // The alias's own initializer, if it has one, is the later declaration and is kept over every member's; otherwise the
+    // members' are folded in order, later members replacing earlier ones.
+    const bool own_init = alias->meta->init.has_value();
     for (const auto& m : ms) {
-        if (inputs && !alias->meta->is_materialized()) fold_init(site, *alias->meta, *m.second->meta, verb);
+        if (inputs && !own_init && !alias->meta->is_materialized()) fold_init(*alias->meta, *m.second->meta);
         merge_into(site, alias->meta, m.second->meta);
     }
 }
@@ -514,7 +489,7 @@ std::shared_ptr<Instance> tie_inputs(const WiringSite& site, const TieMembers& m
     check_alias_shape<Rank>(site, shape, verb, /*is_input=*/true, resolve);
 
     std::shared_ptr<Instance> alias = build_tie_alias<DT, Rank>(members, std::move(name), declarer, shape, IOKind::input, device);
-    check_tie_merge(site, verb, alias, members, /*inputs=*/true);
+    check_tie_merge(site, verb, alias, members);
     apply_tie_merge(site, verb, alias, members, /*inputs=*/true);
     for (const auto& m : members) m.second->can_be_target = false;  // visible at every use site
     return alias;
@@ -550,7 +525,7 @@ std::shared_ptr<Instance> tie_outputs(const WiringSite& site, const TieMembers& 
 
     std::shared_ptr<Instance> alias =
         build_tie_alias<DT, Rank>(members, std::move(name), declarer, shape, IOKind::output, first.second->device);
-    check_tie_merge(site, verb, alias, members, /*inputs=*/false);
+    check_tie_merge(site, verb, alias, members);
     apply_tie_merge(site, verb, alias, members, /*inputs=*/false);
     for (const auto& m : members) m.second->can_be_source = false;
     return alias;
@@ -560,21 +535,15 @@ std::shared_ptr<Instance> tie_outputs(const WiringSite& site, const TieMembers& 
 // Initial values
 // -----------------------------------------------------------------------------
 
-/// Declares the initial value of a free input's variable, at `depth` by `by` (the declarer's path): the smallest depth
-/// wins, an equal depth from a different declarer throws, an equal depth from the same declarer replaces. An output
-/// throws. Declaring one on a connected input is accepted and has no effect (the variable's source wins), as before:
-/// nothing is stored when the variable has a producer.
-inline void declare_init(const WiringSite& site, const std::shared_ptr<Instance>& inst, InitSpec spec, std::size_t depth,
-                         std::string by) {
+/// Declares the initial value of a free input's variable: the last declaration wins, so it replaces any held (a parent's
+/// setup runs after its children's). An output throws. Declaring one on a connected input is accepted and has no
+/// effect (the variable's source wins), as before: nothing is stored when the variable has a producer.
+inline void declare_init(const WiringSite& site, const std::shared_ptr<Instance>& inst, InitSpec spec) {
     if (inst->kind != IOKind::input)
         wiring_fail(site, "init_input", "'" + inst->full_path() + "' is an output; outputs are never initialized");
     VarMeta& v = *inst->meta;
     if (first_of_kind(v, IOKind::output)) return;
-    const InitState held{v.init.has_value(), v.init_depth, v.init_by};
-    if (!init_takes(site, "init_input", held, depth, by)) return;
-    v.init       = std::move(spec);
-    v.init_depth = depth;
-    v.init_by    = std::move(by);
+    v.init = std::move(spec);
 }
 
 }  // namespace detail

@@ -182,9 +182,7 @@ public:
             std::cerr << "naga::cospan: warning: input '" << path << "' is connected to an output; update_input is never applied\n";
             return;
         }
-        v.init       = std::move(init);
-        v.init_depth = 0;  // outranks every declaration made in setup
-        v.init_by    = "Model::update_input";
+        v.init = std::move(init);  // later than every declaration made in setup, so it replaces them
         v.mark_stale();
     }
 

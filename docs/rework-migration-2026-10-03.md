@@ -51,8 +51,10 @@ tie_outputs<DT, 1>({...}, "t", shape, policy);    tie_outputs<DT, 1>({...}, "t",
 `tie_inputs` takes an optional last argument, the device where the tie's initialization runs and its data stays.
 Every wiring rule is checked in its own call, inside `setup()`.
 
-- **Initial values:** `init_input(path, spec)` in `setup()` (component or System). Highest level wins; two at one level
-  from different declarers throw ("two initializers for one variable at the same level"). It is ignored when the input
+- **Initial values:** `init_input(path, spec)` in `setup()` (component or System). The last declaration wins, with no
+  conflict error: a parent's setup runs after its children's, so a tie's, promotion's or System's `init_input` replaces the
+  members' own (tied members and promotions may carry initializers). Two members with inits and no tie-level init: the
+  later merged member wins. It is ignored when the input
   has a source; naming an output throws. Run-time replacement is `Model::update_input` (below).
 - **Marks:** `add_design_var`, `add_constraint`, `add_objective` take no region. A mark is `Mark{path, inst, rec}`.
 - **Order:** execution order is **data dependencies only** (section 3). Add the real edge, or
