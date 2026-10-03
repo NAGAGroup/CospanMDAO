@@ -1,36 +1,34 @@
-// Parallel and Fused tests, every case through a cospan::Model.
+// Fused-component and independent-children tests, every case through a cospan::Model.
 //
-//   Parallel       helper form (plain + group with scratch + host, fed by a
-//                  producer, read by a consumer); typed form with a device
-//                  child; an input connected to a sibling's output throws
-//                  (unspecified and fixed-shape); tied outputs throw unless
-//                  allow_tied_outputs(); rejections; a Parallel nested under
-//                  a plain System
-//   Fused, seq.    three plain stages; two group+scratch stages (B's own
-//                  barrier, own local slices); rank-2 (wg {8,8}) and rank-3
-//                  (7x9x11) waves; stage ranges may differ; ties are not checked
-//   Fused, par.    three independent stages; a connection throws and
-//                  allow_tied_outputs() does not lift it; tied outputs throw and
-//                  allow_tied_outputs() lets them run
-//   Fused, both    value-driven sizes (refused when driven by a stage of the
-//                  same fuse, allowed from outside); the local-memory limit
-//                  (skipped where the device reports none, e.g. omp)
-//   Fused, errors  custom-op, host and mixed-rank children throw at setup
-//   Equivalence    four stages as a plain System and as a sequential
-//                  FusedSystem give bitwise-equal outputs
+// ParallelSystem and FusedSystem are gone (docs/rework-migration-2026-10-03.md). A fused group is a component built by
+// cs::fuse_components<seq|par>(name, connects_desc({...}), subsystem_desc<...>(...)...) and its ports are reached by path
+// ("f.a.x"); a plain System of the same children is cs::system_from(name, ...). Concurrency of independent children
+// comes from data dependencies alone (design review, section 3).
 //
-// The components live in namespace tfl. No case is tagged [os-free]: since
-// the free lane every case runs on CUDA, the value-driven case whose root
-// grows included.
+//   Independent    plain + group with scratch + host children in a system_from group, fed by a producer and read by a
+//                  consumer; a group nested under a plain System
+//   Fused, seq.    three plain stages; two group+scratch stages (B's own barrier, own local slices); rank-2 and rank-3
+//                  waves; stage ranges may differ; the stages' work-group shapes must agree (section 4)
+//   Fused, par.    independent plain stages, independent group stages; a connection throws at setup; atomic tied outputs
+//                  accumulate, non-atomic ones throw at forward
+//   Fused, both    value-driven sizes (refused when driven by a stage of the same fuse, allowed from outside); the
+//                  local-memory limit (skipped where the device reports none, e.g. omp)
+//   Equivalence    four stages as a plain System and as a sequential fused component give bitwise-equal outputs
+//   Lifetime       a transient group is deleted after its turn; a transient reader of a deleted do_once producer
+//
+// The compile-time rules of a fused component (no custom-op or host stages, all-group or all-plain, one rank) are
+// static_asserts in FusedComponent now; they have no runtime test. The components live in namespace tfl.
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <functional>
 #include <memory>
 #include <optional>
 #include <string>
 #include <tuple>
+#include <type_traits>
 #include <vector>
 
 #include <catch2/catch_test_macros.hpp>
@@ -75,23 +73,6 @@ public:
     void setup() override { build_(*this); }
 };
 
-/// A typed ParallelSystem / FusedSystem whose setup() runs a callable.
-class Par : public cs::ParallelSystem {
-    std::function<void(cs::ParallelSystem&)> build_;
-
-public:
-    explicit Par(std::function<void(cs::ParallelSystem&)> b) : build_{std::move(b)} {}
-    void setup() override { build_(*this); }
-};
-class Wave : public cs::FusedSystem {
-    std::function<void(cs::FusedSystem&)> build_;
-
-public:
-    Wave(Mode m, std::optional<sycl::range<3>> wg, std::function<void(cs::FusedSystem&)> b)
-        : cs::FusedSystem(m, wg), build_{std::move(b)} {}
-    void setup() override { build_(*this); }
-};
-
 cs::Model make(Build b) {
     cs::Model m = cs::create_model<Top>(default_config(), std::move(b));
     return m;
@@ -104,9 +85,10 @@ void run_three(cs::Model& m) {
     m.wait();
 }
 
+/// A synced host copy of an output (the model has run: views exist only after the first forward, section 5).
 template <int R>
 std::vector<float> out_of(cs::Model& m, const char* path) {
-    return to_vector(m.view_output<DType::f32, R>(path));
+    return to_vector(cst::synced_output<DType::f32, R>(m, path));
 }
 
 std::vector<float> reverse_in_groups(const std::vector<float>& in, std::size_t wg) {
@@ -502,37 +484,69 @@ public:
     std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config({x_}, {y_}, {}); }
 };
 
-// ---- compile-time rejection: a concept, not a bare requires-expression -------------------------------
-struct SomeSystem : cs::System {};
-template <class P, class T>
-concept CanAdd = requires(P& p) { p.template add_subsystem<T>(std::string{"x"}); };
-template <class P>
-concept CanAddUntyped = requires(P& p) { p.add_subsystem(std::string{"x"}); };
+constexpr int  kLen = 12;  // the group cases; the group body's work-group is 8, so the last group is ragged
+constexpr auto kSeq = cs::fuse_strategy::seq;
+constexpr auto kPar = cs::fuse_strategy::par;
 
-static_assert(CanAdd<cs::System, SomeSystem>, "control: a plain System takes a System child");
-static_assert(CanAdd<cs::System, Src1>, "control: a plain System takes a Component child");
-static_assert(CanAdd<cs::ParallelSystem, Src1>, "a ParallelSystem takes a Component child");
-static_assert(!CanAdd<cs::ParallelSystem, SomeSystem>, "a ParallelSystem must reject a System child");
-static_assert(!CanAdd<cs::ParallelSystem, cs::ParallelSystem>, "nested Parallel is not a concept");
-static_assert(!CanAddUntyped<cs::ParallelSystem>, "a ParallelSystem has no untyped children");
-static_assert(CanAdd<cs::FusedSystem, Src1>, "a FusedSystem takes a Component child");
-static_assert(!CanAdd<cs::FusedSystem, SomeSystem>, "a FusedSystem must reject a System child");
-static_assert(!CanAddUntyped<cs::FusedSystem>, "a FusedSystem has no untyped children");
+/// src -> two BigStage children (a, b) in a fused component "f" of strategy S; each stage's scratch tile has `elems` floats.
+template <cs::fuse_strategy S>
+cs::Model big_wave(std::size_t elems) {
+    return make([elems](cs::System& s) {
+        s.add_subsystem(cs::subsystem_desc<Src1>("src", std::array<int, 1>{256}));
+        s.add_subsystem(cs::fuse_components<S>("f", cs::subsystem_desc<BigStage>("a", elems), cs::subsystem_desc<BigStage>("b", elems)));
+        s.connect("src.y", "f.a.x");
+        s.connect("src.y", "f.b.x");
+    });
+}
 
-constexpr int kLen = 12;  // the Parallel cases; the group body's work-group is 8, so the last group is ragged
+/// zero (ZeroAcc) and a fused "f" of two atomic Adders (1 and 2) tied into one root "sum"; f depends on zero.
+template <cs::fuse_strategy S>
+cs::Model tied_adders() {
+    return make([](cs::System& s) {
+        s.add_subsystem(cs::subsystem_desc<ZeroAcc>("zero"));
+        s.add_subsystem(cs::fuse_components<S>("f", cs::subsystem_desc<Adder>("a", 1.0f), cs::subsystem_desc<Adder>("b", 2.0f)));
+        s.tie_outputs<DType::atomic_f32, 1>({"zero.acc", "f.a.acc", "f.b.acc"}, "sum", cs::alias::fixed(12));  // atomic writers
+        // Execution order is data dependencies only and tied writers never wait on each other (design review, section 3):
+        // the zeroing producer needs an explicit edge.
+        s.depends_on("f", "zero");
+    });
+}
+
+/// A value-driven size driven from OUTSIDE the fuse: it runs and follows the value.
+template <cs::fuse_strategy S>
+void value_from_outside() {
+    cs::Model model = make([](cs::System& s) {
+        s.add_subsystem(cs::subsystem_desc<Src1>("src", std::array<int, 1>{100}));
+        s.add_subsystem(cs::fuse_components<S>("f", cs::subsystem_desc<Elem<0>>("e"), cs::subsystem_desc<Bins>("b")));  // n is a free input
+        s.connect("src.y", "f.e.x");
+    });
+    model.setup();
+    const std::uint32_t nb1 = 8, nb2 = 13;
+    for (const std::uint32_t nb : {nb1, nb2}) {  // the second value grows the output
+        model.update_input("f.b.n", cs::init::from_host(std::vector<std::uint32_t>{nb}));
+        model.forward();
+        model.wait();
+        std::vector<float> want(nb);
+        for (std::uint32_t i = 0; i < nb; ++i) want[i] = static_cast<float>(i + 1);
+        CHECK(out_of<1>(model, "f.b.bins") == want);
+    }
+}
 
 }  // namespace tfl
 
 // =============================================================================================
-// Parallel
+// Independent children (was Parallel)
 // =============================================================================================
-TEST_CASE("parallel: helper form, plain + group with scratch + host, three forwards then one wait",
-          "[flavors][parallel]") {
+TEST_CASE("independent children: plain + group with scratch + host in a system_from group, three forwards then one wait",
+          "[flavors][group]") {
+    // Was ParallelSystem's helper form. Concurrency of independent children comes from data dependencies (section 3), so the
+    // behavior worth keeping is the values: a plain System of the same children.
     cs::Model model = tfl::make([](cs::System& s) {
-        s.add_subsystem<tfl::Src1>("src", std::array<int, 1>{tfl::kLen});
-        s.add_subsystem("par", cs::property_list{cs::property::parallel{}}, s.child<tfl::Elem<0>>("plain"),
-                        s.child<tfl::GroupStage<tfl::RevBody>>("group", std::size_t{8}), s.child<tfl::Prefix>("host"));
-        s.add_subsystem<tfl::Sum3>("sum", tfl::kLen);
+        s.add_subsystem(cs::subsystem_desc<tfl::Src1>("src", std::array<int, 1>{tfl::kLen}));
+        s.add_subsystem(cs::system_from("par", cs::subsystem_desc<tfl::Elem<0>>("plain"),
+                                        cs::subsystem_desc<tfl::GroupStage<tfl::RevBody>>("group", std::size_t{8}),
+                                        cs::subsystem_desc<tfl::Prefix>("host")));
+        s.add_subsystem(cs::subsystem_desc<tfl::Sum3>("sum", tfl::kLen));
         s.connect("src.y", "par.plain.x");
         s.connect("src.y", "par.group.x");
         s.connect("src.y", "par.host.x");
@@ -541,7 +555,6 @@ TEST_CASE("parallel: helper form, plain + group with scratch + host, three forwa
         s.connect("par.host.z", "sum.h");
     });
     model.setup();
-    CHECK(dynamic_cast<cs::ParallelSystem*>(&(*model.get_subsystem("par"))) != nullptr);
 
     std::vector<float> x(tfl::kLen), want_p(tfl::kLen), want_h(tfl::kLen), want_s(tfl::kLen);
     float              acc = 0.0f;
@@ -561,118 +574,16 @@ TEST_CASE("parallel: helper form, plain + group with scratch + host, three forwa
     CHECK(tfl::out_of<1>(model, "sum.s") == want_s);
 }
 
-TEST_CASE("parallel: typed ParallelSystem, a child on property::device equal to the parent's", "[flavors][parallel]") {
-    const sycl::device dev{sycl::default_selector_v};  // the Model's default device
-    cs::Model model = tfl::make([dev](cs::System& s) {
-        s.add_subsystem<tfl::Src1>("src", std::array<int, 1>{tfl::kLen});
-        s.add_subsystem<tfl::Par>("par", std::function<void(cs::ParallelSystem&)>{[dev](cs::ParallelSystem& p) {
-            p.add_subsystem<tfl::Elem<0>>("a");
-            p.add_subsystem<tfl::Elem<2>>("b", cs::property_list{cs::property::device{dev}});
-        }});
-        s.connect("src.y", "par.a.x");
-        s.connect("src.y", "par.b.x");
-    });
-    model.setup();
-    tfl::run_three(model);
-    CHECK(dynamic_cast<tfl::Par*>(&(*model.get_subsystem("par"))) != nullptr);
-    const cs::Placement here{dev, sk::kind::device};
-    CHECK(model.root().entry_at("par.b.x").placement() == here);
-    CHECK(model.root().entry_at("par.a.x").placement() == here);
-    std::vector<float> want_a(tfl::kLen), want_b(tfl::kLen);
-    for (int i = 0; i < tfl::kLen; ++i) {
-        want_a[i] = tfl::ref(0, static_cast<float>(i + 1));
-        want_b[i] = tfl::ref(2, static_cast<float>(i + 1));
-    }
-    CHECK(tfl::out_of<1>(model, "par.a.y") == want_a);
-    CHECK(tfl::out_of<1>(model, "par.b.y") == want_b);
-}
-
-TEST_CASE("parallel: an input connected to a sibling's output throws at forward, naming both",
-          "[flavors][parallel][errors]") {
-    SECTION("an input with an unspecified dim") {
-        cs::Model model = tfl::make([](cs::System& s) {
-            s.add_subsystem("par", cs::property_list{cs::property::parallel{}},
-                            s.child<tfl::Src1>("a", std::array<int, 1>{4}), s.child<tfl::Elem<0>>("b"));
-            s.connect("par.a.y", "par.b.x");  // b.x takes its shape from a sibling's output
-        });
-        model.setup();  // the wiring is legal; only the forward refuses
-        tfl::expect_throws([&] { model.forward(); }, {"par.a", "par.b", "run unordered"});
-        model.wait();
-    }
-    SECTION("a fixed-shape input") {
-        cs::Model model = tfl::make([](cs::System& s) {
-            s.add_subsystem("par", cs::property_list{cs::property::parallel{}},
-                            s.child<tfl::Src1>("a", std::array<int, 1>{4}), s.child<tfl::Sum3>("b", 4));
-            s.connect("par.a.y", "par.b.p");  // not a shape dependency, still a connection
-        });
-        model.setup();
-        tfl::expect_throws([&] { model.forward(); }, {"par.a", "par.b", "run unordered"});
-        model.wait();
-    }
-}
-
-TEST_CASE("parallel: tied outputs throw at forward, naming both, unless allow_tied_outputs()",
-          "[flavors][parallel][errors]") {
-    const auto tied = [](bool allow) {
-        return tfl::make([allow](cs::System& s) {
-            s.add_subsystem<tfl::ZeroAcc>("zero");
-            s.add_subsystem<tfl::Par>("par", std::function<void(cs::ParallelSystem&)>{[allow](cs::ParallelSystem& p) {
-                if (allow) p.allow_tied_outputs();
-                p.add_subsystem<tfl::Adder>("a", 1.0f);
-                p.add_subsystem<tfl::Adder>("b", 2.0f);
-            }});
-            s.tie_outputs<DType::atomic_f32, 1>({"zero.acc", "par.a.acc", "par.b.acc"}, "sum",
-                                                cs::alias::fixed(12));  // atomic writers, one root
-        });
-    };
-    SECTION("refused") {
-        cs::Model model = tied(false);
-        model.setup();
-        tfl::expect_throws([&] { model.forward(); },
-                           {"par.a", "par.b", "share one root", "allow_tied_outputs"});
-        model.wait();
-    }
-    SECTION("allowed: the atomic writers accumulate") {
-        cs::Model model = tied(true);
-        model.setup();
-        model.forward();
-        model.wait();
-        CHECK(tfl::out_of<1>(model, "sum") == std::vector<float>(12, 3.0f));  // 1 + 2
-    }
-}
-
-TEST_CASE("parallel: rejections at setup", "[flavors][parallel][errors]") {
-    SECTION("a non-device property on a child") {
-        cs::Model model = tfl::make([](cs::System& s) {
-            s.add_subsystem<tfl::Par>("par", std::function<void(cs::ParallelSystem&)>{[](cs::ParallelSystem& p) {
-                p.add_subsystem<tfl::Src1>("s", cs::property_list{cs::property::transient{}}, std::array<int, 1>{4});
-            }});
-        });
-        tfl::expect_throws([&] { model.setup(); }, {"takes property::device only"});
-        model.wait();  // setup() may have submitted initializer work before it threw
-    }
-    SECTION("parallel and fused together") {
-        cs::Model model = tfl::make([](cs::System& s) {
-            s.add_subsystem("p", cs::property_list{cs::property::parallel{}, cs::property::fused{}},
-                            s.child<tfl::Src1>("s", std::array<int, 1>{4}));
-        });
-        tfl::expect_throws([&] { model.setup(); }, {"two flavors"});
-        model.wait();  // setup() may have submitted initializer work before it threw
-    }
-    // Compile-time rejection of System children is the static_asserts at the top of the file.
-}
-
-TEST_CASE("parallel: nested under a plain System, values are correct", "[flavors][parallel]") {
+TEST_CASE("independent children: a system_from group nested under a plain System, values are correct", "[flavors][group]") {
     cs::Model model = tfl::make([](cs::System& s) {
-        s.add_subsystem<tfl::Top>("mid", tfl::Build{[](cs::System& m) {
-            m.add_subsystem<tfl::Src1>("src", std::array<int, 1>{tfl::kLen});
-            m.add_subsystem("par", cs::property_list{cs::property::parallel{}}, m.child<tfl::Elem<0>>("a"),
-                            m.child<tfl::Elem<2>>("b"));
-            m.add_subsystem<tfl::Elem<1>>("c");
+        s.add_subsystem(cs::subsystem_desc<tfl::Top>("mid", tfl::Build{[](cs::System& m) {
+            m.add_subsystem(cs::subsystem_desc<tfl::Src1>("src", std::array<int, 1>{tfl::kLen}));
+            m.add_subsystem(cs::system_from("par", cs::subsystem_desc<tfl::Elem<0>>("a"), cs::subsystem_desc<tfl::Elem<2>>("b")));
+            m.add_subsystem(cs::subsystem_desc<tfl::Elem<1>>("c"));
             m.connect("src.y", "par.a.x");
             m.connect("src.y", "par.b.x");
-            m.connect("par.a.y", "c.x");  // a consumer after the Parallel
-        }});
+            m.connect("par.a.y", "c.x");  // a consumer after the group
+        }}));
     });
     model.setup();
     tfl::run_three(model);
@@ -693,18 +604,14 @@ TEST_CASE("parallel: nested under a plain System, values are correct", "[flavors
 // =============================================================================================
 TEST_CASE("fused sequential: three plain stages, A -> B element-wise, C on a ragged size", "[flavors][fused]") {
     cs::Model model = tfl::make([](cs::System& s) {
-        s.add_subsystem<tfl::Src1>("src", std::array<int, 1>{1000});
-        s.add_subsystem<tfl::Src1>("src2", std::array<int, 1>{333});
-        s.add_subsystem<tfl::Wave>(
-            "f", cs::FusedSystem::Mode::sequential, std::optional<sycl::range<3>>{},
-            std::function<void(cs::FusedSystem&)>{[](cs::FusedSystem& w) {
-                w.add_subsystem<tfl::Elem<0>>("a");
-                w.add_subsystem<tfl::Elem<1>>("b");
-                w.add_subsystem<tfl::Elem<2>>("c");
-            }});
+        s.add_subsystem(cs::subsystem_desc<tfl::Src1>("src", std::array<int, 1>{1000}));
+        s.add_subsystem(cs::subsystem_desc<tfl::Src1>("src2", std::array<int, 1>{333}));
+        s.add_subsystem(cs::fuse_components<tfl::kSeq>("f", cs::connects_desc({{"a.y", "b.x"}}),
+                                                       cs::subsystem_desc<tfl::Elem<0>>("a"),
+                                                       cs::subsystem_desc<tfl::Elem<1>>("b"),
+                                                       cs::subsystem_desc<tfl::Elem<2>>("c")));
         s.connect("src.y", "f.a.x");
         s.connect("src2.y", "f.c.x");
-        s.connect("f.a.y", "f.b.x");
     });
     model.setup();
     tfl::run_three(model);
@@ -722,15 +629,11 @@ TEST_CASE("fused sequential: three plain stages, A -> B element-wise, C on a rag
 TEST_CASE("fused sequential: two group+scratch stages, B's own barrier, own local slices, ragged last group",
           "[flavors][fused]") {
     cs::Model model = tfl::make([](cs::System& s) {
-        s.add_subsystem<tfl::Src1>("src", std::array<int, 1>{200});
-        s.add_subsystem<tfl::Wave>(
-            "f", cs::FusedSystem::Mode::sequential, std::optional<sycl::range<3>>{},
-            std::function<void(cs::FusedSystem&)>{[](cs::FusedSystem& w) {
-                w.add_subsystem<tfl::GroupStage<tfl::RevBody>>("a");
-                w.add_subsystem<tfl::GroupStage<tfl::MirrorBody>>("b");
-            }});
+        s.add_subsystem(cs::subsystem_desc<tfl::Src1>("src", std::array<int, 1>{200}));
+        s.add_subsystem(cs::fuse_components<tfl::kSeq>("f", cs::connects_desc({{"a.y", "b.x"}}),
+                                                       cs::subsystem_desc<tfl::GroupStage<tfl::RevBody>>("a"),
+                                                       cs::subsystem_desc<tfl::GroupStage<tfl::MirrorBody>>("b")));
         s.connect("src.y", "f.a.x");
-        s.connect("f.a.y", "f.b.x");
     });
     model.setup();
     model.forward();
@@ -745,19 +648,16 @@ TEST_CASE("fused sequential: two group+scratch stages, B's own barrier, own loca
     CHECK(want_a[192] == 0.0f);
 }
 
-TEST_CASE("fused sequential: rank-2 wave with wg {8,8} and rank-3 wave (7x9x11) with the default wg",
-          "[flavors][fused]") {
-    SECTION("rank 2, 40 x 30, wg {8,8}") {
+TEST_CASE("fused sequential: a rank-2 wave and a rank-3 wave (7x9x11), the default work-group shape", "[flavors][fused]") {
+    // The fuse-level work-group override ({8,8}) is gone: group shape belongs to the component (design review, section 4).
+    // The rank-2 section therefore runs with the default shape for its rank.
+    SECTION("rank 2, 40 x 30") {
         cs::Model model = tfl::make([](cs::System& s) {
-            s.add_subsystem<tfl::Src2>("src", std::array<int, 2>{40, 30}, 1.0f, 0.0f);
-            s.add_subsystem<tfl::Wave>(
-                "f", cs::FusedSystem::Mode::sequential, std::optional<sycl::range<3>>{sycl::range<3>{8, 8, 1}},
-                std::function<void(cs::FusedSystem&)>{[](cs::FusedSystem& w) {
-                    w.add_subsystem<tfl::ElemND<2, 0>>("a");
-                    w.add_subsystem<tfl::ElemND<2, 4>>("b");
-                }});
+            s.add_subsystem(cs::subsystem_desc<tfl::Src2>("src", std::array<int, 2>{40, 30}, 1.0f, 0.0f));
+            s.add_subsystem(cs::fuse_components<tfl::kSeq>("f", cs::connects_desc({{"a.y", "b.x"}}),
+                                                           cs::subsystem_desc<tfl::ElemND<2, 0>>("a"),
+                                                           cs::subsystem_desc<tfl::ElemND<2, 4>>("b")));
             s.connect("src.y", "f.a.x");
-            s.connect("f.a.y", "f.b.x");
         });
         model.setup();
         model.forward();
@@ -771,17 +671,13 @@ TEST_CASE("fused sequential: rank-2 wave with wg {8,8} and rank-3 wave (7x9x11) 
         CHECK(tfl::out_of<2>(model, "f.a.y") == want_a);
         CHECK(tfl::out_of<2>(model, "f.b.y") == want_b);
     }
-    SECTION("rank 3, 7 x 9 x 11, default wg") {
+    SECTION("rank 3, 7 x 9 x 11") {
         cs::Model model = tfl::make([](cs::System& s) {
-            s.add_subsystem<tfl::Src3>("src", std::array<int, 3>{7, 9, 11}, 1.0f, 0.0f);
-            s.add_subsystem<tfl::Wave>(
-                "f", cs::FusedSystem::Mode::sequential, std::optional<sycl::range<3>>{},
-                std::function<void(cs::FusedSystem&)>{[](cs::FusedSystem& w) {
-                    w.add_subsystem<tfl::ElemND<3, 0>>("a");
-                    w.add_subsystem<tfl::ElemND<3, 4>>("b");
-                }});
+            s.add_subsystem(cs::subsystem_desc<tfl::Src3>("src", std::array<int, 3>{7, 9, 11}, 1.0f, 0.0f));
+            s.add_subsystem(cs::fuse_components<tfl::kSeq>("f", cs::connects_desc({{"a.y", "b.x"}}),
+                                                           cs::subsystem_desc<tfl::ElemND<3, 0>>("a"),
+                                                           cs::subsystem_desc<tfl::ElemND<3, 4>>("b")));
             s.connect("src.y", "f.a.x");
-            s.connect("f.a.y", "f.b.x");
         });
         model.setup();
         model.forward();
@@ -800,15 +696,11 @@ TEST_CASE("fused sequential: rank-2 wave with wg {8,8} and rank-3 wave (7x9x11) 
 
 TEST_CASE("fused sequential: stages may launch over different ranges; no inter-stage check", "[flavors][fused]") {
     cs::Model model = tfl::make([](cs::System& s) {
-        s.add_subsystem<tfl::Src1>("src", std::array<int, 1>{1000});
-        s.add_subsystem<tfl::Wave>(
-            "f", cs::FusedSystem::Mode::sequential, std::optional<sycl::range<3>>{},
-            std::function<void(cs::FusedSystem&)>{[](cs::FusedSystem& w) {
-                w.add_subsystem<tfl::Elem<0>>("a");   // launches over 1000
-                w.add_subsystem<tfl::Half>("b");      // launches over 500, reads a's output at the same index
-            }});
+        s.add_subsystem(cs::subsystem_desc<tfl::Src1>("src", std::array<int, 1>{1000}));
+        s.add_subsystem(cs::fuse_components<tfl::kSeq>("f", cs::connects_desc({{"a.y", "b.x"}}),
+                                                       cs::subsystem_desc<tfl::Elem<0>>("a"),   // launches over 1000
+                                                       cs::subsystem_desc<tfl::Half>("b")));    // launches over 500, reads a's output at the same index
         s.connect("src.y", "f.a.x");
-        s.connect("f.a.y", "f.b.x");
     });
     model.setup();
     tfl::run_three(model);
@@ -821,97 +713,133 @@ TEST_CASE("fused sequential: stages may launch over different ranges; no inter-s
     CHECK(std::vector<float>(b.begin(), b.begin() + 500) == want_b);
 }
 
+TEST_CASE("fused: stages asking for different work-group shapes throw at forward, naming both", "[flavors][fused][errors]") {
+    // New (design review, section 4: group shape belongs to the component): the wave has ONE shape, so two stages that ask
+    // for different ones are refused when the launches are collected.
+    const auto build = [](auto strategy_tag) {
+        constexpr cs::fuse_strategy S = decltype(strategy_tag)::value;
+        return tfl::make([](cs::System& s) {
+            s.add_subsystem(cs::subsystem_desc<tfl::Src1>("src", std::array<int, 1>{256}));
+            s.add_subsystem(cs::fuse_components<S>("f", cs::subsystem_desc<tfl::GroupStage<tfl::RevBody>>("a", std::size_t{32}),
+                                                   cs::subsystem_desc<tfl::GroupStage<tfl::RevBody>>("b", std::size_t{64})));
+            s.connect("src.y", "f.a.x");
+            s.connect("src.y", "f.b.x");
+        });
+    };
+    SECTION("sequential") {
+        cs::Model model = build(std::integral_constant<cs::fuse_strategy, tfl::kSeq>{});
+        model.setup();
+        tfl::expect_throws([&] { model.forward(); }, {"f.a", "f.b", "different work-group shapes"});
+        model.wait();
+    }
+    SECTION("parallel") {
+        cs::Model model = build(std::integral_constant<cs::fuse_strategy, tfl::kPar>{});
+        model.setup();
+        tfl::expect_throws([&] { model.forward(); }, {"f.a", "f.b", "different work-group shapes"});
+        model.wait();
+    }
+}
+
 // =============================================================================================
 // Fused, parallel
 // =============================================================================================
-TEST_CASE("fused parallel: three independent stages of different sizes, three forwards", "[flavors][fused]") {
-    cs::Model model = tfl::make([](cs::System& s) {
-        s.add_subsystem<tfl::Src1>("src1", std::array<int, 1>{1000});
-        s.add_subsystem<tfl::Src1>("src2", std::array<int, 1>{257});
-        s.add_subsystem<tfl::Src1>("src3", std::array<int, 1>{640});
-        s.add_subsystem<tfl::Wave>(
-            "f", cs::FusedSystem::Mode::parallel, std::optional<sycl::range<3>>{},
-            std::function<void(cs::FusedSystem&)>{[](cs::FusedSystem& w) {
-                w.add_subsystem<tfl::Elem<0>>("a");                       // plain, 1000
-                w.add_subsystem<tfl::Elem<2>>("c");                       // plain, 257
-                w.add_subsystem<tfl::GroupStage<tfl::RevBody>>("r");      // group + scratch, 640
-            }});
-        s.connect("src1.y", "f.a.x");
-        s.connect("src2.y", "f.c.x");
-        s.connect("src3.y", "f.r.x");
-    });
-    model.setup();
-    tfl::run_three(model);
-    std::vector<float> want_a(1000), want_c(257), x3(640);
-    for (int i = 0; i < 1000; ++i) want_a[i] = tfl::ref(0, static_cast<float>(i + 1));
-    for (int i = 0; i < 257; ++i) want_c[i] = tfl::ref(2, static_cast<float>(i + 1));
-    for (int i = 0; i < 640; ++i) x3[i] = static_cast<float>(i + 1);
-    CHECK(tfl::out_of<1>(model, "f.a.y") == want_a);
-    CHECK(tfl::out_of<1>(model, "f.c.y") == want_c);
-    CHECK(tfl::out_of<1>(model, "f.r.y") == tfl::reverse_in_groups(x3, 64));
+TEST_CASE("fused parallel: independent stages of different sizes, three forwards", "[flavors][fused]") {
+    // A fused component's stages are all plain or all work-group bodies (a static_assert), so the old plain + group mix is
+    // two sections: three plain stages, and two group+scratch stages.
+    SECTION("plain stages") {
+        cs::Model model = tfl::make([](cs::System& s) {
+            s.add_subsystem(cs::subsystem_desc<tfl::Src1>("src1", std::array<int, 1>{1000}));
+            s.add_subsystem(cs::subsystem_desc<tfl::Src1>("src2", std::array<int, 1>{257}));
+            s.add_subsystem(cs::subsystem_desc<tfl::Src1>("src3", std::array<int, 1>{640}));
+            s.add_subsystem(cs::fuse_components<tfl::kPar>("f", cs::subsystem_desc<tfl::Elem<0>>("a"),   // 1000
+                                                           cs::subsystem_desc<tfl::Elem<2>>("c"),         // 257
+                                                           cs::subsystem_desc<tfl::Elem<4>>("d")));       // 640
+            s.connect("src1.y", "f.a.x");
+            s.connect("src2.y", "f.c.x");
+            s.connect("src3.y", "f.d.x");
+        });
+        model.setup();
+        tfl::run_three(model);
+        std::vector<float> want_a(1000), want_c(257), want_d(640);
+        for (int i = 0; i < 1000; ++i) want_a[i] = tfl::ref(0, static_cast<float>(i + 1));
+        for (int i = 0; i < 257; ++i) want_c[i] = tfl::ref(2, static_cast<float>(i + 1));
+        for (int i = 0; i < 640; ++i) want_d[i] = tfl::ref(4, static_cast<float>(i + 1));
+        CHECK(tfl::out_of<1>(model, "f.a.y") == want_a);
+        CHECK(tfl::out_of<1>(model, "f.c.y") == want_c);
+        CHECK(tfl::out_of<1>(model, "f.d.y") == want_d);
+    }
+    SECTION("group stages with scratch") {
+        cs::Model model = tfl::make([](cs::System& s) {
+            s.add_subsystem(cs::subsystem_desc<tfl::Src1>("src1", std::array<int, 1>{640}));
+            s.add_subsystem(cs::subsystem_desc<tfl::Src1>("src2", std::array<int, 1>{200}));
+            s.add_subsystem(cs::fuse_components<tfl::kPar>("f", cs::subsystem_desc<tfl::GroupStage<tfl::RevBody>>("r"),
+                                                           cs::subsystem_desc<tfl::GroupStage<tfl::MirrorBody>>("m")));
+            s.connect("src1.y", "f.r.x");
+            s.connect("src2.y", "f.m.x");
+        });
+        model.setup();
+        tfl::run_three(model);
+        std::vector<float> x1(640), x2(200);
+        for (int i = 0; i < 640; ++i) x1[i] = static_cast<float>(i + 1);
+        for (int i = 0; i < 200; ++i) x2[i] = static_cast<float>(i + 1);
+        CHECK(tfl::out_of<1>(model, "f.r.y") == tfl::reverse_in_groups(x1, 64));
+        CHECK(tfl::out_of<1>(model, "f.m.y") == tfl::reverse_in_groups(x2, 64));  // Mirror reads the mirrored element too
+    }
 }
 
-TEST_CASE("fused parallel: a connection between stages throws naming both, and allow_tied_outputs() does not lift it",
-          "[flavors][fused][errors]") {
-    const auto chain = [](bool allow_ties) {
-        return tfl::make([allow_ties](cs::System& s) {
-            s.add_subsystem<tfl::Src1>("src", std::array<int, 1>{1000});
-            s.add_subsystem<tfl::Wave>(
-                "f", cs::FusedSystem::Mode::parallel, std::optional<sycl::range<3>>{},
-                std::function<void(cs::FusedSystem&)>{[allow_ties](cs::FusedSystem& w) {
-                    if (allow_ties) w.allow_tied_outputs();
-                    w.add_subsystem<tfl::Elem<0>>("a");
-                    w.add_subsystem<tfl::Elem<1>>("b");
-                }});
+TEST_CASE("fused parallel: a connect between stages throws at setup, naming both", "[flavors][fused][errors]") {
+    // Was a forward-time error ("run unordered"). The connection is made inside the fused component's setup, and a par
+    // component rejects it there (fused_component.hpp: FusedComponent::setup).
+    SECTION("an input with an unspecified dim takes its shape from a sibling's output") {
+        cs::Model model = tfl::make([](cs::System& s) {
+            s.add_subsystem(cs::fuse_components<tfl::kPar>("par", cs::connects_desc({{"a.y", "b.x"}}),
+                                                           cs::subsystem_desc<tfl::Src1>("a", std::array<int, 1>{4}),
+                                                           cs::subsystem_desc<tfl::Elem<0>>("b")));
+        });
+        tfl::expect_throws([&] { model.setup(); }, {"par", "connect", "stages run unordered", "'a.y' -> 'b.x'"});
+    }
+    SECTION("a fixed-shape input") {
+        cs::Model model = tfl::make([](cs::System& s) {
+            s.add_subsystem(cs::fuse_components<tfl::kPar>("par", cs::connects_desc({{"a.y", "b.p"}}),  // not a shape dependency, still a connection
+                                                           cs::subsystem_desc<tfl::Src1>("a", std::array<int, 1>{4}),
+                                                           cs::subsystem_desc<tfl::Sum3>("b", 4)));
+        });
+        tfl::expect_throws([&] { model.setup(); }, {"par", "connect", "stages run unordered", "'a.y' -> 'b.p'"});
+    }
+    SECTION("a chain A -> B") {
+        cs::Model model = tfl::make([](cs::System& s) {
+            s.add_subsystem(cs::subsystem_desc<tfl::Src1>("src", std::array<int, 1>{1000}));
+            s.add_subsystem(cs::fuse_components<tfl::kPar>("f", cs::connects_desc({{"a.y", "b.x"}}),  // B reads A's output
+                                                           cs::subsystem_desc<tfl::Elem<0>>("a"),
+                                                           cs::subsystem_desc<tfl::Elem<1>>("b")));
             s.connect("src.y", "f.a.x");
-            s.connect("f.a.y", "f.b.x");  // B reads A's output
         });
-    };
-    SECTION("refused") {
-        cs::Model model = chain(false);
-        model.setup();  // only the forward sees the pair
-        tfl::expect_throws([&] { model.forward(); }, {"f.a", "f.b", "run unordered"});
-        model.wait();
+        tfl::expect_throws([&] { model.setup(); }, {"f", "connect", "stages run unordered", "'a.y' -> 'b.x'"});
     }
-    SECTION("no override: allow_tied_outputs() is about ties only") {
-        cs::Model model = chain(true);
-        model.setup();
-        tfl::expect_throws([&] { model.forward(); }, {"f.a", "f.b", "run unordered"});
-        model.wait();
-    }
+    // (allow_tied_outputs() is gone, so its "does not lift it" section is deleted.)
 }
 
-TEST_CASE("fused: tied outputs throw in parallel mode unless allow_tied_outputs(); sequential mode does not check",
+TEST_CASE("fused: tied outputs in parallel mode are accepted when atomic and rejected at forward otherwise; sequential does not check",
           "[flavors][fused][errors]") {
-    const auto tied = [](cs::FusedSystem::Mode mode, bool allow) {
-        return tfl::make([mode, allow](cs::System& s) {
-            s.add_subsystem<tfl::ZeroAcc>("zero");
-            s.add_subsystem<tfl::Wave>(
-                "f", mode, std::optional<sycl::range<3>>{},
-                std::function<void(cs::FusedSystem&)>{[allow](cs::FusedSystem& w) {
-                    if (allow) w.allow_tied_outputs();
-                    w.add_subsystem<tfl::Adder>("a", 1.0f);
-                    w.add_subsystem<tfl::Adder>("b", 2.0f);
-                }});
-            s.tie_outputs<DType::atomic_f32, 1>({"zero.acc", "f.a.acc", "f.b.acc"}, "sum",
-                                                cs::alias::fixed(12));  // atomic writers, one root
-        });
-    };
-    SECTION("parallel, refused") {
-        cs::Model model = tied(cs::FusedSystem::Mode::parallel, false);
-        model.setup();
-        tfl::expect_throws([&] { model.forward(); }, {"f.a", "f.b", "share one root", "allow_tied_outputs"});
-        model.wait();
-    }
-    SECTION("parallel, allowed: the atomic writers accumulate") {
-        cs::Model model = tied(cs::FusedSystem::Mode::parallel, true);
+    SECTION("parallel, atomic: the writers accumulate") {
+        cs::Model model = tfl::tied_adders<tfl::kPar>();
         model.setup();
         model.forward();
         model.wait();
-        CHECK(tfl::out_of<1>(model, "sum") == std::vector<float>(12, 3.0f));
+        CHECK(tfl::out_of<1>(model, "sum") == std::vector<float>(12, 3.0f));  // 1 + 2
+    }
+    SECTION("parallel, not atomic: forward throws naming both") {
+        cs::Model model = tfl::make([](cs::System& s) {
+            s.add_subsystem(cs::fuse_components<tfl::kPar>("f", cs::subsystem_desc<tfl::Src1>("a", std::array<int, 1>{12}),
+                                                           cs::subsystem_desc<tfl::Src1>("b", std::array<int, 1>{12}, 2.0f, 0.0f)));
+            s.tie_outputs<DType::f32, 1>({"f.a.y", "f.b.y"}, "t", cs::alias::fixed(12), cs::TieOutputsPolicy::allow_plain);
+        });
+        CHECK_NOTHROW(model.setup());
+        tfl::expect_throws([&] { model.forward(); }, {"f.a", "f.b", "not atomic"});
+        model.wait();
     }
     SECTION("sequential: no check, the writers accumulate") {
-        cs::Model model = tied(cs::FusedSystem::Mode::sequential, false);
+        cs::Model model = tfl::tied_adders<tfl::kSeq>();
         model.setup();
         model.forward();
         model.wait();
@@ -922,80 +850,48 @@ TEST_CASE("fused: tied outputs throw in parallel mode unless allow_tied_outputs(
 // =============================================================================================
 // Fused, both modes: value-driven sizes, the local-memory limit
 // =============================================================================================
-TEST_CASE("fused: a value-driven size driven by a stage of the same fuse throws at setup, in both modes",
-          "[flavors][fused][errors]") {
+TEST_CASE("fused: a value-driven size driven by a stage of the same fuse is refused at setup", "[flavors][fused][errors]") {
     // (FromInputDim and unspecified dims through connections are allowed: the chains above use both.)
-    const auto refused = [](cs::FusedSystem::Mode mode) {
-        cs::Model model = tfl::make([mode](cs::System& s) {
-            s.add_subsystem<tfl::Wave>("f", mode, std::optional<sycl::range<3>>{},
-                                       std::function<void(cs::FusedSystem&)>{[](cs::FusedSystem& w) {
-                                           w.add_subsystem<tfl::NSrc>("a", 8.0f);
-                                           w.add_subsystem<tfl::Bins>("b");
-                                       }});
-            s.connect("f.a.n", "f.b.n");  // b's output size is the VALUE of a's output
+    SECTION("sequential: the setup-end check names both stages") {
+        cs::Model model = tfl::make([](cs::System& s) {
+            s.add_subsystem(cs::fuse_components<tfl::kSeq>("f", cs::connects_desc({{"a.n", "b.n"}}),  // b's output size is the VALUE of a's output
+                                                           cs::subsystem_desc<tfl::NSrc>("a", 8.0f),
+                                                           cs::subsystem_desc<tfl::Bins>("b")));
         });
         tfl::expect_throws([&] { model.setup(); }, {"f.b", "f.a", "VALUE"});
-        model.wait();  // setup() may have submitted initializer work before it threw
-    };
-    SECTION("sequential") { refused(cs::FusedSystem::Mode::sequential); }
-    SECTION("parallel") { refused(cs::FusedSystem::Mode::parallel); }
+    }
+    SECTION("parallel: the connect itself is rejected, before that check") {
+        cs::Model model = tfl::make([](cs::System& s) {
+            s.add_subsystem(cs::fuse_components<tfl::kPar>("f", cs::connects_desc({{"a.n", "b.n"}}),
+                                                           cs::subsystem_desc<tfl::NSrc>("a", 8.0f),
+                                                           cs::subsystem_desc<tfl::Bins>("b")));
+        });
+        tfl::expect_throws([&] { model.setup(); }, {"f", "connect", "stages run unordered"});
+    }
 }
 
 TEST_CASE("fused: a value-driven size driven from outside the fuse runs and follows the value, in both modes",
           "[flavors][fused]") {
-    const auto run = [](cs::FusedSystem::Mode mode) {
-        cs::Model model = tfl::make([mode](cs::System& s) {
-            s.add_subsystem<tfl::Src1>("src", std::array<int, 1>{100});
-            s.add_subsystem<tfl::Wave>("f", mode, std::optional<sycl::range<3>>{},
-                                       std::function<void(cs::FusedSystem&)>{[](cs::FusedSystem& w) {
-                                           w.add_subsystem<tfl::Elem<0>>("e");
-                                           w.add_subsystem<tfl::Bins>("b");  // n is a free input
-                                       }});
-            s.connect("src.y", "f.e.x");
-        });
-        model.setup();
-        const std::uint32_t nb1 = 8, nb2 = 13;
-        for (const std::uint32_t nb : {nb1, nb2}) {  // the second value grows the output root
-            model.init_input("f.b.n", cs::init::from_host(std::vector<std::uint32_t>{nb}));
-            model.forward();
-            model.wait();
-            std::vector<float> want(nb);
-            for (std::uint32_t i = 0; i < nb; ++i) want[i] = static_cast<float>(i + 1);
-            CHECK(tfl::out_of<1>(model, "f.b.bins") == want);
-        }
-    };
-    SECTION("sequential") { run(cs::FusedSystem::Mode::sequential); }
-    SECTION("parallel") { run(cs::FusedSystem::Mode::parallel); }
+    SECTION("sequential") { tfl::value_from_outside<tfl::kSeq>(); }
+    SECTION("parallel") { tfl::value_from_outside<tfl::kPar>(); }
 }
 
 TEST_CASE("fused: a wave's local memory over the device limit throws at forward, naming the scratch stages",
           "[flavors][fused][errors]") {
-    const sycl::device dev{sycl::default_selector_v};  // the Model's default device
+    const sycl::device dev{sycl::default_selector_v};  // the runtime's default device
     const std::size_t  limit = dev.get_info<sycl::info::device::local_mem_size>();
     if (limit > (std::size_t{1} << 24)) SKIP("the device reports no usable local-memory limit (" << limit << " bytes)");
     // Each stage takes 60% of the limit: alone it fits, the two slices of a sequential wave do not,
     // and a parallel wave (disjoint groups, one shared slice) needs only the larger one.
     const std::size_t elems = limit / sizeof(float) * 6 / 10;
-    const auto        make_wave = [elems](cs::FusedSystem::Mode mode) {
-        return tfl::make([elems, mode](cs::System& s) {
-            s.add_subsystem<tfl::Src1>("src", std::array<int, 1>{256});
-            s.add_subsystem<tfl::Wave>("f", mode, std::optional<sycl::range<3>>{},
-                                       std::function<void(cs::FusedSystem&)>{[elems](cs::FusedSystem& w) {
-                                           w.add_subsystem<tfl::BigStage>("a", elems);
-                                           w.add_subsystem<tfl::BigStage>("b", elems);
-                                       }});
-            s.connect("src.y", "f.a.x");
-            s.connect("src.y", "f.b.x");
-        });
-    };
     SECTION("sequential: the slices add up, over the limit") {
-        cs::Model model = make_wave(cs::FusedSystem::Mode::sequential);
+        cs::Model model = tfl::big_wave<tfl::kSeq>(elems);
         model.setup();
         tfl::expect_throws([&] { model.forward(); }, {"f.a", "f.b", "bytes of local memory"});
         model.wait();
     }
     SECTION("parallel: one shared slice, within the limit") {
-        cs::Model model = make_wave(cs::FusedSystem::Mode::parallel);
+        cs::Model model = tfl::big_wave<tfl::kPar>(elems);
         model.setup();
         model.forward();
         model.wait();
@@ -1007,62 +903,20 @@ TEST_CASE("fused: a wave's local memory over the device limit throws at forward,
 }
 
 // =============================================================================================
-// Fused, errors at setup
-// =============================================================================================
-TEST_CASE("fused: a custom-op child, a host child and mixed ranks throw at setup, naming the child",
-          "[flavors][fused][errors]") {
-    const auto bad_wave = [](auto bad_tag, bool bad_has_input) {
-        using Bad = typename decltype(bad_tag)::type;
-        return tfl::make([bad_has_input](cs::System& s) {
-            s.add_subsystem<tfl::Src1>("src", std::array<int, 1>{1000});
-            s.add_subsystem<tfl::Wave>(
-                "f", cs::FusedSystem::Mode::parallel, std::optional<sycl::range<3>>{},
-                std::function<void(cs::FusedSystem&)>{[](cs::FusedSystem& w) {
-                    w.add_subsystem<tfl::Elem<0>>("a");  // a valid stage first, then the offender
-                    if constexpr (std::is_same_v<Bad, tfl::Src2>)
-                        w.add_subsystem<Bad>("bad", std::array<int, 2>{4, 4});
-                    else
-                        w.add_subsystem<Bad>("bad");
-                }});
-            s.connect("src.y", "f.a.x");
-            if (bad_has_input) {
-                s.add_subsystem<tfl::Src1>("src2", std::array<int, 1>{1000});
-                s.connect("src2.y", "f.bad.x");
-            }
-        });
-    };
-    SECTION("custom-op child") {
-        cs::Model model = bad_wave(std::type_identity<tfl::NopCustom>{}, true);
-        tfl::expect_throws([&] { model.setup(); }, {"f.bad", "custom-op", "cannot be fused"});
-        model.wait();  // setup() may have submitted initializer work before it threw
-    }
-    SECTION("host child") {
-        cs::Model model = bad_wave(std::type_identity<tfl::NopHost>{}, true);
-        tfl::expect_throws([&] { model.setup(); }, {"f.bad", "host", "cannot be fused"});
-        model.wait();  // setup() may have submitted initializer work before it threw
-    }
-    SECTION("children of different ranks") {
-        cs::Model model = bad_wave(std::type_identity<tfl::Src2>{}, false);
-        tfl::expect_throws([&] { model.setup(); }, {"f.bad", "share one rank"});
-        model.wait();  // setup() may have submitted initializer work before it threw
-    }
-}
-
-// =============================================================================================
 // Fused vs unfused
 // =============================================================================================
-TEST_CASE("fused vs unfused: four stages as a plain System and as a sequential FusedSystem, bitwise-equal",
+TEST_CASE("fused vs unfused: four stages as a plain System and as a sequential fused component, bitwise-equal",
           "[flavors][fused]") {
     constexpr int kN = 777;
     // Identical, non-round inputs: 0.37 * i - 11.1 (the Src is deterministic).
-    const auto feed = [](cs::System& s) { s.add_subsystem<tfl::Src1>("src", std::array<int, 1>{kN}, 0.37f, -11.1f); };
+    const auto feed = [](cs::System& s) { s.add_subsystem(cs::subsystem_desc<tfl::Src1>("src", std::array<int, 1>{kN}, 0.37f, -11.1f)); };
 
     cs::Model unfused = tfl::make([&](cs::System& s) {
         feed(s);
-        s.add_subsystem<tfl::Elem<0>>("a");
-        s.add_subsystem<tfl::Elem<1>>("b");
-        s.add_subsystem<tfl::Elem<3>>("c");
-        s.add_subsystem<tfl::Elem<2>>("d");
+        s.add_subsystem(cs::subsystem_desc<tfl::Elem<0>>("a"));
+        s.add_subsystem(cs::subsystem_desc<tfl::Elem<1>>("b"));
+        s.add_subsystem(cs::subsystem_desc<tfl::Elem<3>>("c"));
+        s.add_subsystem(cs::subsystem_desc<tfl::Elem<2>>("d"));
         s.connect("src.y", "a.x");
         s.connect("a.y", "b.x");
         s.connect("b.y", "c.x");
@@ -1070,18 +924,12 @@ TEST_CASE("fused vs unfused: four stages as a plain System and as a sequential F
     });
     cs::Model fused = tfl::make([&](cs::System& s) {
         feed(s);
-        s.add_subsystem<tfl::Wave>(
-            "f", cs::FusedSystem::Mode::sequential, std::optional<sycl::range<3>>{},
-            std::function<void(cs::FusedSystem&)>{[](cs::FusedSystem& w) {
-                w.add_subsystem<tfl::Elem<0>>("a");
-                w.add_subsystem<tfl::Elem<1>>("b");
-                w.add_subsystem<tfl::Elem<3>>("c");
-                w.add_subsystem<tfl::Elem<2>>("d");
-            }});
+        s.add_subsystem(cs::fuse_components<tfl::kSeq>("f", cs::connects_desc({{"a.y", "b.x"}, {"b.y", "c.x"}, {"c.y", "d.x"}}),
+                                                       cs::subsystem_desc<tfl::Elem<0>>("a"),
+                                                       cs::subsystem_desc<tfl::Elem<1>>("b"),
+                                                       cs::subsystem_desc<tfl::Elem<3>>("c"),
+                                                       cs::subsystem_desc<tfl::Elem<2>>("d")));
         s.connect("src.y", "f.a.x");
-        s.connect("f.a.y", "f.b.x");
-        s.connect("f.b.y", "f.c.x");
-        s.connect("f.c.y", "f.d.x");
     });
     unfused.setup();
     fused.setup();
@@ -1103,50 +951,50 @@ TEST_CASE("fused vs unfused: four stages as a plain System and as a sequential F
     CHECK(cst::all_close(u, want));
 }
 
-
 // =============================================================================================
-// Transient flavors: the children release after the group or wave
+// Lifetime
 // =============================================================================================
-TEST_CASE("transient: ParallelSystem and FusedSystem children release after the group or wave",
-          "[flavors][transient]") {
+TEST_CASE("transient: a system_from group and a fused component release after their turn", "[flavors][transient]") {
     const bool fused = GENERATE(false, true);
     CAPTURE(fused);
     cs::Model model = cs::create_model<tfl::Top>(cst::pooled_config(), tfl::Build{[fused](cs::System& s) {
-        s.add_subsystem<tfl::Src1>("src", std::array<int, 1>{tfl::kLen});
-        const cs::property_list props = fused ? cs::property_list{cs::property::fused{}, cs::property::transient{}}
-                                              : cs::property_list{cs::property::parallel{}, cs::property::transient{}};
-        s.add_subsystem("grp", props, s.child<tfl::Elem<0>>("a"), s.child<tfl::Elem<0>>("b"));
+        s.add_subsystem(cs::subsystem_desc<tfl::Src1>("src", std::array<int, 1>{tfl::kLen}));
+        const cs::property_list props{cs::property::transient{}};
+        if (fused)
+            s.add_subsystem(props, cs::fuse_components<tfl::kPar>("grp", cs::subsystem_desc<tfl::Elem<0>>("a"), cs::subsystem_desc<tfl::Elem<0>>("b")));
+        else
+            s.add_subsystem(props, cs::system_from("grp", cs::subsystem_desc<tfl::Elem<0>>("a"), cs::subsystem_desc<tfl::Elem<0>>("b")));
         s.connect("src.y", "grp.a.x");
         s.connect("src.y", "grp.b.x");
     }});
     model.setup();
-    // A FusedSystem keeps its wave staging in member usm_vectors drawn from the pool, so the
-    // baseline is taken after the FIRST forward: what the group's roots held is then gone, what the
-    // fuse stages stays. The roots themselves are checked directly after that first forward.
+    // A fused component keeps its wave staging in member usm_vectors drawn from the pool, so the baseline is taken after the
+    // FIRST forward: what the group's variables held is then gone (the group is deleted with its staging).
     model.forward();
     model.wait();
-    CHECK(model.get_subsystem("grp") == nullptr);  // the group is deleted after its turn, its roots with it
+    CHECK(model.get_subsystem("grp") == nullptr);  // the group is deleted after its turn, its variables with it
     for (const char* p : {"grp.a.y", "grp.b.y"}) {
         INFO(p);
-        tfl::expect_throws([&] { (void)model.root().entry_at(p); }, {"'grp' is deleted"});
+        tfl::expect_throws([&] { (void)cst::synced_output<DType::f32, 1>(model, p); }, {"was deleted"});
     }
+    // REVIEW: the equality below assumes a steady state after the first forward (the pool returns what a rebuilt group
+    // allocates, and the fused staging buffers go with the group). Nothing in the headers states the pool accounting.
     const auto base = cst::pool_in_use(model);
     model.forward();
     model.forward();
     model.wait();
     CHECK(cst::pool_in_use(model) == base);  // every later forward returns what it allocated
-    tfl::expect_throws([&] { (void)model.view_output<DType::f32, 1>("grp.a.y"); }, {"grp"});
 }
 
-TEST_CASE("ownership: a placement that comes back is copied from a live one, not recomputed", "[flavors][transient]") {
-    // src.y is written once (do_once, then deleted). The eternal e1 keeps its DEVICE placement live. The transient host-kind
-    // Prefix is rebuilt every forward: its host placement is freed with it and must come back as a COPY of the live device
-    // placement (no producer runs again, and an output is never initialized).
+TEST_CASE("replay: a transient host reader of a deleted do_once producer reads its last value on every forward",
+          "[flavors][transient]") {
+    // src.y is written once (do_once, then deleted). The eternal e1 keeps its variable alive. The transient host-kind Prefix is
+    // rebuilt every forward and reads the producer's last value (nothing runs the producer again).
     cs::Model model = tfl::make([](cs::System& s) {
-        s.add_subsystem<tfl::Src1>("src", cs::property_list{cs::property::do_once{}}, std::array<int, 1>{tfl::kLen});
-        s.add_subsystem<tfl::Elem<0>>("e1");
-        s.add_subsystem<tfl::Prefix>("host", cs::property_list{cs::property::transient{}});
-        s.add_subsystem<tfl::Elem<0>>("e2");
+        s.add_subsystem(cs::property_list{cs::property::do_once{}}, cs::subsystem_desc<tfl::Src1>("src", std::array<int, 1>{tfl::kLen}));
+        s.add_subsystem(cs::subsystem_desc<tfl::Elem<0>>("e1"));
+        s.add_subsystem(cs::property_list{cs::property::transient{}}, cs::subsystem_desc<tfl::Prefix>("host"));
+        s.add_subsystem(cs::subsystem_desc<tfl::Elem<0>>("e2"));
         s.connect("src.y", "e1.x");
         s.connect("src.y", "host.x");
         s.connect("host.z", "e2.x");
@@ -1166,74 +1014,4 @@ TEST_CASE("ownership: a placement that comes back is copied from a live one, not
     }
     CHECK(model.get_subsystem("src") == nullptr);   // the producer ran once and is gone
     CHECK(model.get_subsystem("host") == nullptr);  // the transient host stage is deleted at the end of each forward
-}
-
-TEST_CASE("write epochs: Fused and Parallel systems give the same deltas as the plain System (+1 per written root per forward)",
-          "[flavors][epoch]") {
-    const auto delta_of = [](cs::Model& m, const char* path) {
-        const auto before = m.root().entry_at(path).write_epoch();
-        m.forward();
-        m.wait();
-        return m.root().entry_at(path).write_epoch() - before;
-    };
-    // plain: src -> a -> b at the top level
-    cs::Model plain = tfl::make([](cs::System& s) {
-        s.add_subsystem<tfl::Src1>("src", std::array<int, 1>{1000});
-        s.add_subsystem<tfl::Elem<0>>("a");
-        s.add_subsystem<tfl::Elem<1>>("b");
-        s.connect("src.y", "a.x");
-        s.connect("a.y", "b.x");
-    });
-    plain.setup();
-    // fused sequential: the same two stages in a wave
-    cs::Model fused = tfl::make([](cs::System& s) {
-        s.add_subsystem<tfl::Src1>("src", std::array<int, 1>{1000});
-        s.add_subsystem<tfl::Wave>("f", cs::FusedSystem::Mode::sequential, std::optional<sycl::range<3>>{},
-                                   std::function<void(cs::FusedSystem&)>{[](cs::FusedSystem& w) {
-                                       w.add_subsystem<tfl::Elem<0>>("a");
-                                       w.add_subsystem<tfl::Elem<1>>("b");
-                                   }});
-        s.connect("src.y", "f.a.x");
-        s.connect("f.a.y", "f.b.x");
-    });
-    fused.setup();
-    // fused parallel: independent stages
-    cs::Model fpar = tfl::make([](cs::System& s) {
-        s.add_subsystem<tfl::Src1>("src", std::array<int, 1>{1000});
-        s.add_subsystem<tfl::Wave>("f", cs::FusedSystem::Mode::parallel, std::optional<sycl::range<3>>{},
-                                   std::function<void(cs::FusedSystem&)>{[](cs::FusedSystem& w) {
-                                       w.add_subsystem<tfl::Elem<0>>("a");
-                                       w.add_subsystem<tfl::Elem<2>>("b");
-                                   }});
-        s.connect("src.y", "f.a.x");
-        s.connect("src.y", "f.b.x");
-    });
-    fpar.setup();
-    // typed ParallelSystem: independent children
-    cs::Model par = tfl::make([](cs::System& s) {
-        s.add_subsystem<tfl::Src1>("src", std::array<int, 1>{1000});
-        s.add_subsystem<tfl::Par>("f", std::function<void(cs::ParallelSystem&)>{[](cs::ParallelSystem& p) {
-            p.add_subsystem<tfl::Elem<0>>("a");
-            p.add_subsystem<tfl::Elem<2>>("b");
-        }});
-        s.connect("src.y", "f.a.x");
-        s.connect("src.y", "f.b.x");
-    });
-    par.setup();
-    for (cs::Model* m : {&plain, &fused, &fpar, &par}) {
-        m->forward();  // the first forward allocates
-        m->wait();
-    }
-    for (int r = 0; r < 3; ++r) {
-        CHECK(delta_of(plain, "src.y") == 1);
-        CHECK(delta_of(plain, "a.y") == 1);
-        CHECK(delta_of(plain, "b.y") == 1);
-        CHECK(delta_of(fused, "src.y") == 1);
-        CHECK(delta_of(fused, "f.a.y") == 1);
-        CHECK(delta_of(fused, "f.b.y") == 1);
-        CHECK(delta_of(fpar, "f.a.y") == 1);
-        CHECK(delta_of(fpar, "f.b.y") == 1);
-        CHECK(delta_of(par, "f.a.y") == 1);
-        CHECK(delta_of(par, "f.b.y") == 1);
-    }
 }
