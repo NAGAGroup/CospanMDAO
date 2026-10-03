@@ -1,7 +1,7 @@
 #pragma once
 
 // =============================================================================
-// naga/cospan/dtype.hpp — the closed set of I/O element types (r01 §2.1)
+// naga/cospan/dtype.hpp — the closed set of I/O element types (r02 section 4)
 // =============================================================================
 
 #include <cstddef>

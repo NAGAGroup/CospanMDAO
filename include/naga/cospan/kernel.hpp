@@ -1,7 +1,7 @@
 #pragma once
 
 // =============================================================================
-// naga/cospan/kernel.hpp — kernel machinery (r01 §5)
+// naga/cospan/kernel.hpp — kernel machinery (r02 sections 4 and 5)
 // =============================================================================
 //
 // The KernelBody contract (concepts read off the call operator's signature),
@@ -36,7 +36,7 @@ namespace sk = ::naga::slabkit;
 // -----------------------------------------------------------------------------
 
 /// What a custom-operation body receives (D1: native backend work only). The
-/// one place a raw device pointer is obtainable (r01 §5.1).
+/// one place a raw device pointer is obtainable (r02 section 4.1).
 struct CustomOp {
     sycl::interop_handle& h;
 
@@ -116,7 +116,7 @@ private:
 };
 
 // -----------------------------------------------------------------------------
-// StageRecord, FnOffsetInfo (r01 §5.4)
+// StageRecord, FnOffsetInfo (r02 section 5)
 // -----------------------------------------------------------------------------
 
 struct StageRecord {
@@ -290,7 +290,7 @@ template <class KB>
 inline constexpr int launch_rank_v = kernel_rank_v<KB> > 0 ? kernel_rank_v<KB> : 1;
 
 // -----------------------------------------------------------------------------
-// Local layout (r01 §5.2)
+// Local layout (r02 section 4.1)
 // -----------------------------------------------------------------------------
 
 namespace detail {
@@ -420,7 +420,7 @@ struct ItemFixup {
 }  // namespace detail
 
 // -----------------------------------------------------------------------------
-// The generated device function and its placeholders (r01 §5.5, §5.6)
+// The generated device function and its placeholders (r02 section 5)
 // -----------------------------------------------------------------------------
 
 /// Placeholders: one per launch rank; declarations only, the JIT replaces them.
@@ -502,7 +502,7 @@ sycl::AdaptiveCpp_jit::dynamic_function_config& jit_config() {
 
 namespace detail {
 
-/// Default work-group shape per rank (implementation-tunable, r01 §5.7).
+/// Default work-group shape per rank (implementation-tunable, r02 section 4.2).
 template <int R>
 sycl::range<3> default_wg() {
     if constexpr (R == 1)
@@ -555,7 +555,7 @@ sycl::event launch_individual(sk::unordered_queue& q, const sycl::device& dev, c
 }
 
 // -----------------------------------------------------------------------------
-// The chained wave (fused owners, r01 §5.6, §7.5)
+// The chained wave (fused owners, r02 section 5)
 // -----------------------------------------------------------------------------
 
 using JitId = sycl::AdaptiveCpp_jit::dynamic_function_id;

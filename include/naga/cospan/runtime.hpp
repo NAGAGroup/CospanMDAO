@@ -10,8 +10,7 @@
 // (docs/design-review-2026-10-03.md, section 2), and an instance or a variable
 // never stores one.
 //
-// The Model owns the Runtime (wired in a later phase) and passes it down a
-// forward. `forward` counts the Model's runs: the event lists on a variable's
+// The Model owns the Runtime and passes it down a forward. `forward` counts the Model's runs: the event lists on a variable's
 // shared metadata roll over when it changes (variable.hpp, EventLists), so it is
 // the one number that separates "this forward's writes" from the last one's.
 

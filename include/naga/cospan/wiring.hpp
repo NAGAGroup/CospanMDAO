@@ -15,7 +15,8 @@
 //   connect: the SOURCE's metadata wins. The target side's initializer is dropped: an initializer on a connected
 //            input is accepted and ignored (the source supplies the values).
 //   tie:     the ALIAS's metadata wins (it owns the shape). The members' initializers are folded into it by the
-//            highest-level-wins rule (smaller depth wins; two at one depth from different declarers are an error).
+//            last-declaration-wins rule (design review, section 9; a tie's own initializer replaces its members').
+//            A member's initializer is carried only when the alias has none.
 //   promote: the MEMBER's metadata wins: the promotion joins the member's variable directly.
 // One exception, in merge_into: when exactly one side already holds data (a rebuilt child rejoining live data),
 // that side's object survives, carrying the merged shape definition, and keeping its own
@@ -25,8 +26,8 @@
 // that outlives it (a tie builds its alias first, but that is only reachable once the call returns).
 //
 // CALLER CONTRACT (the System, phase 4): it resolves paths to instances; it passes the WiringSite (its location
-// text, the child positions of the two ends, its warning set); it passes the declaration depth and declarer
-// path to declare_init; it keeps the returned alias instances alive (instances are owned by their declarer); and
+// text, the child positions of the two ends, its warning set); it passes the initializer to declare_init (the last
+// declaration wins); it keeps the returned alias instances alive (instances are owned by their declarer); and
 // to wire a rebuilt child back in, it replays these same calls in declaration order. It checks names and the
 // "legal inside setup()" guard itself: neither is a wiring rule.
 
@@ -401,7 +402,7 @@ inline void apply_tie_merge(const WiringSite& site, const char* verb, const std:
 
 /// A NEW variable (target, not source); every member's variable merges into it and the alias's metadata wins. The
 /// members are inputs of dtype DT and rank Rank; their unspecified dims come from the tie and their specified dims
-/// are constraints on it. The members' initializers fold into it (smallest depth wins). `device`: where the tie's
+/// are constraints on it. The members' initializers fold into it (the last declaration wins). `device`: where the tie's
 /// initialization runs. Members become non-targets: they connect through the alias.
 template <DType DT, int Rank>
 std::shared_ptr<Instance> tie_inputs(const WiringSite& site, const TieMembers& members, std::string name,

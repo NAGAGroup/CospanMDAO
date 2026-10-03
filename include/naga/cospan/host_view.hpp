@@ -115,12 +115,12 @@ private:
     std::shared_ptr<detail::Instance> inst_;
 };
 
-/// HostRagged<DT, Rank> — a host view of a ragged variable, Rank 2..3: the flat data (the blocks end to end), N blocks
+/// HostRagged<DT, Rank> — a host view of a ragged variable, Rank 2 only: the flat data (the blocks end to end), N blocks
 /// and their offsets. Also taken of a DENSE variable (the blocks are its rows).
 template <DType DT, int Rank>
 class HostRagged {
 public:
-    static_assert(Rank >= 2 && Rank <= 3, "cospan: a ragged host view has rank 2..3");
+    static_assert(Rank == 2, "cospan: a ragged host view is rank 2 only");
     using value_type = cpp_type_t<value_dtype(DT)>;
     static constexpr DType dtype = DT;
     static constexpr int   rank  = Rank;

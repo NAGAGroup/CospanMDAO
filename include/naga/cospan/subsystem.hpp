@@ -21,9 +21,8 @@
 // set_device, which the factory (System::add_subsystem) calls after the child's setup (section 2), and the outer
 // call wins.
 //
-// THE FORWARD. The three steps and the event getter below belong to section 3 of the record. They are implemented
-// by components (phase 5) and by Systems (phase 6); they are part of the contract now so that the owner's
-// structure code (deleting a child waits on events()) is written against the final shape.
+// THE FORWARD. The three steps and the event getter below belong to section 3 of the record and to r02 section 3.
+// They are implemented by components and by Systems; deleting a child waits on its events().
 
 #include <memory>
 #include <span>
@@ -72,8 +71,9 @@ public:
     /// Appends this subsystem's own instances (not its children's).
     virtual void collect_instances(std::vector<std::shared_ptr<detail::Instance>>& out) const = 0;
 
-    // ---- forward (section 3): implemented by components (phase 5) and Systems (phase 6) ----------
-    /// A component: resolve derived shapes, materialize inputs, then outputs. A System: rebuild transient children.
+    // ---- forward (section 3): implemented by components and Systems ----------
+    /// A component: materialize the inputs, run pre_forward, materialize the outputs, point the wrappers (design review,
+    /// section 10). A System: rebuild transient children, then pre_forward.
     virtual void run_precompute(detail::Runtime& rt) = 0;
     /// A component: submit its work. A System: call each child's forward in declaration order.
     virtual void run_compute(detail::Runtime& rt) = 0;
