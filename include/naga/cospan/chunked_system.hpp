@@ -1,6 +1,14 @@
 #pragma once
 
 // =============================================================================
+// DEAD CODE, kept for reference only. ChunkedSystem, slices and leading ranges
+// were not ported to the 2026-10-03 data model (docs/design-review-2026-10-03.md,
+// section 8, phase 9). They are being redesigned next; this header shows how the
+// old ones worked. It is not included by cospan.hpp and does not compile.
+// =============================================================================
+#error "naga/cospan/chunked_system.hpp is dead code awaiting the chunked redesign"
+
+// =============================================================================
 // naga/cospan/chunked_system.hpp — ChunkedSystem (r01 "Chunked systems")
 // =============================================================================
 //

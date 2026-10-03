@@ -1,3 +1,4 @@
+// NOT BUILT: chunked systems are set aside pending their redesign (docs/design-review-2026-10-03.md, section 8, phase 9).
 #pragma once
 
 // Helpers for ChunkedSystem tests.

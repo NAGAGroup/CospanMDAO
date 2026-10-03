@@ -18,4 +18,3 @@
 #include "naga/cospan/system.hpp"
 #include "naga/cospan/fused_component.hpp"
 #include "naga/cospan/model.hpp"
-#include "naga/cospan/chunked_system.hpp"
