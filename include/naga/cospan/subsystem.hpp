@@ -13,10 +13,12 @@
 #include <cstddef>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 #include <sycl/sycl.hpp>
 
@@ -64,8 +66,11 @@ public:
     virtual ~LaunchDescription() = default;
     virtual bool is_custom_op() const = 0;
     virtual bool is_host() const      = 0;
-    /// Ordering is the stream's (r01 §7.3).
-    virtual void submit(SubmitTarget& t) const = 0;
+    /// Ordering is the stream's (r01 §7.3). Returns the events of what it submitted: one for a
+    /// kernel, custom-op or host launch, none when nothing was submitted (an empty range). The
+    /// caller registers them on the storage of every port the launch touched (r01 §4.4,
+    /// Subsystem::register_launch_events).
+    virtual std::vector<sycl::event> submit(SubmitTarget& t) const = 0;
     /// Null for custom-op and host descriptions.
     virtual const KernelParts* kernel() const { return nullptr; }
 };
@@ -103,6 +108,12 @@ public:
     /// A Component: the other-placement sync, then DECREMENT every root it touches and free the ones that
     /// reach 0 (one stream wait for the batch; r01 §4.4).
     virtual void run_post_compute(ExecCtx& owner_ctx) = 0;
+
+    /// The owner calls this right after submitting this subsystem's launch, before run_post_compute:
+    /// a Component registers the launch's events on the storage of every port it touched, at the
+    /// placement the launch ran on (SlabKit usm_vector::register_events, r01 §4.4). Systems have
+    /// no launch of their own: the default does nothing.
+    virtual void register_launch_events(std::span<const sycl::event> events) { (void)events; }
 
     /// Run policy (given by the owner at registration): the LIVE counter (-1 eternal, -2 transient,
     /// n > 0 runs left, 0 skipped) and the value the owner asked for.

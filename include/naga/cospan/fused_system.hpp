@@ -154,8 +154,10 @@ public:
         }
 
         const std::vector<const KernelParts*> parts = validate(ds);
-        submit_wave(parts);
+        const std::vector<sycl::event>        wave  = submit_wave(parts);  // empty when every stage is empty
 
+        // The wave's one event goes on every child's ports (r01 §4.4), before any post_compute pushes.
+        for (std::size_t i = 0; i < n; ++i) children_[i]->register_launch_events(wave);
         for (std::size_t i = 0; i < n; ++i) children_[i]->run_post_compute(child_ctx_[i]);
         return nullptr;  // "I submitted"
     }
@@ -240,7 +242,9 @@ private:
         v->from_host(std::span<const T>{src});  // a routed, stream-ordered copy of a task-owned snapshot
     }
 
-    void submit_wave(const std::vector<const KernelParts*>& parts) {
+    /// Submits the wave; returns its event (none when every stage is empty). The event is also
+    /// registered on the staging buffers the wave reads, so the next forward's overwrite is ordered after it.
+    std::vector<sycl::event> submit_wave(const std::vector<const KernelParts*>& parts) {
         const sycl::range<3> w       = wave_wg(parts);
         const std::size_t    wg_size = w[0] * w[1] * w[2];
 
@@ -292,7 +296,7 @@ private:
                 (mode_ == Mode::sequential ? "the sum of its stages' slices" : "the largest stage's slice, shared") +
                 ") but the device offers " + std::to_string(local_limit) + "; scratch stages: " + scratch_stages);
         }
-        if (total_groups == 0) return;  // every stage is empty
+        if (total_groups == 0) return {};  // every stage is empty
 
         upload(recs_, recs);
         upload(in_, in);
@@ -304,17 +308,24 @@ private:
         const std::byte*   ip = in_->data();
         std::byte*         op = out_->data();
         const std::byte*   bp = body_->data();
+        sycl::event        ev;
         switch (rank_) {
             case 1:
-                detail::launch_wave<1>(t, *cfg_, detail::wave_nd_range<1>(total_groups, w), rp, ip, op, bp, local_bytes);
+                ev = detail::launch_wave<1>(t, *cfg_, detail::wave_nd_range<1>(total_groups, w), rp, ip, op, bp, local_bytes);
                 break;
             case 2:
-                detail::launch_wave<2>(t, *cfg_, detail::wave_nd_range<2>(total_groups, w), rp, ip, op, bp, local_bytes);
+                ev = detail::launch_wave<2>(t, *cfg_, detail::wave_nd_range<2>(total_groups, w), rp, ip, op, bp, local_bytes);
                 break;
             default:
-                detail::launch_wave<3>(t, *cfg_, detail::wave_nd_range<3>(total_groups, w), rp, ip, op, bp, local_bytes);
+                ev = detail::launch_wave<3>(t, *cfg_, detail::wave_nd_range<3>(total_groups, w), rp, ip, op, bp, local_bytes);
                 break;
         }
+        const std::vector<sycl::event> evs{ev};
+        recs_->register_events(evs);
+        in_->register_events(evs);
+        out_->register_events(evs);
+        body_->register_events(evs);
+        return evs;
     }
 
     Mode                          mode_;

@@ -106,14 +106,17 @@ public:
         detail::check_no_stage_connections(describe(), "ParallelSystem", children());
         if (!allow_tied_) detail::check_tied_outputs(describe(), "ParallelSystem", children());
 
+        std::vector<std::vector<sycl::event>> events(n);  // each child's own launch events
         ctx_.queue->submit_group([&](sk::queue::group& g) {
             GroupScope scope{*this, &g};
             for (std::size_t i = 0; i < n; ++i) {
                 SubmitTarget t = child_ctx_[i].target();  // the child's device, and the group
-                ds[i]->submit(t);
+                events[i]      = ds[i]->submit(t);
             }
         });
 
+        // Every child's launch events go on that child's ports (r01 §4.4), before any post_compute pushes.
+        for (std::size_t i = 0; i < n; ++i) children_[i]->register_launch_events(events[i]);
         for (std::size_t i = 0; i < n; ++i) children_[i]->run_post_compute(child_ctx_[i]);
         return nullptr;  // "I submitted"
     }

@@ -542,7 +542,10 @@ public:
             c.run_pre_compute(cc);
             if (auto d = c.run_compute_forward()) {
                 SubmitTarget t = cc.target();
-                d->submit(t);
+                // The launch's events go on the storage of every port the child touched, before its
+                // post_compute pushes to the other placements (r01 §4.4). Inside a ChunkedSystem this
+                // loop runs once per chunk, so each chunk's launch is registered.
+                c.register_launch_events(d->submit(t));
             }
             c.run_post_compute(cc);
             if (c.run_counter_ > 0) {

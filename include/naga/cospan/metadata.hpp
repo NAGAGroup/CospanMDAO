@@ -780,6 +780,19 @@ public:
     /// Roots only; primary (the declarer's own placement) first.
     std::span<const Placement> storage_placements() const noexcept { return placements_; }
 
+    /// Register the events of a launch on the storage this entry's PORT holds: the root's usm_vector
+    /// at this entry's own placement (and its ragged index arrays), through SlabKit's
+    /// usm_vector::register_events. Later memory operations on that storage are ordered after the
+    /// events, and a free waits on them (r01 §4.4). Any entry; a no-op when the root has no storage
+    /// there.
+    void register_launch_events(std::span<const sycl::event> events) {
+        if (events.empty()) return;
+        root_->register_events_on(placement(), events);
+    }
+    /// A test hook: how many registered events the storage this entry's port holds is keeping
+    /// (0 when the root has no storage at this entry's placement).
+    std::size_t registered_event_count() const { return root_->registered_events_on(placement()); }
+
     /// Arena route: a root, fully fixed, in device-kind storage (arenas are device-kind), that is
     /// marked or whose every partner runs eternally (setup_run_ == -1), and that is not internal to
     /// a ChunkedSystem (those are sized per chunk).
@@ -870,6 +883,11 @@ protected:
     }
 
     virtual void* raw_storage_on(const Placement& p) const = 0;
+
+    /// ROOTS ONLY: usm_vector::register_events on the storage at `p` (and its ragged index arrays).
+    virtual void register_events_on(const Placement& p, std::span<const sycl::event> events) = 0;
+    /// ROOTS ONLY: the number of events the storage at `p` is keeping registered.
+    virtual std::size_t registered_events_on(const Placement& p) const = 0;
 
     /// The only writer of wrapper fields (friendship, r01 §2.1).
     template <class W, class P>
@@ -1503,6 +1521,22 @@ protected:
     StorageEntry(std::string name, IOKind k, DType dt, int rank, std::vector<DimRecord> dims,
                  bool can_source, bool can_target)
         : IOEntry{std::move(name), k, dt, rank, std::move(dims), can_source, can_target} {}
+
+    void register_events_on(const Placement& p, std::span<const sycl::event> events) override {
+        if (!is_root() || !present_) return;
+        Slot* s = find_slot(p);
+        if (s == nullptr) return;
+        s->data.register_events(events);
+        if (s->offs) s->offs->register_events(events);  // the kernel reads the index arrays too
+        for (auto& a : s->per)
+            if (a) a->register_events(events);
+    }
+
+    std::size_t registered_events_on(const Placement& p) const override {
+        if (!is_root() || !present_) return 0;
+        const Slot* s = find_slot(p);
+        return s == nullptr ? 0 : s->data.registered_event_count();
+    }
 
     void* raw_storage_on(const Placement& p) const override {
         Slot* s = find_slot(p);

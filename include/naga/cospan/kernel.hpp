@@ -499,11 +499,11 @@ const std::byte* bytes_of(const T* p) {
 
 /// Submit the ONE outer kernel of rank R. `payload` (a trivially copyable
 /// struct with members rec, in, out, body) is captured by value; the stage
-/// function reads the private copies through FnOffsetInfo and byte pointers.
+/// function reads the private copies through FnOffsetInfo and byte pointers. Returns its event.
 template <int R, class Payload>
-void launch_individual(const SubmitTarget& t, sycl::AdaptiveCpp_jit::dynamic_function_config& cfg,
-                       const sycl::nd_range<R>& nd, const Payload& payload,
-                       std::size_t scratch_bytes) {
+sycl::event launch_individual(const SubmitTarget& t, sycl::AdaptiveCpp_jit::dynamic_function_config& cfg,
+                              const sycl::nd_range<R>& nd, const Payload& payload,
+                              std::size_t scratch_bytes) {
     auto cgf = [&](sycl::handler& h) {
         sycl::local_accessor<std::byte, 1> local{sycl::range<1>{scratch_bytes ? scratch_bytes : 1}, h};
         h.parallel_for(nd, cfg.apply([=](sycl::nd_item<R> it) {
@@ -520,10 +520,8 @@ void launch_individual(const SubmitTarget& t, sycl::AdaptiveCpp_jit::dynamic_fun
                 kb_entry_r3(it, info, in_b, out_b, body_b, lb);
         }));
     };
-    if (t.group != nullptr)
-        t.group->submit(t.device, cgf);
-    else
-        t.queue->submit(t.device, cgf);
+    if (t.group != nullptr) return t.group->submit(t.device, cgf);
+    return t.queue->submit(t.device, cgf);
 }
 
 // -----------------------------------------------------------------------------
@@ -565,11 +563,11 @@ inline JitId wave_entry_id(int rank) {
 /// Submit the ONE outer kernel of a fused wave: like launch_individual, but the
 /// records and the three byte streams are USM the owner staged, captured as
 /// raw pointers. Every work-item starts with a fresh cursor at record 0; the
-/// call sequence in `cfg` walks the records in position order.
+/// call sequence in `cfg` walks the records in position order. Returns its event.
 template <int R>
-void launch_wave(const SubmitTarget& t, sycl::AdaptiveCpp_jit::dynamic_function_config& cfg,
-                 const sycl::nd_range<R>& nd, const StageRecord* records, const std::byte* in_bytes,
-                 std::byte* out_bytes, const std::byte* body_bytes, std::size_t local_bytes) {
+sycl::event launch_wave(const SubmitTarget& t, sycl::AdaptiveCpp_jit::dynamic_function_config& cfg,
+                        const sycl::nd_range<R>& nd, const StageRecord* records, const std::byte* in_bytes,
+                        std::byte* out_bytes, const std::byte* body_bytes, std::size_t local_bytes) {
     auto cgf = [&](sycl::handler& h) {
         sycl::local_accessor<std::byte, 1> local{sycl::range<1>{local_bytes ? local_bytes : 1}, h};
         h.parallel_for(nd, cfg.apply([=](sycl::nd_item<R> it) {
@@ -583,10 +581,8 @@ void launch_wave(const SubmitTarget& t, sycl::AdaptiveCpp_jit::dynamic_function_
                 kb_entry_r3(it, info, in_bytes, out_bytes, body_bytes, lb);
         }));
     };
-    if (t.group != nullptr)
-        t.group->submit(t.device, cgf);
-    else
-        t.queue->submit(t.device, cgf);
+    if (t.group != nullptr) return t.group->submit(t.device, cgf);
+    return t.queue->submit(t.device, cgf);
 }
 
 }  // namespace detail

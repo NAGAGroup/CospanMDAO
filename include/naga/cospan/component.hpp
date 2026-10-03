@@ -292,6 +292,22 @@ public:
         }
     }
 
+    /// The launch's events go on the storage of every port this Component touched, inputs and
+    /// outputs, at this Component's placement (the one the launch ran on): later memory
+    /// operations on that storage (the other-placement push below, a resize) are then ordered
+    /// after the kernel by SlabKit, and a free waits on them (r01 §4.4). Tied members share a
+    /// root, so each (root, placement) is registered once.
+    void register_launch_events(std::span<const sycl::event> events) override {
+        if (events.empty()) return;
+        std::vector<detail::IOEntry*> seen;
+        for (detail::IOEntry* e : order_) {
+            detail::IOEntry* r = e->root();
+            if (std::find(seen.begin(), seen.end(), r) != seen.end()) continue;
+            seen.push_back(r);  // one placement per Component, so the root alone identifies the pair
+            e->register_launch_events(events);
+        }
+    }
+
     /// Refresh the other-placement copies of every output root this Component
     /// produces (routed copies: device<->host, cross-device), ordered after the
     /// launch by the stream; then DECREMENT every root it touches and RELEASE the
@@ -715,10 +731,10 @@ public:
     bool is_host() const override { return false; }
     const KernelParts* kernel() const override { return &parts_; }
 
-    void submit(SubmitTarget& t) const override {
-        if (payload_.rec.flat_extent == 0) return;  // nothing to run for an empty range
-        launch_individual<R>(t, *cfg_, wave_nd_range<R>(payload_.rec.group_count, wg3_), payload_,
-                             scratch_bytes_);
+    std::vector<sycl::event> submit(SubmitTarget& t) const override {
+        if (payload_.rec.flat_extent == 0) return {};  // nothing to run for an empty range
+        return {launch_individual<R>(t, *cfg_, wave_nd_range<R>(payload_.rec.group_count, wg3_), payload_,
+                                     scratch_bytes_)};
     }
 
 private:
@@ -754,7 +770,7 @@ public:
     bool is_custom_op() const override { return true; }
     bool is_host() const override { return false; }
 
-    void submit(SubmitTarget& t) const override {
+    std::vector<sycl::event> submit(SubmitTarget& t) const override {
         const typename KB::Inputs  in   = in_;
         const typename KB::Outputs out  = out_;
         const KB                   body = body_;
@@ -764,10 +780,8 @@ public:
                 body(op, in, out);
             });
         };
-        if (t.group != nullptr)
-            t.group->submit(t.device, cgf);
-        else
-            t.queue->submit(t.device, cgf);
+        if (t.group != nullptr) return {t.group->submit(t.device, cgf)};
+        return {t.queue->submit(t.device, cgf)};
     }
 
 private:
@@ -790,16 +804,14 @@ public:
     bool is_custom_op() const override { return false; }
     bool is_host() const override { return true; }
 
-    void submit(SubmitTarget& t) const override {
+    std::vector<sycl::event> submit(SubmitTarget& t) const override {
         const typename KB::Inputs  in   = in_;
         const typename KB::Outputs out  = out_;
         const KB                   body = body_;
         auto f = [=]() { body(Host{}, in, out); };
         diag::count_host_tasks();
-        if (t.group != nullptr)
-            t.group->async_host(t.device, f);
-        else
-            t.queue->async_host_in_order(t.device, f);
+        if (t.group != nullptr) return {t.group->async_host(t.device, f)};
+        return {t.queue->async_host_in_order(t.device, f)};
     }
 
 private:

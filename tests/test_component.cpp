@@ -577,6 +577,31 @@ TEST_CASE("plain body: y = 2x + 1 at ranks 1, 2 and 3", "[component][plain]") {
     SECTION("rank 3, 7 x 9 x 11") { tc::check_affine<3>(sycl::range<3>{7, 9, 11}); }
 }
 
+TEST_CASE("a launch's event is registered on the storage of every port it touched", "[component][plain][events]") {
+    auto model = cs::create_model<tc::TopAffine<1>>(default_config(), sycl::range<1>{1000});
+    model.setup();
+
+    // Before any forward nothing is materialized, so nothing is registered.
+    CHECK(model.root().entry_at("aff.x").registered_event_count() == 0);
+    CHECK(model.root().entry_at("aff.y").registered_event_count() == 0);
+
+    model.init_input("aff.x", cs::init::fill(1.0f));
+    model.forward();
+    model.wait();
+
+    // The kernel read x and wrote y: its event is registered on both ports' storage (a completed
+    // event stays registered until the next registration or mutation prunes it).
+    CHECK(model.root().entry_at("aff.x").registered_event_count() >= 1);
+    CHECK(model.root().entry_at("aff.y").registered_event_count() >= 1);
+
+    // A second forward registers again, and the result is still right.
+    model.forward();
+    model.wait();
+    CHECK(model.root().entry_at("aff.y").registered_event_count() >= 1);
+    auto y = wait_and_view<DType::f32, 1>(model, "aff.y");
+    CHECK(to_vector(y) == std::vector<float>(1000, 3.0f));
+}
+
 // =============================================================================================
 // WeightedHistogram
 // =============================================================================================
