@@ -875,7 +875,9 @@ private:
         const auto bad  = [&](const std::string& why) { fail("shape_hook", "'" + path + "': " + why); };
         if (inst->kind != IOKind::input && !detail::is_tie_output(*inst)) bad("a shape hook targets an input or a tie alias");
         detail::VarMeta& m = *inst->meta;
-        if (inst->kind == IOKind::input && (!inst->can_be_target || detail::first_of_kind(m, IOKind::output)))
+        // An input that is already hooked was never connected or tied (connect refuses it), so for it the per-dimension
+        // ownership check below answers: a second hook on a dimension gets "only one hook owns it", not the connected message.
+        if (inst->kind == IOKind::input && !inst->hooked && (!inst->can_be_target || detail::first_of_kind(m, IOKind::output)))
             bad("it is connected or tied; a shape hook and a connection exclude each other");
         const bool ragged_target = m.is_ragged() && m.rank == 2;
         if (ragged_target) {

@@ -118,6 +118,7 @@ class ShBad : public cs::Component<ShProdBody> {
 
 public:
     void setup() override { declare_output(y_, "y", cs::unspecified); }
+    void pre_forward() override { set_shape(y_, sycl::range<1>{3}); }  // legal: the output has its shape when compute_forward runs
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         set_shape(y_, sycl::range<1>{3});  // illegal here
         return create_launch_config(y_.shape(), {}, {y_}, {});
