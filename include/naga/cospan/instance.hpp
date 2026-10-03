@@ -144,6 +144,7 @@ public:
 // What variable.hpp declared for VarMeta's sake.
 inline DataKey             key_of(const Instance& i) { return i.key(); }
 inline void                give_data(Instance& i, std::shared_ptr<DeviceDataBase> d) { i.set_data(std::move(d)); }
+inline bool                has_data(const Instance& i) { return static_cast<bool>(i.data); }
 inline bool                is_output_port(const Instance& i) { return i.kind == IOKind::output && i.role == Role::port; }
 inline std::string         path_of(const Instance& i) { return i.full_path(); }
 inline const sycl::device& device_of(const Instance& i) { return i.device; }

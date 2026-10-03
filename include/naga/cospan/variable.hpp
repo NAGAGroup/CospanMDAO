@@ -329,6 +329,7 @@ class Instance;  // instance.hpp
 // What VarMeta needs to know of an instance, defined in instance.hpp (which includes this header).
 inline DataKey             key_of(const Instance& i);
 inline void                give_data(Instance& i, std::shared_ptr<DeviceDataBase> d);
+inline bool                has_data(const Instance& i);
 inline bool                is_output_port(const Instance& i);
 inline bool                is_tie_output(const Instance& i);
 inline std::string         path_of(const Instance& i);
@@ -808,6 +809,7 @@ public:
         const std::vector<std::shared_ptr<Instance>> insts = live_instances();
         if (insts.empty()) return;
         std::erase_if(data, [](const auto& p) { return p.second.expired(); });
+        adopt_live_data(insts);  // an instance that joined a key with live data (a second view, a rebuilt child) takes it
 
         // The keys that have an instance, and those among them without live data.
         const std::vector<DataKey> needed  = keys_of(insts);
@@ -896,7 +898,8 @@ public:
                                    "' has no data: nothing that uses it has run, or its data was freed");
         std::erase_if(data, [](const auto& p) { return p.second.expired(); });
         const std::vector<std::shared_ptr<Instance>> insts   = live_instances();
-        const std::vector<DataKey>                   missing = missing_of(keys_of(insts));
+        adopt_live_data(insts);
+        const std::vector<DataKey> missing = missing_of(keys_of(insts));
         if (missing.empty()) return;
         const std::shared_ptr<Data> donor = live_donor();
         for (const auto& d : allocate_missing(rt, insts, missing)) {
@@ -941,6 +944,15 @@ private:
             if (std::find(keys.begin(), keys.end(), k) == keys.end()) keys.push_back(k);
         }
         return keys;
+    }
+    /// Hands the live data of its key to every instance that has none yet: a second host view on the host key, or a new or
+    /// rebuilt instance on a device that is already live. allocate_missing and missing_of only look at keys WITHOUT live
+    /// data, so nothing else would ever give such an instance its data.
+    void adopt_live_data(const std::vector<std::shared_ptr<Instance>>& insts) {
+        for (const auto& i : insts) {
+            if (has_data(*i)) continue;
+            if (std::shared_ptr<DeviceDataBase> d = data_on(key_of(*i))) give_data(*i, std::move(d));
+        }
     }
     /// Those among `keys` without live data.
     std::vector<DataKey> missing_of(const std::vector<DataKey>& keys) const {
