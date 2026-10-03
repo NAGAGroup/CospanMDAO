@@ -29,9 +29,11 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <set>
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -213,6 +215,7 @@ public:
     std::vector<sycl::event> read_deps() const { return cur_has_writer_ ? cur_writes_ : prev_writes_; }
 
     void record_write(sycl::event e) {
+        ++write_count_;
         cur_writes_.push_back(std::move(e));
         cur_has_writer_ = true;
         prune(cur_writes_);
@@ -221,6 +224,9 @@ public:
         cur_reads_.push_back(std::move(e));
         prune(cur_reads_);
     }
+
+    /// How many writes were ever recorded: a consumer's cached copy of a value is valid while this has not changed.
+    std::uint64_t write_count() const { return write_count_; }
 
     /// Every write still tracked (this forward's and the last's), for a host sync.
     std::vector<sycl::event> all_writes() const { return joined(cur_writes_, prev_writes_); }
@@ -249,6 +255,7 @@ private:
 
     std::vector<sycl::event> cur_writes_, cur_reads_, prev_writes_, prev_reads_;
     bool                     cur_has_writer_ = false;
+    std::uint64_t            write_count_    = 0;
     std::uint64_t            gen_forward_    = ~std::uint64_t{0};
 };
 
@@ -302,6 +309,16 @@ public:
 
     /// The forward in which refresh_alias_shape last ran (once per forward); ~0 = never.
     std::uint64_t alias_forward_ = ~0ull;
+
+    // ---- shape-driving state (section 6) ---------------------------------------------------------
+    // Set when a consumer reads this variable's VALUES to size something (driving_value). The producer then does the
+    // shape work in its postcompute: one small copy of the driving elements to a host buffer, once per variable,
+    // however many consumers it sizes.
+    bool                 shape_driving_ = false;
+    std::set<std::size_t> value_indices_;                 ///< the elements consumers asked for
+    std::uint64_t        shape_write_count_ = ~0ull;      ///< events.write_count() when the copy was queued
+    sycl::event          shape_event_;                    ///< the copy of the driving elements
+    bool                 shape_valid_ = false;            ///< the host buffer holds the values of the last write
 
     /// The instances that share this metadata (weak; used by merges and to answer where the variable lives).
     std::vector<std::weak_ptr<Instance>> instances;
@@ -458,16 +475,23 @@ public:
     virtual bool is_ragged() const noexcept { return false; }
 
     /// The driving-value accessor (section 6): the VALUE of element `index` (flat) of this variable, which sizes a
-    /// consumer's dimension, materializing the variable if need be. Implemented in Phase 8.
-    virtual std::size_t driving_value(Runtime&, std::size_t index) {
-        (void)index;
-        throw std::logic_error("naga::cospan: driving_value: not implemented until Phase 8");
+    /// consumer's dimension. The one accessor a consumer reads driving values through. It marks the variable
+    /// shape-driving; a variable that is stale (or not materialized: a free input) is materialized first, which runs its
+    /// initializer; the producer usually queued the small copy right after its launch, so the wait on it is usually
+    /// already over (section 6). A negative value is an error.
+    std::size_t driving_value(Runtime& rt, std::size_t index) {
+        shape_driving_ = true;
+        value_indices_.insert(index);
+        if (is_stale()) materialize(rt);
+        if (!shape_valid_ || shape_write_count_ != events.write_count() || index >= shape_host_size()) do_shape_work(rt);
+        shape_event_.wait();
+        return read_shape_host(index);
     }
     /// The same for per-index extents: the values of column `column` (rank 1 [N]: column 0; rank 2 [N, k]) as an
-    /// array of N extents. Implemented in Phase 8.
+    /// array of N extents. Implemented in Phase 8b.
     virtual std::vector<std::size_t> driving_values(Runtime&, std::size_t column) {
         (void)column;
-        throw std::logic_error("naga::cospan: driving_values: not implemented until Phase 8");
+        throw std::logic_error("naga::cospan: driving_values: not implemented until Phase 8b");
     }
 
     /// "2x(per-index)x4": a shape as text, for messages.
@@ -556,6 +580,19 @@ public:
     /// Gives the variable a new resolved shape: resizes every live data in place (contents are kept, and the
     /// variable never becomes stale). A no-op when the shape is unchanged.
     virtual void set_shape(Runtime& rt, const ResolvedShape& s) = 0;
+
+    /// Makes a placement that is MISSING live (a host view's, a new instance's) by copying from a live one. It NEVER
+    /// initializes, even when the variable is stale (section 5: a view made after update_input shows the old values
+    /// until the next run). \throws std::logic_error when nothing holds data.
+    virtual void attach_missing(Runtime& rt) = 0;
+
+    /// The shape work (section 6): copies the driving elements to a small host buffer, event-ordered. A no-op unless the
+    /// variable is shape-driving and materialized.
+    virtual void do_shape_work(Runtime& rt) = 0;
+
+    /// The host buffer of driving elements: its size, and element `index` converted to a size.
+    virtual std::size_t shape_host_size() const = 0;
+    virtual std::size_t read_shape_host(std::size_t index) const = 0;
 
 private:
     /// The variable an alias rule reads, through the instance it names (weak: a deleted child's expires). With
@@ -647,14 +684,8 @@ public:
         std::erase_if(data, [](const auto& p) { return p.second.expired(); });
 
         // The keys that have an instance, and those among them without live data.
-        std::vector<DataKey> needed;
-        for (const auto& i : insts) {
-            const DataKey k = key_of(*i);
-            if (std::find(needed.begin(), needed.end(), k) == needed.end()) needed.push_back(k);
-        }
-        std::vector<DataKey> missing;
-        for (const DataKey& k : needed)
-            if (!data_on(k)) missing.push_back(k);
+        const std::vector<DataKey> needed  = keys_of(insts);
+        const std::vector<DataKey> missing = missing_of(needed);
 
         const bool stale = is_stale();
         if (!stale && missing.empty()) return;  // (c) nothing to do
@@ -662,25 +693,15 @@ public:
         if (!shape.known) {
             if (has_producer()) throw shape_unknown();
             resolve_free_shape();
+        } else if (stale && !has_producer()) {
+            refresh_free_shape(rt);  // update_input may have supplied a new shape
         }
 
         // A live data to copy from, if the variable is live somewhere already.
-        std::shared_ptr<Data> donor;
-        for (const auto& p : data)
-            if (std::shared_ptr<DeviceDataBase> b = p.second.lock()) {
-                donor = std::static_pointer_cast<Data>(b);
-                break;
-            }
+        std::shared_ptr<Data> donor = live_donor();
 
         // Allocate on every missing key. The new data are held here until every instance has taken its own.
-        std::vector<std::shared_ptr<Data>> fresh;
-        for (const DataKey& k : missing) {
-            std::shared_ptr<Data> d = make_data(rt, k);
-            data.emplace_back(k, std::weak_ptr<DeviceDataBase>{d});
-            fresh.push_back(d);
-            for (const auto& i : insts)
-                if (key_of(*i) == k) give_data(*i, d);
-        }
+        const std::vector<std::shared_ptr<Data>> fresh = allocate_missing(rt, insts, missing);
 
         // (a) Live elsewhere and not stale: a placement that comes back is a COPY of a live one, never recomputed.
         if (!stale) {
@@ -715,6 +736,7 @@ public:
         const std::shared_ptr<Data> idata = std::static_pointer_cast<Data>(data_on(ikey));
 
         if (!has_producer()) {  // an output is never initialized: its producer writes it
+            shape_valid_ = false;  // an initializer is about to run: the copy of the driving elements is out of date
             std::vector<sycl::event> deps = events.write_deps(rt.forward);
             {
                 const std::vector<sycl::event> own = idata->events();
@@ -740,6 +762,22 @@ public:
         stale_ = false;
     }
 
+    void attach_missing(Runtime& rt) override {
+        if (!is_materialized())
+            throw std::logic_error("naga::cospan: '" + display_path() +
+                                   "' has no data: nothing that uses it has run, or its data was freed");
+        std::erase_if(data, [](const auto& p) { return p.second.expired(); });
+        const std::vector<std::shared_ptr<Instance>> insts   = live_instances();
+        const std::vector<DataKey>                   missing = missing_of(keys_of(insts));
+        if (missing.empty()) return;
+        const std::shared_ptr<Data> donor = live_donor();
+        for (const auto& d : allocate_missing(rt, insts, missing)) {
+            const std::vector<sycl::event> dev = donor->events();
+            const sycl::event              e   = d->copy_from(*donor, dev);  // a ragged variable's index arrays follow
+            donor->register_event(e);                                         // a later writer of the donor's copy waits for the read
+        }
+    }
+
     void set_shape(Runtime& rt, const ResolvedShape& s) override {
         ResolvedShape next = s;
         next.known         = true;
@@ -758,6 +796,48 @@ public:
         }
     }
 
+    void do_shape_work(Runtime& rt) override {
+        if (!shape_driving_ || value_indices_.empty() || !is_materialized()) return;
+        const std::size_t n = *value_indices_.rbegin() + 1;
+        if (n > shape.elements())
+            throw std::invalid_argument("naga::cospan: '" + display_path() + "' drives a size from element " +
+                                        std::to_string(*value_indices_.rbegin()) + " but has only " +
+                                        std::to_string(shape.elements()) + " elements");
+        // The source: a live device-kind data if there is one, else any live data.
+        std::shared_ptr<Data> src;
+        for (const auto& p : data) {
+            const std::shared_ptr<DeviceDataBase> b = p.second.lock();
+            if (!b) continue;
+            if (!src || (b->key.kind == sk::kind::device && src->key.kind != sk::kind::device)) src = std::static_pointer_cast<Data>(b);
+        }
+        // The host buffer: reallocated only when it must grow.
+        if (!shape_host_ || shape_host_->size() < n) shape_host_.emplace(n, rt.allocator_for<T>(src->key.dev, sk::kind::host));
+        std::vector<sycl::event> deps = events.read_deps();
+        for (const std::vector<sycl::event>& v : {src->events(), shape_host_->events()}) deps.insert(deps.end(), v.begin(), v.end());
+        const sycl::event e = rt.q.copy(src->key.dev, deps, static_cast<const T*>(src->raw()), shape_host_->data(), n);
+        src->register_event(e);
+        shape_host_->register_event(e);
+        events.record_read(e);  // a later writer waits until the copy has read
+        shape_event_       = e;
+        shape_write_count_ = events.write_count();
+        shape_valid_       = true;
+    }
+
+    std::size_t shape_host_size() const override { return shape_host_ ? shape_host_->size() : 0; }
+
+    std::size_t read_shape_host(std::size_t index) const override {
+        if (!shape_host_ || index >= shape_host_->size())
+            throw std::logic_error("naga::cospan: '" + display_path() + "': element " + std::to_string(index) +
+                                   " was not copied to the host");
+        const T v = shape_host_->data()[index];
+        if constexpr (std::is_signed_v<T>) {
+            if (v < 0)
+                throw std::invalid_argument("naga::cospan: '" + display_path() + "': element " + std::to_string(index) + " is " +
+                                            std::to_string(v) + "; a size cannot be negative");
+        }
+        return static_cast<std::size_t>(v);
+    }
+
 protected:
     /// Allocates this variable's data on `key` (its elements; a ragged variable adds its index arrays).
     virtual std::shared_ptr<Data> make_data(Runtime& rt, const DataKey& key) {
@@ -767,6 +847,64 @@ protected:
     virtual void fill_index(Runtime&, Data&, const DataKey&) {}
     /// A ragged variable's index arrays copied from a donor's.
     virtual void copy_index(Data&, Data&) {}
+
+private:
+    /// The distinct keys of the instances' placements.
+    static std::vector<DataKey> keys_of(const std::vector<std::shared_ptr<Instance>>& insts) {
+        std::vector<DataKey> keys;
+        for (const auto& i : insts) {
+            const DataKey k = key_of(*i);
+            if (std::find(keys.begin(), keys.end(), k) == keys.end()) keys.push_back(k);
+        }
+        return keys;
+    }
+    /// Those among `keys` without live data.
+    std::vector<DataKey> missing_of(const std::vector<DataKey>& keys) const {
+        std::vector<DataKey> missing;
+        for (const DataKey& k : keys)
+            if (!data_on(k)) missing.push_back(k);
+        return missing;
+    }
+    /// The first live data, if any.
+    std::shared_ptr<Data> live_donor() const {
+        for (const auto& p : data)
+            if (std::shared_ptr<DeviceDataBase> b = p.second.lock()) return std::static_pointer_cast<Data>(b);
+        return nullptr;
+    }
+    /// Allocates the data of every missing key and hands each to the instances on that key (the shared step of
+    /// materialize and attach_missing). The metadata keeps them weakly: the caller holds the returned pointers.
+    std::vector<std::shared_ptr<Data>> allocate_missing(Runtime& rt, const std::vector<std::shared_ptr<Instance>>& insts,
+                                                        const std::vector<DataKey>& missing) {
+        std::vector<std::shared_ptr<Data>> fresh;
+        for (const DataKey& k : missing) {
+            std::shared_ptr<Data> d = make_data(rt, k);
+            data.emplace_back(k, std::weak_ptr<DeviceDataBase>{d});
+            fresh.push_back(d);
+            for (const auto& i : insts)
+                if (key_of(*i) == k) give_data(*i, d);
+        }
+        return fresh;
+    }
+
+    /// A free variable whose initializer carries a shape, and whose definition has an unspecified dimension: the shape
+    /// follows the initializer (update_input may have replaced it). Only when every dimension is fixed, unspecified or
+    /// per-index from the host: a derived dimension is the component's to resolve.
+    void refresh_free_shape(Runtime& rt) {
+        if (!init || !init->shape()) return;
+        bool has_unspecified = false;
+        for (const DimRecord& r : definition) {
+            if (r.how == DimRecord::How::unspecified) has_unspecified = true;
+            else if (r.how != DimRecord::How::fixed && r.how != DimRecord::How::per_index_host) return;
+        }
+        if (!has_unspecified) return;
+        const ResolvedShape keep = shape;
+        resolve_free_shape();
+        const ResolvedShape next = shape;
+        shape                    = keep;
+        if (!(next == keep)) set_shape(rt, next);
+    }
+
+    std::optional<sk::usm_vector<T>> shape_host_;  ///< the driving elements, on the host (section 6)
 };
 
 /// A ragged variable: the same, with the block offsets and per-index extents on the device beside the elements

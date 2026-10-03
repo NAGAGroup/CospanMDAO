@@ -311,7 +311,6 @@ public:
     /// Pushes each output variable this component wrote to the variable's OTHER placements, ordered after the launch
     /// and the data's own events. A tied output is pushed by the tie's System (phase 6). Then the user's hook.
     void run_postcompute(detail::Runtime& rt) override {
-        (void)rt;
         std::vector<detail::VarMeta*> seen;
         for (const auto& inst : order_) {
             if (inst->kind != IOKind::output) continue;
@@ -330,7 +329,11 @@ public:
                 own->register_event(e);  // a later writer of this copy waits for the read
             }
         }
-        // Phase 8: producer-side shape work for shape-driving variables goes here.
+        // The shape work (section 6): the producer does it right after its own launch, once per variable, as ordinary
+        // queued work ordered by events: one small copy of the driving elements to the host, which a consumer's
+        // precompute waits on. A tied output's is done by the tie's System, as the pushes are.
+        for (detail::VarMeta* m : metas_of(IOKind::output))
+            if (!m->alias_shape && m->shape_driving_) m->do_shape_work(rt);
         post_forward();
     }
 

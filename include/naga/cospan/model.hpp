@@ -14,8 +14,7 @@
 // Setup never allocates, never submits and never compiles. There is no default device (section 2): every instance
 // takes AdaptiveCpp's default when it is declared, and a device given to add_subsystem overrides a subtree.
 //
-// The forward is here (section 3). Coming later (section 8): host views, update_input and the memory report's OS
-// counters, in phase 8.
+// The forward (section 3), host views and update_input (section 5) and the memory report are all here.
 //
 // STATE LIVES ON THE HEAP. The Model is one pointer to an Impl; moving a Model moves the pointer. Inside Impl the
 // members are declared so that destruction (the reverse of declaration) runs the root System first: its instances go,
@@ -26,6 +25,7 @@
 
 #include <concepts>
 #include <cstddef>
+#include <iostream>
 #include <memory>
 #include <optional>
 #include <span>
@@ -39,11 +39,13 @@
 #include <sycl/sycl.hpp>
 
 #include "naga/cospan/diagnostics.hpp"
+#include "naga/cospan/host_view.hpp"
 #include "naga/cospan/instance.hpp"
 #include "naga/cospan/metadata.hpp"
 #include "naga/cospan/runtime.hpp"
 #include "naga/cospan/subsystem.hpp"
 #include "naga/cospan/system.hpp"
+#include "naga/cospan/wiring.hpp"
 
 namespace naga::cospan {
 
@@ -140,6 +142,52 @@ public:
         s.uqueue.wait_and_throw();
     }
 
+    // ---- host access (section 5), between and after runs ------------------------------------
+    // A host view is an instance of the variable on a host placement. While it lives, every forward pushes one copy to it
+    // (each live view costs one copy per forward); obtain one only after a run; call sync() before reading it. See
+    // host_view.hpp.
+    template <DType DT, int Rank>
+    HostView<DT, Rank> view_input(std::string_view path) {
+        return HostView<DT, Rank>{make_view("view_input", path, IOKind::input, DT, Rank, /*dense=*/true)};
+    }
+    template <DType DT, int Rank>
+    HostView<DT, Rank> view_output(std::string_view path) {
+        return HostView<DT, Rank>{make_view("view_output", path, IOKind::output, DT, Rank, /*dense=*/true)};
+    }
+    /// Views of a ragged variable (also of a dense one: its blocks are the rows).
+    template <DType DT, int Rank>
+    HostRagged<DT, Rank> view_ragged_input(std::string_view path) {
+        return HostRagged<DT, Rank>{make_view("view_ragged_input", path, IOKind::input, DT, Rank, /*dense=*/false)};
+    }
+    template <DType DT, int Rank>
+    HostRagged<DT, Rank> view_ragged_output(std::string_view path) {
+        return HostRagged<DT, Rank>{make_view("view_ragged_output", path, IOKind::output, DT, Rank, /*dense=*/false)};
+    }
+
+    /// The only host write (section 5): assigns an initializer to the input's variable and marks it STALE. It queues NO
+    /// work now. At the next run, the first thing that touches the variable acts on it: not materialized, it
+    /// materializes and initializes; materialized, it initializes IN PLACE (waiting on the previous run's readers, and
+    /// recorded as a write). Several updates before a run collapse to the last one, and a variable nothing touches is never
+    /// initialized. A host view synced before the next run still shows the OLD values. If the input has a source (it is
+    /// connected to an output) a warning is printed and the update is never applied. Naming an output throws
+    /// std::invalid_argument.
+    void update_input(std::string_view path, InitSpec init) {
+        Impl&                                   s    = ready("update_input");
+        const std::shared_ptr<detail::Instance> inst = s.root->instance_at(path);
+        if (inst->kind != IOKind::input)
+            throw std::invalid_argument("naga::cospan: Model::update_input: '" + std::string{path} +
+                                        "' is an output; outputs are never initialized");
+        detail::VarMeta& v = *inst->meta;
+        if (detail::first_of_kind(v, IOKind::output)) {
+            std::cerr << "naga::cospan: warning: input '" << path << "' is connected to an output; update_input is never applied\n";
+            return;
+        }
+        v.init       = std::move(init);
+        v.init_depth = 0;  // outranks every declaration made in setup
+        v.init_by    = "Model::update_input";
+        v.mark_stale();
+    }
+
     // ---- retrieval & observation ------------------------------------------------
     System&    root() { return *impl("root").root; }
     Subsystem* get_subsystem(std::string_view path) { return ready("get_subsystem").root->get_subsystem(path); }
@@ -148,7 +196,7 @@ public:
         /// A snapshot at the time of the call, between runs.
         struct PerDevice {
             std::size_t pool_bytes = 0, pool_bytes_in_use = 0;    ///< slots x node size
-            std::size_t os_allocations = 0, os_bytes_in_use = 0;  ///< the fallback to the OS: counted from Phase 8 (always 0 until then)
+            std::size_t os_allocations = 0, os_bytes_in_use = 0;  ///< allocations the pool sent to the OS (cumulative) and the bytes of those still live; tracked for devices with a pool only
         };
         std::unordered_map<sycl::device, PerDevice> devices;
     };
@@ -159,6 +207,8 @@ public:
             MemoryReport::PerDevice p;
             p.pool_bytes        = pool.slot_count() * pool.node_size();
             p.pool_bytes_in_use = pool.outstanding() * pool.node_size();
+            p.os_allocations    = pool.fallback_allocations();
+            p.os_bytes_in_use   = pool.fallback_bytes_in_use();
             r.devices.emplace(d, p);
         }
         return r;
@@ -217,6 +267,33 @@ private:
         Impl& s = impl(verb);
         if (!s.ready) throw std::logic_error(std::string{"naga::cospan: Model::"} + verb + " before setup() has completed");
         return s;
+    }
+
+    /// A host view instance of the variable at `path`: checked, joined to the variable on a host placement on the device
+    /// with the most instances (section 5), and attached (a copy of a live placement; nothing is initialized).
+    std::shared_ptr<detail::Instance> make_view(const char* verb, std::string_view path, IOKind want, DType dt, int rank, bool dense) {
+        Impl& s = ready(verb);
+        if (s.rt.forward == 0)
+            throw std::logic_error(std::string{"naga::cospan: Model::"} + verb +
+                                   ": a host view can be obtained only after a run (call forward() first)");
+        const std::shared_ptr<detail::Instance> inst = s.root->instance_at(path);
+        if (inst->kind != want)
+            throw std::invalid_argument(std::string{"naga::cospan: Model::"} + verb + ": '" + std::string{path} + "' is " +
+                                        (want == IOKind::input ? "an output" : "an input"));
+        if (!dtype_compatible(inst->meta->dtype, dt) || inst->meta->rank != rank)
+            throw std::invalid_argument(std::string{"naga::cospan: Model::"} + verb + ": '" + std::string{path} +
+                                        "' was asked for with the wrong dtype or rank");
+        if (dense && inst->meta->shape.known && inst->meta->shape.ragged())
+            throw std::invalid_argument("naga::cospan: '" + std::string{path} +
+                                        "' is ragged and has no rectangular host view; use view_ragged_input / view_ragged_output");
+        const std::shared_ptr<detail::VarMeta> meta = inst->meta;
+        const sycl::device                     dev  = meta->busiest_device();  // counted before the view joins
+        std::shared_ptr<detail::Instance> view = detail::make_alias_instance(dt, rank, "<host view>", nullptr, inst->kind, detail::Role::host_view,
+                                                                              meta->definition, false, false, meta);
+        view->device       = dev;
+        view->storage_kind = sk::kind::host;
+        meta->attach_missing(s.rt);
+        return view;
     }
 
     /// Releases the Impl in the order the header names. Does not wait.

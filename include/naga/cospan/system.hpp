@@ -469,7 +469,6 @@ public:
     /// The System that owns a tie alias pushes the tied outputs to the variable's other placements after ALL members
     /// have submitted, depending on all their writes (section 3). Then the user's post_forward().
     void run_postcompute(detail::Runtime& rt) override {
-        (void)rt;
         for (const auto& alias : alias_order_) {
             if (alias->role != detail::Role::tie || alias->kind != IOKind::output) continue;
             const std::shared_ptr<detail::DeviceDataBase> src = alias->data;
@@ -486,6 +485,10 @@ public:
                 forward_events_.push_back(e);
             }
         }
+        // The shape work of a tied variable that drives sizes (section 6): done here, as the pushes are, once per variable.
+        for (const auto& alias : alias_order_)
+            if (alias->role == detail::Role::tie && alias->kind == IOKind::output && alias->meta->shape_driving_)
+                alias->meta->do_shape_work(rt);
         post_forward();
     }
 
