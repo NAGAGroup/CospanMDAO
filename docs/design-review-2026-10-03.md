@@ -105,6 +105,8 @@ This is the working record of the design review that started 2026-10-03 (Jack an
 
 ## 6. Value-driven shapes (settled)
 
+> **SUPERSEDED by section 10** (shapes, connections, ties, promotions); the text below is kept for history.
+
 - A dimension declared from a value (from_input value, per-index from_input values, tie alias shapes from values) marks the DRIVING variable's shared metadata as shape-driving.
 - Whoever produces a shape-driving variable does the shape work right after its own launch, in its postcompute, as ordinary queued work ordered by events (no in-order reliance). For a tied output, the System owning the tie does it, as it does the device pushes. It is done once per variable, however many consumers it sizes.
   - Dense: copy just the driving element(s) to a small host copy kept on the driving variable's metadata.
@@ -180,11 +182,47 @@ This is the working record of the design review that started 2026-10-03 (Jack an
 
 ## 9. Corrections during implementation (Jack, 2026-10-03)
 
+> **SUPERSEDED by section 10:** the bullets on tie shape constraints, gone shape sources and the parallel scan of value-driven columns; the text is kept.
+
 - **The last initializer wins.** A parent's setup runs after its children's, so a tie's, promotion's or System's initializer replaces the members'; there is no same-level error (section 2, Initializer bullet).
-- **Ties keep their shape rules as constraints after a connect.** Ties follow the same shape rules as inputs and outputs: a tie does not override its members or its source, and its rule must be consistent with them. When a connect makes the source's variable the survivor, the tie's rule is kept on the variable (`shape_constraints`) and evaluated once per forward; a mismatch throws "tie alias '<path>' declares the shape ... but is connected to a source whose shape is ...". **Promotions take no shape rule.**
-- **A gone shape source keeps its last shape.** When the instance and the variable a tie's rule reads are both gone, the variable can never change again: it keeps its current shape. "... which does not exist right now" is thrown only when the shape was never known.
+- *(SUPERSEDED by section 10)* **Ties keep their shape rules as constraints after a connect.** Ties follow the same shape rules as inputs and outputs: a tie does not override its members or its source, and its rule must be consistent with them. When a connect makes the source's variable the survivor, the tie's rule is kept on the variable (`shape_constraints`) and evaluated once per forward; a mismatch throws "tie alias '<path>' declares the shape ... but is connected to a source whose shape is ...". **Promotions take no shape rule.**
+- *(SUPERSEDED by section 10)* **A gone shape source keeps its last shape.** When the instance and the variable a tie's rule reads are both gone, the variable can never change again: it keeps its current shape. "... which does not exist right now" is thrown only when the shape was never known.
 - **A rebuilt consumer whose producer is gone, with nothing holding its data, is a user error.** Promote what must stay durable (a promotion's alias instance holds the data).
 - **Par ties follow the tie policy.** A par fused component adds no check of its own on tied outputs: `tie_outputs` requires atomic members, or its `allow_plain` flag says the writers are disjoint.
 - **A device without a pool is a zero-byte pool.** Every context device gets a `DevicePool`, sized by its configured size or `default_pool_bytes`, possibly 0; a zero-byte pool serves nothing and every allocation falls back to the OS and is counted. `memory_report` covers every device.
 - **Marks only on subsystems that never go out of scope.** Model::setup's finalize walks the slots from the root to a mark's declaring subsystem and throws if any has a run policy (run_n, do_once, transient).
-- **Scans run in parallel on the device, ragged dimensions included.** The exclusive scan behind a value-driven column is a parallel reduce-then-scan (`device_scan.hpp`). Several per-index dimensions on the device (no host fallback) are not done yet: they wait for the review of shape, connection, tie and promotion semantics.
+- *(SUPERSEDED by section 10)* **Scans run in parallel on the device, ragged dimensions included.** The exclusive scan behind a value-driven column is a parallel reduce-then-scan (`device_scan.hpp`). Several per-index dimensions on the device (no host fallback) are not done yet: they wait for the review of shape, connection, tie and promotion semantics.
+
+## 10. Shapes, connections, ties, promotions (settled with Jack, 2026-10-03; supersedes section 6)
+
+- **Definition and actual shape.** Each variable's metadata holds a shape DEFINITION, fixed once setup ends, and the ACTUAL shape, which changes at run time. Per dimension, the definition is one of:
+  - specified (a value, set at declaration, never changes);
+  - unspecified;
+  - hook (owned by exactly one registered hook).
+- **Component declarations** say only specified or unspecified per dimension. There are no derived specs: FromInputDim, FromInput, FromInputValues and FromInputArray are removed. A declaration is the component's contract: specified forces that dimension on anything joined to it; unspecified places no constraint.
+- **Ragged is rank 2 only**: a dense leading dimension plus one per-index dimension. A ragged declaration is one of:
+  - a host array given as counts or as offsets, which also defines the leading dimension;
+  - both unspecified;
+  - the leading dimension specified and the counts or offsets unspecified.
+- **Merging at setup.** Connect, tie and promote merge the definitions of all participants: unspecified absorbs specified, and two specified values that disagree are an error at the call.
+- **Every run-time shape change is checked against the definition.** It may only touch dimensions it is allowed to, and a specified dimension can never come out different. Two sets of one dimension in one forward must agree.
+- **Inputs are never reshaped.** An input's shape comes from its definition, its initializer, its connection's source, or a hook.
+- **Outputs are reshaped only by their producing component's precompute**, within the definition. An output always decides the shape for everything downstream of it. Nothing outside a component may set an output's shape, and outputs take no initializers.
+- **Components may read values to size outputs on their own**, e.g. through a host view kept as a component member (shown in a user-docs example later). There is no framework helper for this.
+- **Tied outputs.** A component may NOT reshape an output that is tied (an error). The members' declared dimensions merge and are checked at tie_outputs (setup). Any dimension still unspecified on a tie_outputs alias must be set at the System level by a hook on that alias. That is the one output-side hook.
+- **Ties and promotions.** Ties carry per-dimension specified/unspecified like ports. Promotions take no shape. Tied members and promotions may carry initializers; the last declaration wins (section 9).
+- **Hooks** are a System's contract.
+  - API: `shape_hook(target_path, <one descriptor per dimension>)`. The descriptors are:
+    - `cs::dim::as_is()`;
+    - `cs::dim::from_shape(path, d)`;
+    - `cs::dim::from_value(path, index)`;
+    - `cs::dim::custom(fn(ShapeHookCtx&) -> size_t)`;
+    - `cs::dim::fixed_at_run(v)` (a value decided at setup: it simply makes that dimension specified);
+    - for ragged targets, one descriptor for both dimensions: `cs::ragged::counts_from(path)` or `cs::ragged::offsets_from(path)`.
+  - Targets: an input, an input tie alias, or an output tie alias. Sources may be any variable, read only.
+  - Hooked dimensions are those not `as_is`. Each must be unspecified in the definition and owned by one hook only. Violations are setup errors.
+  - **Hooks and connections exclude each other** through the input's can-be-target flag. A hook clears it, so a later connect or tie into that input fails. A connected or tied input can't take a hook. Tied members can't take hooks; their tie alias can.
+  - **Run point:** a hook is a lightweight type-erased step (not a component), run on the main thread immediately before the first child that has an instance of the target. Every source's producer must be in an earlier slot. Otherwise it's a setup error naming the hook, the source and the target. Free inputs and aliases are fine as sources anywhere.
+  - from_value reads are batched (one wait). counts_from and offsets_from use the parallel device scan, and only the total comes back to the host.
+- **A rebuilt consumer whose producer is gone with nothing holding its data is a user error** (section 9).
+- **Removed by this section:** the value-driven dimension specs, the driving-value accessor, producer-side shape work and the shape-driving flag, device-sourced shapes in ResolvedShape, AliasShape's value and shape kinds (ties become per-dimension specified/unspecified), refresh_alias_shape's rule evaluation and the tie shape constraints (both replaced by the definition merge), and rank-3 ragged.

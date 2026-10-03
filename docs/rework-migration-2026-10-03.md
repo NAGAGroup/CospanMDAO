@@ -155,3 +155,7 @@ the retire list, setup-time shape checks, `fused_system.hpp`, `wave_rules.hpp`, 
 - **Par fused components** add no tie check of their own: use `tie_outputs` with atomic members, or `allow_plain` for disjoint writers.
 - **Pools:** every context device has a pool (0 bytes if unconfigured, then every allocation is an OS allocation, counted); `memory_report().devices` has an entry for every device.
 - **Marks** (`add_design_var`, `add_constraint`, `add_objective`) are refused, at `Model::setup`, on a subsystem that can go out of scope: no `run_n`, `do_once` or `transient` slot on the path from the root.
+
+## Shapes (section 10)
+
+The shape API is being reworked (definitions merged at setup, shape hooks, no value-driven specs). Section 10 of docs/design-review-2026-10-03.md is authoritative; anything here about value-driven shapes or tie shape constraints is superseded.
