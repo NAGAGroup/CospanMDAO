@@ -177,6 +177,7 @@ struct AliasShape {
     std::array<std::size_t, 3> extents{1, 1, 1};    ///< fixed
     std::string                path;                ///< from_output_* / from_input_shape: an entry, in the declaring System's namespace
     std::vector<AliasDim>      dim_specs;           ///< dims: one per dimension
+    AliasSrc                   src;                 ///< from_output_shape / from_output_values / from_input_shape: the upstream instance, resolved at the tie call
 };
 
 namespace detail {

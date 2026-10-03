@@ -9,6 +9,7 @@
 #include "naga/cospan/runtime.hpp"
 #include "naga/cospan/dispatch.hpp"
 #include "naga/cospan/instance.hpp"
+#include "naga/cospan/wiring.hpp"
 #include "naga/cospan/init.hpp"
 #include "naga/cospan/wrappers.hpp"
 #include "naga/cospan/subsystem.hpp"

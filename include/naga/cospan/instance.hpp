@@ -130,6 +130,9 @@ public:
 
     /// Writes the component's member wrapper from the current shape and data. Aliases have none.
     virtual void point_wrapper() {}
+
+    /// A dense Input port (not RaggedInput): it cannot see per-index extents (wiring.hpp, connect).
+    virtual bool is_dense_input_port() const { return false; }
 };
 
 // What variable.hpp declared for VarMeta's sake.
@@ -211,6 +214,7 @@ public:
         if (member_ != nullptr) this->point(*member_);
     }
     Input<DT, Rank>& member() const { return *member_; }
+    bool is_dense_input_port() const override { return true; }
 
 private:
     Input<DT, Rank>* member_;
