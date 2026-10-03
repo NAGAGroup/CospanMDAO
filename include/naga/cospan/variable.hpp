@@ -43,6 +43,7 @@
 #include "naga/slabkit/slabkit.hpp"
 
 #include "naga/cospan/dispatch.hpp"
+#include "naga/cospan/device_scan.hpp"
 #include "naga/cospan/dtype.hpp"
 #include "naga/cospan/init_spec.hpp"
 #include "naga/cospan/metadata.hpp"
@@ -163,6 +164,7 @@ struct DeviceColumn {
     std::size_t                                      n = 0;    ///< the number of indices
     mutable std::optional<sk::usm_vector<std::uint64_t>> extents;     ///< n entries
     mutable std::optional<sk::usm_vector<std::uint64_t>> offs;        ///< n + 1 entries: the exclusive scan
+    mutable std::optional<sk::usm_vector<std::uint64_t>> neg_flag;    ///< 1 entry on the device: set (atomic OR) by a negative value
     std::optional<sk::usm_vector<std::uint64_t>>     host_total;  ///< host kind, 2 elements: [total, negative flag]
     std::uint64_t                                    total   = 0;     ///< read from host_total once the task is done
     std::uint64_t                                    version = ~0ull; ///< the driver's write_count() when it was built
@@ -1076,10 +1078,12 @@ public:
         return static_cast<std::size_t>(v);
     }
 
-    /// ONE serial device task for now (section 6: "possibly optimized later"): for i in [0, n): v = data[i * k + column];
-    /// a negative value sets the flag (and counts as 0); extents[i] = v; offs[i + 1] = offs[i] + extents[i]; finally the
-    /// total and the flag go to the host buffer. The producer queues this in its postcompute (do_shape_work), once per
-    /// write; a consumer that asks first does it itself. The column held in columns_ keeps the containers alive.
+    /// The column's extents and their exclusive scan, in PARALLEL on the device (section 6; section 9). One parallel_for
+    /// converts the column into extents (extents[i] = data[i * k + column]; a negative value counts as 0 and sets a device
+    /// flag by an atomic OR); detail::exclusive_scan_u64 (device_scan.hpp) writes the n + 1 offsets; a tiny task then copies
+    /// [total, flag] to the host buffer. The events are chained. The producer queues this in its postcompute
+    /// (do_shape_work), once per write; a consumer that asks first does it itself. The column held in columns_ keeps the
+    /// containers alive.
     void do_column_work(Runtime& rt, std::size_t column) override {
         if (!is_materialized()) return;
         if (!is_integer_value_dtype(dtype))
@@ -1104,10 +1108,11 @@ public:
         DeviceColumn&      col = *slot;
         const sycl::device dev = src->key.dev;
         // The vectors are reused while they live on the same device; their size follows n (a resize within capacity).
-        if (!(col.key.dev == dev) || !col.extents || !col.offs || !col.host_total) {
+        if (!(col.key.dev == dev) || !col.extents || !col.offs || !col.host_total || !col.neg_flag) {
             col.key        = DataKey{dev, sk::kind::device};
             col.extents.emplace(n, rt.allocator_for<std::uint64_t>(dev, sk::kind::device));
             col.offs.emplace(n + 1, rt.allocator_for<std::uint64_t>(dev, sk::kind::device));
+            col.neg_flag.emplace(1, rt.allocator_for<std::uint64_t>(dev, sk::kind::device));
             col.host_total.emplace(2, rt.allocator_for<std::uint64_t>(dev, sk::kind::host));
         } else {
             if (col.extents->size() != n) col.extents->resize(n, std::span<const sycl::event>{col.extents->events()});
@@ -1116,37 +1121,56 @@ public:
         col.n = n;
 
         std::vector<sycl::event> deps = events.read_deps();
-        for (const std::vector<sycl::event>& v : {src->events(), col.extents->events(), col.offs->events(), col.host_total->events()})
+        for (const std::vector<sycl::event>& v :
+             {src->events(), col.extents->events(), col.offs->events(), col.host_total->events(), col.neg_flag->events()})
             deps.insert(deps.end(), v.begin(), v.end());
 
-        const T*             in  = static_cast<const T*>(src->raw());
-        std::uint64_t*       ex  = col.extents->data();
-        std::uint64_t*       of  = col.offs->data();
-        std::uint64_t*       tot = col.host_total->data();
+        const T*             in   = static_cast<const T*>(src->raw());
+        std::uint64_t*       ex   = col.extents->data();
+        std::uint64_t*       of   = col.offs->data();
+        std::uint64_t*       flag = col.neg_flag->data();
+        std::uint64_t*       tot  = col.host_total->data();
         const std::size_t    nn = n, kk = k, cc = column;
-        const sycl::event e = rt.uq.single_task(dev, deps, [=]() {
-            std::uint64_t flag = 0;
-            of[0]              = 0;
-            for (std::size_t i = 0; i < nn; ++i) {
-                const T       v = in[i * kk + cc];
-                std::uint64_t x = 0;
+
+        // (1) the negative flag starts at 0; (2) one parallel_for: extents[i] = max(data[i * k + column], 0), flag |= negative
+        const sycl::event ev_zero = rt.uq.single_task(dev, deps, [=]() { flag[0] = 0; });
+        sycl::event       ev_conv = ev_zero;
+        if (nn != 0) {
+            const std::vector<sycl::event> dconv{ev_zero};
+            ev_conv = rt.uq.parallel_for(dev, dconv, sycl::range<1>{nn}, [=](sycl::id<1> id) {
+                const std::size_t i = id[0];
+                const T           v = in[i * kk + cc];
+                std::uint64_t     x = 0;
                 if constexpr (std::is_signed_v<T>) {
-                    if (v < T{0}) flag = 1;
-                    else x = static_cast<std::uint64_t>(v);
+                    if (v < T{0}) {
+                        sycl::atomic_ref<std::uint64_t, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                                         sycl::access::address_space::global_space>
+                            f{flag[0]};
+                        f.fetch_or(std::uint64_t{1});
+                    } else {
+                        x = static_cast<std::uint64_t>(v);
+                    }
                 } else {
                     x = static_cast<std::uint64_t>(v);
                 }
-                ex[i]     = x;
-                of[i + 1] = of[i] + x;
-            }
+                ex[i] = x;
+            });
+        }
+        // (3) the parallel exclusive scan of the extents into the n + 1 offsets
+        const std::vector<sycl::event> dscan{ev_conv};
+        const sycl::event              ev_scan = exclusive_scan_u64(rt, dev, dscan, ex, of, nn);
+        // (4) a tiny task copies [total, flag] to the host buffer
+        const std::vector<sycl::event> dtot{ev_scan, ev_conv};
+        const sycl::event              e = rt.uq.single_task(dev, dtot, [=]() {
             tot[0] = of[nn];
-            tot[1] = flag;
+            tot[1] = flag[0];
         });
-        src->register_event(e);
-        col.extents->register_event(e);
+        src->register_event(ev_conv);  // the conversion is the only read of the driving data
+        col.extents->register_event(ev_scan);
         col.offs->register_event(e);
+        col.neg_flag->register_event(e);
         col.host_total->register_event(e);
-        events.record_read(e);  // a later writer waits until the task has read
+        events.record_read(ev_conv);  // a later writer waits until the conversion has read
         col.ev      = e;
         col.version = events.write_count();
     }

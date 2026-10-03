@@ -7,6 +7,7 @@
 #include "naga/cospan/host_view.hpp"
 #include "naga/cospan/metadata.hpp"
 #include "naga/cospan/runtime.hpp"
+#include "naga/cospan/device_scan.hpp"
 #include "naga/cospan/dispatch.hpp"
 #include "naga/cospan/instance.hpp"
 #include "naga/cospan/wiring.hpp"
