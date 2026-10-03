@@ -13,7 +13,7 @@
 //                       Model
 //   4. Host access      unknown path, view_input on an output, update_input on an output
 //   5. Memory report    a small static model computes; the pool report (there is no arena)
-//   6. Pool             a pool on the device and a value-driven (FromInput) output root
+//   6. Pool             a pool on the device and a value-driven (shape hook) output root
 //   7. Two devices      producer and consumer on different devices of one context
 //
 // The components live in namespace tmod.
@@ -230,8 +230,8 @@ public:
         add_subsystem(cs::subsystem_desc<G1<DT>>("g1"));
         add_subsystem(cs::subsystem_desc<G2<DT>>("g2"));
 
-        tie_inputs<DT, 1>({"d1.z", "d2.z", "obj.z"}, "z", cs::alias::fixed(2));
-        tie_inputs<DT, 1>({"d1.x", "obj.x"}, "x", cs::alias::fixed(1));
+        tie_inputs<DT, 1>({"d1.z", "d2.z", "obj.z"}, "z", cs::shape(2));
+        tie_inputs<DT, 1>({"d1.x", "obj.x"}, "x", cs::shape(1));
         connect("d1.y1", "d2.y1");
         connect("d1.y1", "obj.y1");
         connect("d2.y2", "obj.y2");
@@ -417,7 +417,7 @@ public:
         add_subsystem(cs::subsystem_desc<Gen>("gen"));
         add_subsystem(cs::subsystem_desc<Cvt>("cvt"));
         add_subsystem(cs::subsystem_desc<Comb>("comb"));
-        tie_inputs<DType::f32, 1>({"comb.b", "comb.c"}, "bc", cs::alias::fixed(8));
+        tie_inputs<DType::f32, 1>({"comb.b", "comb.c"}, "bc", cs::shape(8));
         connect("gen.y", "cvt.a");
         connect("cvt.d", "comb.e");
         promote<DType::f32, 1>("comb.o", "out");
@@ -426,9 +426,12 @@ public:
 
 // ---- Value-driven size on a pool (case 6) -----------------------------------------------------------
 // Bins: a free u32 input n and an output of n floats (bins[i] = i + 1).
+// REVIEW: a component cannot read a value and a hook cannot target an output (section 10), so Bins takes a free input `ref`
+// that its System hooks with from_value(n) (hook_bins) and copies its shape in pre_forward.
 struct BinsBody {
     struct Inputs {
         cs::Input<DType::u32, 1> n;
+        cs::Input<DType::f32, 1> ref;
     };
     struct Outputs {
         cs::Output<DType::f32, 1> bins;
@@ -437,20 +440,26 @@ struct BinsBody {
 };
 class Bins : public cs::Component<BinsBody> {
     cs::Input<DType::u32, 1>  n_;
+    cs::Input<DType::f32, 1>  ref_;
     cs::Output<DType::f32, 1> bins_;
 
 public:
     void setup() override {
         declare_input(n_, "n", 1);
-        declare_output(bins_, "bins", cs::FromInput{"n", 0});
+        declare_input(ref_, "ref", cs::unspecified);
+        declare_output(bins_, "bins", cs::unspecified);
     }
+    void pre_forward() override { set_shape(bins_, shape_of(ref_)); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(bins_.shape(), {n_}, {bins_}, {});
+        return create_launch_config(bins_.shape(), {n_, ref_}, {bins_}, {});
     }
 };
 class PoolTop : public cs::System {
 public:
-    void setup() override { add_subsystem(cs::subsystem_desc<Bins>("bins")); }
+    void setup() override {
+        add_subsystem(cs::subsystem_desc<Bins>("bins"));
+        shape_hook("bins.ref", cs::dim::from_value("bins.n", 0));
+    }
 };
 
 // ---- Two devices (case 7) ---------------------------------------------------------------------------
@@ -500,8 +509,9 @@ class Scale : public cs::Component<ScaleBody> {
 public:
     void setup() override {
         declare_input(x_, "x", cs::unspecified_shape<1>());
-        declare_output(y_, "y", cs::from_input_shape<1>("x"));
+        declare_output(y_, "y", cs::unspecified_shape<1>());
     }
+    void pre_forward() override { set_shape(y_, shape_of(x_)); }  // the output follows the input (section 10: no derived dims)
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return create_launch_config(y_.shape(), {x_}, {y_}, {});
     }
@@ -511,6 +521,7 @@ class EmptyTop : public cs::System {
 public:
     void setup() override {
         add_subsystem(cs::subsystem_desc<Bins>("bins"));
+        shape_hook("bins.ref", cs::dim::from_value("bins.n", 0));
         add_subsystem(cs::subsystem_desc<Scale>("sc"));
         connect("bins.bins", "sc.x");
     }

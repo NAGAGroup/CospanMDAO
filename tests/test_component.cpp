@@ -9,9 +9,9 @@
 // after the first forward and sync()ed before it is read (cst::wait_and_view / synced_input do all three).
 //
 //   plain body, rank 1/2/3        y = 2x + 1, ragged sizes (1000, 40x30, 7x9x11)
-//   WeightedHistogram             atomic output, unspecified dims, value-driven
-//                                 n_bins; ZeroBins + tie_outputs; two forwards, n_bins changed by
-//                                 update_input between them
+//   WeightedHistogram             atomic output, unspecified dims; ZeroBins + tie_outputs whose shape is a
+//                                 System shape hook (cs::dim::from_value of NBins' output); two forwards,
+//                                 n_bins changed by update_input between them
 //   TiledTranspose                group body, Local scratch, wg override; 37x53
 //   host component chain          producer -> host prefix sum -> consumer
 //   custom-op plumbing            device_ptr recorded at submission
@@ -83,7 +83,8 @@ class Affine : public cs::Component<AffineBody<R>> {
 public:
     explicit Affine(sycl::range<R> dims) : dims_{dims} {}
     void setup() override {
-        // A free input with declared dims; the output takes the input's shape.
+        // A free input with declared dims; the output's dims are unspecified and pre_forward gives it the input's shape
+        // (design review, section 10: an output is reshaped by its producing component).
         if constexpr (R == 1) {
             this->declare_input(x_, "x", static_cast<int>(dims_[0]));
         } else if constexpr (R == 2) {
@@ -92,8 +93,9 @@ public:
             this->declare_input(x_, "x", static_cast<int>(dims_[0]), static_cast<int>(dims_[1]),
                                 static_cast<int>(dims_[2]));
         }
-        this->declare_output(y_, "y", cs::from_input_shape<R>("x"));
+        this->declare_output(y_, "y", cs::unspecified_shape<R>());
     }
+    void pre_forward() override { this->set_shape(y_, this->shape_of(x_)); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return this->create_launch_config(x_.shape(), {x_}, {y_}, {});
     }
@@ -184,9 +186,9 @@ public:
     WeightedHistogram(float lo, float hi) : lo_{lo}, hi_{hi} {}
     void setup() override {
         declare_input(values_, "values", cs::unspecified);
-        declare_input(weights_, "weights", cs::from_input_shape<1>("values"));
+        declare_input(weights_, "weights", cs::unspecified);  // connected from the producer: it takes the producer's shape
         declare_input(n_bins_, "n_bins", cs::unspecified_shape<1>());  // connected from the NBins producer
-        declare_output(bins_, "bins", cs::unspecified_shape<1>());  // a tie_outputs member: the alias takes its shape from NBins' value
+        declare_output(bins_, "bins", cs::unspecified_shape<1>());  // a tie_outputs member: the tie's shape hook sets it from NBins' value
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return create_launch_config(values_.shape(), {values_, weights_, n_bins_}, {bins_}, {lo_, hi_});
@@ -213,7 +215,7 @@ public:
     }
 };
 
-// The bin count as an OUTPUT (an alias shape reads an upstream output): n[0] = v[0], where v is
+// The bin count as an OUTPUT (a shape hook reads an upstream output's value): n[0] = v[0], where v is
 // the free input the test drives (promoted as "n_bins").
 struct NBinsBody {
     struct Inputs {
@@ -243,14 +245,16 @@ class TopHist : public cs::System {
 public:
     void setup() override {
         add_subsystem(cs::subsystem_desc<HistProducer>("prod"));
-        // nb must be declared BEFORE zero: the tie's shape is the VALUE of nb.n, which zero's precompute reads on the host,
-        // and children run in declaration order (design review, sections 3 and 6). A host-side shape read needs its producer earlier.
+        // nb must be declared BEFORE zero: the tie's shape hook reads the VALUE of nb.n and runs before the first child that
+        // has the tied variable (zero), and children run in declaration order; a hook's source needs its producer in an
+        // earlier slot (design review, section 10).
         add_subsystem(cs::subsystem_desc<NBins>("nb"));
         add_subsystem(cs::subsystem_desc<ZeroBins>("zero"));
         add_subsystem(cs::subsystem_desc<WeightedHistogram>("hist", 0.0f, 1.0f));
         connect("nb.n", "hist.n_bins");
-        // The bins root's shape is the VALUE of nb.n[0], read by the root's owner (zero) each run.
-        tie_outputs<DType::atomic_f32, 1>({"zero.bins", "hist.bins"}, "bins", cs::alias::from_output_values("nb.n"));
+        // The bins' shape is the VALUE of nb.n[0], set by a hook on the tie alias before zero runs, each forward.
+        tie_outputs<DType::atomic_f32, 1>({"zero.bins", "hist.bins"}, "bins");
+        shape_hook("bins", cs::dim::from_value("nb.n", 0));
         promote<DType::u32, 1>("nb.v", "n_bins");  // the test drives the bin count by this name
         connect("prod.values", "hist.values");
         connect("prod.weights", "hist.weights");
@@ -317,7 +321,11 @@ class TiledTranspose : public cs::Component<TransposeBody> {
 public:
     void setup() override {
         declare_input(in_, "in", cs::unspecified_shape<2>());
-        declare_output(out_, "out", cs::FromInputDim{"in", 1}, cs::FromInputDim{"in", 0});
+        declare_output(out_, "out", cs::unspecified_shape<2>());
+    }
+    void pre_forward() override {
+        const sycl::range<2> s = shape_of(in_);
+        set_shape(out_, sycl::range<2>{s[1], s[0]});  // the transpose
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         TransposeBody::Scratch s;
@@ -373,8 +381,9 @@ class Plus1 : public cs::Component<Plus1Body> {
 public:
     void setup() override {
         declare_input(z_, "z", cs::unspecified_shape<1>());
-        declare_output(w_, "w", cs::from_input_shape<1>("z"));
+        declare_output(w_, "w", cs::unspecified_shape<1>());
     }
+    void pre_forward() override { set_shape(w_, shape_of(z_)); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return create_launch_config(z_.shape(), {z_}, {w_}, {});
     }
@@ -405,8 +414,9 @@ class PrefixSum : public cs::Component<PrefixBody> {
 public:
     void setup() override {
         declare_input(y_, "y", cs::unspecified_shape<1>());
-        declare_output(z_, "z", cs::from_input_shape<1>("y"));
+        declare_output(z_, "z", cs::unspecified_shape<1>());
     }
+    void pre_forward() override { set_shape(z_, shape_of(y_)); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return create_launch_config({y_}, {z_}, {});
     }
@@ -448,8 +458,9 @@ public:
     std::atomic<const void*> in_rec{nullptr}, out_rec{nullptr};
     void setup() override {
         declare_input(x_, "x", cs::unspecified_shape<1>());
-        declare_output(y_, "y", cs::from_input_shape<1>("x"));
+        declare_output(y_, "y", cs::unspecified_shape<1>());
     }
+    void pre_forward() override { set_shape(y_, shape_of(x_)); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return create_launch_config({x_}, {y_}, {&in_rec, &out_rec});
     }
@@ -526,7 +537,7 @@ public:
 
     // Hooks for the phase-guard checks, called by the test after setup.
     void try_declare() { declare_output(extra_, "extra", 1); }
-    void try_reshape() { reshape(y_, sycl::range<1>{2}); }
+    void try_reshape() { set_shape(y_, sycl::range<1>{2}); }
     void try_init() { init_input("x", cs::init::zero()); }
 };
 
@@ -552,11 +563,12 @@ public:
             declare_input(x_, "x", cs::unspecified_shape<1>());  // a tie_inputs member: the tie alias owns the shape
         else
             declare_input(x_, "x", 4);
-        declare_output(y_, "y", cs::from_input_shape<1>("x"));
+        declare_output(y_, "y", cs::unspecified_shape<1>());
         if (init_) init_input("x", *init_);
         if (mode_ == 1) init_input("y", cs::init::zero());
         if (mode_ == 2) init_input("x", cs::init::fill(3.0f));
     }
+    void pre_forward() override { set_shape(y_, shape_of(x_)); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return create_launch_config(x_.shape(), {x_}, {y_}, {});
     }
@@ -615,7 +627,7 @@ TEST_CASE("a launch's event is registered on the storage of every port it touche
 // =============================================================================================
 // WeightedHistogram
 // =============================================================================================
-TEST_CASE("WeightedHistogram: atomic output, unspecified dims, value-driven n_bins", "[component][histogram]") {
+TEST_CASE("WeightedHistogram: atomic output, unspecified dims, tie shape set by a from_value hook", "[component][histogram]") {
     auto model = cs::create_model<tc::TopHist>(default_config());
     model.setup();
 
@@ -768,7 +780,7 @@ TEST_CASE("initial values: metadata rules (connected, output, duplicates, last d
         auto model = top([](cs::System& s) {
             s.add_subsystem(cs::subsystem_desc<tc::InitAffine>("a", std::optional<cs::InitSpec>{cs::init::fill(1.0f)}, 0, true));
             s.add_subsystem(cs::subsystem_desc<tc::InitAffine>("b", std::optional<cs::InitSpec>{cs::init::fill(2.0f)}, 0, true));
-            s.tie_inputs<DType::f32, 1>({"a.x", "b.x"}, "x", cs::alias::fixed(4));
+            s.tie_inputs<DType::f32, 1>({"a.x", "b.x"}, "x", cs::shape(4));
         });
         CHECK_NOTHROW(model.setup());
         auto a = wait_and_view<DType::f32, 1>(model, "a.y");
@@ -780,7 +792,7 @@ TEST_CASE("initial values: metadata rules (connected, output, duplicates, last d
             // last declaration and wins, with no throw (section 2).
             s.add_subsystem(cs::subsystem_desc<tc::InitAffine>("a", std::optional<cs::InitSpec>{cs::init::fill(1.0f)}, 0, true));
             s.add_subsystem(cs::subsystem_desc<tc::InitAffine>("b", std::optional<cs::InitSpec>{cs::init::fill(2.0f)}, 0, true));
-            s.tie_inputs<DType::f32, 1>({"a.x", "b.x"}, "x", cs::alias::fixed(4));
+            s.tie_inputs<DType::f32, 1>({"a.x", "b.x"}, "x", cs::shape(4));
             s.init_input("x", cs::init::fill(9.0f));
         });
         model.setup();
@@ -790,7 +802,7 @@ TEST_CASE("initial values: metadata rules (connected, output, duplicates, last d
     }
 }
 
-TEST_CASE("phase guards: init_input, reshape and declare outside their phase throw", "[component][init][guards]") {
+TEST_CASE("phase guards: init_input, set_shape and declare outside their phase throw", "[component][init][guards]") {
     auto model = cs::create_model<tc::TopInit>(default_config());
     model.setup();
     auto& c = dynamic_cast<tc::InitDemo&>((*model.get_subsystem("ini")));
@@ -798,7 +810,7 @@ TEST_CASE("phase guards: init_input, reshape and declare outside their phase thr
     SECTION("init_input outside setup() throws") {
         tc::expect_throws([&] { c.try_init(); }, "setup() only");
     }
-    SECTION("reshape outside pre_forward() throws") {
+    SECTION("set_shape outside pre_forward() throws") {
         tc::expect_throws([&] { c.try_reshape(); }, "pre_forward() only");
     }
     SECTION("declare outside setup() throws") {

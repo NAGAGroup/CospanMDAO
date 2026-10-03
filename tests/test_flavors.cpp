@@ -164,8 +164,9 @@ class ElemND : public cs::Component<ElemBody<R, Op>> {
 public:
     void setup() override {
         this->declare_input(x_, "x", cs::unspecified_shape<R>());
-        this->declare_output(y_, "y", cs::from_input_shape<R>("x"));
+        this->declare_output(y_, "y", cs::unspecified_shape<R>());
     }
+    void pre_forward() override { this->set_shape(y_, this->shape_of(x_)); }  // the output follows the input (section 10: no derived dims)
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return this->create_launch_config(x_.shape(), {x_}, {y_}, {});
     }
@@ -200,8 +201,9 @@ class Half : public cs::Component<HalfBody> {
 public:
     void setup() override {
         declare_input(x_, "x", cs::unspecified_shape<1>());
-        declare_output(y_, "y", cs::from_input_shape<1>("x"));
+        declare_output(y_, "y", cs::unspecified_shape<1>());
     }
+    void pre_forward() override { set_shape(y_, shape_of(x_)); }  // the output follows the input (section 10: no derived dims)
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return create_launch_config(sycl::range<1>{x_.shape()[0] / 2}, {x_}, {y_}, {});
     }
@@ -258,8 +260,9 @@ public:
     explicit GroupStage(std::size_t wg = 64) : wg_{wg} {}
     void setup() override {
         this->declare_input(x_, "x", cs::unspecified_shape<1>());
-        this->declare_output(y_, "y", cs::from_input_shape<1>("x"));
+        this->declare_output(y_, "y", cs::unspecified_shape<1>());
     }
+    void pre_forward() override { this->set_shape(y_, this->shape_of(x_)); }  // the output follows the input (section 10: no derived dims)
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         typename Body::Scratch s;
         s.tile.reshape(sycl::range<1>{wg_});
@@ -290,8 +293,9 @@ class Prefix : public cs::Component<PrefixBody> {
 public:
     void setup() override {
         declare_input(x_, "x", cs::unspecified_shape<1>());
-        declare_output(z_, "z", cs::from_input_shape<1>("x"));
+        declare_output(z_, "z", cs::unspecified_shape<1>());
     }
+    void pre_forward() override { set_shape(z_, shape_of(x_)); }  // the output follows the input (section 10: no derived dims)
     std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config({x_}, {z_}, {}); }
 };
 
@@ -363,7 +367,9 @@ public:
     }
 };
 
-// ---- NSrc / Bins: a value-driven size. NSrc writes the value n; Bins' output has n elements (FromInput) -----
+// ---- NSrc / Bins: a value-driven size. NSrc writes the value n; Bins' output has n elements -----
+// REVIEW: a component cannot read a value and a hook cannot target an output (section 10), so Bins takes a free input `ref`
+// that its System hooks with from_value(n) (hook_bins), and copies its shape in pre_forward.
 struct NSrcBody {
     struct Inputs {};
     struct Outputs {
@@ -386,6 +392,7 @@ public:
 struct BinsBody {
     struct Inputs {
         cs::Input<DType::u32, 1> n;
+        cs::Input<DType::f32, 1> ref;
     };
     struct Outputs {
         cs::Output<DType::f32, 1> bins;
@@ -394,17 +401,24 @@ struct BinsBody {
 };
 class Bins : public cs::Component<BinsBody> {
     cs::Input<DType::u32, 1>  n_;
+    cs::Input<DType::f32, 1>  ref_;
     cs::Output<DType::f32, 1> bins_;
 
 public:
     void setup() override {
         declare_input(n_, "n", 1);
-        declare_output(bins_, "bins", cs::FromInput{"n", 0});
+        declare_input(ref_, "ref", cs::unspecified);
+        declare_output(bins_, "bins", cs::unspecified);
     }
+    void pre_forward() override { set_shape(bins_, shape_of(ref_)); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(bins_.shape(), {n_}, {bins_}, {});
+        return create_launch_config(bins_.shape(), {n_, ref_}, {bins_}, {});
     }
 };
+/// Hooks the `ref` of the Bins at `path` (e.g. "f.b") with the value of its `n`.
+inline void hook_bins(cs::System& s, const std::string& path) {
+    s.shape_hook(path + ".ref", cs::dim::from_value(path + ".n", 0));
+}
 
 // ---- BigStage: a group stage whose scratch tile has `elems` floats (the work-group is 64) -----------------
 struct BigBody {
@@ -433,8 +447,9 @@ public:
     explicit BigStage(std::size_t elems) : elems_{elems} {}
     void setup() override {
         declare_input(x_, "x", cs::unspecified_shape<1>());
-        declare_output(y_, "y", cs::from_input_shape<1>("x"));
+        declare_output(y_, "y", cs::unspecified_shape<1>());
     }
+    void pre_forward() override { set_shape(y_, shape_of(x_)); }  // the output follows the input (section 10: no derived dims)
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         BigBody::Scratch s;
         s.tile.reshape(sycl::range<1>{elems_});
@@ -459,8 +474,9 @@ class NopCustom : public cs::Component<NopCustomBody> {
 public:
     void setup() override {
         declare_input(x_, "x", cs::unspecified_shape<1>());
-        declare_output(y_, "y", cs::from_input_shape<1>("x"));
+        declare_output(y_, "y", cs::unspecified_shape<1>());
     }
+    void pre_forward() override { set_shape(y_, shape_of(x_)); }  // the output follows the input (section 10: no derived dims)
     std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config({x_}, {y_}, {}); }
 };
 struct NopHostBody {
@@ -479,8 +495,9 @@ class NopHost : public cs::Component<NopHostBody> {
 public:
     void setup() override {
         declare_input(x_, "x", cs::unspecified_shape<1>());
-        declare_output(y_, "y", cs::from_input_shape<1>("x"));
+        declare_output(y_, "y", cs::unspecified_shape<1>());
     }
+    void pre_forward() override { set_shape(y_, shape_of(x_)); }  // the output follows the input (section 10: no derived dims)
     std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config({x_}, {y_}, {}); }
 };
 
@@ -505,7 +522,7 @@ cs::Model tied_adders() {
     return make([](cs::System& s) {
         s.add_subsystem(cs::subsystem_desc<ZeroAcc>("zero"));
         s.add_subsystem(cs::fuse_components<S>("f", cs::subsystem_desc<Adder>("a", 1.0f), cs::subsystem_desc<Adder>("b", 2.0f)));
-        s.tie_outputs<DType::atomic_f32, 1>({"zero.acc", "f.a.acc", "f.b.acc"}, "sum", cs::alias::fixed(12));  // atomic writers
+        s.tie_outputs<DType::atomic_f32, 1>({"zero.acc", "f.a.acc", "f.b.acc"}, "sum", cs::shape(12));  // atomic writers
         // Execution order is data dependencies only and tied writers never wait on each other (design review, section 3):
         // the zeroing producer needs an explicit edge.
         s.depends_on("f", "zero");
@@ -519,6 +536,7 @@ void value_from_outside() {
         s.add_subsystem(cs::subsystem_desc<Src1>("src", std::array<int, 1>{100}));
         s.add_subsystem(cs::fuse_components<S>("f", cs::subsystem_desc<Elem<0>>("e"), cs::subsystem_desc<Bins>("b")));  // n is a free input
         s.connect("src.y", "f.e.x");
+        hook_bins(s, "f.b");
     });
     model.setup();
     const std::uint32_t nb1 = 8, nb2 = 13;
@@ -835,7 +853,7 @@ TEST_CASE("fused: tied outputs follow the ordinary tie policy, in parallel and s
             // identical writers (both y[i] = i + 1), so the result does not depend on how they interleave
             s.add_subsystem(cs::fuse_components<tfl::kPar>("f", cs::subsystem_desc<tfl::Src1>("a", std::array<int, 1>{12}),
                                                            cs::subsystem_desc<tfl::Src1>("b", std::array<int, 1>{12})));
-            s.tie_outputs<DType::f32, 1>({"f.a.y", "f.b.y"}, "t", cs::alias::fixed(12), cs::TieOutputsPolicy::allow_plain);
+            s.tie_outputs<DType::f32, 1>({"f.a.y", "f.b.y"}, "t", cs::shape(12), cs::TieOutputsPolicy::allow_plain);
         });
         CHECK_NOTHROW(model.setup());
         CHECK_NOTHROW(model.forward());
@@ -848,7 +866,7 @@ TEST_CASE("fused: tied outputs follow the ordinary tie policy, in parallel and s
         cs::Model model = tfl::make([](cs::System& s) {
             s.add_subsystem(cs::fuse_components<tfl::kPar>("f", cs::subsystem_desc<tfl::Src1>("a", std::array<int, 1>{12}),
                                                            cs::subsystem_desc<tfl::Src1>("b", std::array<int, 1>{12})));
-            s.tie_outputs<DType::f32, 1>({"f.a.y", "f.b.y"}, "t", cs::alias::fixed(12));
+            s.tie_outputs<DType::f32, 1>({"f.a.y", "f.b.y"}, "t", cs::shape(12));
         });
         tfl::expect_throws([&] { model.setup(); }, {"is not atomic", "require_atomic", "allow_plain"});
     }
@@ -865,14 +883,18 @@ TEST_CASE("fused: tied outputs follow the ordinary tie policy, in parallel and s
 // Fused, both modes: value-driven sizes, the local-memory limit
 // =============================================================================================
 TEST_CASE("fused: a value-driven size driven by a stage of the same fuse is refused at setup", "[flavors][fused][errors]") {
-    // (FromInputDim and unspecified dims through connections are allowed: the chains above use both.)
+    // (Unspecified dims through connections are allowed: the chains above use them; derived dims are gone, section 10.)
     SECTION("sequential: the setup-end check names both stages") {
         cs::Model model = tfl::make([](cs::System& s) {
             s.add_subsystem(cs::fuse_components<tfl::kSeq>("f", cs::connects_desc({{"a.n", "b.n"}}),  // b's output size is the VALUE of a's output
                                                            cs::subsystem_desc<tfl::NSrc>("a", 8.0f),
                                                            cs::subsystem_desc<tfl::Bins>("b")));
+            tfl::hook_bins(s, "f.b");
         });
-        tfl::expect_throws([&] { model.setup(); }, {"f.b", "f.a", "VALUE"});
+        // REVIEW: the old setup-end check of the fuse ("f.b", "f.a", "VALUE") is gone from fused_component.hpp. The hook's source
+        // f.b.n is produced by f.a, inside the same child f, so system.hpp compute_hook_slots should reject it ("produced by 'f',
+        // which does not come before 'f'"); whether a hook path into a fused component resolves that way is not settled.
+        tfl::expect_throws([&] { model.setup(); }, {"shape_hook", "'f.b.ref'", "'f.b.n'", "does not come before 'f'"});
     }
     SECTION("parallel: the connect itself is rejected, before that check") {
         cs::Model model = tfl::make([](cs::System& s) {

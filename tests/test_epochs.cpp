@@ -74,8 +74,9 @@ class Rd : public cs::Component<RdBody> {
 public:
     void setup() override {
         declare_input(x_, "x", cs::unspecified);
-        declare_output(z_, "z", cs::FromInputDim{"x", 0});
+        declare_output(z_, "z", cs::unspecified_shape<1>());
     }
+    void pre_forward() override { set_shape(z_, shape_of(x_)); }  // the output follows the input (section 10: no derived dims)
     std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(z_.shape(), {x_}, {z_}, {}); }
 };
 
@@ -135,13 +136,17 @@ public:
     std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(y_.shape(), {x_}, {y_}, {}); }
 };
 
-/// RGen: a free u32 input `counts` [n] drives the ragged output r [n, counts[i], 3]; r block i = 1000 i + q.
+/// RGen: a free u32 input `counts` [n] drives the ragged output r [n, counts[i]]; r block i = 1000 i + q.
+/// Section 10: ragged is rank 2 (was [n, counts[i], 3]); a component cannot read values, so RGenTop hooks the free ragged input
+/// `layout` with counts_from(g.counts) and r copies its shape in pre_forward.
+/// REVIEW: this is the same device as Fill in test_ragged.cpp; a hook cannot target an output.
 struct RGenBody {
     struct Inputs {
-        cs::Input<DType::u32, 1> counts;
+        cs::Input<DType::u32, 1>       counts;
+        cs::RaggedInput<DType::f32, 2> layout;
     };
     struct Outputs {
-        cs::RaggedOutput<DType::f32, 3> r;
+        cs::RaggedOutput<DType::f32, 2> r;
     };
     void operator()(sycl::id<1> id, Inputs, Outputs o) const {
         auto b = o.r.block(id[0]);
@@ -151,17 +156,20 @@ struct RGenBody {
 class RGen : public cs::Component<RGenBody> {
     std::vector<std::uint32_t>      init_;
     cs::Input<DType::u32, 1>        counts_;
-    cs::RaggedOutput<DType::f32, 3> r_;
+    cs::RaggedInput<DType::f32, 2>  layout_;
+    cs::RaggedOutput<DType::f32, 2> r_;
 
 public:
     explicit RGen(std::vector<std::uint32_t> init) : init_{std::move(init)} {}
     void setup() override {
         declare_input(counts_, "counts", init_.size());
         init_input("counts", cs::init::from_host(init_));
-        declare_output(r_, "r", cs::FromInputDim{"counts", 0}, cs::FromInputValues{"counts"}, 3);
+        declare_input(layout_, "layout");
+        declare_output(r_, "r");
     }
+    void pre_forward() override { set_shape(r_, shape_of(layout_)); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(counts_.shape(), {counts_}, {r_}, {});
+        return create_launch_config(counts_.shape(), {counts_, layout_}, {r_}, {});
     }
 };
 
@@ -171,7 +179,7 @@ public:
     void setup() override {
         add_subsystem(cs::subsystem_desc<TieMember<true>>("z"));
         add_subsystem(cs::subsystem_desc<TieMember<false>>("a"));
-        tie_outputs<DType::f32, 1>({"z.t", "a.t"}, "t", cs::alias::fixed(kN), cs::TieOutputsPolicy::allow_plain);
+        tie_outputs<DType::f32, 1>({"z.t", "a.t"}, "t", cs::shape(kN), cs::TieOutputsPolicy::allow_plain);
         // Execution order is data dependencies only (design review, section 3), and tied writers do not wait on each
         // other: the accumulator runs after the zeroing producer only because the edge is declared.
         depends_on("a", "z");
@@ -205,7 +213,10 @@ class RGenTop : public cs::System {
 
 public:
     explicit RGenTop(std::vector<std::uint32_t> c) : counts_{std::move(c)} {}
-    void setup() override { add_subsystem(cs::subsystem_desc<RGen>("g", counts_)); }
+    void setup() override {
+        add_subsystem(cs::subsystem_desc<RGen>("g", counts_));
+        shape_hook("g.layout", cs::ragged::counts_from("g.counts"));
+    }
 };
 
 }  // namespace tep
@@ -280,12 +291,12 @@ TEST_CASE("Views: a value-driven ragged output follows its driver", "[epoch][vie
     // shape change of its variable is not settled by host_view.hpp (it says each forward pushes a copy, not what a
     // resize does to the host copy), so the view is released before the driver changes.
     {
-        const auto v = m.view_ragged_output<DType::f32, 3>("g.r");
+        const auto v = m.view_ragged_output<DType::f32, 2>("g.r");
         v.sync();
         REQUIRE(v.n() == counts.size());
         for (std::size_t i = 0; i < counts.size(); ++i) {
             const auto b = v.block(i);
-            REQUIRE(b.size() == static_cast<std::size_t>(counts[i]) * 3);
+            REQUIRE(b.size() == static_cast<std::size_t>(counts[i]));
             for (std::size_t q = 0; q < b.size(); ++q) CHECK(b[q] == static_cast<float>(i * 1000 + q));
         }
     }
@@ -293,10 +304,10 @@ TEST_CASE("Views: a value-driven ragged output follows its driver", "[epoch][vie
     const std::vector<std::uint32_t> next{1, 1, 1, 5, 0, 2};
     m.update_input("g.counts", cs::init::from_host(next));
     forward_and_wait(m);
-    const auto w = m.view_ragged_output<DType::f32, 3>("g.r");
+    const auto w = m.view_ragged_output<DType::f32, 2>("g.r");
     w.sync();
     REQUIRE(w.n() == next.size());
-    for (std::size_t i = 0; i < next.size(); ++i) CHECK(w.block(i).size() == static_cast<std::size_t>(next[i]) * 3);
+    for (std::size_t i = 0; i < next.size(); ++i) CHECK(w.block(i).size() == static_cast<std::size_t>(next[i]));
 }
 
 TEST_CASE("Views: a deleted transient's variables cannot be viewed by path", "[epoch][view][transient]") {

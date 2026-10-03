@@ -1,8 +1,9 @@
 // Initializers check every dimension of the root they are applied to, and carry ragged shapes.
 //
-//   cs::init::Shape / ragged(n, d1[, d2]) / from_host(data, ragged shape)
-//   check_init_shape compares the init's shape with the resolved root on the rank and on EVERY dimension
-//   (fixed, inherited, value-driven, per-index element by element), at the full range, and names both sides.
+//   cs::init::Shape / ragged(n, d1) / from_host(data, ragged shape)
+//   the init's shape is compared with the resolved root on the rank and on EVERY dimension
+//   (fixed, hooked, per-index counts element by element), at the full range, and names both sides.
+//   Design review, section 10: there are no derived dimensions (FromInputDim, FromInput, ...); ragged is rank 2 only.
 //
 // Design review, section 2: setup checks wiring rules only and shapes are reactive, so every init shape check fires at the
 // first forward (the variable's materialization), not at setup. Initial values are declared with init_input in setup()
@@ -76,7 +77,8 @@ struct ProbeBody {
     };
     void operator()(sycl::id<1> i, Inputs a, Outputs o) const { o.y[i] = a.x[i] + a.w[i]; }
 };
-/// mode 0: x, w fixed 5.  mode 1: x unspecified, w = FromInputDim{x, 0}.  mode 2: x fixed 3, w = FromInput{n, 0}.
+/// mode 0: x, w fixed 5.  mode 1: x, w unspecified (shaped by their initializers).  mode 2: x fixed 3, w unspecified
+/// (a System shape hook sets it from the value of n). The output takes x's shape in pre_forward.
 class Probe : public cs::Component<ProbeBody> {
     int                       mode_;
     cs::Input<DType::f32, 1>  x_, w_;
@@ -92,13 +94,14 @@ public:
             declare_input(w_, "w", std::size_t{5});
         } else if (mode_ == 1) {
             declare_input(x_, "x", cs::unspecified);
-            declare_input(w_, "w", cs::FromInputDim{"x", 0});
+            declare_input(w_, "w", cs::unspecified);
         } else {
             declare_input(x_, "x", std::size_t{3});
-            declare_input(w_, "w", cs::FromInput{"n", 0});
+            declare_input(w_, "w", cs::unspecified);
         }
-        declare_output(y_, "y", cs::FromInputDim{"x", 0});
+        declare_output(y_, "y", cs::unspecified);
     }
+    void pre_forward() override { set_shape(y_, shape_of(x_)); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return create_launch_config(y_.shape(), {x_, w_, n_}, {y_}, {});
     }
@@ -119,8 +122,8 @@ struct RagSumBody {
         o.sums[id] = s;
     }
 };
-/// mode 0: x unspecified in both dims (a connection or an init shapes it).  mode 1: x has all dims unspecified, for a tie.
-/// mode 2: x declared with n = sizes.size() and per_index(sizes).
+/// mode 0: x unspecified in both dims (a connection or an init shapes it).  mode 1: the same, for a tie.
+/// mode 2: x declared with cs::counts(sizes) (N = sizes.size()). The output has one sum per index.
 class RagSum : public cs::Component<RagSumBody> {
     int                            mode_;
     Sizes                          sizes_;
@@ -130,14 +133,13 @@ class RagSum : public cs::Component<RagSumBody> {
 public:
     RagSum(int mode, Sizes sizes) : mode_{mode}, sizes_{std::move(sizes)} {}
     void setup() override {
-        if (mode_ == 0)
-            declare_input(x_, "x", cs::unspecified, cs::unspecified);
-        else if (mode_ == 1)
-            declare_input(x_, "x", cs::unspecified_shape<2>());
+        if (mode_ == 0 || mode_ == 1)
+            declare_input(x_, "x");
         else
-            declare_input(x_, "x", sizes_.size(), cs::per_index(sizes_));
-        declare_output(sums_, "sums", cs::FromInputDim{"x", 0});
+            declare_input(x_, "x", cs::counts(sizes_));
+        declare_output(sums_, "sums", cs::unspecified);
     }
+    void pre_forward() override { set_shape(sums_, sycl::range<1>{shape_of(x_).n}); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return create_launch_config(sums_.shape(), {x_}, {sums_}, {});
     }
@@ -160,8 +162,9 @@ class Dbl : public cs::Component<DblBody> {
 public:
     void setup() override {
         declare_input(in_, "in", cs::unspecified);
-        declare_output(out_, "out", cs::FromInputDim{"in", 0});
+        declare_output(out_, "out", cs::unspecified);
     }
+    void pre_forward() override { set_shape(out_, shape_of(in_)); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(out_.shape(), {in_}, {out_}, {}); }
 };
 
@@ -242,24 +245,18 @@ TEST_CASE("shape: an init that disagrees with a FIXED dim names both sides", "[s
     tis::forward_throws(m, {"init for 'p.x' has dimension 0 = 4", "'p.x' resolved dimension 0 (fixed) = 5"});
 }
 
-TEST_CASE("shape: an init that disagrees with an INHERITED dim names both sides", "[shape][init]") {
-    auto m = tis::make([](cs::System& s) {
-        s.add_subsystem(cs::subsystem_desc<tis::Probe>("p", 1));
-        s.init_input("p.x", cs::init::fill(1.0f, {4}));  // x is shaped by this: 4
-        s.init_input("p.w", cs::init::fill(1.0f, {3}));  // w inherits x's dim 0 = 4
-    });
-    m.setup();
-    tis::forward_throws(m, {"init for 'p.w' has dimension 0 = 3", "'p.w' resolved dimension 0 (FromInputDim{'x', 0}) = 4"});
-}
-
-TEST_CASE("shape: an init that disagrees with a VALUE-DRIVEN dim names both sides", "[shape][init]") {
+// The old INHERITED case (w = FromInputDim{x, 0}, an init on w disagreeing with the dim it inherits) is DELETED: derived
+// dimensions are removed (design review, section 10); w would simply be shaped by its own initializer.
+TEST_CASE("shape: an init that disagrees with a HOOKED dim names both sides", "[shape][init]") {
+    // was: a VALUE-DRIVEN dim (FromInput{n, 0}); a size from an upstream value is a shape hook now
     auto m = tis::make([](cs::System& s) {
         s.add_subsystem(cs::subsystem_desc<tis::Probe>("p", 2));
         s.init_input("p.n", cs::init::from_host(std::vector<std::uint32_t>{3}));  // w has 3 elements
+        s.shape_hook("p.w", cs::dim::from_value("p.n", 0));
         s.init_input("p.w", cs::init::fill(1.0f, {5}));
     });
     m.setup();
-    tis::forward_throws(m, {"init for 'p.w' has dimension 0 = 5", "'p.w' resolved dimension 0 (FromInput{'n', 0}) = 3"});
+    tis::forward_throws(m, {"init for 'p.w' has dimension 0 = 5", "'p.w' resolved dimension 0 (set by a shape hook) = 3"});
 }
 
 TEST_CASE("shape: an init that disagrees with a PER-INDEX dim names both sides, element by element", "[shape][init]") {
@@ -268,7 +265,7 @@ TEST_CASE("shape: an init that disagrees with a PER-INDEX dim names both sides, 
         s.init_input("p.x", cs::init::from_host(std::vector<float>(7, 1.0f), cs::init::ragged(3, tis::Sizes{3, 0, 4})));
     });
     m.setup();
-    tis::forward_throws(m, {"init for 'p.x' has dimension 1 = [3,0,4]", "'p.x' resolved dimension 1 (PerIndex) = [3,1,4]"});
+    tis::forward_throws(m, {"init for 'p.x' has dimension 1 = [3,0,4]", "'p.x' resolved dimension 1 (fixed counts [3,1,4]) = [3,1,4]"});
 }
 
 TEST_CASE("shape: an init that agrees with a per-index dim runs", "[shape][init]") {
@@ -318,32 +315,22 @@ TEST_CASE("shape: bare data (from_host(vec)) carries no shape for a rank-2 root"
 // =============================================================================================================================
 // ragged shapes
 // =============================================================================================================================
-TEST_CASE("shape: ragged() builds [n, d1] and [n, d1, d2], and a wrong vector length throws", "[shape][init]") {
+TEST_CASE("shape: ragged() builds [n, d1] (rank 2 only), and a wrong vector length throws", "[shape][init]") {
     const auto r2 = cs::init::ragged(3, tis::Sizes{3, 0, 4});
     CHECK(r2.get().rank == 2);
     CHECK(r2.get().extents[0] == 3);
-    CHECK(r2.get().per[1]);
-    CHECK(r2.get().per_index[1] == tis::Sizes{3, 0, 4});
+    CHECK(r2.get().per);
+    CHECK(r2.get().per_index == tis::Sizes{3, 0, 4});
     CHECK(r2.get().elements() == 7);
-
-    const auto r3 = cs::init::ragged(2, tis::Sizes{2, 3}, 4);  // blocks 2 x 4 and 3 x 4
-    CHECK(r3.get().rank == 3);
-    CHECK_FALSE(r3.get().per[2]);
-    CHECK(r3.get().extents[2] == 4);
-    CHECK(r3.get().elements() == 20);
-
-    const auto r33 = cs::init::ragged(2, tis::Sizes{2, 3}, tis::Sizes{5, 1});  // blocks 10 and 3
-    CHECK(r33.get().elements() == 13);
+    // the rank-3 forms (ragged(n, sizes, d2), ragged(n, sizes, sizes)) are deleted: ragged is rank 2 only (section 10)
 
     const auto dense = cs::init::ragged(4, 3);  // no per-index vector: a dense [4, 3]
     CHECK_FALSE(dense.get().ragged());
     CHECK(dense.get().elements() == 12);
 
     CHECK_THROWS_WITH(cs::init::ragged(3, tis::Sizes{1, 2}),
-                      Catch::Matchers::ContainsSubstring("dimension 1 has 2 extents but dimension 0 has 3 indices"));
+                      Catch::Matchers::ContainsSubstring("the counts have 2 entries but dimension 0 has 3 indices"));
     CHECK_THROWS_AS(cs::init::ragged(3, tis::Sizes{1, 2}), std::invalid_argument);
-    CHECK_THROWS_WITH(cs::init::ragged(2, 4, tis::Sizes{1, 2, 3}),
-                      Catch::Matchers::ContainsSubstring("dimension 2 has 3 extents but dimension 0 has 2 indices"));
     CHECK_NOTHROW(cs::init::ragged(0, tis::Sizes{}));  // n = 0 is legal
 }
 
