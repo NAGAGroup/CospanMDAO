@@ -1050,9 +1050,23 @@ Aliasing is complete the moment each structural call returns. Storage follows in
 
 `tie_outputs` members MUST share the alias's placement: producers cannot write one storage from two placements. Checked in the members' Components' `get_exec_info` (an output member whose placement differs from the alias's — the alias was processed first by its System, so the placement is known), error naming the tie.
 
-SHAPES ARE REACTIVE. A shape is read when something needs it at run time. If it is not known then, the read throws there, naming what needed it, which dimension, and what it was waiting on (a producer that has not run, an input whose value is unread, a connection that supplies none). Setup rejects only fully declared contradictions (§3.6); it does no ordering or cycle analysis for shapes.
+SHAPES ARE REACTIVE. A shape is read when something needs it at run time. If it is not known then, the read throws there (`std::logic_error`, built by one helper, `detail::shape_needed`), in one form with three parts:
 
-CYCLE WARNING. At setup, a connection whose consumer runs before its producer in registration order (depth-first, which is execution order) is a cycle. CoSpan has no solvers yet, so it prints `naga::cospan: warning: ...` on std::cerr naming both, and never throws. The check is independent of shapes.
+`naga::cospan: shape not known yet: '<needed by>' needs <what> of '<port>', <producer clause>`
+
+(a) `<needed by>` is what needed the shape: a port path, a tie alias path, or, for the unresolved boundary dimension of a chunked system, that System's path. (b) `<what>` is the dimension or value: `dimension d`, `the value of element n`, `the per-index extents by value (column k)`, or, when a variable is materialized, `its shape and storage`. (c) `<port>` is the variable by a port path, and the producer clause says why it is not known:
+
+- `fed by '<producer path>', which has not run yet in this forward` (the producer exists and has not run);
+- `fed by '<producer path>', which does not currently exist (its producer was deleted; rearm it first)`;
+- `which no producer feeds`.
+
+A value is read from a variable that has a producer and no data anywhere only after that producer has run; a free input is materialized on need instead. Setup rejects only fully declared contradictions (§3.6: rank or dtype mismatch, a fixed dimension against an initializer, an unspecified dimension nothing can supply, a shape source no component produces). It makes NO registration-order check on a tie's shape source: a tie whose source is produced after the tie's first member materializes fails at the forward with the message above. It does no ordering or cycle analysis for shapes.
+
+CYCLE WARNING. A connection whose consumer Component runs before its producer Component in registration order (depth-first, which is execution order) is a cycle. CoSpan has no solvers yet. At the end of the root's setup, and after a rebuild's replay (for the connections that touch the rebuilt child), it prints one line on std::cerr per (consumer port, producer port) pair, never twice for the same pair, and never throws:
+
+`naga::cospan: warning: '<consumer port>' reads '<producer port>', which runs after it: this is a cycle; without a solver the consumer sees the producer's previous value (or its initial state on the first forward)`
+
+Promotions and ties count through their ports: the pair is the Component port that reads and the Component port that writes the same variable. The check is independent of shapes.
 
 ### 4.6 Sample
 
@@ -2774,7 +2788,7 @@ order it fires, with the state that exists after each. Binding contract.
 Cast: Model (§9) · Subsystem verbs (§6.1) · System and ExecCtx (§7) ·
 Component (§6) · IOEntry sets (§4) · SlabKit memory (SlabKit's spec).
 
-**Assumption stated once:** the model is ACYCLIC; cycles are not supported.
+**Assumption stated once:** the model is acyclic. A cycle is expressible by registration order; it warns at setup (§4.5) and runs with the consumer reading the producer's previous value, until solvers exist.
 
 ### 11.1 Construct
 
@@ -2822,7 +2836,8 @@ its `init` (highest declaring level wins; a tie at one depth is an error; an ini
 output is an error; an init on a variable with a source is ignored; none means zeros).
 It checks the shape-authority setup errors of §3.6, which are fully declared
 contradictions only (no ordering or cycle analysis for shapes, §4.5), and prints the
-cycle warning of §4.5 for each connection whose consumer runs before its producer.
+cycle warning of §4.5 for each connection whose consumer runs before its producer (once per
+port pair; a rebuild's replay repeats the check for the rebuilt child's connections only).
 Nothing is materialized here, and no run counter is derived: each parent keeps the
 counter of each child from its `add_subsystem` property (§4.4). A mark does not affect
 lifetime.
