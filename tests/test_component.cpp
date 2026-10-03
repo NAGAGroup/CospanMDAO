@@ -779,8 +779,10 @@ TEST_CASE("initial values: metadata rules (connected, output, duplicates, highes
     }
     SECTION("a System-level init beats the components' on a tied alias") {
         auto model = top([](cs::System& s) {
+            // Only member a carries a component-level init: two members' inits at one level now throw at tie_inputs (see the
+            // section above, and test_system's TieInitTwo). The System-level init on the tie still wins over a's.
             s.add_subsystem(cs::subsystem_desc<tc::InitAffine>("a", std::optional<cs::InitSpec>{cs::init::fill(1.0f)}, 0, true));
-            s.add_subsystem(cs::subsystem_desc<tc::InitAffine>("b", std::optional<cs::InitSpec>{cs::init::fill(2.0f)}, 0, true));
+            s.add_subsystem(cs::subsystem_desc<tc::InitAffine>("b", std::optional<cs::InitSpec>{}, 0, true));
             s.tie_inputs<DType::f32, 1>({"a.x", "b.x"}, "x", cs::alias::fixed(4));
             s.init_input("x", cs::init::fill(9.0f));
         });

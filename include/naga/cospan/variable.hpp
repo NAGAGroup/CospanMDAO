@@ -726,15 +726,16 @@ public:
     virtual std::size_t read_shape_host(std::size_t index) const = 0;
 
 private:
-    /// The variable an alias rule reads, through the instance it names (weak: a deleted child's expires). With
+    /// The variable an alias rule reads, through the instance it names while that exists, else through the weak variable
+    /// fallback (a deleted producer's value stays readable while anything holds its variable). With
     /// `need_shape` its shape must be known: a free source that is not materialized yet is materialized first (that is
     /// where its initializer's shape is applied).
     std::shared_ptr<VarMeta> alias_source(Runtime& rt, const AliasSrc& src, bool need_shape) {
         const std::shared_ptr<Instance> up = src.inst.lock();
-        if (!up)
+        std::shared_ptr<VarMeta>        m  = up ? meta_of(*up) : src.var.lock();
+        if (!m)
             throw std::logic_error("naga::cospan: '" + display_path() + "': its shape comes from '" + src.path +
                                    "', which does not exist right now");
-        std::shared_ptr<VarMeta> m = meta_of(*up);
         if (need_shape) {
             if (!m->shape.known && !m->has_producer()) m->materialize(rt);
             if (!m->shape.known)

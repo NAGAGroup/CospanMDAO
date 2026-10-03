@@ -400,7 +400,7 @@ void check_alias_shape(const WiringSite& site, AliasShape& s, const char* verb, 
                 if (sp.how == AliasDim::How::output_dim && static_cast<int>(sp.index) >= up->meta->rank)
                     fail(dim + "'" + sp.path + "' has rank " + std::to_string(up->meta->rank) + ", no dimension " +
                          std::to_string(sp.index));
-                sp.src = AliasSrc{sp.path, up};
+                sp.src = AliasSrc{sp.path, up, up->meta};
             }
             return;
         }
@@ -419,7 +419,7 @@ void check_alias_shape(const WiringSite& site, AliasShape& s, const char* verb, 
             if (up->meta->rank != Rank)
                 fail("alias::from_input_shape('" + s.path + "') names an input of rank " + std::to_string(up->meta->rank) +
                      " but the alias is rank " + std::to_string(Rank));
-            s.src = AliasSrc{s.path, up};
+            s.src = AliasSrc{s.path, up, up->meta};
             return;
         }
         case AliasShape::Kind::from_output_shape:
@@ -431,7 +431,7 @@ void check_alias_shape(const WiringSite& site, AliasShape& s, const char* verb, 
                      " but the alias is rank " + std::to_string(Rank));
             if (s.kind == AliasShape::Kind::from_output_values && !is_integer_value_dtype(up->meta->dtype))
                 fail("alias::from_output_values('" + s.path + "') names an output that is not of integer dtype");
-            s.src = AliasSrc{s.path, up};
+            s.src = AliasSrc{s.path, up, up->meta};
             return;
         }
     }

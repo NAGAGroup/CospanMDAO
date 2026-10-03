@@ -30,6 +30,7 @@ class Subsystem;
 
 namespace detail {
 class Instance;  // instance.hpp
+class VarMeta;   // variable.hpp
 }  // namespace detail
 
 enum class IOKind : uint8_t { input, output };
@@ -120,10 +121,16 @@ concept AliasDimSpec = std::integral<T> || std::same_as<T, PerIndex> || std::sam
 
 /// An upstream instance an alias shape reads (or a tie member), by path and by weak pointer: a deleted
 /// child's instance expires, and nothing here keeps it alive (docs/design-review-2026-10-03.md, section 1).
+///
+/// The instance names the source while it exists. The variable is a weak FALLBACK: a deleted producer's value stays
+/// readable while anything else still holds its variable (a promotion, a consumer, another alias). Nothing keeps it alive on
+/// the tie's behalf (docs/design-review-2026-10-03.md, section 2: alias instances replace the old user hold).
 struct AliasSrc {
-    std::string                    path;
+    std::string                     path;
     std::weak_ptr<detail::Instance> inst;
-    explicit operator bool() const noexcept { return !inst.expired(); }
+    std::weak_ptr<detail::VarMeta>  var;
+    /// True while either the instance or its variable is alive.
+    explicit operator bool() const noexcept { return !inst.expired() || !var.expired(); }
 };
 
 /// One dimension of an alias::dims shape, type-erased.

@@ -2711,13 +2711,18 @@ TEST_CASE("lifetime: transient together with run_n or do_once throws, naming the
 
 namespace tsys2 {
 /// A transient System: nb (NCopy, do_once) gives the tie's extent by VALUE (alias::from_output_values), a and b are the members.
+/// With `hold_n`, the System also promotes nb.n as "n": the promotion holds nb's variable after nb is deleted.
 class ValueSourceSys : public cs::System {
+    bool hold_n_;
+
 public:
+    explicit ValueSourceSys(bool hold_n = false) : hold_n_{hold_n} {}
     void setup() override {
         add_subsystem(cs::property_list{cs::property::do_once{}}, cs::subsystem_desc<NCopy>("nb"));
         add_subsystem(cs::subsystem_desc<TScale>("a"));
         add_subsystem(cs::subsystem_desc<TScale>("b"));
         tie_inputs<DType::f32, 1>({"a.x", "b.x"}, "x", cs::alias::from_output_values("nb.n"));
+        if (hold_n_) promote<DType::u32, 1>("nb.n", "n");
     }
 };
 }  // namespace tsys2
@@ -2735,33 +2740,44 @@ TEST_CASE("lifetime: a value-driven alias shape keeps a finite producer's output
     CHECK(model.get_subsystem("s") == nullptr);  // (the extent check on s.x went with the deleted transient)
 }
 
-TEST_CASE("lifetime: a tie alias reads a do_once producer's value on forward 1; once the producer is deleted its source is gone",
+TEST_CASE("lifetime: a tie alias reads a do_once producer's value; once the producer is deleted, only a held variable keeps it",
           "[system][lifetime][alias]") {
-    // The tie's shape rule reads nb.n by a WEAK reference to nb's output instance (design review, section 1: instances
-    // are owned by their component; the metadata holds weak pointers only).
-    auto model = tsys2::make([](cs::System& s) { s.add_subsystem(cs::subsystem_desc<tsys2::ValueSourceSys>("s")); }, cst::pooled_config());
-    model.setup();
-    model.update_input("s.nb.v", cs::init::from_host(tsys2::one_u32(4)));
-    CHECK_NOTHROW(model.forward());
-    model.wait();
-    CHECK(cst::synced_input<DType::f32, 1>(model, "s.x").shape()[0] == 4);
-    CHECK(model.get_subsystem("s.nb") == nullptr);  // the producer is gone
-    CHECK(model.get_subsystem("s") != nullptr);
+    // Design review, section 2: alias instances replace the old user hold, so nothing keeps nb's variable alive on the tie's
+    // behalf. The tie's shape rule (AliasSrc) names nb.n by its instance, with the variable as a weak fallback: a deleted
+    // producer's value stays readable only while something else (a promotion, a consumer, another alias) holds the variable.
+    for (const bool hold : {false, true}) {
+        DYNAMIC_SECTION(hold ? "nb.n is promoted: the variable stays held" : "nothing holds nb.n") {
+            auto model = tsys2::make(
+                [hold](cs::System& s) { s.add_subsystem(cs::subsystem_desc<tsys2::ValueSourceSys>("s", hold)); },
+                cst::pooled_config());
+            model.setup();
+            model.update_input("s.nb.v", cs::init::from_host(tsys2::one_u32(4)));
+            CHECK_NOTHROW(model.forward());
+            model.wait();
+            CHECK(cst::synced_input<DType::f32, 1>(model, "s.x").shape()[0] == 4);
+            CHECK(model.get_subsystem("s.nb") == nullptr);  // the producer is gone
+            CHECK(model.get_subsystem("s") != nullptr);
 
-    // REVIEW: the old case expected forwards 2 and 3 to keep working ("the tie-holding System is a USER of nb.n and
-    // holds it"). By variable.hpp alias_source, a rule whose source instance has been deleted throws "... which does not
-    // exist right now", and nothing in the headers keeps nb's output instance alive after its component is deleted.
-    // This asserts what the headers say, not what the old test wanted; whether the design intends a do_once value
-    // source to be re-evaluated on later forwards is not settled.
-    std::string what = "<no exception>";
-    try {
-        model.forward();
-    } catch (const std::exception& e) {
-        what = e.what();
+            if (hold) {
+                // forwards 2 and 3 work and the tie still reads the last value (4)
+                for (int k = 2; k <= 3; ++k) {
+                    CHECK_NOTHROW(model.forward());
+                    model.wait();
+                    CHECK(cst::synced_input<DType::f32, 1>(model, "s.x").shape()[0] == 4);
+                }
+            } else {
+                std::string what = "<no exception>";
+                try {
+                    model.forward();
+                } catch (const std::exception& e) {
+                    what = e.what();
+                }
+                model.wait();
+                INFO("thrown: " << what);
+                CHECK(what.find("does not exist right now") != std::string::npos);
+            }
+        }
     }
-    model.wait();
-    INFO("thrown: " << what);
-    CHECK(what.find("does not exist right now") != std::string::npos);
 }
 
 // =============================================================================================
