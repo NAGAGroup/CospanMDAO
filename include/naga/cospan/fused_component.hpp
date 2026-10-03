@@ -21,8 +21,9 @@
 // STRATEGIES. seq: the stages run one after the other inside each work-group (every stage has group_offset 0).
 // THERE ARE NO FRAMEWORK BARRIERS: a stage that reads, across work-items, what an earlier stage wrote calls its own
 // group barrier first; stage ranges may differ; across groups nothing is ordered. par: the stages own disjoint slices
-// of the work-groups and run unordered, so connects between them are rejected (in the call) and two stages may write
-// one variable only if it is atomic.
+// of the work-groups and run unordered, so connects between them are rejected (in the call). Tied outputs follow the
+// ordinary tie policy and nothing else (design review, section 9): tie_outputs requires atomic members, or its
+// allow_plain flag says the writers are disjoint; the fused component adds no check of its own.
 //
 // LOCAL MEMORY. seq: every scratch stage gets its OWN slice (StageRecord::local_off = the running sum of the
 // earlier stages' scratch_bytes, each rounded up to 16) and the launch's local size is the sum. par: the stages own
@@ -166,8 +167,7 @@ public:
         const sycl::range<3> w       = wave_wg(st, parts);
         const std::size_t    wg_size = w[0] * w[1] * w[2];
 
-        // 3. par: two stages writing one variable are unordered writers: the variable must be atomic.
-        if (strategy_ == fuse_strategy::par) check_unordered_writers(st);
+        // 3. (par ties follow the ordinary tie policy, checked in tie_outputs: nothing to check here, section 9)
 
         // 4. Records, offsets and local memory.
         const sycl::device dev = ComponentAccess::device_of(*st.front());
@@ -328,23 +328,6 @@ private:
         }
     }
 
-    /// par: two stages writing one variable are unordered writers, so the variable must be atomic.
-    void check_unordered_writers(const std::vector<ComponentBase*>& st) const {
-        for (std::size_t i = 0; i < st.size(); ++i)
-            for (std::size_t j = i + 1; j < st.size(); ++j) {
-                std::vector<std::shared_ptr<Instance>> a, b;
-                st[i]->collect_instances(a);
-                st[j]->collect_instances(b);
-                for (const auto& x : a)
-                    for (const auto& y : b)
-                        if (x->kind == IOKind::output && y->kind == IOKind::output && x->meta == y->meta && !is_atomic(x->meta->dtype))
-                            throw std::invalid_argument("naga::cospan: " + describe() + ": forward: '" + st[i]->path() + "' and '" +
-                                                        st[j]->path() +
-                                                        "' write the same variable in a par fused component and it is not atomic; their "
-                                                        "stages run unordered");
-            }
-    }
-
     static std::uint32_t append(std::vector<std::byte>& v, std::span<const std::byte> s) {
         const std::size_t off = (v.size() + 15) / 16 * 16;  // 16-byte aligned; padding is zero
         v.resize(off + s.size());
@@ -436,7 +419,8 @@ private:
 }  // namespace detail
 
 /// One kernel, one submission: the stages `Descs` (descriptors of components), added in order, run as one wave.
-/// Connections (seq only) are made after the stages are added and their variables are marked `internal`.
+/// Connections (seq only) are made after the stages are added and their variables are marked `internal`. Tied outputs of
+/// its stages follow the ordinary tie policy (section 9).
 template <fuse_strategy S, class... Descs>
 class FusedComponent final : public detail::FusedBase {
     static_assert(sizeof...(Descs) >= 1, "naga::cospan: a fused component needs at least one stage");

@@ -28,6 +28,7 @@
 // to wire a rebuilt child back in, it replays these same calls in declaration order. It checks names and the
 // "legal inside setup()" guard itself: neither is a wiring rule.
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -179,11 +180,25 @@ inline std::shared_ptr<VarMeta> merge_into(const WiringSite& site, std::shared_p
     if (wm && lm) throw std::logic_error("naga::cospan: " + site.where + ": both sides of a merge hold data");
     std::shared_ptr<VarMeta> survivor = winner;
     std::shared_ptr<VarMeta> other    = loser;
+    // A tie's shape rule that the survivor does not take is kept as a CONSTRAINT (design review, section 9): a tie does not
+    // override its members or its source, its rule must be consistent with them, and a mismatch is thrown at the forward.
+    // The rules the other side already carried as constraints come across too.
+    const auto is_rule = [](const std::optional<AliasShape>& a) { return a && a->kind != AliasShape::Kind::unspecified; };
+    std::vector<std::pair<std::string, AliasShape>> carried = loser->shape_constraints;
     if (lm) {  // a rebuilt child rejoining live data: its object survives, with the rule-winner's rules
-        survivor             = loser;
-        other                = winner;
+        survivor              = loser;
+        other                 = winner;
+        carried               = winner->shape_constraints;
+        if (is_rule(survivor->alias_shape)) carried.emplace_back(survivor->display_path(), *survivor->alias_shape);  // not taken
         survivor->definition  = winner->definition;
         survivor->alias_shape = winner->alias_shape;
+    } else if (is_rule(other->alias_shape)) {
+        carried.emplace_back(other->display_path(), *other->alias_shape);
+    }
+    for (auto& c : carried) {
+        const bool known = std::any_of(survivor->shape_constraints.begin(), survivor->shape_constraints.end(),
+                                       [&](const auto& e) { return e.first == c.first; });
+        if (!known) survivor->shape_constraints.push_back(std::move(c));
     }
     for (const std::shared_ptr<Instance>& i : other->live_instances()) i->rebind(survivor);
     return survivor;

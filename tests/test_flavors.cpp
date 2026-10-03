@@ -10,7 +10,7 @@
 //   Fused, seq.    three plain stages; two group+scratch stages (B's own barrier, own local slices); rank-2 and rank-3
 //                  waves; stage ranges may differ; the stages' work-group shapes must agree (section 4)
 //   Fused, par.    independent plain stages, independent group stages; a connection throws at setup; atomic tied outputs
-//                  accumulate, non-atomic ones throw at forward
+//                  accumulate, plain ones need allow_plain (the ordinary tie policy, section 9)
 //   Fused, both    value-driven sizes (refused when driven by a stage of the same fuse, allowed from outside); the
 //                  local-memory limit (skipped where the device reports none, e.g. omp)
 //   Equivalence    four stages as a plain System and as a sequential fused component give bitwise-equal outputs
@@ -819,7 +819,7 @@ TEST_CASE("fused parallel: a connect between stages throws at setup, naming both
     // (allow_tied_outputs() is gone, so its "does not lift it" section is deleted.)
 }
 
-TEST_CASE("fused: tied outputs in parallel mode are accepted when atomic and rejected at forward otherwise; sequential does not check",
+TEST_CASE("fused: tied outputs follow the ordinary tie policy, in parallel and sequential mode",
           "[flavors][fused][errors]") {
     SECTION("parallel, atomic: the writers accumulate") {
         cs::Model model = tfl::tied_adders<tfl::kPar>();
@@ -828,15 +828,29 @@ TEST_CASE("fused: tied outputs in parallel mode are accepted when atomic and rej
         model.wait();
         CHECK(tfl::out_of<1>(model, "sum") == std::vector<float>(12, 3.0f));  // 1 + 2
     }
-    SECTION("parallel, not atomic: forward throws naming both") {
+    // Par fused components follow the ordinary tie policy and add no check of their own (design review, section 9, Jack
+    // 2026-10-03): allow_plain is the "these writers are disjoint" flag, require_atomic refuses plain members at the call.
+    SECTION("parallel, plain members with allow_plain: accepted, and it runs") {
         cs::Model model = tfl::make([](cs::System& s) {
+            // identical writers (both y[i] = i + 1), so the result does not depend on how they interleave
             s.add_subsystem(cs::fuse_components<tfl::kPar>("f", cs::subsystem_desc<tfl::Src1>("a", std::array<int, 1>{12}),
-                                                           cs::subsystem_desc<tfl::Src1>("b", std::array<int, 1>{12}, 2.0f, 0.0f)));
+                                                           cs::subsystem_desc<tfl::Src1>("b", std::array<int, 1>{12})));
             s.tie_outputs<DType::f32, 1>({"f.a.y", "f.b.y"}, "t", cs::alias::fixed(12), cs::TieOutputsPolicy::allow_plain);
         });
         CHECK_NOTHROW(model.setup());
-        tfl::expect_throws([&] { model.forward(); }, {"f.a", "f.b", "not atomic"});
+        CHECK_NOTHROW(model.forward());
         model.wait();
+        std::vector<float> want(12);
+        for (int i = 0; i < 12; ++i) want[i] = static_cast<float>(i + 1);
+        CHECK(tfl::out_of<1>(model, "t") == want);
+    }
+    SECTION("parallel, plain members with require_atomic (the default): tie_outputs throws at setup") {
+        cs::Model model = tfl::make([](cs::System& s) {
+            s.add_subsystem(cs::fuse_components<tfl::kPar>("f", cs::subsystem_desc<tfl::Src1>("a", std::array<int, 1>{12}),
+                                                           cs::subsystem_desc<tfl::Src1>("b", std::array<int, 1>{12})));
+            s.tie_outputs<DType::f32, 1>({"f.a.y", "f.b.y"}, "t", cs::alias::fixed(12));
+        });
+        tfl::expect_throws([&] { model.setup(); }, {"is not atomic", "require_atomic", "allow_plain"});
     }
     SECTION("sequential: no check, the writers accumulate") {
         cs::Model model = tfl::tied_adders<tfl::kSeq>();

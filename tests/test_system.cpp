@@ -2476,22 +2476,25 @@ TEST_CASE("alias: a connected tie_inputs alias joins the producer's root", "[sys
         }
     }
     SECTION("a mismatching fixed AliasShape errors on the first run") {
+        // Design review, section 9 (Jack, 2026-10-03): the connect makes the source's variable the survivor and the tie's
+        // rule is kept as a constraint; it is evaluated each forward and a mismatch throws (the old resolve_alias_shapes text).
         auto model = tsys2::make(build(cs::alias::fixed(5)));
         model.setup();
         model.update_input("v.n", cs::init::from_host(tsys2::one_u32(4)));
-        // REVIEW: the old needle "declares the shape" is gone with the rework, and the headers do not settle whether a
-        // fixed AliasShape that disagrees with a connected producer's shape throws reactively (refresh_alias_shape resizes
-        // the variable to the alias's rule). The forward is run and what it throws, if anything, is only recorded; nothing is
-        // asserted until the behavior is specified.
-        std::string what = "<no exception>";
-        try {
-            model.forward();
-        } catch (const std::exception& e) {
-            what = e.what();
-        }
+        tsys::expect_throws([&] { model.forward(); },
+                            "tie alias 'x' declares the shape 5 but is connected to a source whose shape is 4");
         model.wait();
-        INFO("thrown: " << what);
-        SUCCEED();
+    }
+    SECTION("a fixed AliasShape that stops agreeing when the source's size changes") {
+        auto model = tsys2::make(build(cs::alias::fixed(4)));
+        model.setup();
+        model.update_input("v.n", cs::init::from_host(tsys2::one_u32(4)));
+        CHECK_NOTHROW(model.forward());
+        model.wait();
+        model.update_input("v.n", cs::init::from_host(tsys2::one_u32(6)));
+        tsys::expect_throws([&] { model.forward(); },
+                            "tie alias 'x' declares the shape 4 but is connected to a source whose shape is 6");
+        model.wait();
     }
     SECTION("a matching fixed AliasShape runs") {
         auto model = tsys2::make(build(cs::alias::fixed(4)));
@@ -2677,14 +2680,12 @@ TEST_CASE("lifetime: a model-level promotion is eternal", "[system][lifetime]") 
     }
 }
 
-TEST_CASE("lifetime: a marked root under a transient System does not throw and is eternal", "[system][lifetime]") {
+TEST_CASE("lifetime: a mark under a transient System is refused at setup", "[system][lifetime]") {
+    // Changed (design review, section 9, Jack 2026-10-03): marks live only on subsystems that never go out of scope, so this
+    // used to be accepted ("marks keep nothing alive") and now throws in Model::setup's finalize.
     cs::Model model = cs::create_model<tsys::MarkedInTransient>(cst::pooled_config());
-    CHECK_NOTHROW(model.setup());
-    for (int run = 1; run <= 2; ++run) {
-        model.forward();
-        model.wait();
-        CHECK(model.get_subsystem("tr") == nullptr);  // marks keep nothing alive: the transient's data went with it
-    }
+    tsys::expect_throws([&] { model.setup(); },
+                        "'tr.a.x' is a design variable on a subsystem that can go out of scope ('tr' has a run policy)");
 }
 
 TEST_CASE("lifetime: rearm sends a do_once's variables back out of scope and they are initialized again", "[system][lifetime][rearm]") {
@@ -2759,13 +2760,13 @@ TEST_CASE("lifetime: a value-driven alias shape keeps a finite producer's output
     CHECK(model.get_subsystem("s") == nullptr);  // (the extent check on s.x went with the deleted transient)
 }
 
-TEST_CASE("lifetime: a tie alias reads a do_once producer's value; once the producer is deleted, only a held variable keeps it",
+TEST_CASE("lifetime: a tie alias keeps the last shape of a do_once value source that is gone",
           "[system][lifetime][alias]") {
-    // Design review, section 2: alias instances replace the old user hold, so nothing keeps nb's variable alive on the tie's
-    // behalf. The tie's shape rule (AliasSrc) names nb.n by its instance, with the variable as a weak fallback: a deleted
-    // producer's value stays readable only while something else (a promotion, a consumer, another alias) holds the variable.
+    // Design review, section 9 (Jack, 2026-10-03): a shape source that is gone (its instance and variable both expired) can
+    // never change again, so the tie keeps its last shape; "which does not exist right now" is for a shape that was never
+    // known. Nothing needs to hold nb.n for the SHAPE to survive. Promoting nb.n (hold) additionally keeps its VALUE readable.
     for (const bool hold : {false, true}) {
-        DYNAMIC_SECTION(hold ? "nb.n is promoted: the variable stays held" : "nothing holds nb.n") {
+        DYNAMIC_SECTION(hold ? "nb.n is promoted: its value stays readable too" : "nothing holds nb.n") {
             auto model = tsys2::make(
                 [hold](cs::System& s) { s.add_subsystem(cs::subsystem_desc<tsys2::ValueSourceSys>("s", hold)); },
                 cst::pooled_config());
@@ -2777,23 +2778,13 @@ TEST_CASE("lifetime: a tie alias reads a do_once producer's value; once the prod
             CHECK(model.get_subsystem("s.nb") == nullptr);  // the producer is gone
             CHECK(model.get_subsystem("s") != nullptr);
 
-            if (hold) {
-                // forwards 2 and 3 work and the tie still reads the last value (4)
-                for (int k = 2; k <= 3; ++k) {
-                    CHECK_NOTHROW(model.forward());
-                    model.wait();
-                    CHECK(cst::synced_input<DType::f32, 1>(model, "s.x").shape()[0] == 4);
-                }
-            } else {
-                std::string what = "<no exception>";
-                try {
-                    model.forward();
-                } catch (const std::exception& e) {
-                    what = e.what();
-                }
+            // forwards 2 and 3 work, with the last shape (4), whether or not anything holds nb.n
+            for (int k = 2; k <= 3; ++k) {
+                INFO("forward " << k);
+                CHECK_NOTHROW(model.forward());
                 model.wait();
-                INFO("thrown: " << what);
-                CHECK(what.find("does not exist right now") != std::string::npos);
+                CHECK(cst::synced_input<DType::f32, 1>(model, "s.x").shape()[0] == 4);
+                if (hold) CHECK(to_vector(cst::synced_output<DType::u32, 1>(model, "s.n")) == std::vector<std::uint32_t>{4});  // the value
             }
         }
     }

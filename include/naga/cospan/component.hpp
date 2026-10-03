@@ -298,6 +298,18 @@ public:
         }
         for (const auto& inst : order_) check_dense(*inst, inst->meta->shape);
 
+        // (6b) The tie rules kept as constraints of the variables this component touches (a tie that was connected to a
+        // source does not override it: its rule must agree with the shape the variable has, section 9), once each.
+        {
+            std::vector<detail::VarMeta*> checked;
+            for (const auto& inst : order_) {
+                detail::VarMeta* m = inst->meta.get();
+                if (std::find(checked.begin(), checked.end(), m) != checked.end()) continue;
+                checked.push_back(m);
+                m->check_shape_constraints(rt);
+            }
+        }
+
         // (7) The member wrappers.
         for (const auto& inst : order_) inst->point_wrapper();
     }

@@ -103,7 +103,7 @@ cs::ModelConfig cfg; cfg.default_device = d;           // gone: devices go to ad
   and is never applied; on an output it throws `std::invalid_argument`.
 - `ModelConfig` has no `default_device`. Fields: `ctx`, `pool_bytes`, `default_pool_bytes`, `pool_node_size`, `async_handler`.
 - `memory_report().devices[dev]` has `pool_bytes`, `pool_bytes_in_use`, `os_allocations`, `os_bytes_in_use`
-  (no arena fields). Devices without a pool are absent.
+  (no arena fields). Every context device has an entry: a device without a configured size is a zero-byte pool.
 - `design_vars()`, `constraints()`, `objectives()` return `Mark{std::string path, std::weak_ptr<Instance> inst, MarkRecord rec}`;
   `rec` is `{bounds, equals, scaling}`. The old per-root `root` pointer is replaced by `inst.lock()->meta` (the shared variable).
 - `root().entry_at(path)` is gone; `root().instance_at(path)` and `get_subsystem(path)` remain.
@@ -146,3 +146,12 @@ cs::init::custom_host<DType::f32, 1>(std::function<void(cs::HostInit<DType::f32,
 `registered_event_count`, `entry_at`, the host read cache and its counters, `get_input` / `get_output`, `compile()`,
 the retire list, setup-time shape checks, `fused_system.hpp`, `wave_rules.hpp`, `alias_eval`, and the diagnostics counters
 `frees`, `allocations`, `host_reads`, `host_read_hits`, `ragged_uploads`, `resizes`, `full_passes`, `resolve_shapes` and the chunk window.
+
+## Corrections during implementation (design review, section 9)
+
+- **Initializers:** the last declaration wins; no same-level error.
+- **Ties and shapes:** a tie keeps its shape rule as a constraint when a connect makes the source's variable the survivor; a mismatch throws at the forward ("tie alias '<path>' declares the shape ... but is connected to a source whose shape is ..."). Promotions take no shape rule. A shape source that is gone keeps its last shape.
+- **Durability:** a rebuilt consumer whose producer is gone, with nothing holding its data, is a user error: promote what must stay durable.
+- **Par fused components** add no tie check of their own: use `tie_outputs` with atomic members, or `allow_plain` for disjoint writers.
+- **Pools:** every context device has a pool (0 bytes if unconfigured, then every allocation is an OS allocation, counted); `memory_report().devices` has an entry for every device.
+- **Marks** (`add_design_var`, `add_constraint`, `add_objective`) are refused, at `Model::setup`, on a subsystem that can go out of scope: no `run_n`, `do_once` or `transient` slot on the path from the root.

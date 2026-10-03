@@ -176,3 +176,15 @@ This is the working record of the design review that started 2026-10-03 (Jack an
 10. **Tests and examples** rewritten to the new API.
 11. **Docs (last):** r01 rewrite, a D-entry, roadmap, README.
 12. **Build and integrate:** push SlabKit, repin CoSpan, build, test, iterate, squash, push.
+
+
+## 9. Corrections during implementation (Jack, 2026-10-03)
+
+- **The last initializer wins.** A parent's setup runs after its children's, so a tie's, promotion's or System's initializer replaces the members'; there is no same-level error (section 2, Initializer bullet).
+- **Ties keep their shape rules as constraints after a connect.** Ties follow the same shape rules as inputs and outputs: a tie does not override its members or its source, and its rule must be consistent with them. When a connect makes the source's variable the survivor, the tie's rule is kept on the variable (`shape_constraints`) and evaluated once per forward; a mismatch throws "tie alias '<path>' declares the shape ... but is connected to a source whose shape is ...". **Promotions take no shape rule.**
+- **A gone shape source keeps its last shape.** When the instance and the variable a tie's rule reads are both gone, the variable can never change again: it keeps its current shape. "... which does not exist right now" is thrown only when the shape was never known.
+- **A rebuilt consumer whose producer is gone, with nothing holding its data, is a user error.** Promote what must stay durable (a promotion's alias instance holds the data).
+- **Par ties follow the tie policy.** A par fused component adds no check of its own on tied outputs: `tie_outputs` requires atomic members, or its `allow_plain` flag says the writers are disjoint.
+- **A device without a pool is a zero-byte pool.** Every context device gets a `DevicePool`, sized by its configured size or `default_pool_bytes`, possibly 0; a zero-byte pool serves nothing and every allocation falls back to the OS and is counted. `memory_report` covers every device.
+- **Marks only on subsystems that never go out of scope.** Model::setup's finalize walks the slots from the root to a mark's declaring subsystem and throws if any has a run policy (run_n, do_once, transient).
+- **Scans run in parallel on the device, ragged dimensions included.** The exclusive scan behind a value-driven column is a parallel reduce-then-scan (`device_scan.hpp`). Several per-index dimensions on the device (no host fallback) are not done yet: they wait for the review of shape, connection, tie and promotion semantics.

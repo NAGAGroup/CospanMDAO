@@ -386,6 +386,18 @@ public:
     /// Declaration order = execution order. Null entries are deleted children.
     std::span<Subsystem* const> children() const noexcept { return child_ptrs_; }
 
+    /// The run policy asked for the child named `name` (a single segment): -1 eternal, -2 transient, n turns (run_n n,
+    /// do_once = 1). -1 also for a name that is no slot.
+    long run_policy_of(std::string_view name) const {
+        const auto it = child_index_.find(std::string{name});
+        return it == child_index_.end() ? -1 : slots_[it->second].requested;
+    }
+    /// The live child named `name`, or null (never declared, or deleted).
+    const Subsystem* child_of(std::string_view name) const {
+        const auto it = child_index_.find(std::string{name});
+        return it == child_index_.end() ? nullptr : child_ptrs_[it->second];
+    }
+
     // ---- Subsystem verbs ---------------------------------------------------------
     /// Runs setup() with the declaring flag up. The Model's setup is the only other pass.
     void run_setup() override {

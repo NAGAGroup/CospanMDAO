@@ -60,8 +60,9 @@ struct ModelConfig {
     explicit ModelConfig(std::span<const sycl::device> devices)
         : ctx(std::vector<sycl::device>(devices.begin(), devices.end())) {}
 
-    /// Per-device pool sizes in bytes; a device not listed gets `default_pool_bytes`. 0 = no pool = every allocation
-    /// takes the OS route. `pool_node_size` is the page granularity (section 2).
+    /// Per-device pool sizes in bytes; a device not listed gets `default_pool_bytes`. EVERY context device gets a pool:
+    /// 0 is a pool of zero bytes, which serves nothing, so every allocation takes the OS route and is counted
+    /// (design review, section 9). `pool_node_size` is the page granularity (section 2).
     std::unordered_map<sycl::device, std::size_t> pool_bytes;
     std::size_t                                   default_pool_bytes = 0;
     std::size_t                                   pool_node_size     = 1024;
@@ -194,8 +195,10 @@ public:
         /// A snapshot at the time of the call, between runs.
         struct PerDevice {
             std::size_t pool_bytes = 0, pool_bytes_in_use = 0;    ///< slots x node size
-            std::size_t os_allocations = 0, os_bytes_in_use = 0;  ///< allocations the pool sent to the OS (cumulative) and the bytes of those still live; tracked for devices with a pool only
+            std::size_t os_allocations = 0, os_bytes_in_use = 0;  ///< allocations the pool sent to the OS (cumulative) and the bytes of those still live
         };
+        /// Every context device has an entry: a device without a configured size is a pool of 0 bytes, whose allocations
+        /// all count as OS allocations.
         std::unordered_map<sycl::device, PerDevice> devices;
     };
     MemoryReport memory_report() const {
@@ -229,15 +232,15 @@ private:
             if (!root) throw std::invalid_argument("naga::cospan: Model needs a root System");
         }
 
-        /// One pool per context device whose size (its own, else the default) is above 0. Built in place: a pool is
-        /// not copied.
+        /// One pool per context device, sized by its own entry, else the default (possibly 0: a zero-byte pool serves
+        /// nothing and every allocation falls back and is counted). Built in place: a pool is not copied.
         static std::unordered_map<sycl::device, sk::DevicePool> build_pools(const sk::context& ctx, const sk::queue& q,
                                                                            const ModelConfig& c) {
             std::unordered_map<sycl::device, sk::DevicePool> pools;
             for (const sycl::device& d : ctx.devices()) {
                 const auto        it    = c.pool_bytes.find(d);
                 const std::size_t bytes = it != c.pool_bytes.end() ? it->second : c.default_pool_bytes;
-                if (bytes > 0) pools.try_emplace(d, q, d, sk::kind::device, bytes, c.pool_node_size);
+                pools.try_emplace(d, q, d, sk::kind::device, bytes, c.pool_node_size);
             }
             return pools;
         }
@@ -300,12 +303,37 @@ private:
         s_.reset();
     }
 
+    /// Marks live only on subsystems that never go out of scope (design review, section 9): walks the slots from the
+    /// root along the mark's absolute path to the instance's declaring subsystem (every segment but the last), and
+    /// throws at the first slot that has a run policy (run_n, do_once or transient).
+    static void check_mark_scope(const System& root, const Mark& m, const char* kind) {
+        const System* cur  = &root;
+        std::string   slot;
+        std::size_t   from = 0;
+        while (cur != nullptr) {
+            const std::size_t dot = m.path.find('.', from);
+            if (dot == std::string::npos) return;  // the last segment is the port or alias itself, not a slot
+            const std::string seg = m.path.substr(from, dot - from);
+            slot += (slot.empty() ? "" : ".") + seg;
+            if (cur->run_policy_of(seg) != -1)
+                throw std::invalid_argument("naga::cospan: '" + m.path + "' is a " + kind +
+                                            " on a subsystem that can go out of scope ('" + slot +
+                                            "' has a run policy); marks must live on subsystems that never go out of scope");
+            cur  = dynamic_cast<const System*>(cur->child_of(seg));
+            from = dot + 1;
+        }
+    }
+
     /// FINALIZE: depth-first in declaration order, a System's own marks and then its live children. Each declared
     /// mark becomes a Mark by absolute path (the declaring System's path, a dot, the declared path; at the root, the
     /// declared path).
     static void collect_marks(const System& sys, Impl& s) {
         for (const System::MarkDecl& m : sys.marks()) {
             Mark out{sys.path().empty() ? m.path : sys.path() + "." + m.path, m.inst, m.rec};
+            check_mark_scope(*s.root, out,
+                             m.kind == System::MarkDecl::Kind::design_var   ? "design variable"
+                             : m.kind == System::MarkDecl::Kind::constraint ? "constraint"
+                                                                            : "objective");
             switch (m.kind) {
                 case System::MarkDecl::Kind::design_var: s.design_vars.push_back(std::move(out)); break;
                 case System::MarkDecl::Kind::constraint: s.constraints.push_back(std::move(out)); break;

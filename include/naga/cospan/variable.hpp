@@ -629,18 +629,109 @@ public:
     /// A tie alias's shape, evaluated by its rule NOW and given to the variable (section 2 and section 6): a no-op for a
     /// variable without an alias rule, and once per forward. The rules read other variables, so the shape is reactive:
     /// it can change between forwards. `unspecified` is not evaluated here: the connection or the initializer supplies
-    /// it (resolve_free_shape). A source that does not exist any more, or whose shape is not known, is an error.
+    /// it (resolve_free_shape). A source whose shape is not known yet is an error. A source that is GONE (its instance and
+    /// its variable are both expired) can never change again: when this variable's shape is known it keeps its last shape
+    /// (section 9); "does not exist right now" is thrown only when the shape was never known.
+    ///
+    /// Then the tie rules kept as CONSTRAINTS (shape_constraints) are checked against the shape the variable has.
     void refresh_alias_shape(Runtime& rt) {
-        if (!alias_shape || alias_forward_ == rt.forward) return;
-        const AliasShape& rule = *alias_shape;
-        if (rule.kind == AliasShape::Kind::unspecified) return;
+        if (alias_shape && alias_shape->kind != AliasShape::Kind::unspecified && alias_forward_ != rt.forward) {
+            const AliasShape& rule = *alias_shape;
+            if (const AliasSrc* gone = gone_source(rule)) {
+                if (!shape.known)
+                    throw std::logic_error("naga::cospan: '" + display_path() + "': its shape comes from '" + gone->path +
+                                           "', which does not exist right now");
+                alias_forward_ = rt.forward;  // a gone source never changes: the last shape stands
+            } else {
+                ResolvedShape s = eval_alias_rule(rt, rule);
+                // every host-sourced per-index array has one entry per index of dimension 0 (a device column's is checked below)
+                for (int d = 1; d < rank; ++d) {
+                    const auto u = static_cast<std::size_t>(d);
+                    if (s.per[u] && !s.dev_per[u] && s.per_index[u].size() != s.extents[0])
+                        throw std::invalid_argument("naga::cospan: tie alias '" + display_path() + "': per-index dimension " + std::to_string(d) +
+                                                    " has " + std::to_string(s.per_index[u].size()) + " extents but dimension 0 has " +
+                                                    std::to_string(s.extents[0]) + " (the shape is " + alias_shape_str(s.extents, s.per, rank) + ")");
+                }
+                // per-index dimensions have no scalar extent; the total (a device column's times the scalar dimensions,
+                // else the host sum)
+                finish_ragged_total(s, rt, display_path());
+                set_shape(rt, s);
+                alias_forward_ = rt.forward;
+            }
+            // this variable's shape is its tie's rule, just refreshed: the constraints of other ties can be checked now. A
+            // variable whose shape comes from a producer is checked after the producer's component set it (Component::
+            // run_precompute), never against a shape that is about to be replaced.
+            check_shape_constraints(rt);
+        }
+    }
+
+    /// The rules of the ties this variable was merged into by a connect (the source won, so the tie's rule is not the
+    /// variable's own): once per forward, and again if the shape changed within it, each is evaluated like an alias
+    /// shape and compared with the shape the variable has. A tie does not override its members or its source: its rule
+    /// must be consistent with them (design review, section 9). A rule whose source is gone is skipped: it can never
+    /// change. Does nothing while the shape is not known.
+    void check_shape_constraints(Runtime& rt) {
+        if (shape_constraints.empty() || !shape.known) return;
+        if (constraints_forward_ == rt.forward && constraints_shape_ == shape) return;
+        constraints_forward_ = rt.forward;
+        constraints_shape_   = shape;
+        for (const auto& [path, rule] : shape_constraints) {
+            if (rule.kind == AliasShape::Kind::unspecified || gone_source(rule) != nullptr) continue;
+            ResolvedShape want = eval_alias_rule(rt, rule);
+            for (std::size_t u = 0; u < 3; ++u)
+                if (want.per[u]) want.extents[u] = 0;
+            if (!shape_agrees(want, rt))
+                throw std::invalid_argument("naga::cospan: tie alias '" + path + "' declares the shape " + shape_text(want, rt) +
+                                            " but is connected to a source whose shape is " + shape_text(shape, rt));
+        }
+    }
+
+    /// "4x[2,0,3,1]x3": a shape as text for the constraint message (the port of alias_shape_str, which prints a per-index
+    /// dimension as "(per-index)"; here its extents too, read down from the device only on this error path).
+    std::string shape_text(const ResolvedShape& r, Runtime& rt) const {
+        std::string out;
+        for (int d = 0; d < rank; ++d) {
+            const auto u = static_cast<std::size_t>(d);
+            if (d > 0) out += "x";
+            if (d >= 1 && r.per[u]) {
+                const std::vector<std::size_t> v = r.per_index_on_host(u, rt);
+                out += "[";
+                for (std::size_t i = 0; i < v.size(); ++i) out += (i ? "," : "") + std::to_string(v[i]);
+                out += "]";
+            } else {
+                out += std::to_string(r.extents[u]);
+            }
+        }
+        return out;
+    }
+
+    /// The first source of `rule` that is gone (instance and variable both expired), else null.
+    static const AliasSrc* gone_source(const AliasShape& rule) {
+        const auto gone = [](const AliasSrc& s) { return !s.path.empty() && !s; };
+        switch (rule.kind) {
+            case AliasShape::Kind::from_output_shape:
+            case AliasShape::Kind::from_output_values:
+            case AliasShape::Kind::from_input_shape: return gone(rule.src) ? &rule.src : nullptr;
+            case AliasShape::Kind::dims:
+                for (const AliasDim& sp : rule.dim_specs)
+                    if ((sp.how == AliasDim::How::output_value || sp.how == AliasDim::How::output_values ||
+                         sp.how == AliasDim::How::output_dim) &&
+                        gone(sp.src))
+                        return &sp.src;
+                return nullptr;
+            default: return nullptr;
+        }
+    }
+
+    /// The shape a tie rule gives NOW (the extents of per-index dimensions are 0): read through the sources.
+    ResolvedShape eval_alias_rule(Runtime& rt, const AliasShape& rule) {
         ResolvedShape s;
         s.known = true;
         switch (rule.kind) {
             case AliasShape::Kind::fixed:
                 for (int d = 0; d < rank; ++d) s.extents[static_cast<std::size_t>(d)] = rule.extents[static_cast<std::size_t>(d)];
                 break;
-            case AliasShape::Kind::unspecified: return;
+            case AliasShape::Kind::unspecified: break;
             case AliasShape::Kind::from_output_shape:
             case AliasShape::Kind::from_input_shape: {
                 const std::shared_ptr<VarMeta> up = alias_source(rt, rule.src, /*need_shape=*/true);
@@ -683,19 +774,27 @@ public:
                 }
                 break;
         }
-        // every host-sourced per-index array has one entry per index of dimension 0 (a device column's is checked below)
-        for (int d = 1; d < rank; ++d) {
-            const auto u = static_cast<std::size_t>(d);
-            if (s.per[u] && !s.dev_per[u] && s.per_index[u].size() != s.extents[0])
-                throw std::invalid_argument("naga::cospan: tie alias '" + display_path() + "': per-index dimension " + std::to_string(d) +
-                                            " has " + std::to_string(s.per_index[u].size()) + " extents but dimension 0 has " +
-                                            std::to_string(s.extents[0]) + " (the shape is " + alias_shape_str(s.extents, s.per, rank) + ")");
+        return s;
+    }
+
+    /// Whether the shape `want` (a rule's) is the variable's: the rank is the same, every scalar extent is equal, and a
+    /// per-index dimension is per-index on both sides with equal extents (a device column is read down only when the two
+    /// sides are not the same column).
+    bool shape_agrees(const ResolvedShape& want, Runtime& rt) const {
+        for (int d = 0; d < rank; ++d) {
+            const auto u  = static_cast<std::size_t>(d);
+            const bool wp = d >= 1 && want.per[u];
+            const bool hp = d >= 1 && shape.per[u];
+            if (wp != hp) return false;
+            if (!wp) {
+                if (want.extents[u] != shape.extents[u]) return false;
+                continue;
+            }
+            if (want.dev_per[u] && shape.dev_per[u] && want.dev_per[u] == shape.dev_per[u] && want.dev_version[u] == shape.dev_version[u])
+                continue;
+            if (want.per_index_on_host(u, rt) != shape.per_index_on_host(u, rt)) return false;
         }
-        // per-index dimensions have no scalar extent; the total (a device column's times the scalar dimensions, else the
-        // host sum); two per-index dimensions are brought to the host
-        finish_ragged_total(s, rt, display_path());
-        set_shape(rt, s);
-        alias_forward_ = rt.forward;
+        return true;
     }
 
     /// Brings the variable's data into being on every device that has an instance, then initializes it or

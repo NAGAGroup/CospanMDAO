@@ -947,13 +947,13 @@ TEST_CASE("Ragged ties: a connected tie_inputs alias with dims(input_dim, input_
         }
     }
     SECTION("a mismatching per-index array is an error at forward") {
-        // the alias reads column 0 ([2,0,3,1]); gen.pts has column 1 ([2,0,1,1]): they differ first at index 2
-        // REVIEW: the old text ("tie alias 'pts'", "per-index dimension 1 differs at index 2", "the alias declares 3", "the
-        // connection has 1") is gone and the headers do not say which check reports this pair now (the alias rule and the
-        // producer's expectation are both device columns). Only the throw and the alias's name are asserted.
+        // the alias reads column 0 ([2,0,3,1]); gen.pts has column 1 ([2,0,1,1]): they differ first at index 2. The connect
+        // makes gen.pts's variable the survivor and the tie's rule a constraint (design review, section 9); the mismatch
+        // names both shapes, per-index extents included.
         cs::Model m = cs::create_model<trt::TieInColTop>(default_config(), trt::Counts{2, 2, 0, 0, 3, 1, 1, 1}, std::size_t{0});
         m.setup();
-        trt::expect_throws([&] { m.forward(); }, {"pts"});
+        trt::expect_throws([&] { m.forward(); }, {"tie alias 'pts' declares the shape 4x[2,0,3,1]x3",
+                                                  "but is connected to a source whose shape is 4x[2,0,1,1]x3"});
         m.wait();
     }
 }

@@ -669,6 +669,74 @@ TEST_CASE("Marks: design variables, objective, constraints, one record per root"
     CHECK(on_g2 == 1);
 }
 
+namespace tmod {
+/// Marks under a run policy (design review, section 9). `mode`: 0 eternal; 1 transient; 2 do_once; 3 run_n{2};
+/// 4 an eternal System `in` (marking its own Axpb) under a transient `outer`.
+class MarkInner : public cs::System {
+public:
+    void setup() override {
+        add_subsystem(cs::subsystem_desc<Axpb>("a", 1.0f, 0.0f));
+        add_design_var("a.x");
+    }
+};
+class MarkOuter : public cs::System {
+public:
+    void setup() override { add_subsystem(cs::subsystem_desc<MarkInner>("in")); }
+};
+class MarkScopeTop : public cs::System {
+    int  mode_;
+    char kind_;  // 'd' design var, 'c' constraint
+
+public:
+    MarkScopeTop(int mode, char kind) : mode_{mode}, kind_{kind} {}
+    void setup() override {
+        if (mode_ == 4) {
+            add_subsystem(cs::property_list{cs::property::transient{}}, cs::subsystem_desc<MarkOuter>("outer"));
+            return;
+        }
+        const cs::property_list props = mode_ == 1   ? cs::property_list{cs::property::transient{}}
+                                        : mode_ == 2 ? cs::property_list{cs::property::do_once{}}
+                                        : mode_ == 3 ? cs::property_list{cs::property::run_n{2}}
+                                                     : cs::property_list{};
+        add_subsystem(props, cs::subsystem_desc<Axpb>("a", 1.0f, 0.0f));
+        if (kind_ == 'd')
+            add_design_var("a.x");
+        else
+            add_constraint("a.y");
+    }
+};
+}  // namespace tmod
+
+TEST_CASE("Marks: only on subsystems that never go out of scope", "[model][marks][errors]") {
+    // Design review, section 9 (Jack, 2026-10-03): Model::setup's finalize walks the slots from the root to the mark's
+    // declaring subsystem and refuses a run policy (transient, do_once, run_n) on the way.
+    SECTION("an eternal subsystem: fine") {
+        auto model = cs::create_model<tmod::MarkScopeTop>(default_config(), 0, 'd');
+        CHECK_NOTHROW(model.setup());
+        CHECK(model.design_vars().size() == 1);
+    }
+    SECTION("a transient subsystem") {
+        auto model = cs::create_model<tmod::MarkScopeTop>(default_config(), 1, 'd');
+        tmod::expect_throws([&] { model.setup(); },
+                            {"'a.x' is a design variable on a subsystem that can go out of scope", "('a' has a run policy)",
+                             "marks must live on subsystems that never go out of scope"});
+    }
+    SECTION("a do_once subsystem, a constraint") {
+        auto model = cs::create_model<tmod::MarkScopeTop>(default_config(), 2, 'c');
+        tmod::expect_throws([&] { model.setup(); },
+                            {"'a.y' is a constraint on a subsystem that can go out of scope", "('a' has a run policy)"});
+    }
+    SECTION("a run_n subsystem") {
+        auto model = cs::create_model<tmod::MarkScopeTop>(default_config(), 3, 'd');
+        tmod::expect_throws([&] { model.setup(); }, {"design variable", "('a' has a run policy)"});
+    }
+    SECTION("an eternal System under a transient one: the walk starts at the root") {
+        auto model = cs::create_model<tmod::MarkScopeTop>(default_config(), 4, 'd');
+        tmod::expect_throws([&] { model.setup(); },
+                            {"'outer.in.a.x' is a design variable", "('outer' has a run policy)"});
+    }
+}
+
 // =============================================================================================
 // 3. Lifecycle errors
 // =============================================================================================
@@ -767,6 +835,25 @@ TEST_CASE("Memory report: a static model computes; the pool report after setup a
     CHECK(after_fwd.pool_bytes >= after_fwd.pool_bytes_in_use);
 }
 
+TEST_CASE("Memory report: a device without a configured pool is a zero-byte pool, and its allocations count as OS ones",
+          "[model][memory]") {
+    // Design review, section 9: every context device gets a pool, possibly of 0 bytes (default_config() sets no size).
+    const sycl::device dev{sycl::default_selector_v};
+    auto               model = cs::create_model<tmod::MemTop>(default_config());
+    model.setup();
+    const auto before = tmod::report_on(model, dev);  // an entry exists before anything ran
+    CHECK(before.pool_bytes == 0);
+    CHECK(before.os_allocations == 0);
+    std::array<float, 8> bc{};
+    model.update_input("bc", cs::init::from_host(std::vector<float>{bc.begin(), bc.end()}));
+    cst::forward_and_wait(model);
+    const auto after = tmod::report_on(model, dev);
+    CHECK(after.pool_bytes == 0);
+    CHECK(after.pool_bytes_in_use == 0);
+    CHECK(after.os_allocations > 0);
+    CHECK(after.os_bytes_in_use > 0);
+}
+
 // =============================================================================================
 // 6. Pool
 // =============================================================================================
@@ -824,7 +911,7 @@ TEST_CASE("Two devices: a producer on one, its consumer on the other", "[model][
 
     const std::array<sycl::device, 2> devs{first, host};
     cs::ModelConfig                   cfg{std::span<const sycl::device>{devs}};
-    cfg.default_pool_bytes = std::size_t{1} << 20;  // a pool on each device, so the report has an entry per device
+    cfg.default_pool_bytes = std::size_t{1} << 20;  // a real pool on each device, so both report pool bytes in use
     auto model             = cs::create_model<tmod::TwoDevTop>(std::move(cfg), other);
     model.setup();
 
