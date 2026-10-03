@@ -22,7 +22,8 @@ composing open systems along shared boundaries, and the *MDAO* suffix
 credits the multidisciplinary-design lineage the ML world usually ignores.
 
 Where OpenMDAO orchestrates Python components on CPUs, CospanMDAO is C++20
-on device: connections are pointer aliasing (no copies, ever), execution is
+on device: connected ports share one variable's storage (copies happen only
+between placements, e.g. host and device), execution is
 layered and concurrent, and adjoints are hand-written SYCL kernels flowing
 through the same aliased storage.
 
@@ -31,11 +32,12 @@ through the same aliased storage.
 - **Component / System composition.** Components declare inputs, outputs,
   and state; systems compose components, promote shared inputs, and wire
   connections. Everything resolves to fully-qualified names in one registry.
-- **Connection = aliasing.** A connection makes the target's data and grad
-  pointers alias the source. Composition costs nothing at runtime.
-- **Cycles are first-class.** Marking a component as an *entry point* makes
-  connections into it previous-sweep reads (a register cut), turning cyclic
-  models into layered DAGs — Gauss-Seidel sweeps expressed structurally.
+- **Connection = shared variable.** A connection joins ports into one
+  variable; they share its storage, which lives while some port uses it.
+  Composition costs nothing at runtime.
+- **Cycles are expressed by registration order.** A consumer registered
+  before its producer reads the producer's previous value; CospanMDAO warns
+  at setup until solvers exist.
 - **Equilibrium as an execution mode.** `EquilibriumExecutor` iterates the
   forward model to a fixed point, then solves the adjoint fixed point
   (implicit function theorem — memory cost independent of iteration count;
