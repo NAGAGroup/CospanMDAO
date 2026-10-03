@@ -399,9 +399,9 @@ struct HookStep {
         if (!inst) return;  // the target's child is gone: nothing to set
         VarMeta&      tm  = *inst->meta;
         const std::string who = "the shape hook on '" + path + "'";
-        // REVIEW: section 10 does not say what a hook does when a named source's instance is gone (its child was deleted, e.g.
-        // a do_once producer). Section 9's "a gone shape source keeps its last shape" is carried over: the hook does nothing
-        // while the target's shape is known, and is the "does not exist right now" error when it never was.
+        // A named source whose instance is gone (its child was deleted, e.g. a producer that ran its last turn) can never change
+        // again: while the target's shape is known the hook does nothing and the last shape stands (design review, sections 9
+        // and 10). "... does not exist right now" is thrown only when the shape was never known (source() below).
         if (tm.shape.known)
             for (const HookDim& h : dims)
                 if (h.names_source() && h.src.expired()) return;

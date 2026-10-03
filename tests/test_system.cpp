@@ -2733,15 +2733,18 @@ TEST_CASE("lifetime: transient together with run_n or do_once throws, naming the
 }
 
 namespace tsys2 {
-/// A transient System: nb (NCopy, do_once) gives the tie's extent by VALUE (a from_value shape hook on the tie), a and b are the members.
-/// With `hold_n`, the System also promotes nb.n as "n": the promotion holds nb's variable after nb is deleted.
+/// A System with a FINITE value source: nb (NCopy, run_n{2}) gives the tie's extent by VALUE (a from_value shape hook on the tie), a and b
+/// are the members. nb takes two turns and is deleted after the second. A hook reads its source in the same forward, right
+/// before the first child that has the target (design review, section 10), so the source must still be alive in the forward
+/// that first sets the shape: a do_once producer would be deleted before the hook ran. With `hold_n`, the System also promotes
+/// nb.n as "n": the promotion holds nb's variable after nb is deleted, so its VALUE stays readable.
 class ValueSourceSys : public cs::System {
     bool hold_n_;
 
 public:
     explicit ValueSourceSys(bool hold_n = false) : hold_n_{hold_n} {}
     void setup() override {
-        add_subsystem(cs::property_list{cs::property::do_once{}}, cs::subsystem_desc<NCopy>("nb"));
+        add_subsystem(cs::property_list{cs::property::run_n{2}}, cs::subsystem_desc<NCopy>("nb"));
         add_subsystem(cs::subsystem_desc<TScale>("a"));
         add_subsystem(cs::subsystem_desc<TScale>("b"));
         tie_inputs<DType::f32, 1>({"a.x", "b.x"}, "x");
@@ -2751,26 +2754,30 @@ public:
 };
 }  // namespace tsys2
 
-TEST_CASE("lifetime: a value-driven alias shape keeps a finite producer's output alive until it has materialized",
+TEST_CASE("lifetime: a transient System with a finite value source for a hook is deleted on schedule",
           "[system][lifetime][alias]") {
+    // Was: "a value-driven alias shape keeps a finite producer's output alive until it has materialized". Under section 10
+    // nothing keeps a producer's output alive for a tie or a hook: the hook reads the source's value in the forward that sets
+    // the shape, so the source producer must be alive then (nb takes two turns). Each forward rebuilds the transient System
+    // with a fresh nb, so every forward sees a live source; the System itself is deleted after its turn.
     auto model = tsys2::make([](cs::System& s) { s.add_subsystem(tsys::kTransient, cs::subsystem_desc<tsys2::ValueSourceSys>("s")); },
                              cst::pooled_config());
     model.setup();
     model.update_input("s.nb.v", cs::init::from_host(tsys2::one_u32(4)));
-    // nb.n is written by the do_once producer (answer 1) and read by the tie's declaring System (a non-writer partner, 1):
-    // the producer's deletion does not free it: the tie's declaring System holds it (a user), after the value was read.
-    CHECK_NOTHROW(model.forward());
-    model.wait();
-    CHECK(model.get_subsystem("s") == nullptr);  // (the extent check on s.x went with the deleted transient)
+    for (int k = 1; k <= 2; ++k) {
+        INFO("forward " << k);
+        CHECK_NOTHROW(model.forward());
+        model.wait();
+        CHECK(model.get_subsystem("s") == nullptr);  // deleted after its turn, on schedule
+    }
 }
 
-TEST_CASE("lifetime: a tie alias keeps the last shape of a do_once value source that is gone",
+TEST_CASE("lifetime: a hook whose value source is gone keeps the last shape",
           "[system][lifetime][alias]") {
-    // REVIEW: the tie's size is now a from_value hook whose source (nb.n) is gone after nb's do_once turn; whether a hook with a
-    // dead source keeps the last shape is not settled by the headers (system.hpp replay_hook only skips dead paths).
-    // Design review, section 9 (Jack, 2026-10-03): a shape source that is gone (its instance and variable both expired) can
-    // never change again, so the tie keeps its last shape; "which does not exist right now" is for a shape that was never
-    // known. Nothing needs to hold nb.n for the SHAPE to survive. Promoting nb.n (hold) additionally keeps its VALUE readable.
+    // Design review, sections 9 and 10: a hook source that is gone (its instance expired) can never change again, so while the
+    // target's shape is known the hook does nothing and the last shape stands; "... does not exist right now" is for a shape
+    // that was never known. nb takes two turns: forwards 1 and 2 read it, forward 3 runs after nb is gone. Nothing needs to
+    // hold nb.n for the SHAPE to survive. Promoting nb.n (hold) additionally keeps its VALUE readable.
     for (const bool hold : {false, true}) {
         DYNAMIC_SECTION((hold ? "nb.n is promoted: its value stays readable too" : "nothing holds nb.n")) {
             auto model = tsys2::make(
@@ -2778,24 +2785,18 @@ TEST_CASE("lifetime: a tie alias keeps the last shape of a do_once value source 
                 cst::pooled_config());
             model.setup();
             model.update_input("s.nb.v", cs::init::from_host(tsys2::one_u32(4)));
-            CHECK_NOTHROW(model.forward());
-            model.wait();
-            CHECK(cst::synced_input<DType::f32, 1>(model, "s.x").shape()[0] == 4);
-            CHECK(model.get_subsystem("s.nb") == nullptr);  // the producer is gone
-            CHECK(model.get_subsystem("s") != nullptr);
-
-            // forwards 2 and 3 work, with the last shape (4), whether or not anything holds nb.n
-            for (int k = 2; k <= 3; ++k) {
+            for (int k = 1; k <= 3; ++k) {
                 INFO("forward " << k);
                 CHECK_NOTHROW(model.forward());
                 model.wait();
-                CHECK(cst::synced_input<DType::f32, 1>(model, "s.x").shape()[0] == 4);
+                CHECK(cst::synced_input<DType::f32, 1>(model, "s.x").shape()[0] == 4);  // the last shape stands from forward 3 on
+                CHECK((model.get_subsystem("s.nb") == nullptr) == (k >= 2));  // deleted after its second turn
+                CHECK(model.get_subsystem("s") != nullptr);
                 if (hold) CHECK(to_vector(cst::synced_output<DType::u32, 1>(model, "s.n")) == std::vector<std::uint32_t>{4});  // the value
             }
         }
     }
 }
-
 // =============================================================================================
 // Shared ownership and parent-owned children: the Round 4 tests
 // =============================================================================================
