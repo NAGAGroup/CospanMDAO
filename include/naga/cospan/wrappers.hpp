@@ -1,12 +1,12 @@
 #pragma once
 
 // =============================================================================
-// naga/cospan/wrappers.hpp — the device-side data handles (r01 §2.1, §5.2)
+// naga/cospan/wrappers.hpp — the device-side data handles (r02 section 4)
 // =============================================================================
 //
 // Input, Output, Initializer and Local are pure device payload: {shape,
 // stride, data}, trivially copyable, no identity. Their fields are private and
-// written only by detail::IOEntry (friendship): user code never sees a pointer.
+// written only by detail::WrapperAccess (friendship): user code never sees a pointer.
 // Indexing is by sycl::id<Rank> or by a flat row-major index over shape();
 // stride() is the element step per dimension in the OWNING allocation.
 
@@ -21,11 +21,11 @@
 
 namespace naga::cospan {
 
-struct CustomOp;  // the one place a raw device pointer is obtainable (r01 §5.1)
+struct CustomOp;  // the one place a raw device pointer is obtainable (r02 section 4.1)
 
 namespace detail {
 
-class IOEntry;
+struct WrapperAccess;
 template <class T, int Rank>
 struct RaggedAccess;
 struct ScratchLayout;
@@ -102,7 +102,7 @@ private:
     sycl::range<Rank> shape_  = detail::filled_range<Rank>(0);
     sycl::range<Rank> stride_ = detail::filled_range<Rank>(0);
     const value_type* data_   = nullptr;
-    friend class detail::IOEntry;
+    friend struct detail::WrapperAccess;
     friend struct CustomOp;
 };
 
@@ -149,13 +149,12 @@ private:
     sycl::range<Rank> shape_  = detail::filled_range<Rank>(0);
     sycl::range<Rank> stride_ = detail::filled_range<Rank>(0);
     value_type*       data_   = nullptr;
-    friend class detail::IOEntry;
+    friend struct detail::WrapperAccess;
     friend struct CustomOp;
 };
 
-/// Initializer<DT, Rank> — the writable twin of an I/O for init(): the same
-/// accessor discipline as Output, over the entry's root storage on the
-/// Component's device. Obtained inside init() only (r01 §6.2).
+/// Initializer<DT, Rank> — the writable twin of an Output for a custom initializer (cs::init::custom): the same
+/// accessor discipline as Output, over the variable's data on the device the initializer runs on (r02 section 2.5).
 template <DType DT, int Rank>
 struct Initializer {
     static_assert(Rank >= 1 && Rank <= 3, "cospan: rank is 1..3");
@@ -195,7 +194,7 @@ private:
     sycl::range<Rank> shape_  = detail::filled_range<Rank>(0);
     sycl::range<Rank> stride_ = detail::filled_range<Rank>(0);
     value_type*       data_   = nullptr;
-    friend class detail::IOEntry;
+    friend struct detail::WrapperAccess;
     friend struct CustomOp;
 };
 
@@ -229,11 +228,11 @@ private:
 
 // ---- ragged wrappers -------------------------------------------------------------
 
-/// A dense row-major view of one block of a ragged port: rank R (= the port's rank - 1), shape per
+/// A dense row-major view of one block of a ragged port: rank 1 (ragged is rank 2 only: the port's rank - 1), shape per
 /// block. `T` is const-qualified for an input. Trivially copyable; made by RaggedInput/RaggedOutput::block.
 template <class T, int R>
 struct Block {
-    static_assert(R >= 1 && R <= 2, "cospan: a ragged block has rank 1..2");
+    static_assert(R == 1, "cospan: a ragged block has rank 1 (ragged is rank 2 only)");
     T& operator[](sycl::id<R> idx) const {
         std::size_t flat = 0;
         for (int d = 0; d < R; ++d) flat = flat * shape_[d] + idx[d];
@@ -290,12 +289,12 @@ struct RaggedAccess {
 
 }  // namespace detail
 
-/// RaggedInput<DT, Rank> — read-only ragged port, Rank 2..3: N blocks, block i of shape (extent_1(i)[, extent_2(i)]).
+/// RaggedInput<DT, Rank> — read-only ragged port, Rank 2 only: N blocks, block i of shape (extent_1(i)).
 /// Also accepts a DENSE port (block i = row i). Non-atomic only.
 template <DType DT, int Rank>
     requires(!is_atomic_v<DT>)
 struct RaggedInput {
-    static_assert(Rank >= 2 && Rank <= 3, "cospan: a ragged port has rank 2..3");
+    static_assert(Rank == 2, "cospan: a ragged port is rank 2 only");
     using value_type = cpp_type_t<DT>;
     static constexpr DType dtype  = DT;
     static constexpr int   rank   = Rank;
@@ -312,14 +311,14 @@ private:
     const std::uint64_t*                offsets_ = nullptr;
     std::array<std::size_t, 2>          ext_{1, 1};
     std::array<const std::uint64_t*, 2> per_{nullptr, nullptr};
-    friend class detail::IOEntry;
+    friend struct detail::WrapperAccess;
 };
 
 /// RaggedOutput<DT, Rank> — the writable twin. With an atomic DT, block(i) is an AtomicBlock (operator[] gives a
 /// sycl::atomic_ref, relaxed, device scope), mirroring a dense atomic Output.
 template <DType DT, int Rank>
 struct RaggedOutput {
-    static_assert(Rank >= 2 && Rank <= 3, "cospan: a ragged port has rank 2..3");
+    static_assert(Rank == 2, "cospan: a ragged port is rank 2 only");
     using value_type = cpp_type_t<DT>;
     static constexpr DType dtype  = DT;
     static constexpr int   rank   = Rank;
@@ -343,14 +342,14 @@ private:
     const std::uint64_t*                offsets_ = nullptr;
     std::array<std::size_t, 2>          ext_{1, 1};
     std::array<const std::uint64_t*, 2> per_{nullptr, nullptr};
-    friend class detail::IOEntry;
+    friend struct detail::WrapperAccess;
 };
 
-static_assert(std::is_trivially_copyable_v<RaggedInput<DType::f32, 3>>);
-static_assert(std::is_trivially_copyable_v<RaggedOutput<DType::f32, 3>>);
-static_assert(std::is_trivially_copyable_v<Block<float, 2>>);
-static_assert(std::is_trivially_copyable_v<RaggedOutput<DType::atomic_f32, 3>>);
-static_assert(std::is_trivially_copyable_v<AtomicBlock<float, 2>>);
+static_assert(std::is_trivially_copyable_v<RaggedInput<DType::f32, 2>>);
+static_assert(std::is_trivially_copyable_v<RaggedOutput<DType::f32, 2>>);
+static_assert(std::is_trivially_copyable_v<Block<float, 1>>);
+static_assert(std::is_trivially_copyable_v<RaggedOutput<DType::atomic_f32, 2>>);
+static_assert(std::is_trivially_copyable_v<AtomicBlock<float, 1>>);
 
 static_assert(std::is_trivially_copyable_v<Input<DType::f32, 2>>);
 static_assert(std::is_trivially_copyable_v<Output<DType::atomic_f32, 1>>);

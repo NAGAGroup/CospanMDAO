@@ -2,14 +2,16 @@
 //
 // Each case builds a tiny top System that holds the components under test,
 // makes a Model (create_model / setup), and checks through the Model
-// (forward / wait / view_* / set_*). There is no driver and no entry access
-// here; the only thing reached past the Model's verbs is the Model's own
-// retrieval (root().entry_at, get_subsystem).
+// (forward / wait / view_* / update_input). There is no driver here; the only things reached past the
+// Model's verbs are the Model's own retrieval (get_subsystem, root().instance_at).
+//
+// Reading results (docs/design-review-2026-10-03.md, section 5): forward() only enqueues; a host view is obtained
+// after the first forward and sync()ed before it is read (cst::wait_and_view / synced_input do all three).
 //
 //   plain body, rank 1/2/3        y = 2x + 1, ragged sizes (1000, 40x30, 7x9x11)
-//   WeightedHistogram             atomic output, unspecified dims, value-driven
-//                                 n_bins; ZeroBins + tie_outputs; two forwards, n_bins changed by
-//                                 init_input between them
+//   WeightedHistogram             atomic output, unspecified dims; ZeroBins + tie_outputs whose shape is a
+//                                 System shape hook (cs::dim::from_value of NBins' output); two forwards,
+//                                 n_bins changed by update_input between them
 //   TiledTranspose                group body, Local scratch, wg override; 37x53
 //   host component chain          producer -> host prefix sum -> consumer
 //   custom-op plumbing            device_ptr recorded at submission
@@ -81,7 +83,8 @@ class Affine : public cs::Component<AffineBody<R>> {
 public:
     explicit Affine(sycl::range<R> dims) : dims_{dims} {}
     void setup() override {
-        // A free input with declared dims; the output takes the input's shape.
+        // A free input with declared dims; the output's dims are unspecified and pre_forward gives it the input's shape
+        // (design review, section 10: an output is reshaped by its producing component).
         if constexpr (R == 1) {
             this->declare_input(x_, "x", static_cast<int>(dims_[0]));
         } else if constexpr (R == 2) {
@@ -90,8 +93,9 @@ public:
             this->declare_input(x_, "x", static_cast<int>(dims_[0]), static_cast<int>(dims_[1]),
                                 static_cast<int>(dims_[2]));
         }
-        this->declare_output(y_, "y", cs::from_input_shape<R>("x"));
+        this->declare_output(y_, "y", cs::unspecified_shape<R>());
     }
+    void pre_forward() override { this->set_shape(y_, this->shape_of(x_)); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return this->create_launch_config(x_.shape(), {x_}, {y_}, {});
     }
@@ -103,7 +107,7 @@ class TopAffine : public cs::System {
 
 public:
     explicit TopAffine(sycl::range<R> dims) : dims_{dims} {}
-    void setup() override { add_subsystem<Affine<R>>("aff", dims_); }
+    void setup() override { add_subsystem(cs::subsystem_desc<Affine<R>>("aff", dims_)); }
 };
 
 template <int R>
@@ -118,7 +122,7 @@ void check_affine(sycl::range<R> dims) {
             x[k]    = static_cast<float>(k % 97) * 0.5f * static_cast<float>(round + 1);
             want[k] = 2.0f * x[k] + 1.0f;
         }
-        model.init_input("aff.x", cs::init::from_host(x));
+        model.update_input("aff.x", cs::init::from_host(x));
         auto y = wait_and_view<DType::f32, R>(model, "aff.y");
         REQUIRE(y.shape() == dims);
         CHECK(all_close(to_vector(y), want));
@@ -182,9 +186,9 @@ public:
     WeightedHistogram(float lo, float hi) : lo_{lo}, hi_{hi} {}
     void setup() override {
         declare_input(values_, "values", cs::unspecified);
-        declare_input(weights_, "weights", cs::from_input_shape<1>("values"));
+        declare_input(weights_, "weights", cs::unspecified);  // connected from the producer: it takes the producer's shape
         declare_input(n_bins_, "n_bins", cs::unspecified_shape<1>());  // connected from the NBins producer
-        declare_output(bins_, "bins", cs::unspecified_shape<1>());  // a tie_outputs member: the alias takes its shape from NBins' value
+        declare_output(bins_, "bins", cs::unspecified_shape<1>());  // a tie_outputs member: the tie's shape hook sets it from NBins' value
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return create_launch_config(values_.shape(), {values_, weights_, n_bins_}, {bins_}, {lo_, hi_});
@@ -211,7 +215,7 @@ public:
     }
 };
 
-// The bin count as an OUTPUT (an alias shape reads an upstream output): n[0] = v[0], where v is
+// The bin count as an OUTPUT (a shape hook reads an upstream output's value): n[0] = v[0], where v is
 // the free input the test drives (promoted as "n_bins").
 struct NBinsBody {
     struct Inputs {
@@ -240,16 +244,23 @@ public:
 class TopHist : public cs::System {
 public:
     void setup() override {
-        add_subsystem<HistProducer>("prod");
-        add_subsystem<NBins>("nb");        // produces the bin count; registered before the tie's members
-        add_subsystem<ZeroBins>("zero");  // BEFORE hist: registration order is execution order
-        add_subsystem<WeightedHistogram>("hist", 0.0f, 1.0f);
+        add_subsystem(cs::subsystem_desc<HistProducer>("prod"));
+        // nb must be declared BEFORE zero: the tie's shape hook reads the VALUE of nb.n and runs before the first child that
+        // has the tied variable (zero), and children run in declaration order; a hook's source needs its producer in an
+        // earlier slot (design review, section 10).
+        add_subsystem(cs::subsystem_desc<NBins>("nb"));
+        add_subsystem(cs::subsystem_desc<ZeroBins>("zero"));
+        add_subsystem(cs::subsystem_desc<WeightedHistogram>("hist", 0.0f, 1.0f));
         connect("nb.n", "hist.n_bins");
-        // The bins root's shape is the VALUE of nb.n[0], read by the root's owner (zero) each run.
-        tie_outputs<DType::atomic_f32, 1>({"zero.bins", "hist.bins"}, "bins", cs::alias::from_output_values("nb.n"));
+        // The bins' shape is the VALUE of nb.n[0], set by a hook on the tie alias before zero runs, each forward.
+        tie_outputs<DType::atomic_f32, 1>({"zero.bins", "hist.bins"}, "bins");
+        shape_hook("bins", cs::dim::from_value("nb.n", 0));
         promote<DType::u32, 1>("nb.v", "n_bins");  // the test drives the bin count by this name
         connect("prod.values", "hist.values");
         connect("prod.weights", "hist.weights");
+        // Execution order is data dependencies only (section 3) and tied writers do not wait on each other: hist
+        // accumulates onto what zero writes, so the edge is declared (it used to be registration order).
+        depends_on("hist", "zero");
     }
 };
 
@@ -310,7 +321,11 @@ class TiledTranspose : public cs::Component<TransposeBody> {
 public:
     void setup() override {
         declare_input(in_, "in", cs::unspecified_shape<2>());
-        declare_output(out_, "out", cs::FromInputDim{"in", 1}, cs::FromInputDim{"in", 0});
+        declare_output(out_, "out", cs::unspecified_shape<2>());
+    }
+    void pre_forward() override {
+        const sycl::range<2> s = shape_of(in_);
+        set_shape(out_, sycl::range<2>{s[1], s[0]});  // the transpose
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         TransposeBody::Scratch s;
@@ -322,8 +337,8 @@ public:
 class TopTranspose : public cs::System {
 public:
     void setup() override {
-        add_subsystem<Iota2D>("iota", 37, 53);
-        add_subsystem<TiledTranspose>("tr");
+        add_subsystem(cs::subsystem_desc<Iota2D>("iota", 37, 53));
+        add_subsystem(cs::subsystem_desc<TiledTranspose>("tr"));
         connect("iota.out", "tr.in");
     }
 };
@@ -366,8 +381,9 @@ class Plus1 : public cs::Component<Plus1Body> {
 public:
     void setup() override {
         declare_input(z_, "z", cs::unspecified_shape<1>());
-        declare_output(w_, "w", cs::from_input_shape<1>("z"));
+        declare_output(w_, "w", cs::unspecified_shape<1>());
     }
+    void pre_forward() override { set_shape(w_, shape_of(z_)); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return create_launch_config(z_.shape(), {z_}, {w_}, {});
     }
@@ -398,8 +414,9 @@ class PrefixSum : public cs::Component<PrefixBody> {
 public:
     void setup() override {
         declare_input(y_, "y", cs::unspecified_shape<1>());
-        declare_output(z_, "z", cs::from_input_shape<1>("y"));
+        declare_output(z_, "z", cs::unspecified_shape<1>());
     }
+    void pre_forward() override { set_shape(z_, shape_of(y_)); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return create_launch_config({y_}, {z_}, {});
     }
@@ -408,9 +425,9 @@ public:
 class TopHostChain : public cs::System {
 public:
     void setup() override {
-        add_subsystem<Iota1D>("iota", static_cast<int>(kN));
-        add_subsystem<PrefixSum>("prefix");
-        add_subsystem<Plus1>("plus1");
+        add_subsystem(cs::subsystem_desc<Iota1D>("iota", static_cast<int>(kN)));
+        add_subsystem(cs::subsystem_desc<PrefixSum>("prefix"));
+        add_subsystem(cs::subsystem_desc<Plus1>("plus1"));
         connect("iota.y", "prefix.y");
         connect("prefix.z", "plus1.z");
     }
@@ -441,8 +458,9 @@ public:
     std::atomic<const void*> in_rec{nullptr}, out_rec{nullptr};
     void setup() override {
         declare_input(x_, "x", cs::unspecified_shape<1>());
-        declare_output(y_, "y", cs::from_input_shape<1>("x"));
+        declare_output(y_, "y", cs::unspecified_shape<1>());
     }
+    void pre_forward() override { set_shape(y_, shape_of(x_)); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return create_launch_config({x_}, {y_}, {&in_rec, &out_rec});
     }
@@ -451,9 +469,9 @@ public:
 class TopCustomOp : public cs::System {
 public:
     void setup() override {
-        add_subsystem<Iota1D>("iota", static_cast<int>(kN));
-        add_subsystem<Recorder>("rec");
-        add_subsystem<Plus1>("plus1");
+        add_subsystem(cs::subsystem_desc<Iota1D>("iota", static_cast<int>(kN)));
+        add_subsystem(cs::subsystem_desc<Recorder>("rec"));
+        add_subsystem(cs::subsystem_desc<Plus1>("plus1"));
         connect("iota.y", "rec.x");
         connect("rec.y", "plus1.z");
     }
@@ -495,25 +513,23 @@ public:
         init_input("x", cs::init::fill(2.0f));
         init_input("w", cs::init::from_host(std::vector<float>{1.0f, 2.0f, 3.0f, 4.0f}));
         init_input("u", cs::init::zero());
-        init_input("v", cs::init::custom_host<DType::f32, 1>(std::function<void(cs::HostViewMut<DType::f32, 1>&)>{
-                            [](cs::HostViewMut<DType::f32, 1>& h) {
+        init_input("v", cs::init::custom_host<DType::f32, 1>(std::function<void(cs::HostInit<DType::f32, 1>&)>{
+                            [](cs::HostInit<DType::f32, 1>& h) {
                                 ++g_host_calls;
                                 for (std::size_t k = 0; k < 4; ++k) h[k] = 100.0f * static_cast<float>(k + 1);
                             }}));
-        init_input("m", cs::init::custom<DType::f32, 1>(
-                            std::function<void(sk::queue&, cs::Initializer<DType::f32, 1>)>{
-                                [](sk::queue& q, cs::Initializer<DType::f32, 1> out) {
-                                    ++g_custom_calls;
-                                    g_custom_size = out.size();
-                                    // A device kernel on the given queue writes m[i] = 10 + i through
-                                    // the Initializer's public operator[] (the submit form CoSpan's own
-                                    // launches use: queue.submit(device, command-group)).
-                                    q.submit(q.get_device(), [=](sycl::handler& h) {
-                                        h.parallel_for(sycl::range<1>{out.size()}, [=](sycl::id<1> i) {
-                                            out[i] = 10.0f + static_cast<float>(i[0]);
-                                        });
-                                    });
-                                }}));
+        // The custom function gets the unordered queue, the device, the events its work must follow, and the
+        // Initializer; it enqueues its own kernel with those events and RETURNS that kernel's event (init.hpp).
+        init_input("m", cs::init::custom<DType::f32, 1>(cs::init::CustomFn<DType::f32, 1>{
+                            [](sk::unordered_queue& q, const sycl::device& dev, const std::vector<sycl::event>& deps,
+                               cs::Initializer<DType::f32, 1> out) {
+                                ++g_custom_calls;
+                                g_custom_size = out.size();
+                                // A device kernel writes m[i] = 10 + i through the Initializer's operator[].
+                                return q.parallel_for(dev, deps, sycl::range<1>{out.size()}, [=](sycl::id<1> i) {
+                                    out[i] = 10.0f + static_cast<float>(i[0]);
+                                });
+                            }}));
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return create_launch_config(y_.shape(), {x_, w_, u_, v_, d_, m_}, {y_}, {});
@@ -521,13 +537,13 @@ public:
 
     // Hooks for the phase-guard checks, called by the test after setup.
     void try_declare() { declare_output(extra_, "extra", 1); }
-    void try_reshape() { reshape(y_, sycl::range<1>{2}); }
+    void try_reshape() { set_shape(y_, sycl::range<1>{2}); }
     void try_init() { init_input("x", cs::init::zero()); }
 };
 
 class TopInit : public cs::System {
 public:
-    void setup() override { add_subsystem<InitDemo>("ini"); }
+    void setup() override { add_subsystem(cs::subsystem_desc<InitDemo>("ini")); }
 };
 
 /// y = 2 x + 1 on a free 4-vector, with optional init declarations for the metadata rules:
@@ -547,11 +563,12 @@ public:
             declare_input(x_, "x", cs::unspecified_shape<1>());  // a tie_inputs member: the tie alias owns the shape
         else
             declare_input(x_, "x", 4);
-        declare_output(y_, "y", cs::from_input_shape<1>("x"));
+        declare_output(y_, "y", cs::unspecified_shape<1>());
         if (init_) init_input("x", *init_);
         if (mode_ == 1) init_input("y", cs::init::zero());
         if (mode_ == 2) init_input("x", cs::init::fill(3.0f));
     }
+    void pre_forward() override { set_shape(y_, shape_of(x_)); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return create_launch_config(x_.shape(), {x_}, {y_}, {});
     }
@@ -581,23 +598,28 @@ TEST_CASE("a launch's event is registered on the storage of every port it touche
     auto model = cs::create_model<tc::TopAffine<1>>(default_config(), sycl::range<1>{1000});
     model.setup();
 
-    // Before any forward nothing is materialized, so nothing is registered.
-    CHECK(model.root().entry_at("aff.x").registered_event_count() == 0);
-    CHECK(model.root().entry_at("aff.y").registered_event_count() == 0);
+    // Before any forward nothing is materialized (setup allocates nothing, design review section 2): the instances
+    // have no data, so nothing is registered.
+    const auto xi = model.root().instance_at("aff.x");
+    const auto yi = model.root().instance_at("aff.y");
+    CHECK(xi->data == nullptr);
+    CHECK(yi->data == nullptr);
 
-    model.init_input("aff.x", cs::init::fill(1.0f));
+    model.update_input("aff.x", cs::init::fill(1.0f));
     model.forward();
-    model.wait();
 
-    // The kernel read x and wrote y: its event is registered on both ports' storage (a completed
-    // event stays registered until the next registration or mutation prunes it).
-    CHECK(model.root().entry_at("aff.x").registered_event_count() >= 1);
-    CHECK(model.root().entry_at("aff.y").registered_event_count() >= 1);
+    // The kernel read x and wrote y: its event is registered on both ports' data (component.hpp, record_launch).
+    // Checked before any wait. REVIEW: whether usm_vector::events() still reports an event once it has completed
+    // (pruning) is not settled by the headers, so this is read straight after the forward, not after wait().
+    REQUIRE(xi->data != nullptr);
+    REQUIRE(yi->data != nullptr);
+    CHECK(xi->data->events().size() >= 1);
+    CHECK(yi->data->events().size() >= 1);
+    model.wait();
 
     // A second forward registers again, and the result is still right.
     model.forward();
-    model.wait();
-    CHECK(model.root().entry_at("aff.y").registered_event_count() >= 1);
+    CHECK(yi->data->events().size() >= 1);
     auto y = wait_and_view<DType::f32, 1>(model, "aff.y");
     CHECK(to_vector(y) == std::vector<float>(1000, 3.0f));
 }
@@ -605,27 +627,27 @@ TEST_CASE("a launch's event is registered on the storage of every port it touche
 // =============================================================================================
 // WeightedHistogram
 // =============================================================================================
-TEST_CASE("WeightedHistogram: atomic output, unspecified dims, value-driven n_bins", "[component][histogram]") {
+TEST_CASE("WeightedHistogram: atomic output, unspecified dims, tie shape set by a from_value hook", "[component][histogram]") {
     auto model = cs::create_model<tc::TopHist>(default_config());
     model.setup();
 
     const std::uint32_t nb1 = 8, nb2 = 13;
 
     SECTION("first forward, n_bins = 8") {
-        model.init_input("n_bins", cs::init::from_host(std::vector<std::uint32_t>{nb1}));
+        model.update_input("n_bins", cs::init::from_host(std::vector<std::uint32_t>{nb1}));
         auto bins = wait_and_view<DType::f32, 1>(model, "bins");
         CHECK(bins.size() == nb1);
         CHECK(to_vector(bins) == tc::histogram_ref(nb1));
     }
 
-    SECTION("second forward with n_bins changed by init_input: the root grows and accumulates") {
-        model.init_input("n_bins", cs::init::from_host(std::vector<std::uint32_t>{nb1}));
+    SECTION("second forward with n_bins changed by update_input: the root grows and accumulates") {
+        model.update_input("n_bins", cs::init::from_host(std::vector<std::uint32_t>{nb1}));
         {
             auto bins = wait_and_view<DType::f32, 1>(model, "bins");
             REQUIRE(bins.size() == nb1);
             CHECK(to_vector(bins) == tc::histogram_ref(nb1));
         }
-        model.init_input("n_bins", cs::init::from_host(std::vector<std::uint32_t>{nb2}));
+        model.update_input("n_bins", cs::init::from_host(std::vector<std::uint32_t>{nb2}));
         auto bins = wait_and_view<DType::f32, 1>(model, "bins");
         REQUIRE(bins.size() == nb2);
         // ZeroBins zeroes the grown root each forward, then the histogram accumulates onto it.
@@ -644,7 +666,7 @@ TEST_CASE("TiledTranspose: group body, Local scratch, work-group override, 37 x 
     REQUIRE(out.shape()[1] == 37);
     bool good = true;
     for (std::size_t j = 0; j < 53 && good; ++j)
-        for (std::size_t i = 0; i < 37 && good; ++i) good = out[sycl::id<2>{j, i}] == static_cast<float>(i * 1000 + j);
+        for (std::size_t i = 0; i < 37 && good; ++i) good = out(j, i) == static_cast<float>(i * 1000 + j);
     CHECK(good);  // out[j][i] == in[i][j]
 }
 
@@ -656,8 +678,8 @@ TEST_CASE("host component chain: producer -> host prefix sum -> consumer", "[com
     model.setup();
 
     // The host component's I/O are host-kind USM (moved by the ordinary copy rule).
-    CHECK(model.root().entry_at("prefix.y").storage_kind() == sk::kind::host);
-    CHECK(model.root().entry_at("prefix.z").storage_kind() == sk::kind::host);
+    CHECK(model.root().instance_at("prefix.y")->storage_kind == sk::kind::host);
+    CHECK(model.root().instance_at("prefix.z")->storage_kind == sk::kind::host);
 
     auto w = wait_and_view<DType::f32, 1>(model, "plus1.w");
     REQUIRE(w.size() == tc::kN);
@@ -682,11 +704,10 @@ TEST_CASE("custom op: device_ptr at submission is the storage the consumer reads
     model.setup();
     auto w = wait_and_view<DType::f32, 1>(model, "plus1.w");
 
-    const sycl::device    dev{sycl::default_selector_v};
-    const cs::Placement   dev_pl{dev, sk::kind::device};
-    auto&                 rec      = dynamic_cast<tc::Recorder&>((*model.get_subsystem("rec")));
-    const void*           want_in  = model.root().entry_at("iota.y").root()->storage_on(dev_pl);
-    const void*           want_out = model.root().entry_at("rec.y").root()->storage_on(dev_pl);
+    // The device data of the variables, read off the instances (the old per-root storage_on(placement) is gone).
+    auto&       rec      = dynamic_cast<tc::Recorder&>((*model.get_subsystem("rec")));
+    const void* want_in  = model.root().instance_at("iota.y")->data->raw();
+    const void* want_out = model.root().instance_at("rec.y")->data->raw();
     CHECK(rec.in_rec.load() != nullptr);
     CHECK(rec.in_rec.load() == want_in);
     CHECK(rec.out_rec.load() != nullptr);
@@ -711,17 +732,17 @@ TEST_CASE("initial values: fill / zero / from_host / custom / custom_host, and z
 
     const std::vector<float> ramp{1.0f, 2.0f, 3.0f, 4.0f};
     SECTION("inputs") {
-        CHECK(model.view_input<DType::f32, 1>("ini.x")[std::size_t{0}] == 2.0f);  // fill
-        CHECK(to_vector(model.view_input<DType::f32, 1>("ini.w")) == ramp);       // from_host
-        CHECK(to_vector(model.view_input<DType::f32, 1>("ini.u")) == std::vector<float>(4, 0.0f));  // zero
-        CHECK(to_vector(model.view_input<DType::f32, 1>("ini.v")) ==
+        CHECK(cst::synced_input<DType::f32, 1>(model, "ini.x")[std::size_t{0}] == 2.0f);  // fill
+        CHECK(to_vector(cst::synced_input<DType::f32, 1>(model, "ini.w")) == ramp);       // from_host
+        CHECK(to_vector(cst::synced_input<DType::f32, 1>(model, "ini.u")) == std::vector<float>(4, 0.0f));  // zero
+        CHECK(to_vector(cst::synced_input<DType::f32, 1>(model, "ini.v")) ==
               std::vector<float>({100.0f, 200.0f, 300.0f, 400.0f}));  // custom_host
-        CHECK(to_vector(model.view_input<DType::f32, 1>("ini.d")) == std::vector<float>(4, 0.0f));  // default
+        CHECK(to_vector(cst::synced_input<DType::f32, 1>(model, "ini.d")) == std::vector<float>(4, 0.0f));  // default
     }
     SECTION("custom ran once, with the root's shape, and its device kernel wrote the values") {
         CHECK(tc::g_custom_calls.load() == 1);
         CHECK(tc::g_custom_size.load() == 4);
-        CHECK(to_vector(model.view_input<DType::f32, 1>("ini.m")) == std::vector<float>({10.0f, 11.0f, 12.0f, 13.0f}));
+        CHECK(to_vector(cst::synced_input<DType::f32, 1>(model, "ini.m")) == std::vector<float>({10.0f, 11.0f, 12.0f, 13.0f}));
         CHECK(tc::g_host_calls.load() == 1);  // an eternal root is initialized once, at its owner's first run, not per forward
     }
     SECTION("the kernel sees the initialized inputs") {
@@ -730,15 +751,15 @@ TEST_CASE("initial values: fill / zero / from_host / custom / custom_host, and z
     }
 }
 
-TEST_CASE("initial values: metadata rules (connected, output, duplicates, highest level)", "[component][init][rules]") {
+TEST_CASE("initial values: metadata rules (connected, output, duplicates, last declaration wins)", "[component][init][rules]") {
     const auto top = [](std::function<void(cs::System&)> build) {
         return cs::create_model<tc::TopFn>(default_config(), std::move(build));
     };
 
     SECTION("an init on a connected input is ignored") {
         auto model = top([](cs::System& s) {
-            s.add_subsystem<tc::InitAffine>("p", std::optional<cs::InitSpec>{cs::init::fill(1.0f)});
-            s.add_subsystem<tc::InitAffine>("c", std::optional<cs::InitSpec>{cs::init::fill(100.0f)});
+            s.add_subsystem(cs::subsystem_desc<tc::InitAffine>("p", std::optional<cs::InitSpec>{cs::init::fill(1.0f)}));
+            s.add_subsystem(cs::subsystem_desc<tc::InitAffine>("c", std::optional<cs::InitSpec>{cs::init::fill(100.0f)}));
             s.connect("p.y", "c.x");
         });
         model.setup();
@@ -749,39 +770,39 @@ TEST_CASE("initial values: metadata rules (connected, output, duplicates, highes
         tc::expect_throws(
             [&] {
                 auto model = top([](cs::System& s) {
-                    s.add_subsystem<tc::InitAffine>("a", std::optional<cs::InitSpec>{}, 1);
+                    s.add_subsystem(cs::subsystem_desc<tc::InitAffine>("a", std::optional<cs::InitSpec>{}, 1));
                 });
                 model.setup();
             },
             "is an output");
     }
-    SECTION("two inits at one depth on one root throw") {
-        tc::expect_throws(
-            [&] {
-                auto model = top([](cs::System& s) {
-                    s.add_subsystem<tc::InitAffine>("a", std::optional<cs::InitSpec>{cs::init::fill(1.0f)}, 0, true);
-                    s.add_subsystem<tc::InitAffine>("b", std::optional<cs::InitSpec>{cs::init::fill(2.0f)}, 0, true);
-                    s.tie_inputs<DType::f32, 1>({"a.x", "b.x"}, "x", cs::alias::fixed(4));
-                });
-                model.setup();
-            },
-            "two initial values");
+    SECTION("two members' inits and no tie-level init: the later merged member wins (the last declaration wins, section 2)") {
+        auto model = top([](cs::System& s) {
+            s.add_subsystem(cs::subsystem_desc<tc::InitAffine>("a", std::optional<cs::InitSpec>{cs::init::fill(1.0f)}, 0, true));
+            s.add_subsystem(cs::subsystem_desc<tc::InitAffine>("b", std::optional<cs::InitSpec>{cs::init::fill(2.0f)}, 0, true));
+            s.tie_inputs<DType::f32, 1>({"a.x", "b.x"}, "x", cs::shape(4));
+        });
+        CHECK_NOTHROW(model.setup());
+        auto a = wait_and_view<DType::f32, 1>(model, "a.y");
+        CHECK(to_vector(a) == std::vector<float>(4, 5.0f));  // b's fill(2) is the later member: 2 * 2 + 1
     }
     SECTION("a System-level init beats the components' on a tied alias") {
         auto model = top([](cs::System& s) {
-            s.add_subsystem<tc::InitAffine>("a", std::optional<cs::InitSpec>{cs::init::fill(1.0f)}, 0, true);
-            s.add_subsystem<tc::InitAffine>("b", std::optional<cs::InitSpec>{cs::init::fill(2.0f)}, 0, true);
-            s.tie_inputs<DType::f32, 1>({"a.x", "b.x"}, "x", cs::alias::fixed(4));
+            // Both members carry a component-level init; the System-level init_input runs after their setups, so it is the
+            // last declaration and wins, with no throw (section 2).
+            s.add_subsystem(cs::subsystem_desc<tc::InitAffine>("a", std::optional<cs::InitSpec>{cs::init::fill(1.0f)}, 0, true));
+            s.add_subsystem(cs::subsystem_desc<tc::InitAffine>("b", std::optional<cs::InitSpec>{cs::init::fill(2.0f)}, 0, true));
+            s.tie_inputs<DType::f32, 1>({"a.x", "b.x"}, "x", cs::shape(4));
             s.init_input("x", cs::init::fill(9.0f));
         });
         model.setup();
         auto a = wait_and_view<DType::f32, 1>(model, "a.y");
         CHECK(to_vector(a) == std::vector<float>(4, 19.0f));
-        CHECK(to_vector(model.view_output<DType::f32, 1>("b.y")) == std::vector<float>(4, 19.0f));
+        CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "b.y")) == std::vector<float>(4, 19.0f));
     }
 }
 
-TEST_CASE("phase guards: init_input, reshape and declare outside their phase throw", "[component][init][guards]") {
+TEST_CASE("phase guards: init_input, set_shape and declare outside their phase throw", "[component][init][guards]") {
     auto model = cs::create_model<tc::TopInit>(default_config());
     model.setup();
     auto& c = dynamic_cast<tc::InitDemo&>((*model.get_subsystem("ini")));
@@ -789,7 +810,7 @@ TEST_CASE("phase guards: init_input, reshape and declare outside their phase thr
     SECTION("init_input outside setup() throws") {
         tc::expect_throws([&] { c.try_init(); }, "setup() only");
     }
-    SECTION("reshape outside pre_forward() throws") {
+    SECTION("set_shape outside pre_forward() throws") {
         tc::expect_throws([&] { c.try_reshape(); }, "pre_forward() only");
     }
     SECTION("declare outside setup() throws") {
@@ -800,5 +821,5 @@ TEST_CASE("phase guards: init_input, reshape and declare outside their phase thr
         auto y = wait_and_view<DType::f32, 1>(model, "ini.y");
         CHECK(to_vector(y) == std::vector<float>({121.0f, 222.0f, 323.0f, 424.0f}));
     }
-    model.wait();  // setup() submitted initial-value work; wait before the Model goes out of scope
+    model.wait();  // a forward may have been enqueued; let it finish before the Model goes out of scope
 }

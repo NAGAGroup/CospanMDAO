@@ -1,12 +1,22 @@
-// Ragged dimensions: the full test set.
+// Ragged dimensions: the full test set, on the section 10 shape model.
 //
-//   Counts   u32 [N] counts (a copy of a free input)
-//   Fill     RaggedOutput<f32,3> "pts": N x counts[i] x 3, extents from the VALUES of `counts`
-//            (FromInputValues); pts.block(i)[j,k] = i*1000 + j*10 + k
-//   Scale    RaggedInput -> RaggedOutput (inherits the input's per-index dims with FromInputDim): x2
-//   Sum      RaggedInput (inherits through an unspecified dim) -> a dense [N] output of block sums
+//   Counts   u32 [N] counts (a copy of a free input of fixed size N)
+//   Fill     RaggedOutput<f32,2> "pts": N blocks of counts[i] elements, pts.block(i)[j] = i*1000 + j. Its shape comes from
+//            a hooked "layout" input (a System shape hook, cs::ragged::counts_from("counts.counts")) that Fill copies in
+//            pre_forward with set_shape(pts, shape_of(layout))
+//   Scale    RaggedInput -> RaggedOutput (set_shape(out, shape_of(in))): x2
+//   Sum      RaggedInput -> a dense [N] output of block sums
 //
-// Everything is checked against host references, through view_output (dense) and view_ragged_*.
+// Everything is checked against host references, through view_output (dense) and view_ragged_* (n(), block_offsets(),
+// block(i), span()), synced after the forward (docs/design-review-2026-10-03.md, section 5).
+//
+// PORT NOTES (design review, section 10). Ragged is RANK 2 only, a per-index dimension is declared with cs::counts / cs::offsets
+// (the length of the counts is N), there are no derived dimensions (FromInputDim, FromInputValues, ...), and an output is
+// reshaped only by its producing component's pre_forward. DELETED: the rank-3 cases (Fill's 3-wide rows, "both trailing dims
+// per-index, from two columns", the Cols component) and the declaration errors that can no longer be written ("a per-index spec
+// on dimension 0", "a dense wrapper declared with a per-index spec": cs::counts is not a DimSpec, so they do not compile) and
+// "a dense output inheriting a per-index dim" (a dense set_shape carries no per-index extents). The old "a per-index length
+// different from N" is converted into a connect-time mismatch of N.
 
 #include <cstddef>
 #include <cstdint>
@@ -58,63 +68,64 @@ struct CountsBody {
     };
     void operator()(sycl::id<1> i, Inputs in, Outputs out) const { out.counts[i] = in.raw[i]; }
 };
-// N comes from a free input `n` (so `raw` is value-driven: a fixed size-0 root would have no arena).
+// N is fixed by the declaration of the free input `raw` (the old free input `n` that sized it by value is gone: a size
+// from a value is a shape hook now, covered in test_shapes.cpp).
 class Counts : public cs::Component<CountsBody> {
     std::size_t               n_;
-    cs::Input<DType::u32, 1>  nin_;
     cs::Input<DType::u32, 1>  raw_;
     cs::Output<DType::u32, 1> counts_;
 
 public:
     explicit Counts(std::size_t n) : n_{n} {}
     void setup() override {
-        declare_input(nin_, "n", 1);
-        init_input("n", cs::init::from_host(std::vector<std::uint32_t>{static_cast<std::uint32_t>(n_)}));
-        declare_input(raw_, "raw", cs::FromInput{"n", 0});
-        declare_output(counts_, "counts", cs::FromInputDim{"raw", 0});
+        declare_input(raw_, "raw", n_);
+        declare_output(counts_, "counts", cs::unspecified);
     }
+    void pre_forward() override { set_shape(counts_, shape_of(raw_)); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return create_launch_config(counts_.shape(), {raw_}, {counts_}, {});
     }
 };
 
-// ---- Fill: pts.block(i)[j,k] = i*1000 + j*10 + k ---------------------------------------------------
+// ---- Fill: pts.block(i)[j] = i*1000 + j ----------------------------------------------------------
 struct FillBody {
     struct Inputs {
-        cs::Input<DType::u32, 1> counts;
+        cs::RaggedInput<DType::f32, 2> layout;
     };
     struct Outputs {
-        cs::RaggedOutput<DType::f32, 3> pts;
+        cs::RaggedOutput<DType::f32, 2> pts;
     };
     void operator()(sycl::id<1> id, Inputs, Outputs out) const {
         const std::size_t i = id[0];
         auto              b = out.pts.block(i);
-        for (std::size_t j = 0; j < b.shape()[0]; ++j)
-            for (std::size_t k = 0; k < b.shape()[1]; ++k)
-                b[sycl::id<2>{j, k}] = static_cast<float>(i * 1000 + j * 10 + k);
+        for (std::size_t j = 0; j < b.shape()[0]; ++j) b[j] = static_cast<float>(i * 1000 + j);
     }
 };
+// REVIEW: the old Fill sized its output by the VALUES of its `counts` input (FromInputValues). A component has no value-read
+// helper in the new headers (host views are made by the Model only) and a hook cannot target an output, so the size comes in
+// through a free ragged input `layout` that the System hooks with counts_from, and Fill copies its shape.
 class Fill : public cs::Component<FillBody> {
-    cs::Input<DType::u32, 1>        counts_;
-    cs::RaggedOutput<DType::f32, 3> pts_;
+    cs::RaggedInput<DType::f32, 2>  layout_;
+    cs::RaggedOutput<DType::f32, 2> pts_;
 
 public:
     void setup() override {
-        declare_input(counts_, "counts", cs::unspecified);
-        declare_output(pts_, "pts", cs::FromInputDim{"counts", 0}, cs::FromInputValues{"counts"}, 3);
+        declare_input(layout_, "layout");
+        declare_output(pts_, "pts");
     }
+    void pre_forward() override { set_shape(pts_, shape_of(layout_)); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(counts_.shape(), {counts_}, {pts_}, {});
+        return create_launch_config(sycl::range<1>{layout_.size()}, {layout_}, {pts_}, {});
     }
 };
 
-// ---- Scale: out = 2 * in, the output inherits the input's per-index dims (FromInputDim) -----------------
+// ---- Scale: out = 2 * in, the output takes the input's ragged shape ---------------------------------------
 struct ScaleBody {
     struct Inputs {
-        cs::RaggedInput<DType::f32, 3> in;
+        cs::RaggedInput<DType::f32, 2> in;
     };
     struct Outputs {
-        cs::RaggedOutput<DType::f32, 3> out;
+        cs::RaggedOutput<DType::f32, 2> out;
     };
     void operator()(sycl::id<1> id, Inputs in, Outputs out) const {
         auto bi = in.in.block(id[0]);
@@ -123,20 +134,21 @@ struct ScaleBody {
     }
 };
 class Scale : public cs::Component<ScaleBody> {
-    cs::RaggedInput<DType::f32, 3>  in_;
-    cs::RaggedOutput<DType::f32, 3> out_;
+    cs::RaggedInput<DType::f32, 2>  in_;
+    cs::RaggedOutput<DType::f32, 2> out_;
 
 public:
     void setup() override {
-        declare_input(in_, "in", cs::unspecified, cs::unspecified, cs::unspecified);
-        declare_output(out_, "out", cs::FromInputDim{"in", 0}, cs::FromInputDim{"in", 1}, cs::FromInputDim{"in", 2});
+        declare_input(in_, "in");
+        declare_output(out_, "out");
     }
+    void pre_forward() override { set_shape(out_, shape_of(in_)); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return create_launch_config(sycl::range<1>{in_.size()}, {in_}, {out_}, {});
     }
 };
 
-// ---- Sum: sums[i] = the sum of every element of block i (rank-agnostic, flat access) -----------------
+// ---- Sum: sums[i] = the sum of every element of block i ---------------------------------------------------
 template <int R>
 struct SumBody {
     struct Inputs {
@@ -159,68 +171,37 @@ class Sum : public cs::Component<SumBody<R>> {
 
 public:
     void setup() override {
-        if constexpr (R == 3)
-            this->declare_input(pts_, "pts", cs::unspecified, cs::unspecified, cs::unspecified);
-        else
-            this->declare_input(pts_, "pts", cs::unspecified, cs::unspecified);
-        this->declare_output(sums_, "sums", cs::FromInputDim{"pts", 0});
+        this->declare_input(pts_, "pts");
+        this->declare_output(sums_, "sums", cs::unspecified);
     }
+    void pre_forward() override { this->set_shape(sums_, sycl::range<1>{this->shape_of(pts_).n}); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return this->create_launch_config(sums_.shape(), {pts_}, {sums_}, {});
     }
 };
 
-/// counts -> fill -> scale -> sum (n counts, free input "counts.raw").
+/// counts -> fill -> scale -> sum (n counts, free input "counts.raw"); fill's layout is hooked from counts.counts.
 class RaggedTop : public cs::System {
     std::size_t n_;
 
 public:
     explicit RaggedTop(std::size_t n) : n_{n} {}
     void setup() override {
-        add_subsystem<Counts>("counts", n_);
-        add_subsystem<Fill>("fill");
-        add_subsystem<Scale>("scale");
-        add_subsystem<Sum<3>>("sum");
-        connect("counts.counts", "fill.counts");
+        add_subsystem(cs::subsystem_desc<Counts>("counts", n_));
+        add_subsystem(cs::subsystem_desc<Fill>("fill"));
+        add_subsystem(cs::subsystem_desc<Scale>("scale"));
+        add_subsystem(cs::subsystem_desc<Sum<2>>("sum"));
+        shape_hook("fill.layout", cs::ragged::counts_from("counts.counts"));
         connect("fill.pts", "scale.in");
         connect("scale.out", "sum.pts");
     }
 };
 
-// ---- Cols: [N,2] input; BOTH trailing dims per-index, from the two columns ----------------------------------
-struct ColsBody {
+// ---- Col0: [N,2] input; the counts are COLUMN 0 (counts_from reads column 0 of a rank-2 source) --------------
+struct Col0Body {
     struct Inputs {
-        cs::Input<DType::u32, 2> ab;
-    };
-    struct Outputs {
-        cs::RaggedOutput<DType::f32, 3> t;
-    };
-    void operator()(sycl::id<1> id, Inputs, Outputs out) const {
-        const std::size_t i = id[0];
-        auto              b = out.t.block(i);
-        for (std::size_t j = 0; j < b.shape()[0]; ++j)
-            for (std::size_t k = 0; k < b.shape()[1]; ++k)
-                b[sycl::id<2>{j, k}] = static_cast<float>(i * 1000 + j * 10 + k);
-    }
-};
-class Cols : public cs::Component<ColsBody> {
-    cs::Input<DType::u32, 2>        ab_;
-    cs::RaggedOutput<DType::f32, 3> t_;
-
-public:
-    void setup() override {
-        declare_input(ab_, "ab", 4, 2);
-        declare_output(t_, "t", cs::FromInputDim{"ab", 0}, cs::FromInputValues{"ab", 0}, cs::FromInputValues{"ab", 1});
-    }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(sycl::range<1>{ab_.shape()[0]}, {ab_}, {t_}, {});
-    }
-};
-
-// ---- Col1: [N,2] input, the extents are COLUMN 1 -------------------------------------------------------------
-struct Col1Body {
-    struct Inputs {
-        cs::Input<DType::u32, 2> cnt;
+        cs::Input<DType::u32, 2>       cnt;
+        cs::RaggedInput<DType::f32, 2> layout;
     };
     struct Outputs {
         cs::RaggedOutput<DType::f32, 2> v;
@@ -231,24 +212,28 @@ struct Col1Body {
         for (std::size_t j = 0; j < b.shape()[0]; ++j) b[j] = static_cast<float>(i * 100 + j);
     }
 };
-class Col1 : public cs::Component<Col1Body> {
+class Col0 : public cs::Component<Col0Body> {
     cs::Input<DType::u32, 2>        cnt_;
+    cs::RaggedInput<DType::f32, 2>  layout_;
     cs::RaggedOutput<DType::f32, 2> v_;
 
 public:
     void setup() override {
         declare_input(cnt_, "cnt", 4, 2);
-        declare_output(v_, "v", cs::FromInputDim{"cnt", 0}, cs::FromInputValues{"cnt", 1});
+        declare_input(layout_, "layout");
+        declare_output(v_, "v");
     }
+    void pre_forward() override { set_shape(v_, shape_of(layout_)); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(sycl::range<1>{cnt_.shape()[0]}, {cnt_}, {v_}, {});
+        return create_launch_config(sycl::range<1>{cnt_.shape()[0]}, {cnt_, layout_}, {v_}, {});
     }
 };
 
 // ---- Neg: an i32 input of extents; a negative one is an error ---------------------------------------------------
 struct NegBody {
     struct Inputs {
-        cs::Input<DType::i32, 1> cnt;
+        cs::Input<DType::i32, 1>       cnt;
+        cs::RaggedInput<DType::f32, 2> layout;
     };
     struct Outputs {
         cs::RaggedOutput<DType::f32, 2> v;
@@ -257,19 +242,32 @@ struct NegBody {
 };
 class Neg : public cs::Component<NegBody> {
     cs::Input<DType::i32, 1>        cnt_;
+    cs::RaggedInput<DType::f32, 2>  layout_;
     cs::RaggedOutput<DType::f32, 2> v_;
 
 public:
     void setup() override {
         declare_input(cnt_, "cnt", 3);
-        declare_output(v_, "v", cs::FromInputDim{"cnt", 0}, cs::FromInputValues{"cnt"});
+        declare_input(layout_, "layout");
+        declare_output(v_, "v");
     }
+    void pre_forward() override { set_shape(v_, shape_of(layout_)); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(cnt_.shape(), {cnt_}, {v_}, {});
+        return create_launch_config(cnt_.shape(), {cnt_, layout_}, {v_}, {});
     }
 };
 
-// ---- Make: a PerIndex host-array port of n blocks; m.block(i)[j] = i*100 + j -------------------------------------
+/// One child "c" whose ragged input `layout` is hooked from its own input `cnt`.
+template <class C>
+class HookedTop : public cs::System {
+public:
+    void setup() override {
+        add_subsystem(cs::subsystem_desc<C>("c"));
+        shape_hook("c.layout", cs::ragged::counts_from("c.cnt"));
+    }
+};
+
+// ---- Make: a cs::counts host-array port of n blocks; m.block(i)[j] = i*100 + j -----------------------------------
 struct MakeBody {
     struct Inputs {};
     struct Outputs {
@@ -282,58 +280,45 @@ struct MakeBody {
     }
 };
 class Make : public cs::Component<MakeBody> {
-    std::size_t                     n_;
     Sizes                           sizes_;
     cs::RaggedOutput<DType::f32, 2> m_;
 
 public:
-    Make(std::size_t n, Sizes sizes) : n_{n}, sizes_{std::move(sizes)} {}
-    void setup() override { declare_output(m_, "m", n_, cs::per_index(sizes_)); }
+    explicit Make(Sizes sizes) : sizes_{std::move(sizes)} {}
+    void setup() override { declare_output(m_, "m", cs::counts(sizes_)); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(sycl::range<1>{n_}, {}, {m_}, {});
+        return create_launch_config(sycl::range<1>{sizes_.size()}, {}, {m_}, {});
     }
 };
 
-/// Sums a rank-2 ragged input that DECLARES its own per-index host array (checked against the source).
+/// Sums a rank-2 ragged input that DECLARES its own counts (merged with the source's at connect).
 class TakeSum : public cs::Component<SumBody<2>> {
-    std::size_t                    n_;
     Sizes                          sizes_;
     cs::RaggedInput<DType::f32, 2> pts_;
     cs::Output<DType::f32, 1>      sums_;
 
 public:
-    TakeSum(std::size_t n, Sizes sizes) : n_{n}, sizes_{std::move(sizes)} {}
+    explicit TakeSum(Sizes sizes) : sizes_{std::move(sizes)} {}
     void setup() override {
-        declare_input(pts_, "pts", n_, cs::per_index(sizes_));
-        declare_output(sums_, "sums", cs::FromInputDim{"pts", 0});
+        declare_input(pts_, "pts", cs::counts(sizes_));
+        declare_output(sums_, "sums", cs::unspecified);
     }
+    void pre_forward() override { set_shape(sums_, sycl::range<1>{shape_of(pts_).n}); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return create_launch_config(sums_.shape(), {pts_}, {sums_}, {});
     }
 };
 
-/// make (n blocks of `make_sizes`) -> take (declares `take_sizes`).
+/// make (blocks of `make_sizes`) -> take (declares `take_sizes`).
 class PerIndexTop : public cs::System {
-    std::size_t n_;
-    Sizes       make_, take_;
+    Sizes make_, take_;
 
 public:
-    PerIndexTop(std::size_t n, Sizes make_sizes, Sizes take_sizes)
-        : n_{n}, make_{std::move(make_sizes)}, take_{std::move(take_sizes)} {}
+    PerIndexTop(Sizes make_sizes, Sizes take_sizes) : make_{std::move(make_sizes)}, take_{std::move(take_sizes)} {}
     void setup() override {
-        add_subsystem<Make>("make", n_, make_);
-        add_subsystem<TakeSum>("take", n_, take_);
+        add_subsystem(cs::subsystem_desc<Make>("make", make_));
+        add_subsystem(cs::subsystem_desc<TakeSum>("take", take_));
         connect("make.m", "take.pts");
-    }
-};
-
-/// make -> sum<2> (inherits through an unspecified dim), the Slice of `slice` between them.
-class SliceTop : public cs::System {
-public:
-    void setup() override {
-        add_subsystem<Make>("make", std::size_t{4}, Sizes{1, 0, 3, 2});
-        add_subsystem<Sum<2>>("sum");
-        connect("make.m", "sum.pts", cs::Slice{cs::subarray<2>({0, 0}, {2, 1})});
     }
 };
 
@@ -357,46 +342,14 @@ public:
 class DenseTop : public cs::System {
 public:
     void setup() override {
-        add_subsystem<DenseGen>("gen");
-        add_subsystem<Sum<2>>("sum");
+        add_subsystem(cs::subsystem_desc<DenseGen>("gen"));
+        add_subsystem(cs::subsystem_desc<Sum<2>>("sum"));
         connect("gen.d", "sum.pts");
     }
 };
 
 // ---- errors ----------------------------------------------------------------------------------------------------------
-struct NoopBody {
-    struct Inputs {};
-    struct Outputs {};
-    void operator()(sycl::id<1>, Inputs, Outputs) const {}
-};
-/// A per-index spec on dimension 0.
-class Dim0Bad : public cs::Component<MakeBody> {
-    cs::RaggedOutput<DType::f32, 2> m_;
-
-public:
-    void setup() override { declare_output(m_, "m", cs::per_index(Sizes{1, 2}), 2); }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(sycl::range<1>{2}, {}, {m_}, {});
-    }
-};
-/// A DENSE wrapper declared with a per-index spec.
-struct DenseBadBody {
-    struct Inputs {};
-    struct Outputs {
-        cs::Output<DType::f32, 2> m;
-    };
-    void operator()(sycl::id<1>, Inputs, Outputs) const {}
-};
-class DenseBad : public cs::Component<DenseBadBody> {
-    cs::Output<DType::f32, 2> m_;
-
-public:
-    void setup() override { declare_output(m_, "m", std::size_t{4}, cs::per_index(Sizes{1, 0, 3, 2})); }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(sycl::range<1>{4}, {}, {m_}, {});
-    }
-};
-/// A dense INPUT that inherits a ragged source (through an unspecified dim).
+/// A dense INPUT that would take a ragged source (through unspecified dims).
 struct DenseInBody {
     struct Inputs {
         cs::Input<DType::f32, 2> in;
@@ -413,56 +366,20 @@ public:
         return create_launch_config(sycl::range<1>{4}, {in_}, {}, {});
     }
 };
-/// A dense OUTPUT that inherits a ragged input's per-index dim (FromInputDim).
-struct DenseOutBody {
-    struct Inputs {
-        cs::RaggedInput<DType::f32, 2> in;
-    };
-    struct Outputs {
-        cs::Output<DType::f32, 2> o;
-    };
-    void operator()(sycl::id<1>, Inputs, Outputs) const {}
-};
-class DenseOut : public cs::Component<DenseOutBody> {
-    cs::RaggedInput<DType::f32, 2> in_;
-    cs::Output<DType::f32, 2>      o_;
-
-public:
-    void setup() override {
-        declare_input(in_, "in", cs::unspecified, cs::unspecified);
-        declare_output(o_, "o", cs::FromInputDim{"in", 0}, cs::FromInputDim{"in", 1});
-    }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(sycl::range<1>{4}, {in_}, {o_}, {});
-    }
-};
 template <class C>
 class InheritTop : public cs::System {
 public:
     void setup() override {
-        add_subsystem<Make>("make", std::size_t{4}, Sizes{1, 0, 3, 2});
-        add_subsystem<C>("c");
+        add_subsystem(cs::subsystem_desc<Make>("make", Sizes{1, 0, 3, 2}));
+        add_subsystem(cs::subsystem_desc<C>("c"));
         connect("make.m", "c.in");
     }
 };
-template <class C>
-class SingleTop : public cs::System {
+/// A fused component (a helper-built descriptor) whose only stage has a ragged output.
+template <cs::fuse_strategy S>
+class FusedRagged : public cs::System {
 public:
-    void setup() override { add_subsystem<C>("c"); }
-};
-class WaveTop : public cs::FusedSystem {
-public:
-    WaveTop() : cs::FusedSystem(Mode::sequential, {}) {}
-    void setup() override { add_subsystem<Make>("make", std::size_t{4}, Sizes{1, 0, 3, 2}); }
-};
-class ParTop : public cs::ParallelSystem {
-public:
-    void setup() override { add_subsystem<Make>("make", std::size_t{4}, Sizes{1, 0, 3, 2}); }
-};
-template <class W>
-class HostTop : public cs::System {
-public:
-    void setup() override { add_subsystem<W>("w"); }
+    void setup() override { add_subsystem(cs::fuse_components<S>("w", cs::subsystem_desc<Make>("make", Sizes{1, 0, 3, 2}))); }
 };
 
 // ---- references ------------------------------------------------------------------------------------------------------
@@ -474,22 +391,30 @@ struct FillRef {
 FillRef fill_ref(const std::vector<std::uint32_t>& counts) {
     FillRef r;
     for (std::size_t i = 0; i < counts.size(); ++i) {
-        for (std::size_t j = 0; j < counts[i]; ++j)
-            for (std::size_t k = 0; k < 3; ++k) r.data.push_back(static_cast<float>(i * 1000 + j * 10 + k));
+        for (std::size_t j = 0; j < counts[i]; ++j) r.data.push_back(static_cast<float>(i * 1000 + j));
         r.offsets.push_back(r.data.size());
     }
     return r;
 }
 
+/// A synced host copy of a dense rank-1 output (the model has run).
+std::vector<float> dense1(cs::Model& model, const char* path) { return cst::to_vector(cst::synced_output<DType::f32, 1>(model, path)); }
+
+/// The elements of a synced ragged view, end to end.
+template <class View>
+std::vector<float> flat_of(const View& v) {
+    return std::vector<float>(v.span().begin(), v.span().end());
+}
+
 /// Run one forward with `counts` and check every view against the references.
 void run_counts(cs::Model& model, const std::vector<std::uint32_t>& counts) {
-    if (!counts.empty()) model.init_input("counts.raw", cs::init::from_host(counts));
+    if (!counts.empty()) model.update_input("counts.raw", cs::init::from_host(counts));
     model.forward();
     model.wait();
     const FillRef ref = fill_ref(counts);
 
     // the dense sums of the scaled blocks
-    auto sums = model.view_output<DType::f32, 1>("sum.sums");
+    auto sums = cst::synced_output<DType::f32, 1>(model, "sum.sums");
     REQUIRE(sums.size() == counts.size());
     for (std::size_t i = 0; i < counts.size(); ++i) {
         float want = 0.0f;
@@ -499,28 +424,25 @@ void run_counts(cs::Model& model, const std::vector<std::uint32_t>& counts) {
     }
 
     // the ragged output itself, and its peer
-    auto pts = model.view_ragged_output<DType::f32, 3>("fill.pts");
-    CHECK(pts.size() == counts.size());
-    CHECK(pts.offsets == ref.offsets);
-    CHECK(pts.data == ref.data);
-    CHECK(pts.extents(1) == Sizes(counts.begin(), counts.end()));
-    CHECK(pts.extents(2) == Sizes(counts.size(), 3));
-    CHECK(pts.is_per_index(1));
-    CHECK_FALSE(pts.is_per_index(2));
+    auto pts = model.view_ragged_output<DType::f32, 2>("fill.pts");
+    pts.sync();
+    CHECK(pts.n() == counts.size());
+    CHECK(pts.block_offsets() == ref.offsets);
+    CHECK(flat_of(pts) == ref.data);
     for (std::size_t i = 0; i < counts.size(); ++i) {
-        auto b = pts.block(i);
-        REQUIRE(b.shape()[0] == counts[i]);
-        REQUIRE(b.shape()[1] == 3);
-        for (std::size_t j = 0; j < counts[i]; ++j)
-            for (std::size_t k = 0; k < 3; ++k) CHECK(b[sycl::id<2>{j, k}] == static_cast<float>(i * 1000 + j * 10 + k));
+        const auto b = pts.block(i);  // a flat span: counts[i] elements
+        REQUIRE(b.size() == counts[i]);
+        for (std::size_t j = 0; j < counts[i]; ++j) CHECK(b[j] == static_cast<float>(i * 1000 + j));
     }
-    auto scaled = model.view_ragged_output<DType::f32, 3>("scale.out");
-    CHECK(scaled.offsets == ref.offsets);
-    REQUIRE(scaled.data.size() == ref.data.size());
-    for (std::size_t q = 0; q < ref.data.size(); ++q) CHECK(scaled.data[q] == 2.0f * ref.data[q]);
-    auto peer = model.view_ragged_input<DType::f32, 3>("scale.in");  // an input peer of the root
-    CHECK(peer.data == ref.data);
-    CHECK(peer.extents(1) == pts.extents(1));
+    auto scaled = model.view_ragged_output<DType::f32, 2>("scale.out");
+    scaled.sync();
+    CHECK(scaled.block_offsets() == ref.offsets);
+    REQUIRE(scaled.size() == ref.data.size());
+    for (std::size_t q = 0; q < ref.data.size(); ++q) CHECK(scaled.span()[q] == 2.0f * ref.data[q]);
+    auto peer = model.view_ragged_input<DType::f32, 2>("scale.in");  // an input peer of the root
+    peer.sync();
+    CHECK(flat_of(peer) == ref.data);
+    CHECK(peer.block_offsets() == ref.offsets);
 }
 
 }  // namespace trag
@@ -536,69 +458,42 @@ TEST_CASE("Ragged: fill / scale / sum over forwards with changing counts", "[rag
 }
 
 TEST_CASE("Ragged: N = 0 stays ragged-capable", "[ragged]") {
+    // REVIEW: n = 0 makes zero-size variables (raw, counts, layout, pts); the headers do not say how a zero-element allocation
+    // is handled now that the old arena (and its "no arena for a size-0 root" comment) is gone. The old assertions are kept.
     cs::Model model = cs::create_model<trag::RaggedTop>(default_config(), std::size_t{0});
     model.setup();
     trag::run_counts(model, {});
-    auto pts = model.view_ragged_output<DType::f32, 3>("fill.pts");
+    auto pts = model.view_ragged_output<DType::f32, 2>("fill.pts");
+    pts.sync();
+    CHECK(pts.n() == 0);
+    CHECK(pts.block_offsets() == std::vector<std::uint64_t>{0});
     CHECK(pts.size() == 0);
-    CHECK(pts.offsets == std::vector<std::uint64_t>{0});
-    CHECK(pts.data.empty());
 }
 
-TEST_CASE("Ragged: FromInputValues on a rank-2 [N,k] input, column 1", "[ragged]") {
-    cs::Model model = cs::create_model<trag::SingleTop<trag::Col1>>(default_config());
+TEST_CASE("Ragged: counts_from on a rank-2 [N,k] input reads column 0", "[ragged]") {
+    // was: FromInputValues on column 1. counts_from takes no column argument: it reads column 0 (the data below is the old
+    // one with its columns swapped), see the REVIEW in test_shapes.cpp.
+    cs::Model model = cs::create_model<trag::HookedTop<trag::Col0>>(default_config());
     model.setup();
-    model.init_input("c.cnt", cs::init::from_host(std::vector<std::uint32_t>{9, 2, 9, 0, 9, 3, 9, 1}));
+    model.update_input("c.cnt", cs::init::from_host(std::vector<std::uint32_t>{2, 9, 0, 9, 3, 9, 1, 9}));
     model.forward();
     model.wait();
     auto v = model.view_ragged_output<DType::f32, 2>("c.v");
-    CHECK(v.size() == 4);
-    CHECK(v.offsets == std::vector<std::uint64_t>{0, 2, 2, 5, 6});
-    CHECK(v.extents(1) == trag::Sizes{2, 0, 3, 1});
-    CHECK(v.data == std::vector<float>{0, 1, 200, 201, 202, 300});
+    v.sync();
+    CHECK(v.n() == 4);
+    CHECK(v.block_offsets() == std::vector<std::uint64_t>{0, 2, 2, 5, 6});
+    const trag::Sizes extents{2, 0, 3, 1};  // the blocks' sizes (the per-index extents of dimension 1)
+    for (std::size_t i = 0; i < 4; ++i) CHECK(v.block(i).size() == extents[i]);
+    CHECK(trag::flat_of(v) == std::vector<float>{0, 1, 200, 201, 202, 300});
 }
 
-TEST_CASE("Ragged: both trailing dims per-index, from two columns", "[ragged]") {
-    cs::Model model = cs::create_model<trag::SingleTop<trag::Cols>>(default_config());
-    model.setup();
-    const auto run = [&](const std::vector<std::uint32_t>& ab) {
-        model.init_input("c.ab", cs::init::from_host(ab));
-        model.forward();
-        model.wait();
-        auto t = model.view_ragged_output<DType::f32, 3>("c.t");
-        REQUIRE(t.size() == 4);
-        trag::Sizes        e1, e2;
-        std::vector<float> data;
-        std::vector<std::uint64_t> offs{0};
-        for (std::size_t i = 0; i < 4; ++i) {
-            e1.push_back(ab[2 * i]);
-            e2.push_back(ab[2 * i + 1]);
-            for (std::size_t j = 0; j < ab[2 * i]; ++j)
-                for (std::size_t k = 0; k < ab[2 * i + 1]; ++k) data.push_back(static_cast<float>(i * 1000 + j * 10 + k));
-            offs.push_back(data.size());
-        }
-        CHECK(t.extents(1) == e1);
-        CHECK(t.extents(2) == e2);
-        CHECK(t.is_per_index(1));
-        CHECK(t.is_per_index(2));
-        CHECK(t.offsets == offs);
-        CHECK(t.data == data);
-        for (std::size_t i = 0; i < 4; ++i) {
-            CHECK(t.block(i).shape()[0] == e1[i]);
-            CHECK(t.block(i).shape()[1] == e2[i]);
-        }
-    };
-    run({2, 3, 0, 4, 3, 0, 1, 1});  // empty blocks in the middle (a zero in either column)
-    run({0, 5, 2, 2, 3, 1, 0, 0});  // empty first and last blocks, then growth
-}
-
-TEST_CASE("Ragged: a ragged output connected to a ragged input with matching extents", "[ragged]") {
+TEST_CASE("Ragged: a ragged output connected to a ragged input with matching counts", "[ragged]") {
     const trag::Sizes sizes{1, 0, 3, 2};
-    cs::Model model = cs::create_model<trag::PerIndexTop>(default_config(), std::size_t{4}, sizes, sizes);
+    cs::Model         model = cs::create_model<trag::PerIndexTop>(default_config(), sizes, sizes);
     model.setup();
     model.forward();
     model.wait();
-    auto sums = model.view_output<DType::f32, 1>("take.sums");
+    auto sums = cst::synced_output<DType::f32, 1>(model, "take.sums");
     REQUIRE(sums.size() == 4);
     for (std::size_t i = 0; i < 4; ++i) {
         float want = 0.0f;
@@ -606,33 +501,40 @@ TEST_CASE("Ragged: a ragged output connected to a ragged input with matching ext
         CHECK(sums.span()[i] == want);
     }
     auto m = model.view_ragged_output<DType::f32, 2>("make.m");
-    CHECK(m.offsets == std::vector<std::uint64_t>{0, 1, 1, 4, 6});
-    CHECK(m.extents(1) == sizes);
-    CHECK(m.data == std::vector<float>{0, 200, 201, 202, 300, 301});
-    // N = 0 with a PerIndex array of length 0 is ragged-capable too
-    cs::Model zero = cs::create_model<trag::PerIndexTop>(default_config(), std::size_t{0}, trag::Sizes{}, trag::Sizes{});
+    m.sync();
+    CHECK(m.block_offsets() == std::vector<std::uint64_t>{0, 1, 1, 4, 6});
+    for (std::size_t i = 0; i < 4; ++i) CHECK(m.block(i).size() == sizes[i]);
+    CHECK(trag::flat_of(m) == std::vector<float>{0, 200, 201, 202, 300, 301});
+    // N = 0 with a counts array of length 0 is ragged-capable too
+    cs::Model zero = cs::create_model<trag::PerIndexTop>(default_config(), trag::Sizes{}, trag::Sizes{});
     zero.setup();
     zero.forward();
     zero.wait();
     auto z = zero.view_ragged_output<DType::f32, 2>("make.m");
-    CHECK(z.size() == 0);
-    CHECK(z.offsets == std::vector<std::uint64_t>{0});
+    z.sync();
+    CHECK(z.n() == 0);
+    CHECK(z.block_offsets() == std::vector<std::uint64_t>{0});
 }
 
-TEST_CASE("Ragged: mismatching declared per-index arrays error at forward", "[ragged][errors][shape]") {
-    SECTION("same total, different extents") {
-        cs::Model model = cs::create_model<trag::PerIndexTop>(default_config(), std::size_t{4}, trag::Sizes{1, 0, 3, 2},
-                                                              trag::Sizes{2, 1, 2, 1});
-        model.setup();
-        trag::expect_throws([&] { model.forward(); }, {"'take.pts'", "dimension 1 is PerIndex", "'make.m'"});
-        model.wait();  // the source already launched
+TEST_CASE("Ragged: mismatching declared counts error at connect (setup)", "[ragged][errors][shape]") {
+    // Design review, section 10: declared counts are definitions and merge at the connect: two specified values that
+    // disagree are an error AT THE CALL (it was a forward-time error before).
+    SECTION("same total, different counts") {
+        cs::Model model = cs::create_model<trag::PerIndexTop>(default_config(), trag::Sizes{1, 0, 3, 2}, trag::Sizes{2, 1, 2, 1});
+        trag::expect_throws([&] { model.setup(); },
+                            {"connect('make.m', 'take.pts')", "dimension 1", "the counts must match", "[1,0,3,2]", "[2,1,2,1]"});
     }
     SECTION("a different total") {
-        cs::Model model = cs::create_model<trag::PerIndexTop>(default_config(), std::size_t{4}, trag::Sizes{1, 0, 3, 2},
-                                                              trag::Sizes{1, 1, 1, 1});
-        model.setup();
-        trag::expect_throws([&] { model.forward(); }, {"'take.pts'", "per-index", "'make.m'"});
-        model.wait();
+        cs::Model model = cs::create_model<trag::PerIndexTop>(default_config(), trag::Sizes{1, 0, 3, 2}, trag::Sizes{1, 1, 1, 1});
+        trag::expect_throws([&] { model.setup(); },
+                            {"connect('make.m', 'take.pts')", "the counts must match", "[1,1,1,1]", "[1,0,3,2]"});
+    }
+    SECTION("a different number of indices") {
+        // was "a per-index length different from N" (a forward-time error): N is the length of the counts, so the leading
+        // dimensions disagree
+        cs::Model model = cs::create_model<trag::PerIndexTop>(default_config(), trag::Sizes{1, 2, 3, 4}, trag::Sizes{1, 2, 3});
+        trag::expect_throws([&] { model.setup(); },
+                            {"connect('make.m', 'take.pts')", "dimension 0", "declares 4", "declares 3", "the extents must match"});
     }
 }
 
@@ -641,79 +543,56 @@ TEST_CASE("Ragged: a RaggedInput reading a DENSE port", "[ragged]") {
     model.setup();
     model.forward();
     model.wait();
-    auto sums = model.view_output<DType::f32, 1>("sum.sums");
+    auto sums = cst::synced_output<DType::f32, 1>(model, "sum.sums");
     REQUIRE(sums.size() == 3);
     for (std::size_t i = 0; i < 3; ++i) CHECK(sums.span()[i] == static_cast<float>(40 * i + 6));
     // view_ragged_* on a dense entry: offsets are the row starts
     auto d = model.view_ragged_output<DType::f32, 2>("gen.d");
-    CHECK(d.size() == 3);
-    CHECK(d.offsets == std::vector<std::uint64_t>{0, 4, 8, 12});
-    CHECK(d.extents(1) == trag::Sizes{4, 4, 4});
-    CHECK_FALSE(d.is_per_index(1));
+    d.sync();
+    CHECK(d.n() == 3);
+    CHECK(d.block_offsets() == std::vector<std::uint64_t>{0, 4, 8, 12});
+    for (std::size_t i = 0; i < 3; ++i) CHECK(d.block(i).size() == 4);
     CHECK(d.block(2)[std::size_t{3}] == 23.0f);
     auto in = model.view_ragged_input<DType::f32, 2>("sum.pts");
-    CHECK(in.data == d.data);
-    CHECK(in.offsets == d.offsets);
+    in.sync();
+    CHECK(trag::flat_of(in) == trag::flat_of(d));
+    CHECK(in.block_offsets() == d.block_offsets());
     // the dense view of a dense entry is unchanged
-    CHECK(model.view_output<DType::f32, 2>("gen.d").span()[5] == 11.0f);
+    CHECK(cst::synced_output<DType::f32, 2>(model, "gen.d").span()[5] == 11.0f);
 }
 
 TEST_CASE("Ragged: the dense host views of a ragged entry point to view_ragged_*", "[ragged][errors]") {
     cs::Model model = cs::create_model<trag::RaggedTop>(default_config(), std::size_t{6});
     model.setup();
     trag::run_counts(model, {3, 0, 2, 4, 0, 1});
-    trag::expect_throws([&] { (void)model.view_output<DType::f32, 3>("fill.pts"); }, {"fill.pts", "view_ragged_output"});
-    trag::expect_throws([&] { (void)model.view_input<DType::f32, 3>("sum.pts"); }, {"sum.pts", "view_ragged_input"});
+    trag::expect_throws([&] { (void)model.view_output<DType::f32, 2>("fill.pts"); }, {"fill.pts", "view_ragged_output"});
+    trag::expect_throws([&] { (void)model.view_input<DType::f32, 2>("sum.pts"); }, {"sum.pts", "view_ragged_input"});
     // the wrong dtype or rank still names the view
-    trag::expect_throws([&] { (void)model.view_ragged_output<DType::u32, 3>("fill.pts"); }, {"wrong dtype or rank"});
+    trag::expect_throws([&] { (void)model.view_ragged_output<DType::u32, 2>("fill.pts"); }, {"wrong dtype or rank"});
 }
 
 TEST_CASE("Ragged: declaration and binding errors", "[ragged][errors]") {
-    SECTION("a per-index spec on dimension 0") {
-        cs::Model model = cs::create_model<trag::SingleTop<trag::Dim0Bad>>(default_config());
-        trag::expect_throws([&] { model.setup(); }, {"dimension 0"});
-    }
-    SECTION("a dense wrapper declared with a per-index spec") {
-        cs::Model model = cs::create_model<trag::SingleTop<trag::DenseBad>>(default_config());
-        trag::expect_throws([&] { model.setup(); }, {"'m'", "per-index dims need RaggedInput/RaggedOutput"});
-    }
-    SECTION("a dense input inheriting a ragged source") {
+    SECTION("a dense input connected to a ragged source: the connect throws at setup") {
+        // A dense Input cannot see per-index extents, and that is a wiring rule: connect checks it in its own call
+        // (section 2; wiring.hpp, connect).
         cs::Model model = cs::create_model<trag::InheritTop<trag::DenseIn>>(default_config());
-        model.setup();
-        trag::expect_throws([&] { model.forward(); }, {"'in' is ragged; declare it with RaggedInput/RaggedOutput"});
-        model.wait();
-    }
-    SECTION("a dense output inheriting a per-index dim of a ragged input") {
-        cs::Model model = cs::create_model<trag::InheritTop<trag::DenseOut>>(default_config());
-        model.setup();
-        trag::expect_throws([&] { model.forward(); }, {"'o' is ragged; declare it with RaggedInput/RaggedOutput"});
-        model.wait();
-    }
-    SECTION("a per-index length different from N") {
-        cs::Model model = cs::create_model<trag::PerIndexTop>(default_config(), std::size_t{4}, trag::Sizes{1, 2, 3},
-                                                              trag::Sizes{1, 2, 3, 4});
-        model.setup();
-        trag::expect_throws([&] { model.forward(); },
-                            {"make.m", "per-index dimension 1 has 3 extents but dimension 0 has 4"});
+        trag::expect_throws([&] { model.setup(); },
+                            {"connect('make.m', 'c.in')", "'make.m' is ragged", "a dense Input cannot see per-index extents", "RaggedInput"});
     }
     SECTION("negative extents") {
-        cs::Model model = cs::create_model<trag::SingleTop<trag::Neg>>(default_config());
+        cs::Model model = cs::create_model<trag::HookedTop<trag::Neg>>(default_config());
         model.setup();
-        model.init_input("c.cnt", cs::init::from_host(std::vector<std::int32_t>{1, -1, 2}));
-        trag::expect_throws([&] { model.forward(); }, {"negative extent"});
+        model.update_input("c.cnt", cs::init::from_host(std::vector<std::int32_t>{1, -1, 2}));
+        // (the old needle was "negative extent"; the hook says "holds a negative value; a size cannot be negative")
+        trag::expect_throws([&] { model.forward(); }, {"shape hook on 'c.layout'", "holds a negative value"});
+        model.wait();
     }
-    SECTION("a Slice onto a ragged port") {
-        cs::Model model = cs::create_model<trag::SliceTop>(default_config());
-        trag::expect_throws([&] { model.setup(); }, {"ragged", "Slice"});
+    SECTION("a ragged port in a fused component: refused at setup") {
+        cs::Model model = cs::create_model<trag::FusedRagged<cs::fuse_strategy::seq>>(default_config());
+        trag::expect_throws([&] { model.setup(); }, {"ragged ports are not supported in fused components yet"});
     }
-    SECTION("a ragged port in a FusedSystem") {
-        cs::Model model = cs::create_model<trag::HostTop<trag::WaveTop>>(default_config());
-        trag::expect_throws([&] { model.setup(); },
-                            {"ragged ports are not supported in fused/parallel systems yet"});
-    }
-    SECTION("a ragged port in a ParallelSystem") {
-        cs::Model model = cs::create_model<trag::HostTop<trag::ParTop>>(default_config());
-        trag::expect_throws([&] { model.setup(); },
-                            {"ragged ports are not supported in fused/parallel systems yet"});
+    SECTION("a ragged port in a parallel fused component: refused at setup") {
+        cs::Model model = cs::create_model<trag::FusedRagged<cs::fuse_strategy::par>>(default_config());
+        trag::expect_throws([&] { model.setup(); }, {"ragged ports are not supported in fused components yet"});
     }
 }

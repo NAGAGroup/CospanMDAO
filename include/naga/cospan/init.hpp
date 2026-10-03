@@ -1,167 +1,119 @@
 #pragma once
 
 // =============================================================================
-// naga/cospan/init.hpp — initial values of free input roots (r01 §4.4)
+// naga/cospan/init.hpp — initializers: the initial value, and the value, of a free input
 // =============================================================================
 //
-// An initial value is METADATA on a free input root (an input root with no
-// source), declared during setup() with ComponentBase::init_input(name, init)
-// or System::init_input(path, init), or at any time after setup with
-// Model::init_input(path, init), which wins over both. The highest level
-// wins; the root's owner applies it when it allocates the root, and again when
-// Model::init_input leaves one pending. Data reaches an input from the host only this way; outputs are
-// never initialized (§6.0).
+// An initializer is METADATA on a variable (docs/design-review-2026-10-03.md, sections 1, 5 and 6): it is
+// declared during setup() with ComponentBase::init_input(name, init) or System::init_input(path, init), and
+// replaced at run time by Model::update_input(path, init), which also marks the variable stale. Which
+// declaration wins is simple: the LAST one (a parent's setup runs after its children's, so a tie's, promotion's or
+// System's initializer replaces the members'; no conflict error).
+// materialize (variable.hpp) runs the initializer when the variable is stale: on a variable that is not
+// materialized, at its allocation; on a live one, in place. Outputs are never initialized.
 //
-//   cs::init::fill(v)           every element = v (converted to the root's dtype)
+// EVERY initializer RETURNS THE EVENT OF THE WORK IT ENQUEUED: materialize records it as the variable's
+// write, and whatever reads the variable (the driving-value accessor of section 6, a consumer) waits on it.
+//
+//   cs::init::fill(v)           every element = v (converted to the variable's dtype)
 //   cs::init::zero()            every element = 0
-//   cs::init::from_host(vec)    element i = vec[i]; vec.size() = the root's flat size
-//   cs::init::custom<DT,R>(fn)  fn(queue&, Initializer<DT,R>): the function enqueues
-//                               its own kernel on the queue
-//   cs::init::custom_host<DT,R>(fn)  fn(HostViewMut<DT,R>&): host-side, committed on return
-//                               (HostViewMut is only this callback's argument type)
+//   cs::init::from_host(vec)    element i = vec[i]; vec.size() = the variable's number of elements
+//   cs::init::custom<DT,R>(fn)  fn(unordered_queue&, device, deps, Initializer<DT,R>) -> event: the function
+//                               enqueues its own kernel (or copy) on the queue, makes it depend on `deps`, and
+//                               returns the event of that work
+//   cs::init::custom_host<DT,R>(fn)  fn(HostInit<DT,R>&): host-side; the buffer is copied to the device after it returns
 //
 // A shape (cs::init::Shape) is written as a list of extents, {n, m}, or as a ragged one:
-//   cs::init::ragged(n, d1[, d2])  each di is one extent for every index or a vector of n extents, one per index
+//   cs::init::ragged(n, d1)        d1 is one extent for every index or a vector of n counts, one per index (rank 2 only)
 // An initializer that carries a shape supplies a free input's unspecified dimensions, and EVERY dimension of it is
-// checked against the resolved root when it is applied (at the full range): a mismatch throws, naming both sides.
+// checked against the resolved variable when it is applied: a mismatch throws, naming both sides.
 
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <initializer_list>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
 #include <vector>
 
+#include <sycl/sycl.hpp>
+
+#include "naga/slabkit/slabkit.hpp"
+
+#include "naga/cospan/dispatch.hpp"
 #include "naga/cospan/dtype.hpp"
-#include "naga/cospan/host_view.hpp"
+#include "naga/cospan/init_spec.hpp"
+#include "naga/cospan/instance.hpp"
 #include "naga/cospan/metadata.hpp"
-#include "naga/cospan/reactive_shape.hpp"
+#include "naga/cospan/runtime.hpp"
+#include "naga/cospan/subsystem.hpp"
+#include "naga/cospan/variable.hpp"
 #include "naga/cospan/wrappers.hpp"
 
 namespace naga::cospan {
 
 namespace detail {
+struct HostInitAccess;
+}
 
-/// Calls f(std::type_identity<T>{}) with T the C++ element type of `dt`.
-template <class F>
-void dispatch_dtype(DType dt, F&& f) {
-    switch (value_dtype(dt)) {
-        case DType::f32: f(std::type_identity<float>{}); break;
-        case DType::f64: f(std::type_identity<double>{}); break;
-        case DType::i32: f(std::type_identity<int32_t>{}); break;
-        case DType::u32: f(std::type_identity<uint32_t>{}); break;
-        case DType::i64: f(std::type_identity<int64_t>{}); break;
-        case DType::u64: f(std::type_identity<uint64_t>{}); break;
-        default: f(std::type_identity<uint8_t>{}); break;
+/// HostInit<DT, Rank> — the zero-initialized host buffer handed to a cs::init::custom_host function: one element per
+/// element of the variable. It is built by the framework only; the framework copies it to the device when the
+/// function returns. Dense variables are addressed by shape() and operator()(i, j, ...) (row-major); a ragged
+/// variable's buffer is its blocks end to end, addressed flat.
+template <DType DT, int Rank>
+class HostInit {
+public:
+    using value_type = cpp_type_t<DT>;
+    static constexpr DType dtype = DT;
+    static constexpr int   rank  = Rank;
+
+    HostInit(const HostInit&)            = delete;
+    HostInit& operator=(const HostInit&) = delete;
+    HostInit(HostInit&&) noexcept        = default;
+
+    sycl::range<Rank>     shape() const { return shape_; }
+    std::size_t           size() const { return host_.size(); }
+    value_type*           data() { return host_.data(); }
+    std::span<value_type> span() { return {host_.data(), host_.size()}; }
+
+    value_type& operator[](std::size_t flat) { return host_[flat]; }
+    value_type& operator()(std::size_t i)
+        requires(Rank == 1)
+    {
+        return host_[i];
     }
-}
-
-/// Depth of a subsystem in the tree: the root System is 0, its children 1, and so on.
-/// The declaring subsystem's depth decides which initial value wins (smallest depth).
-inline std::size_t depth_of(const Subsystem& s) {
-    if (s.path().empty()) return 0;
-    std::size_t d = 1;
-    for (const char c : s.path())
-        if (c == '.') ++d;
-    return d;
-}
-
-/// Zero a root's primary storage (ordered in the stream).
-inline void zero_primary(IOEntry& root, sk::queue& q) {
-    if (root.flat_size() == 0) return;
-    const Placement pl = root.storage_placements().front();
-    q.memset_in_order(pl.device, root.storage_on(pl), 0, root.flat_size() * dtype_size(root.dtype()));
-}
-
-inline std::string extents_str(const std::vector<std::size_t>& v) {
-    std::string out = "[";
-    for (std::size_t i = 0; i < v.size(); ++i) out += (i ? "," : "") + std::to_string(v[i]);
-    return out + "]";
-}
-
-/// The shape an init carries against the root's resolved shape: the rank and EVERY dimension (fixed, inherited,
-/// value-driven, per-index element by element). A scalar extent c equals a per-index array of c's. Bare data
-/// (from_host(vec)) describes only a rank-1 root; its size is checked when it is written.
-inline void check_init_shape(const IOEntry& root, const InitShape& s) {
-    if (s.flat && root.rank() != 1) return;
-    const std::string name = root.full_path();
-    if (s.rank != root.rank())
-        throw std::invalid_argument("naga::cospan: init for '" + name + "' has rank " + std::to_string(s.rank) + " but '" + name +
-                                    "' resolved rank " + std::to_string(root.rank()));
-    const std::size_t n = root.extents()[0];
-    for (int d = 0; d < root.rank(); ++d) {
-        const auto        u         = static_cast<std::size_t>(d);
-        const bool        init_per  = d >= 1 && s.per[u];
-        const bool        root_per  = d >= 1 && root.dim_is_per(d);
-        std::vector<std::size_t> init_v, root_v;
-        if (d == 0) {
-            init_v = {s.extents[0]};
-            root_v = {n};
-        } else {
-            init_v = init_per ? s.per_index[u] : std::vector<std::size_t>(s.extents[0], s.extents[u]);
-            root_v = root_per ? root.per_index_extents(d) : std::vector<std::size_t>(n, root.extents()[u]);
-        }
-        if (init_v == root_v) continue;
-        const std::string init_str = init_per ? extents_str(init_v) : std::to_string(s.extents[u]);
-        const std::string root_str = root_per ? extents_str(root_v) : std::to_string(root.extents()[u]);
-        throw std::invalid_argument("naga::cospan: init for '" + name + "' has dimension " + std::to_string(d) + " = " + init_str +
-                                    " but '" + name + "' resolved dimension " + std::to_string(d) + " (" + root.declared_rule(d) +
-                                    ") = " + root_str);
+    value_type& operator()(std::size_t i, std::size_t j)
+        requires(Rank == 2)
+    {
+        return host_[i * shape_[1] + j];
     }
-}
-
-/// A free input root that its owner has just allocated from nothing: its init, else zeros;
-/// then the other placements follow the primary. `full_range`: the root holds the whole run (not one chunk of a
-/// ChunkedSystem's replay), so the init's shape is checked against it.
-inline void apply_root_init(IOEntry& root, sk::queue& q, bool full_range = true) {
-    if (full_range)
-        if (const auto& s = root.init_spec(); s && s->shape()) check_init_shape(root, *s->shape());
-    if (root.flat_size() == 0) return;
-    root.bump_write();  // the init (fill, zero, from_host, custom) rewrites the whole root
-    if (const auto& s = root.init_spec())
-        s->apply(root, q);
-    else
-        zero_primary(root, q);
-    if (root.storage_placements().size() > 1) root.sync_other_placements(q);
-}
-
-/// MATERIALIZE ON NEED (r01 §4.5): the one function that brings a Variable's storage into being.
-///  - live nowhere: a bundle for every registered placement; a free input then takes its init (declared, else zeros);
-///  - live on some placements only: the missing ones are allocated and copy from a live one (no init);
-///  - live everywhere: nothing, except a pending Model::init_input, applied now.
-/// Every port then holds the bundle of its own placement, which is what keeps it alive: freeing is the last
-/// holder dropping it. A sourced variable that is live nowhere while its producer does not exist throws.
-inline void Variable::materialize(sk::queue& q, Substrates* subs, bool full_range, bool apply_init) {
-    IOEntry&          r   = *shadow;
-    const std::string who = ports.empty() ? std::string{r.name_} : ports.front()->full_path();
-    if (subs == nullptr) subs = r.substrates_;
-    if (subs == nullptr) throw std::logic_error("naga::cospan: '" + who + "' cannot be allocated before setup() completes");
-    const bool none_live = !any_live();
-    if (none_live && source_port == nullptr && !source_path.empty())
-        throw shape_needed(who, "its shape and storage", *shadow);
-    if (!r.placements_.empty()) {  // the shadow acts at the primary placement (an init writes there)
-        r.device_       = r.placements_.front().device;
-        r.storage_kind_ = r.placements_.front().kind;
+    value_type& operator()(std::size_t i, std::size_t j, std::size_t k)
+        requires(Rank == 3)
+    {
+        return host_[(i * shape_[1] + j) * shape_[2] + k];
     }
-    std::vector<std::shared_ptr<void>> fresh;  // held until every port has taken its own
-    r.allocate_missing(q, *subs, fresh);
-    for (IOEntry* p : ports)
-        if (auto b = live_bundle(p->placement())) p->bundle_ = std::move(b);
-    // The non-port users (a System reading this variable in a tie alias's shape rule) hold the primary placement's
-    // bundle, as a port does. Taken here, so a producer deleted right after its turn does not take the value away.
-    std::erase_if(users, [](const std::weak_ptr<UserHold>& w) { return w.expired(); });
-    if (!users.empty() && !r.placements_.empty())
-        if (auto b = live_bundle(r.placements_.front()))
-            for (const auto& w : users)
-                if (auto h = w.lock()) h->bundle = b;
-    if (apply_init && r.io_kind_ == IOKind::input && (none_live || r.init_pending_)) {
-        apply_root_init(r, q, full_range);
-        r.init_pending_ = false;
+
+private:
+    explicit HostInit(const detail::ResolvedShape& s)
+        : host_(s.elements(), value_type{}), shape_{detail::make_range<Rank>(s.extents)} {}
+
+    std::vector<value_type> host_;
+    sycl::range<Rank>       shape_;
+    friend struct detail::HostInitAccess;
+};
+
+namespace detail {
+
+/// INTERNAL: builds the HostInit of cs::init::custom_host.
+struct HostInitAccess {
+    template <DType DT, int Rank>
+    static HostInit<DT, Rank> make(const ResolvedShape& s) {
+        return HostInit<DT, Rank>{s};
     }
-}
+};
 
 }  // namespace detail
 
@@ -197,111 +149,96 @@ private:
     InitShape s_;
 };
 
-namespace impl {
-/// One dimension (>= 1) given to ragged(): one extent for every index, or one per index.
-struct RaggedDim {
-    bool                     per = false;
-    std::size_t              scalar = 0;
-    std::vector<std::size_t> values;
-    static RaggedDim one(std::size_t c) { return {false, c, {}}; }
-    static RaggedDim each(const std::vector<std::size_t>& v) { return {true, 0, v}; }
-};
-inline Shape ragged_shape(std::size_t n, const std::vector<RaggedDim>& dims) {
+/// A RAGGED shape is rank 2 (section 10): a dense leading dimension n and one per-index dimension.
+/// ragged(n, d1): n indices of d1 extents each (a rectangle); ragged(n, counts): one count per index, counts.size() == n
+/// (a vector of the wrong length throws here; n = 0 is legal). There is no rank-3 ragged shape.
+inline Shape ragged(std::size_t n, std::size_t d1) {
     InitShape s;
-    s.rank       = 1 + static_cast<int>(dims.size());
+    s.rank       = 2;
     s.extents[0] = n;
-    for (std::size_t i = 0; i < dims.size(); ++i) {
-        const std::size_t d = i + 1;
-        if (dims[i].per) {
-            if (dims[i].values.size() != n)
-                throw std::invalid_argument("naga::cospan: init::ragged: dimension " + std::to_string(d) + " has " +
-                                            std::to_string(dims[i].values.size()) + " extents but dimension 0 has " +
-                                            std::to_string(n) + " indices");
-            s.per[d]       = true;
-            s.per_index[d] = dims[i].values;
-            s.extents[d]   = 0;
-        } else {
-            s.extents[d] = dims[i].scalar;
-        }
-    }
+    s.extents[1] = d1;
     return Shape::of(std::move(s));
 }
-}  // namespace impl
-
-/// A ragged shape [n, d1] or [n, d1, d2]: dimension 0 is n; each di is one extent (a std::size_t) or a vector of n extents,
-/// one per index. A vector of the wrong length throws here; n = 0 is legal.
-inline Shape ragged(std::size_t n, std::size_t d1) { return impl::ragged_shape(n, {impl::RaggedDim::one(d1)}); }
-inline Shape ragged(std::size_t n, const std::vector<std::size_t>& d1) { return impl::ragged_shape(n, {impl::RaggedDim::each(d1)}); }
-inline Shape ragged(std::size_t n, std::size_t d1, std::size_t d2) {
-    return impl::ragged_shape(n, {impl::RaggedDim::one(d1), impl::RaggedDim::one(d2)});
-}
-inline Shape ragged(std::size_t n, std::size_t d1, const std::vector<std::size_t>& d2) {
-    return impl::ragged_shape(n, {impl::RaggedDim::one(d1), impl::RaggedDim::each(d2)});
-}
-inline Shape ragged(std::size_t n, const std::vector<std::size_t>& d1, std::size_t d2) {
-    return impl::ragged_shape(n, {impl::RaggedDim::each(d1), impl::RaggedDim::one(d2)});
-}
-inline Shape ragged(std::size_t n, const std::vector<std::size_t>& d1, const std::vector<std::size_t>& d2) {
-    return impl::ragged_shape(n, {impl::RaggedDim::each(d1), impl::RaggedDim::each(d2)});
+inline Shape ragged(std::size_t n, const std::vector<std::size_t>& counts) {
+    if (counts.size() != n)
+        throw std::invalid_argument("naga::cospan: init::ragged: the counts have " + std::to_string(counts.size()) +
+                                    " entries but dimension 0 has " + std::to_string(n) + " indices");
+    InitShape s;
+    s.rank       = 2;
+    s.extents[0] = n;
+    s.extents[1] = 0;
+    s.per        = true;
+    s.per_index  = counts;
+    return Shape::of(std::move(s));
 }
 
-/// Every element = value (converted to the root's element type). The one-argument form carries no shape: it is
-/// valid when every dimension of the root is specified.
+/// Every element = value (converted to the variable's element type). The one-argument form carries no shape: it is
+/// valid when every dimension of the variable is specified.
 namespace impl {
 namespace detail = ::naga::cospan::detail;
 template <class T>
 InitSpec fill_impl(T value, std::optional<InitShape> shape) {
-    return InitSpec{[value](detail::IOEntry& root, sk::queue& q) {
-        const Placement pl = root.storage_placements().front();
-        void*           p  = root.storage_on(pl);
-        detail::dispatch_dtype(root.dtype(), [&](auto tag) {
-            using E   = typename decltype(tag)::type;
-            const E v = static_cast<E>(value);
-            q.fill_in_order(pl.device, p, v, root.flat_size());
+    return InitSpec{[value](detail::InitCtx& c) -> sycl::event {
+        sycl::event e;
+        detail::dispatch_dtype(c.var.dtype, [&](auto tag) {
+            using E = typename decltype(tag)::type;
+            auto& d = static_cast<detail::DeviceData<E>&>(c.data);
+            e       = d.vec.fill(static_cast<E>(value), std::span<const sycl::event>{c.deps});
         });
-    }, shape};
+        return e;
+    }, std::move(shape)};
+}
+inline InitSpec zero_impl(std::optional<InitShape> shape) {
+    return InitSpec{[](detail::InitCtx& c) -> sycl::event {
+        sycl::event e;
+        detail::dispatch_dtype(c.var.dtype, [&](auto tag) {
+            using E = typename decltype(tag)::type;
+            auto& d = static_cast<detail::DeviceData<E>&>(c.data);
+            e       = d.vec.fill(E{}, std::span<const sycl::event>{c.deps});
+        });
+        return e;
+    }, std::move(shape)};
 }
 }  // namespace impl
 template <class T>
 InitSpec fill(T value) {
     return impl::fill_impl(value, std::nullopt);
 }
-/// fill(v, {n, m}): every element = v, and the shape is {n, m} (it supplies the root's unspecified dimensions).
+/// fill(v, {n, m}): every element = v, and the shape is {n, m} (it supplies the variable's unspecified dimensions).
 template <class T>
 InitSpec fill(T value, const Shape& shape) {
     return impl::fill_impl(value, std::optional<InitShape>{shape.get()});
 }
 
 /// Every element = 0 (no shape).
-inline InitSpec zero() {
-    return InitSpec{[](detail::IOEntry& root, sk::queue& q) { detail::zero_primary(root, q); }};
-}
+inline InitSpec zero() { return impl::zero_impl(std::nullopt); }
 /// zero({n, m}): every element = 0, with that shape.
-inline InitSpec zero(const Shape& shape) {
-    return InitSpec{[](detail::IOEntry& root, sk::queue& q) { detail::zero_primary(root, q); }, shape.get()};
-}
+inline InitSpec zero(const Shape& shape) { return impl::zero_impl(std::optional<InitShape>{shape.get()}); }
 
 namespace impl {
 namespace detail = ::naga::cospan::detail;
 template <class T>
 InitSpec from_host_impl(std::vector<T> values, std::optional<InitShape> shape) {
-    return InitSpec{[values = std::move(values)](detail::IOEntry& root, sk::queue& q) {
-        if (values.size() != root.flat_size())
+    return InitSpec{[values = std::move(values)](detail::InitCtx& c) -> sycl::event {
+        const std::size_t n = c.var.shape.elements();
+        if (values.size() != n)
             throw std::invalid_argument("naga::cospan: init::from_host has " + std::to_string(values.size()) +
-                                        " values but '" + root.full_path() + "' has " +
-                                        std::to_string(root.flat_size()) + " elements");
-        detail::dispatch_dtype(root.dtype(), [&](auto tag) {
+                                        " values but '" + c.var.display_path() + "' has " + std::to_string(n) + " elements");
+        sycl::event e;
+        detail::dispatch_dtype(c.var.dtype, [&](auto tag) {
             using E = typename decltype(tag)::type;
             std::vector<E> converted(values.size());
             for (std::size_t i = 0; i < values.size(); ++i) converted[i] = static_cast<E>(values[i]);
-            detail::storage_of<E>(root).write_primary(q, std::span<const E>{converted.data(), converted.size()});
+            auto& d = static_cast<detail::DeviceData<E>&>(c.data);
+            e       = d.vec.from_host(std::span<const E>{converted.data(), converted.size()}, std::span<const sycl::event>{c.deps});
         });
-    }, shape};
+        return e;
+    }, std::move(shape)};
 }
 }  // namespace impl
 
-/// Element i = values[i]; the size must equal the root's flat size when it is applied. The data's own shape is
-/// rank 1 of its size: it supplies a rank-1 root's unspecified dimension.
+/// Element i = values[i]; the size must equal the variable's number of elements when it is applied. The data's own shape is
+/// rank 1 of its size: it supplies a rank-1 variable's unspecified dimension.
 template <class T>
 InitSpec from_host(std::vector<T> values) {
     InitShape s;
@@ -322,55 +259,69 @@ InitSpec from_host(std::vector<T> values, const Shape& shape) {
     return impl::from_host_impl(std::move(values), s);
 }
 
-/// A device-side initial value: `fn` gets the queue and the writable twin of the root and
-/// enqueues its own kernel (or copy) on the queue. DT and Rank are the root's, spelled at the call:
-///   cs::init::custom<DType::f32, 1>([](sk::queue& q, cs::Initializer<DType::f32, 1> out) { ... })
+/// A device-side initial value. `fn` gets the unordered queue, the device the data lives on, the events its work must
+/// come after, and the writable twin of the variable; it enqueues its own kernel (or copy) with a dependency on `deps`
+/// and RETURNS THE EVENT OF THAT WORK (section 6). DT and Rank are the variable's, spelled at the call:
+///   cs::init::custom<DType::f32, 1>([](sk::unordered_queue& q, const sycl::device& dev,
+///                                      const std::vector<sycl::event>& deps, cs::Initializer<DType::f32, 1> out) {
+///       return q.parallel_for(dev, deps, sycl::range<1>{out.size()}, [=](sycl::id<1> i) { out[i] = 1.0f; });
+///   })
+template <DType DT, int Rank>
+using CustomFn = std::function<sycl::event(sk::unordered_queue&, const sycl::device&, const std::vector<sycl::event>&,
+                                           Initializer<DT, Rank>)>;
+
 namespace impl {
 namespace detail = ::naga::cospan::detail;
 template <DType DT, int Rank>
-InitSpec custom_impl(std::function<void(sk::queue&, Initializer<DT, Rank>)> fn, std::optional<InitShape> shape) {
-    return InitSpec{[fn = std::move(fn)](detail::IOEntry& root, sk::queue& q) {
-        auto* typed = dynamic_cast<detail::TypedEntry<DT, Rank>*>(&root);
-        if (typed == nullptr)
-            throw std::invalid_argument("naga::cospan: init::custom for '" + root.full_path() +
+InitSpec custom_impl(CustomFn<DT, Rank> fn, std::optional<InitShape> shape) {
+    return InitSpec{[fn = std::move(fn)](detail::InitCtx& c) -> sycl::event {
+        if (!dtype_compatible(c.var.dtype, DT) || c.var.rank != Rank)
+            throw std::invalid_argument("naga::cospan: init::custom for '" + c.var.display_path() +
                                         "' was declared with the wrong dtype or rank");
-        fn(q, typed->make_initializer());
-    }, shape};
+        return fn(c.rt.uq, c.data.key.dev, c.deps, detail::make_initializer<DT, Rank>(c.var, c.data));
+    }, std::move(shape)};
 }
 }  // namespace impl
 template <DType DT, int Rank>
-InitSpec custom(std::function<void(sk::queue&, Initializer<DT, Rank>)> fn) {
+InitSpec custom(CustomFn<DT, Rank> fn) {
     return impl::custom_impl<DT, Rank>(std::move(fn), std::nullopt);
 }
 /// custom with a shape: custom<DT, R>(fn, {n, m}); the shape has Rank extents.
 template <DType DT, int Rank>
-InitSpec custom(std::function<void(sk::queue&, Initializer<DT, Rank>)> fn, const Shape& shape) {
+InitSpec custom(CustomFn<DT, Rank> fn, const Shape& shape) {
     if (shape.get().rank != Rank)
         throw std::invalid_argument("naga::cospan: init::custom<..., " + std::to_string(Rank) + "> was given a shape of rank " +
                                     std::to_string(shape.get().rank));
     return impl::custom_impl<DT, Rank>(std::move(fn), std::optional<InitShape>{shape.get()});
 }
 
-/// A host-side initial value: the function receives a zero-initialised host copy of the root (its previous
-/// contents are NOT read from the device); it is written back (a queued copy) on return.
+/// A host-side initial value: the function receives a zero-initialized host buffer of the variable (its previous
+/// contents are NOT read from the device); the buffer is copied to the device (a queued copy) after it returns, and
+/// that copy is the event the initializer returns.
 namespace impl {
 namespace detail = ::naga::cospan::detail;
 template <DType DT, int Rank>
-InitSpec custom_host_impl(std::function<void(HostViewMut<DT, Rank>&)> fn, std::optional<InitShape> shape) {
-    return InitSpec{[fn = std::move(fn)](detail::IOEntry& root, sk::queue& q) {
-        auto view = detail::HostViewAccess::view_mut<DT, Rank>(root, q);
-        fn(view);
-        view.commit();
-    }, shape};
+InitSpec custom_host_impl(std::function<void(HostInit<DT, Rank>&)> fn, std::optional<InitShape> shape) {
+    return InitSpec{[fn = std::move(fn)](detail::InitCtx& c) -> sycl::event {
+        if (!dtype_compatible(c.var.dtype, DT) || c.var.rank != Rank)
+            throw std::invalid_argument("naga::cospan: init::custom_host for '" + c.var.display_path() +
+                                        "' was declared with the wrong dtype or rank");
+        using E = cpp_type_t<DT>;
+        HostInit<DT, Rank> host = detail::HostInitAccess::make<DT, Rank>(c.var.shape);
+        sycl::event::wait(c.deps);  // the host function may read what its dependencies produced
+        fn(host);
+        auto& d = static_cast<detail::DeviceData<E>&>(c.data);
+        return d.vec.from_host(std::span<const E>{host.data(), host.size()}, std::span<const sycl::event>{});
+    }, std::move(shape)};
 }
 }  // namespace impl
 template <DType DT, int Rank>
-InitSpec custom_host(std::function<void(HostViewMut<DT, Rank>&)> fn) {
+InitSpec custom_host(std::function<void(HostInit<DT, Rank>&)> fn) {
     return impl::custom_host_impl<DT, Rank>(std::move(fn), std::nullopt);
 }
 /// custom_host with a shape: custom_host<DT, R>(fn, {n, m}).
 template <DType DT, int Rank>
-InitSpec custom_host(std::function<void(HostViewMut<DT, Rank>&)> fn, const Shape& shape) {
+InitSpec custom_host(std::function<void(HostInit<DT, Rank>&)> fn, const Shape& shape) {
     if (shape.get().rank != Rank)
         throw std::invalid_argument("naga::cospan: init::custom_host<..., " + std::to_string(Rank) + "> was given a shape of rank " +
                                     std::to_string(shape.get().rank));

@@ -38,16 +38,16 @@ Each component takes an optional `resident_items`: when set, the launch range is
 variant promotes the same names, so the driver is variant-agnostic.
 
 * **unfused**: every component its own kernel: 4 kernels per GEMVER, 3 for BiCGK (11 launches).
-* **parallel**: as unfused, but BiCGK's `gemv_q` and `gtp_s` are a `ParallelSystem`.
-* **fused**: GEMVER = `FusedSystem(sequential, wg 256) [r2u, gtp]`, then `cred`, then `gemv`;
-  BiCGK = `FusedSystem(parallel) [gemv_q, gtp_s]`, then `cred_s`. (8 launches.)
+* **parallel**: as unfused, but BiCGK's `gemv_q` and `gtp_s` are a `system_from` group (independent stages; concurrency comes from data dependencies).
+* **fused**: GEMVER = `fuse_components<seq> [r2u, gtp]`, then `cred`, then `gemv`;
+  BiCGK = `fuse_components<par> [gemv_q, gtp_s]`, then `cred_s`. (8 launches.)
 * **onepass**: GEMVER as in fused, BiCGK in ONE pass over `B`: a group body over (strip, 256-column
   block) that accumulates `Ps[c][j] = sum_k r[i] B[i][j]` and, per row, `reduce_over_group(B[i][j] p[j])`
   into `Pq[i][block]`, then `RowReduce` (q) and the scale-1 `ColReduce` (s). It reads `B` once for BiCGK
   instead of twice, but sums in a different order, so it is not bitwise equal to the others
   (relative L2 about 3e-6 against unfused). **Skipped by `--variant all` on omp**, where its `q` is
   wrong (see the open questions); an explicit `--variant onepass` still runs it there.
-* **barrier**: the whole chain as ONE sequential `FusedSystem` (one launch), 7 software grid
+* **barrier**: the whole chain as ONE sequential `fuse_components<seq>` (one launch), 7 software grid
   barriers between the dependent stages, every stage on `G = SMs * blocks-per-cu` resident groups.
   A group that waits `--spin-limit` polls (default 2^24) gives up and sets a timeout flag; the
   driver reports "grid not co-resident at G=..." and fails the run.

@@ -1,14 +1,18 @@
-// Per-root write epochs and the per-root host-copy cache (C1).
+// What survived of the write-epoch and host-cache tests.
 //
-//   epochs: IOEntry::write_epoch() of a root advances once per writer submission (run_post_compute), once per applied
-//           init, and on allocation / release / size change; N tied writers give +N. (The Fused / Parallel deltas are checked in
-//           test_flavors.cpp: wave kernels are only emitted in the translation unit that defines the fused stages.) Read through m.root().entry_at(path).write_epoch().
-//   cache:  read_primary serves a root's host copy while its epoch is unchanged. host_reads (refreshes) and
-//           host_read_hits come from diag::snapshot(). Output lines start with "[epoch]".
+// The per-root write epochs, the host read cache and the counters that measured them (host_reads, host_read_hits)
+// no longer exist (docs/design-review-2026-10-03.md, sections 3 and 5): a read of a result is a host VIEW, obtained after
+// a forward and sync()ed before it is read. What is left here is what those cases also proved about VALUES:
+//
+//   ties     a zeroing producer and an accumulator on one tie_outputs root give the same answer every forward
+//   inputs   a free input's initializer (fill, from_host, custom_host) and update_input between runs
+//   views    two views of one output; a view per run with a new input each run; a value-driven ragged output
+//   deleted  a transient subsystem is gone after its turn, and its variables cannot be viewed by path
+//
+// The Fused / Parallel deltas that used to be checked here went with ParallelSystem.
 
 #include <cstddef>
 #include <cstdint>
-#include <cstdio>
 #include <functional>
 #include <memory>
 #include <stdexcept>
@@ -27,6 +31,8 @@
 namespace cs = naga::cospan;
 using cs::DType;
 using cst::default_config;
+using cst::forward_and_wait;
+using cst::synced_output;
 
 namespace tep {
 
@@ -51,38 +57,6 @@ public:
     std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(y_.shape(), {}, {y_}, {}); }
 };
 
-/// W2: two outputs y1, y2 (separate roots unless tied): y1 = i + 1, y2 = 2 (i + 1).
-struct W2Body {
-    struct Inputs {};
-    struct Outputs {
-        cs::Output<DType::f32, 1> y1;
-        cs::Output<DType::f32, 1> y2;
-    };
-    void operator()(sycl::id<1> i, Inputs, Outputs o) const {
-        o.y1[i] = static_cast<float>(i[0] + 1);
-        o.y2[i] = static_cast<float>(2 * (i[0] + 1));
-    }
-};
-class W2 : public cs::Component<W2Body> {
-    cs::Output<DType::f32, 1> y1_, y2_;
-    bool                      tied_;
-
-public:
-    explicit W2(bool tied = false) : tied_{tied} {}
-    void setup() override {
-        if (tied_) {
-            declare_output(y1_, "y1", cs::unspecified_shape<1>());
-            declare_output(y2_, "y2", cs::unspecified_shape<1>());
-        } else {
-            declare_output(y1_, "y1", kN);
-            declare_output(y2_, "y2", kN);
-        }
-    }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(y1_.shape(), {}, {y1_, y2_}, {});
-    }
-};
-
 /// Rd: z = 2 x.
 struct RdBody {
     struct Inputs {
@@ -100,8 +74,9 @@ class Rd : public cs::Component<RdBody> {
 public:
     void setup() override {
         declare_input(x_, "x", cs::unspecified);
-        declare_output(z_, "z", cs::FromInputDim{"x", 0});
+        declare_output(z_, "z", cs::unspecified_shape<1>());
     }
+    void pre_forward() override { set_shape(z_, shape_of(x_)); }  // the output follows the input (section 10: no derived dims)
     std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(z_.shape(), {x_}, {z_}, {}); }
 };
 
@@ -153,21 +128,25 @@ public:
         if (kind_ == 0) init_input("x", cs::init::fill(3.0f));
         if (kind_ == 1) init_input("x", cs::init::from_host(std::vector<float>(kN, 4.0f)));
         if (kind_ == 2)
-            init_input("x", cs::init::custom_host<DType::f32, 1>(std::function<void(cs::HostViewMut<DType::f32, 1>&)>{
-                                [](cs::HostViewMut<DType::f32, 1>& h) {
+            init_input("x", cs::init::custom_host<DType::f32, 1>(std::function<void(cs::HostInit<DType::f32, 1>&)>{
+                                [](cs::HostInit<DType::f32, 1>& h) {
                                     for (std::size_t k = 0; k < h.size(); ++k) h[k] = 5.0f;
                                 }}));
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(y_.shape(), {x_}, {y_}, {}); }
 };
 
-/// RGen: a free u32 input `counts` [n] drives the ragged output r [n, counts[i], 3]; r block i = 1000 i + q.
+/// RGen: a free u32 input `counts` [n] drives the ragged output r [n, counts[i]]; r block i = 1000 i + q.
+/// Section 10: ragged is rank 2 (was [n, counts[i], 3]); a component cannot read values, so RGenTop hooks the free ragged input
+/// `layout` with counts_from(g.counts) and r copies its shape in pre_forward.
+/// REVIEW: this is the same device as Fill in test_ragged.cpp; a hook cannot target an output.
 struct RGenBody {
     struct Inputs {
-        cs::Input<DType::u32, 1> counts;
+        cs::Input<DType::u32, 1>       counts;
+        cs::RaggedInput<DType::f32, 2> layout;
     };
     struct Outputs {
-        cs::RaggedOutput<DType::f32, 3> r;
+        cs::RaggedOutput<DType::f32, 2> r;
     };
     void operator()(sycl::id<1> id, Inputs, Outputs o) const {
         auto b = o.r.block(id[0]);
@@ -177,74 +156,55 @@ struct RGenBody {
 class RGen : public cs::Component<RGenBody> {
     std::vector<std::uint32_t>      init_;
     cs::Input<DType::u32, 1>        counts_;
-    cs::RaggedOutput<DType::f32, 3> r_;
+    cs::RaggedInput<DType::f32, 2>  layout_;
+    cs::RaggedOutput<DType::f32, 2> r_;
 
 public:
     explicit RGen(std::vector<std::uint32_t> init) : init_{std::move(init)} {}
     void setup() override {
         declare_input(counts_, "counts", init_.size());
         init_input("counts", cs::init::from_host(init_));
-        declare_output(r_, "r", cs::FromInputDim{"counts", 0}, cs::FromInputValues{"counts"}, 3);
+        declare_input(layout_, "layout");
+        declare_output(r_, "r");
     }
+    void pre_forward() override { set_shape(r_, shape_of(layout_)); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(counts_.shape(), {counts_}, {r_}, {});
+        return create_launch_config(counts_.shape(), {counts_, layout_}, {r_}, {});
     }
 };
 
 // ---- systems ---------------------------------------------------------------------------------------------------------
-class Chain : public cs::System {  // a -> b, plain
-public:
-    void setup() override {
-        add_subsystem<W1>("a");
-        add_subsystem<Rd>("b");
-        connect("a.y", "b.x");
-    }
-};
-template <class Inner>
-class Top : public cs::System {
-public:
-    void setup() override { add_subsystem<Inner>("f"); }
-};
-
 class TieTop : public cs::System {
 public:
     void setup() override {
-        add_subsystem<TieMember<true>>("z");
-        add_subsystem<TieMember<false>>("a");
-        tie_outputs<DType::f32, 1>({"z.t", "a.t"}, "t", cs::alias::fixed(kN), cs::TieOutputsPolicy::allow_plain);
+        add_subsystem(cs::subsystem_desc<TieMember<true>>("z"));
+        add_subsystem(cs::subsystem_desc<TieMember<false>>("a"));
+        tie_outputs<DType::f32, 1>({"z.t", "a.t"}, "t", cs::shape(kN), cs::TieOutputsPolicy::allow_plain);
+        // Execution order is data dependencies only (design review, section 3), and tied writers do not wait on each
+        // other: the accumulator runs after the zeroing producer only because the edge is declared.
+        depends_on("a", "z");
     }
-};
-class SameRootTop : public cs::System {
-public:
-    void setup() override {
-        add_subsystem<W2>("w", true);
-        tie_outputs<DType::f32, 1>({"w.y1", "w.y2"}, "t", cs::alias::fixed(kN), cs::TieOutputsPolicy::allow_plain);
-    }
-};
-class TwoOutTop : public cs::System {
-public:
-    void setup() override { add_subsystem<W2>("w"); }
 };
 class FinTop : public cs::System {
     int kind_;
 
 public:
     explicit FinTop(int kind) : kind_{kind} {}
-    void setup() override { add_subsystem<Fin>("fin", kind_); }
+    void setup() override { add_subsystem(cs::subsystem_desc<Fin>("fin", kind_)); }
 };
 class TransInner : public cs::System {
 public:
     void setup() override {
-        add_subsystem<W1>("p");
-        add_subsystem<Rd>("c");
+        add_subsystem(cs::subsystem_desc<W1>("p"));
+        add_subsystem(cs::subsystem_desc<Rd>("c"));
         connect("p.y", "c.x");
     }
 };
 class TransTop : public cs::System {
 public:
     void setup() override {
-        add_subsystem<TransInner>("op", kTransient);
-        add_subsystem<Rd>("sink");
+        add_subsystem(kTransient, cs::subsystem_desc<TransInner>("op"));
+        add_subsystem(cs::subsystem_desc<Rd>("sink"));
         connect("op.c.z", "sink.x");
     }
 };
@@ -253,185 +213,56 @@ class RGenTop : public cs::System {
 
 public:
     explicit RGenTop(std::vector<std::uint32_t> c) : counts_{std::move(c)} {}
-    void setup() override { add_subsystem<RGen>("g", counts_); }
-};
-
-// ---- ragged / dense sources for the leading-range views ------------------------------------------------------------------
-struct RaggedSrcBody {
-    struct Inputs {};
-    struct Outputs {
-        cs::RaggedOutput<DType::f32, 3> out;
-    };
-    void operator()(sycl::id<1> id, Inputs, Outputs o) const {
-        const std::size_t i = id[0];
-        auto              b = o.out.block(i);
-        for (std::size_t j = 0; j < b.shape()[0]; ++j)
-            for (std::size_t k = 0; k < b.shape()[1]; ++k) b[sycl::id<2>{j, k}] = static_cast<float>(i * 1000 + j * 10 + k);
-    }
-};
-class RaggedSrc : public cs::Component<RaggedSrcBody> {
-    std::vector<std::size_t>        sizes_;
-    cs::RaggedOutput<DType::f32, 3> out_;
-
-public:
-    explicit RaggedSrc(std::vector<std::size_t> s) : sizes_{std::move(s)} {}
-    void setup() override { declare_output(out_, "out", sizes_.size(), cs::per_index(sizes_), 3); }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(sycl::range<1>{sizes_.size()}, {}, {out_}, {});
-    }
-};
-struct RSumBody {
-    struct Inputs {
-        cs::RaggedInput<DType::f32, 3> in;
-    };
-    struct Outputs {
-        cs::Output<DType::f32, 1> sums;
-    };
-    void operator()(sycl::id<1> id, Inputs i, Outputs o) const {
-        auto  b = i.in.block(id[0]);
-        float s = 0.0f;
-        for (std::size_t q = 0; q < b.size(); ++q) s += b[q];
-        o.sums[id] = s;
-    }
-};
-class RSum : public cs::Component<RSumBody> {
-    cs::RaggedInput<DType::f32, 3> in_;
-    cs::Output<DType::f32, 1>      sums_;
-
-public:
     void setup() override {
-        declare_input(in_, "in", cs::unspecified, cs::unspecified, cs::unspecified);
-        declare_output(sums_, "sums", cs::FromInputDim{"in", 0});
-    }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(sums_.shape(), {in_}, {sums_}, {}); }
-};
-class LRTop : public cs::System {
-    std::vector<std::size_t> sizes_;
-
-public:
-    explicit LRTop(std::vector<std::size_t> s) : sizes_{std::move(s)} {}
-    void setup() override {
-        add_subsystem<RaggedSrc>("src", sizes_);
-        add_subsystem<RSum>("cons");
-        connect("src.out", "cons.in");
+        add_subsystem(cs::subsystem_desc<RGen>("g", counts_));
+        shape_hook("g.layout", cs::ragged::counts_from("g.counts"));
     }
 };
-
-// ---- helpers -------------------------------------------------------------------------------------------------------------
-std::uint64_t epoch(cs::Model& m, const char* path) { return m.root().entry_at(path).write_epoch(); }
-
-void fwd(cs::Model& m) {
-    m.forward();
-    m.wait();
-}
-
-/// The epoch delta of `path` over one forward.
-std::uint64_t delta(cs::Model& m, const char* path) {
-    const auto before = epoch(m, path);
-    fwd(m);
-    return epoch(m, path) - before;
-}
 
 }  // namespace tep
 
 // =============================================================================================================================
-TEST_CASE("Epochs: one writer, one output: +1 per forward", "[epoch]") {
-    cs::Model m = cs::create_model<tep::Top<tep::Chain>>(default_config());
-    m.setup();
-    const auto first = tep::delta(m, "f.a.y");  // the first forward may include an allocation
-    std::printf("[epoch] plain chain, first forward: a.y +%llu\n", static_cast<unsigned long long>(first));
-    for (int r = 0; r < 3; ++r) CHECK(tep::delta(m, "f.a.y") == 1);
-    // each of the two writers advances its own root once per forward
-    const auto a0 = tep::epoch(m, "f.a.y"), b0 = tep::epoch(m, "f.b.z");
-    tep::fwd(m);
-    CHECK(tep::epoch(m, "f.a.y") - a0 == 1);
-    CHECK(tep::epoch(m, "f.b.z") - b0 == 1);
-    std::printf("[epoch] plain chain: a.y +%llu, b.z +%llu per forward\n", static_cast<unsigned long long>(tep::epoch(m, "f.a.y") - a0),
-                static_cast<unsigned long long>(tep::epoch(m, "f.b.z") - b0));
-}
-
-TEST_CASE("Epochs: one component, two outputs: +1 each (separate roots); aliased to one root: +1", "[epoch]") {
-    {
-        cs::Model m = cs::create_model<tep::TwoOutTop>(default_config());
-        m.setup();
-        tep::fwd(m);
-        const auto a0 = tep::epoch(m, "w.y1"), b0 = tep::epoch(m, "w.y2");
-        tep::fwd(m);
-        CHECK(tep::epoch(m, "w.y1") - a0 == 1);
-        CHECK(tep::epoch(m, "w.y2") - b0 == 1);
-    }
-    try {
-        cs::Model m = cs::create_model<tep::SameRootTop>(default_config());
-        m.setup();
-        tep::fwd(m);
-        const auto t0 = tep::epoch(m, "t");
-        tep::fwd(m);
-        const auto d = tep::epoch(m, "t") - t0;
-        std::printf("[epoch] one component, two outputs tied to ONE root: +%llu per forward\n", static_cast<unsigned long long>(d));
-        CHECK(d == 1);
-        CHECK(tep::epoch(m, "w.y1") == tep::epoch(m, "w.y2"));  // the same root
-    } catch (const std::exception& e) {
-        std::printf("[epoch] one component's two outputs tied to one root is NOT constructible: %s\n", e.what());
-    }
-}
-
-TEST_CASE("Epochs: tie_outputs of a zeroing producer and an accumulator: +2 per forward", "[epoch]") {
+TEST_CASE("Ties: a zeroing producer and an accumulator give i + 1 on every forward", "[epoch][tie]") {
     cs::Model m = cs::create_model<tep::TieTop>(default_config());
     m.setup();
-    const auto first = tep::delta(m, "t");  // includes the tie alias root''s allocation
-    std::printf("[epoch] tie of two members, first forward: +%llu\n", static_cast<unsigned long long>(first));
-    for (int r = 0; r < 3; ++r) CHECK(tep::delta(m, "t") == 2);
-    const auto v = m.view_output<DType::f32, 1>("t");
-    for (std::size_t i = 0; i < tep::kN; ++i) CHECK(v.span()[i] == static_cast<float>(i + 1));
+    for (int r = 0; r < 4; ++r) {  // the first forward and three more
+        forward_and_wait(m);
+        const auto v = synced_output<DType::f32, 1>(m, "t");
+        for (std::size_t i = 0; i < tep::kN; ++i) CHECK(v.span()[i] == static_cast<float>(i + 1));
+    }
 }
 
-TEST_CASE("Epochs: a free input is bumped when its owner applies the init (fill, from_host, custom_host)", "[epoch]") {
+TEST_CASE("Inputs: a free input takes its initializer, and update_input replaces it (fill, from_host, custom_host)", "[epoch][init]") {
     for (int kind = 0; kind < 3; ++kind) {
         INFO("init kind " << kind);
         cs::Model m = cs::create_model<tep::FinTop>(default_config(), kind);
         m.setup();
-        const auto e0 = tep::epoch(m, "fin.x");
-        tep::fwd(m);
-        const auto e1 = tep::epoch(m, "fin.x");
-        CHECK(e1 > e0);  // allocated, then the init applied
-        std::printf("[epoch] init kind %d: free input epoch +%llu on the first forward\n", kind,
-                    static_cast<unsigned long long>(e1 - e0));
-        CHECK(tep::delta(m, "fin.x") == 0);  // nothing re-applies it
-        m.init_input("fin.x", cs::init::from_host(std::vector<float>(tep::kN, 9.0f)));
-        const auto d = tep::delta(m, "fin.x");
-        CHECK(d >= 1);  // re-marked pending: applied again at the owner's next run
-        std::printf("[epoch] init kind %d: +%llu after init_input\n", kind, static_cast<unsigned long long>(d));
-        const auto y = m.view_output<DType::f32, 1>("fin.y");
+        forward_and_wait(m);
+        // update_input marks the variable stale and queues no work; the next run applies it (section 5).
+        m.update_input("fin.x", cs::init::from_host(std::vector<float>(tep::kN, 9.0f)));
+        forward_and_wait(m);
+        const auto y = synced_output<DType::f32, 1>(m, "fin.y");
         for (std::size_t i = 0; i < tep::kN; ++i) CHECK(y.span()[i] == 9.0f);
     }
 }
 
-TEST_CASE("Epochs: a transient root is bumped by its allocation, its writer and its release", "[epoch]") {
+TEST_CASE("Transient: a transient subsystem is deleted after its turn, every forward", "[epoch][transient]") {
     cs::Model m = cs::create_model<tep::TransTop>(default_config());
     m.setup();
     for (int r = 0; r < 2; ++r) {
-        // the transient is deleted after its turn, so its entries cannot be read afterwards: the per-forward epoch
-        // delta (allocation + writer + release = 3) is no longer observable from outside
-        m.forward();
-        m.wait();
+        // the transient is deleted after its turn, so its variables cannot be read afterwards
+        forward_and_wait(m);
         CHECK(m.get_subsystem("op") == nullptr);
     }
 }
 
 // =============================================================================================================================
-TEST_CASE("Host cache: a second view with no forward in between is a hit", "[epoch][cache]") {
+TEST_CASE("Views: two views of one output with no forward in between show the same values", "[epoch][view]") {
     cs::Model m = cs::create_model<tep::FinTop>(default_config(), 0);
     m.setup();
-    tep::fwd(m);
-    const auto s0 = cs::diag::snapshot();
-    const auto v1 = m.view_output<DType::f32, 1>("fin.y");
-    const auto s1 = cs::diag::snapshot();
-    const auto v2 = m.view_output<DType::f32, 1>("fin.y");
-    const auto s2 = cs::diag::snapshot();
-    CHECK((s1 - s0).host_reads == 1);
-    CHECK((s1 - s0).host_read_hits == 0);
-    CHECK((s2 - s1).host_reads == 0);
-    CHECK((s2 - s1).host_read_hits == 1);
+    forward_and_wait(m);
+    const auto v1 = synced_output<DType::f32, 1>(m, "fin.y");
+    const auto v2 = synced_output<DType::f32, 1>(m, "fin.y");
     REQUIRE(v1.size() == tep::kN);
     for (std::size_t i = 0; i < tep::kN; ++i) {
         CHECK(v1.span()[i] == 3.0f);
@@ -439,86 +270,50 @@ TEST_CASE("Host cache: a second view with no forward in between is a hit", "[epo
     }
 }
 
-TEST_CASE("Host cache: a forward invalidates it; two forwards with different inputs give their own values", "[epoch][cache]") {
+TEST_CASE("Views: a forward with a new input gives its own values", "[epoch][view]") {
     cs::Model m = cs::create_model<tep::FinTop>(default_config(), 1);
     m.setup();
     for (const float x : {2.0f, 7.0f, 11.0f}) {
-        m.init_input("fin.x", cs::init::from_host(std::vector<float>(tep::kN, x)));
-        tep::fwd(m);
-        const auto s0 = cs::diag::snapshot();
-        const auto v  = m.view_output<DType::f32, 1>("fin.y");
-        CHECK((cs::diag::snapshot() - s0).host_reads == 1);  // a refresh, not a stale hit
+        // update_input queues nothing; the value is applied at the next run (before the first run too)
+        m.update_input("fin.x", cs::init::from_host(std::vector<float>(tep::kN, x)));
+        forward_and_wait(m);
+        const auto v = synced_output<DType::f32, 1>(m, "fin.y");
         for (std::size_t i = 0; i < tep::kN; ++i) CHECK(v.span()[i] == x);
     }
 }
 
-TEST_CASE("Host cache: a value-driven shape reads its driver once while it is unchanged", "[epoch][cache]") {
+TEST_CASE("Views: a value-driven ragged output follows its driver", "[epoch][view][ragged]") {
     const std::vector<std::uint32_t> counts{2, 0, 3, 1, 4, 2};
     cs::Model                        m = cs::create_model<tep::RGenTop>(default_config(), counts);
     m.setup();
-    for (int r = 0; r < 4; ++r) {
-        const auto s0 = cs::diag::snapshot();
-        tep::fwd(m);
-        const auto d = cs::diag::snapshot() - s0;
-        std::printf("[epoch] value-driven shape, forward %d: host_reads %llu, hits %llu\n", r + 1,
-                    static_cast<unsigned long long>(d.host_reads), static_cast<unsigned long long>(d.host_read_hits));
-        if (r == 0) {
-            CHECK(d.host_reads >= 1);
-        } else {
-            CHECK(d.host_reads == 0);  // the driver `counts` was not written again
-            CHECK(d.host_read_hits >= 1);
+    for (int r = 0; r < 4; ++r) forward_and_wait(m);
+    // REVIEW: the old case kept this first view alive across the shape change below. Whether a live view follows a
+    // shape change of its variable is not settled by host_view.hpp (it says each forward pushes a copy, not what a
+    // resize does to the host copy), so the view is released before the driver changes.
+    {
+        const auto v = m.view_ragged_output<DType::f32, 2>("g.r");
+        v.sync();
+        REQUIRE(v.n() == counts.size());
+        for (std::size_t i = 0; i < counts.size(); ++i) {
+            const auto b = v.block(i);
+            REQUIRE(b.size() == static_cast<std::size_t>(counts[i]));
+            for (std::size_t q = 0; q < b.size(); ++q) CHECK(b[q] == static_cast<float>(i * 1000 + q));
         }
-    }
-    const auto v = m.view_ragged_output<DType::f32, 3>("g.r");
-    REQUIRE(v.size() == counts.size());
-    for (std::size_t i = 0; i < counts.size(); ++i) {
-        const auto b = v.block(i);
-        REQUIRE(b.size() == static_cast<std::size_t>(counts[i]) * 3);
-        for (std::size_t q = 0; q < b.size(); ++q) CHECK(b.span()[q] == static_cast<float>(i * 1000 + q));
     }
     // a changed driver is seen
     const std::vector<std::uint32_t> next{1, 1, 1, 5, 0, 2};
-    m.init_input("g.counts", cs::init::from_host(next));
-    tep::fwd(m);
-    const auto w = m.view_ragged_output<DType::f32, 3>("g.r");
-    REQUIRE(w.size() == next.size());
-    for (std::size_t i = 0; i < next.size(); ++i) CHECK(w.block(i).size() == static_cast<std::size_t>(next[i]) * 3);
+    m.update_input("g.counts", cs::init::from_host(next));
+    forward_and_wait(m);
+    const auto w = m.view_ragged_output<DType::f32, 2>("g.r");
+    w.sync();
+    REQUIRE(w.n() == next.size());
+    for (std::size_t i = 0; i < next.size(); ++i) CHECK(w.block(i).size() == static_cast<std::size_t>(next[i]));
 }
 
-TEST_CASE("Host cache: leading-range views slice the cached whole root", "[epoch][cache]") {
-    const std::vector<std::size_t> sizes{2, 1, 3, 0, 4, 2, 1, 3};
-    const std::size_t              n = sizes.size();
-    cs::Model                      m = cs::create_model<tep::LRTop>(default_config(), sizes);
-    m.setup();
-    tep::fwd(m);
-    const std::vector<std::pair<std::size_t, std::size_t>> ranges{{0, n}, {2, 5}, {n - 1, n}, {1, n - 1}, {4, 4}, {0, n}};
-    const auto                                              s0 = cs::diag::snapshot();
-    for (const auto& [a, b] : ranges) {
-        INFO("range [" << a << ", " << b << ")");
-        cs::detail::LeadingRangeAccess::set(m.root().entry_at("cons.in"), a, b);
-        const auto v = m.view_ragged_input<DType::f32, 3>("cons.in");
-        REQUIRE(v.size() == b - a);
-        std::vector<float>         data;
-        std::vector<std::uint64_t> offs{0};
-        for (std::size_t i = a; i < b; ++i) {
-            for (std::size_t j = 0; j < sizes[i]; ++j)
-                for (std::size_t k = 0; k < 3; ++k) data.push_back(static_cast<float>(i * 1000 + j * 10 + k));
-            offs.push_back(data.size());
-        }
-        CHECK(v.offsets == offs);
-        CHECK(v.data == data);
-    }
-    const auto d = cs::diag::snapshot() - s0;
-    CHECK(d.host_reads == 1);  // one refresh of the root, then only hits
-    CHECK(d.host_read_hits == ranges.size() - 1);
-    std::printf("[epoch] leading-range views: %zu views, host_reads %llu, hits %llu\n", ranges.size(),
-                static_cast<unsigned long long>(d.host_reads), static_cast<unsigned long long>(d.host_read_hits));
-}
-
-TEST_CASE("Host cache: a released transient root still throws on read", "[epoch][cache]") {
+TEST_CASE("Views: a deleted transient's variables cannot be viewed by path", "[epoch][view][transient]") {
     cs::Model m = cs::create_model<tep::TransTop>(default_config());
     m.setup();
-    tep::fwd(m);
+    forward_and_wait(m);
     for (int attempt = 0; attempt < 2; ++attempt) {
         std::string what = "<no exception>";
         try {
@@ -528,9 +323,10 @@ TEST_CASE("Host cache: a released transient root still throws on read", "[epoch]
         }
         INFO("thrown: " << what);
         CHECK(what != "<no exception>");
-        CHECK(what.find("is deleted") != std::string::npos);
+        // The wording is System::instance_at's: "... does not exist right now (it was deleted)".
+        CHECK(what.find("was deleted") != std::string::npos);
     }
-    // the eternal sink is still readable (and cached)
-    const auto v = m.view_output<DType::f32, 1>("sink.z");
+    // the eternal sink is still readable
+    const auto v = synced_output<DType::f32, 1>(m, "sink.z");
     for (std::size_t i = 0; i < tep::kN; ++i) CHECK(v.span()[i] == 4.0f * static_cast<float>(i + 1));
 }

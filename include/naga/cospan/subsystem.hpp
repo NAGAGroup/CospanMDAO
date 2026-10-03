@@ -1,23 +1,33 @@
 #pragma once
 
 // =============================================================================
-// naga/cospan/subsystem.hpp — the owner/child contract (r01 §6.1, §7.1)
+// naga/cospan/subsystem.hpp — the owner/child contract
 // =============================================================================
 //
-// Standalone: it needs the SlabKit types and nothing else from CoSpan, so
-// metadata.hpp can include it for Substrates and kernel.hpp for SubmitTarget.
-// It holds the memory substrates, the execution context, what a submission
-// consumes, the Subsystem verbs, and LaunchDescription (which names KernelParts
-// by forward declaration only).
+// Standalone: it needs SYCL, SlabKit and the standard library, and nothing from CoSpan (the types it names are
+// forward-declared). A Subsystem is what a System owns: a Component (the leaf that does work) or a System (the
+// node that orders it).
+//
+// THE OWNER/CHILD CONTRACT. The OWNER (a System) builds a child, gives it its name, its dotted path and
+// itself as owner (the private fields, set through friendship), and only then asks it to declare itself. The
+// child never reaches back: it holds no pointer to its owner's data, and the owner holds the child alone (by
+// unique_ptr, in a slot).
+//
+// TWO SETUP PASSES (docs/design-review-2026-10-03.md, section 2):
+//   1. setup: run_setup() declares the child's inputs, outputs, aliases and children. It is recursive through
+//      add_subsystem: each add_subsystem builds the child and runs its setup before it returns.
+//   2. finalize: the Model collects the marks. A Subsystem has no part in it.
+// NOTHING IS PASSED DOWN AT SETUP: no context, no queue, no device. A device reaches a subtree only through
+// set_device, which the factory (System::add_subsystem) calls after the child's setup (section 2), and the outer
+// call wins.
+//
+// THE FORWARD. The three steps and the event getter below belong to section 3 of the record and to r02 section 3.
+// They are implemented by components and by Systems; deleting a child waits on its events().
 
-#include <cstddef>
 #include <memory>
-#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
-#include <unordered_map>
-#include <utility>
 #include <vector>
 
 #include <sycl/sycl.hpp>
@@ -29,55 +39,12 @@ namespace naga::cospan {
 namespace sk = ::naga::slabkit;
 
 class System;
-struct KernelParts;
-
-/// One per device: the device's arena (present iff it has static bytes) and
-/// pool (present iff configured), held for the model's life. Every allocation
-/// a subsystem makes goes through its device's substrate.
-struct MemorySubstrate {
-    std::optional<sk::DeviceArena> arena;
-    std::optional<sk::DevicePool>  pool;
-};
-using Substrates = std::unordered_map<sycl::device, MemorySubstrate>;
-
-/// What a submission consumes: the queue, the group when the submission
-/// belongs to a Parallel owner's group, and the device it targets.
-struct SubmitTarget {
-    sk::queue*        queue = nullptr;
-    sk::queue::group* group = nullptr;
-    sycl::device      device;
-};
-
-/// System-owned execution state; children receive a reference only to USE it.
-/// Carries no events: ordering is the stream's (r01 §7.3).
-struct ExecCtx {
-    sycl::device       device;
-    sk::queue*         queue     = nullptr;  ///< the Model's ONE queue
-    sk::queue::group*  group     = nullptr;  ///< non-null only under a Parallel owner
-    MemorySubstrate*   substrate = nullptr;  ///< this device's arena (+ pool)
-
-    SubmitTarget target() { return SubmitTarget{queue, group, device}; }
-};
-
-/// What a Component's compute turn yields. The owner routes on is_custom_op()
-/// (and, for host bodies, is_host()): kernels take the outer-kernel path.
-class LaunchDescription {
-public:
-    virtual ~LaunchDescription() = default;
-    virtual bool is_custom_op() const = 0;
-    virtual bool is_host() const      = 0;
-    /// Ordering is the stream's (r01 §7.3). Returns the events of what it submitted: one for a
-    /// kernel, custom-op or host launch, none when nothing was submitted (an empty range). The
-    /// caller registers them on the storage of every port the launch touched (r01 §4.4,
-    /// Subsystem::register_launch_events).
-    virtual std::vector<sycl::event> submit(SubmitTarget& t) const = 0;
-    /// Null for custom-op and host descriptions.
-    virtual const KernelParts* kernel() const { return nullptr; }
-};
+class Model;
 
 namespace detail {
-struct SubsystemAccess;
-}
+class Instance;  // instance.hpp
+struct Runtime;  // runtime.hpp
+}  // namespace detail
 
 /// The ONE contract between an owner and what it owns.
 class Subsystem {
@@ -86,74 +53,50 @@ public:
     Subsystem(const Subsystem&)            = delete;
     Subsystem& operator=(const Subsystem&) = delete;
 
-    std::string_view name() const noexcept { return name_; }   ///< in the owner's namespace
-    const std::string& path() const noexcept { return path_; } ///< dotted from the root
-    const System*    owner() const noexcept { return owner_; }  ///< null at the root
+    std::string_view   name() const noexcept { return name_; }   ///< in the owner's namespace
+    const std::string& path() const noexcept { return path_; }   ///< dotted from the root
+    const System*      owner() const noexcept { return owner_; } ///< null at the root
 
-    // ---- setup chain (Model drives; r01 §11) ---------------------------------
+    // ---- setup (section 2) ---------------------------------------------------------
+    /// Declares this subsystem. Called once by its owner, after it was named and placed, before add_subsystem returns.
     virtual void run_setup() = 0;
-    virtual std::unordered_map<sycl::device, std::size_t>
-        get_exec_info(const sycl::device& parent_device) = 0;
-    virtual void prepare_exec(sk::queue& queue, Substrates& substrates) = 0;
-    virtual void compile() = 0;
 
-    // ---- forward (per forward; r01 §6.5) -------------------------------------
-    /// A Component: shapes, pre_forward, then MATERIALIZE every variable it touches that is not live; a free input
-    /// takes its init at the allocation (r01 §4.5).
-    virtual void run_pre_compute(ExecCtx& owner_ctx) = 0;
-    /// Components return a description and never submit it; Systems submit
-    /// their subtree's work themselves and return null.
-    virtual std::unique_ptr<LaunchDescription> run_compute_forward() = 0;
-    /// A Component: the epoch bumps and the other-placement sync. Nothing is freed here: storage lives while a
-    /// port holds its bundle (r01 §4.5).
-    virtual void run_post_compute(ExecCtx& owner_ctx) = 0;
+    /// Places this subsystem on `d`: a component sets the device of each of its instances; a System sets the
+    /// device of each of its own aliases and calls this on each live child (section 2). The OUTER call always wins.
+    virtual void set_device(const sycl::device& d) = 0;
 
-    /// The owner calls this right after submitting this subsystem's launch, before run_post_compute:
-    /// a Component registers the launch's events on the storage of every port it touched, at the
-    /// placement the launch ran on (SlabKit usm_vector::register_events, r01 §4.4). Systems have
-    /// no launch of their own: the default does nothing.
-    virtual void register_launch_events(std::span<const sycl::event> events) { (void)events; }
+    /// This subsystem's OWN instance by local name (a component's input or output, a System's alias), else null.
+    virtual std::shared_ptr<detail::Instance> find_instance(std::string_view name) const = 0;
 
-    /// What a launch still in flight needs from this subsystem after it is deleted: the runtime reads a kernel's
-    /// dynamic_function_config on a worker thread when the launch runs. Each entry is (the launch's events, the
-    /// object to keep). The deleting parent hands them to the root's retire list, which holds each until its events
-    /// complete (r01 §7.2). The default has nothing.
-    using InflightKeep = std::pair<std::vector<sycl::event>, std::shared_ptr<void>>;
-    virtual void collect_inflight(std::vector<InflightKeep>& out) const { (void)out; }
+    /// Appends this subsystem's own instances (not its children's).
+    virtual void collect_instances(std::vector<std::shared_ptr<detail::Instance>>& out) const = 0;
 
-    /// The run policy the owner was asked for (-1 eternal, -2 transient, n > 0 turns). The LIVE counter belongs to
-    /// the owner's slot, not to the child (r01 §7.2-7.4).
-    long requested_run() const noexcept { return requested_run_; }
-    /// Eternal: this subsystem and every System above it run every forward and are never deleted or rebuilt
-    /// (the arena route needs it). Defined in system.hpp.
-    bool runs_eternally() const noexcept;
+    // ---- forward (section 3): implemented by components and Systems ----------
+    /// A component: materialize the inputs, run pre_forward, materialize the outputs, point the wrappers (design review,
+    /// section 10). A System: rebuild transient children, then pre_forward.
+    virtual void run_precompute(detail::Runtime& rt) = 0;
+    /// A component: submit its work. A System: call each child's forward in declaration order.
+    virtual void run_compute(detail::Runtime& rt) = 0;
+    /// A component: its postcompute work. A System: the same for its children.
+    virtual void run_postcompute(detail::Runtime& rt) = 0;
+
+    /// A component: its launch event(s). A System: its children's events plus its own push events. The same getter
+    /// serves deletion (the parent waits on a child's events only) and depends_on.
+    virtual std::vector<sycl::event> events() const = 0;
+
+    /// depends_on: events added to every submission of this subsystem for ONE forward.
+    virtual void add_dependencies(std::span<const sycl::event> deps) = 0;
 
 protected:
     Subsystem() = default;
 
 private:
-    friend class System;
-    friend class ChunkedSystem;
-    friend struct detail::SubsystemAccess;
+    friend class System;  // places its children
+    friend class Model;   // places the root
 
     std::string   name_;
     std::string   path_;
     const System* owner_ = nullptr;
-    long          requested_run_ = -1;     ///< -1 eternal, -2 transient, n > 0 (as asked at registration)
-    bool          rebuilt_       = false;  ///< built again by its owner (rearm / transient): its allocations take the pool
 };
 
-namespace detail {
-
-/// INTERNAL / TEST-ONLY until System exists: places a subsystem in its owner's
-/// namespace (System does this itself through friendship).
-struct SubsystemAccess {
-    static void place(Subsystem& s, std::string name, std::string path, const System* owner) {
-        s.name_  = std::move(name);
-        s.path_  = std::move(path);
-        s.owner_ = owner;
-    }
-};
-
-}  // namespace detail
 }  // namespace naga::cospan

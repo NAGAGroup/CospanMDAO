@@ -19,17 +19,18 @@ find_package(cospanmdao REQUIRED)
 find_package(Catch2 3 REQUIRED)
 
 set(COSPAN_TEST_SOURCES
-    test_chunked.cpp
+    # test_chunked.cpp, test_leading_range.cpp, test_replay.cpp: chunked systems, kept for the redesign (not built)
     test_component.cpp
+    test_device_scan.cpp
     test_flavors.cpp
     test_init_shapes.cpp
-    test_leading_range.cpp
     test_model.cpp
     test_ragged.cpp
     test_ragged_ties.cpp
+    test_rework.cpp
+    test_shapes.cpp
     test_diagnostics.cpp
     test_epochs.cpp
-    test_replay.cpp
     test_system.cpp
 )
 

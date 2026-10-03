@@ -4,8 +4,8 @@
 //                [--variant all|unfused|parallel|fused|barrier|onepass]
 //                [--blocks-per-cu 2] [--spin-limit 16777216] [--check] [--dump <dir>]
 //
-// Per variant: create the model, set the inputs from the shared generator, warm up
-// (forward + wait), then time `iters` forwards followed by ONE wait. --check compares
+// Per variant: create the model, set the inputs from the shared generator (Model::update_input: applied by the first
+// forward), warm up (forward + wait), then time `iters` forwards followed by ONE wait. --check compares
 // the outputs with the host double-precision reference and the variants with each other.
 
 #include <algorithm>
@@ -89,24 +89,26 @@ constexpr const char* kVecNames[] = {"x1", "w1", "q", "s", "x2", "w2"};
 
 void set_inputs(cs::Model& m, const Data& d) {
     const auto v1 = [&](const char* path, const std::vector<float>& v) {
-        m.init_input(path, cs::init::from_host(v));
+        m.update_input(path, cs::init::from_host(v));
     };
-    m.init_input("A", cs::init::from_host(d.A0));
+    m.update_input("A", cs::init::from_host(d.A0));
     v1("u1a", d.v.u1); v1("v1a", d.v.v1); v1("u2a", d.v.u2); v1("v2a", d.v.v2); v1("ya", d.v.y); v1("za", d.v.z);
     v1("u1b", d.v.u1); v1("v1b", d.v.v1); v1("u2b", d.v.u2); v1("v2b", d.v.v2);  // G2's own copies, not tied
 }
 
-// A HostView owns the host snapshot its span() points into: keep the view alive while reading it.
+// A HostView owns the host snapshot its span() points into: keep the view alive while reading it, and sync() first.
 std::vector<float> read1(cs::Model& m, const char* path) {
     const auto view = m.view_output<DType::f32, 1>(path);
-    const auto s    = view.span();
+    view.sync();
+    const auto s = view.span();
     return std::vector<float>(s.begin(), s.end());
 }
 Outputs read_outputs(cs::Model& m, bool with_B2) {
     Outputs o{read1(m, "x1"), read1(m, "w1"), read1(m, "q"), read1(m, "s"), read1(m, "x2"), read1(m, "w2"), {}};
     if (with_B2) {
         const auto view = m.view_output<DType::f32, 2>("B2");
-        const auto s    = view.span();
+        view.sync();
+        const auto s = view.span();
         o.B2.assign(s.begin(), s.end());
     }
     return o;
@@ -144,9 +146,10 @@ cs::Model make_model(Variant v, const Options& o, std::size_t groups) {
 /// flag of the LAST forward only; a timeout in an earlier forward of a batch is not remembered.
 std::uint32_t barrier_timeouts(cs::Model& m) {
     std::uint32_t any = 0;
-    for (int i = 1; i <= gc::BarrierChain::kBarriers; ++i) {
+    for (int i = 1; i <= gc::BarrierTop::kBarriers; ++i) {
         const std::string path = "bar" + std::to_string(i) + "_timeout";  // the tie alias at the root
         const auto        view = m.view_output<DType::u32, 1>(path);  // the view owns the snapshot
+        view.sync();
         any |= view.span()[0];
     }
     return any;
@@ -262,6 +265,9 @@ int main(int argc, char** argv) {
             o.variant != "barrier" && o.variant != "onepass")
             throw std::invalid_argument("--variant must be all|unfused|parallel|fused|barrier|onepass");
 
+        // REVIEW: ModelConfig has no default_device and the systems add no device, so the model runs on the runtime's default
+        // device; this default_selector_v device is only used to print its name, to count its compute units for the barrier
+        // grid and to detect the omp backend, and is assumed to be that same device.
         const sycl::device dev{sycl::default_selector_v};
         const bool         is_omp = dev.get_backend() == sycl::backend::omp;
         const std::size_t  groups = static_cast<std::size_t>(dev.get_info<sycl::info::device::max_compute_units>()) *

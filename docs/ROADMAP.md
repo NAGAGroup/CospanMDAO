@@ -2,16 +2,28 @@
 
 Messy by design. Checkboxes, notes, strike-throughs welcome. Each item points at the spec revision that will absorb it and the date of the project-knowledge notes it came from (2026-09-28 unless stated).
 
+## Status and next
+
+- [x] **The 2026-10-03 rework is done**: branch `rework-2026-10-03`, last commit before the docs commit `2e8e223` (default and cuda suites green; spec `docs/spec/revisions/r02-2026-10-03-the-design-as-built.md`, decision D144, migration `docs/rework-migration-2026-10-03.md`).
+- [ ] **Next: the chunked-systems redesign** (Jack). Chunked systems, slices and leading ranges were not ported; the old code is dead code in `include/naga/cospan/chunked_system.hpp` and in git history (`c8553f6`).
+
+Open items after the rework:
+
+- [ ] gemver-chain `onepass` gives a wrong `q` on the OpenMP backend (pre-existing; `--variant all` skips it there, `--variant onepass` shows it; correct on CUDA).
+- [ ] A user-docs example of a host view kept as a component member to size outputs from values (design review section 10: there is no framework helper for it).
+- [ ] Performance passes: the device scan (`device_scan.hpp`, behind `counts_from` and `offsets_from`) and the staging of fused components (packing buffers).
+- [ ] The `REVIEW` markers left in the tests, to be resolved or removed: `tests/test_component.cpp`, `test_epochs.cpp`, `test_flavors.cpp`, `test_model.cpp`, `test_ragged.cpp`, `test_ragged_ties.cpp`, `test_rework.cpp`, `test_shapes.cpp`, `test_system.cpp` (and two in `examples/gemver-chain`: `main.cpp`, `systems.hpp`).
+
 ## Before any code (spec drafts still needed)
 
-- [x] Chunked systems — a system flavour with a scratch budget; nesting and sub-chunking are required; the chunk axis and the sub-chunk declaration are open. (absorbed by: r02)
+- [ ] Chunked systems — a system flavour with a scratch budget; nesting and sub-chunking are required; the chunk axis and the sub-chunk declaration are open. Not ported in the 2026-10-03 rework: redesign next (see Status and next).
 - [ ] Cycles, solvers and implicit components — cycles by registration order; an implicit component is a self-connection with its own buffer; a balance helper. (absorbed by: r02)
 - [ ] A "proven by" list per r01 section — the order-sensitive tests each contract needs. (absorbed by: r02)
 
 ## Build order (forward-complete first)
 
 1. [ ] SlabKit on the fork — repin, six gap tests, spec/README refresh.
-2. [x] CoSpan skeleton, including chunked systems — forward passes for every non-cyclic pattern.
+2. [x] CoSpan skeleton — forward passes for every non-cyclic pattern. (~~including chunked systems~~: not ported by the 2026-10-03 rework.)
 3. [ ] Forward time stepping (MLS-MPM).
 4. [ ] Cycles, solvers, implicit components — Sellar converges.
 5. [ ] Implicit time stepping (FE heat conduction; steady state matches the solver).
@@ -44,26 +56,26 @@ Topics learned while building the light-transport forcing case (2026-09-30). Eac
 - [ ] Atomics are relaxed; use sycl::atomic_fence(acq_rel, device) where ordering matters (e.g. bottom-up tree builds).
 - [ ] Namespaces, promotions and ties: subsystems get their own namespaces; Systems declare no I/O of their own; promote exposes one entry as a public alias (optional, only for what matters outside); ties are how inputs or outputs share a root; connect makes data links; names at one level are unique.
 - [ ] Registration order is execution order: add children in dataflow order.
-- [ ] Value-driven sizes: a size computed by an earlier sibling in the same forward drives a later sibling's shape (count → scan → fill); not inside Fused or Parallel systems.
+- [ ] Value-driven sizes: a size computed by an earlier sibling in the same forward drives a later sibling's shape (count → scan → fill) through a `shape_hook` on the later sibling's input (`from_value`, `counts_from`, `offsets_from`); a hook's sources must be produced by an earlier child. ~~not inside Fused or Parallel systems~~ (ParallelSystem is gone).
 - [ ] Run policy as a property of add_subsystem: eternal (the default), run_n, do_once, or transient (it exists for one forward of its parent: built at the start, deleted at the end). A variable lives while something that uses it exists. rearm(name) on the parent rebuilds a child.
 - [ ] Rearm: the parent rebuilds a child by name; its wiring is replayed.
-- [ ] Initialization as metadata: init_input on free inputs, the highest level wins, ignored when the input is connected, zero by default; applied only when the variable is materialized; Model::init_input applies at the next run.
+- [ ] Initialization as metadata: init_input on free inputs, ~~the highest level wins~~ the last declaration wins (a parent's setup runs after its children's), ignored when the input is connected; applied when the variable is materialized or stale; ~~Model::init_input~~ Model::update_input applies at the next run.
 - [ ] Cycles: expressed by registration order; they warn at setup until solvers exist.
 - [ ] Packaging a CoSpan consumer with pixi: depend on cospanmdao as a host AND run dependency (SlabKit's shared library comes with it).
 
 ## Later, wanted
 
-- [ ] Parallel Systems (beyond Components).
+- [x] ~~Parallel Systems (beyond Components).~~ Superseded: ParallelSystem is removed; concurrency comes from data dependencies (r02 section 3).
 - [ ] Serialization.
 - [ ] A derivative-aware paragraph per forward feature.
 
 ## Housekeeping
 
 - [x] CoSpan pixi manifest repinned to the naga toolchain (full previous manifest at dbebc3a:pixi.toml).
-- [ ] README.md rewrite (it still describes the first-pass framework).
+- [x] README.md rewrite (done with the 2026-10-03 rework docs).
 - [x] Tests from the first code commit.
 - [ ] Clean up tests/smoke and tests/spike: standalone, unbuilt, and stale after D138 (they use init() hooks, initializers, EntryAccess/RootDriver). Fold anything still worth checking into the Catch2 suite, then remove them (Jack decides at cleanup time).
-- [ ] Internal naming: the code still calls a variable's storage record 'root' or 'shadow' (IOEntry::root_, is_root). Rename to variable terms in a dedicated pass.
+- [x] ~~Internal naming: the code still calls a variable's storage record 'root' or 'shadow'.~~ Superseded: roots and shadows are gone (instances and shared metadata, D144).
 
 ## After the 2026-10-01 checkpoint (D140 rework)
 
@@ -73,8 +85,8 @@ Found while porting LRPIM onto opaque chunked systems (C2b to C2e) and measuring
 - [x] D135's one stream wait per releasing component in plain systems. Why: pipeline stalls outside chunked systems. Superseded by D143: frees are ordered by events registered on the storage (SlabKit 572b581); no queue waits.
 - [x] Registration-order diagnostics that name the offending registration. Done (D143): shape errors are reactive and name the needer, the dimension and what it waited on; a connection that forms a cycle warns at setup.
 - [x] Audit of alias kinds and declaration forms for overlap. Done: D142 (FromSourceDim, cs::tied and alias::from_connection collapse into unspecified dims), and variables and ports under D143. Why: several forms now express nearly the same sharing; one should be canonical.
-- [ ] Ragged ports in FusedSystem and ParallelSystem. Why: ragged data is limited to plain systems and chunked systems.
-- [ ] Device-side scan for extents known only on the device. Why: value-driven sizes currently need a host read.
+- [ ] Ragged ports in fused components. Why: ragged data is limited to plain Systems and components (fused components refuse ragged ports). ~~ParallelSystem and chunked systems~~: removed / not ported.
+- [x] Device-side scan for extents known only on the device. Done (D144): `counts_from` and `offsets_from` build the column with a parallel device scan; only the total comes back to the host.
 - [ ] SlabKit `from_host` without the `async_host` keep-alive task (a general fix). Why: host tasks fence the stream.
 - [ ] Per-backend launch configuration (e.g. work-group size). Why: group bodies with many barriers are fast on CUDA but about 5x slower than a one-item-per-group body on the omp backend (LRPIM measurement).
 - [ ] Sparse bundles over ragged ports (CSR, block CSR, SELL); memoryless functional ports; restrict_ptr (see Phase 1 follow-ups). Why: sparse data is what the ragged ports are used for, and each bundle would carry its own invariants.
@@ -86,12 +98,12 @@ Found while porting LRPIM onto opaque chunked systems (C2b to C2e) and measuring
 
 CoSpan's differentiator is orchestration on top of AdaptiveCpp's JIT and fusion. This phase makes CoSpan model anything, fast and accurate, with good ergonomics, and everything after builds on the principles settled here.
 
-- [ ] SlabKit queue: one queue, one mental model. In-order items (single kernels, single host items, parallel task graphs) form the backbone. A parallel task graph's members run concurrently and may themselves be task graphs of sequential and parallel steps (nesting). Why: users shouldn't manage several streams with different ordering guarantees.
-- [ ] SlabKit out-of-order lane: async_host is fully asynchronous again (unordered except by the events passed in; async_host_in_order is the ordered form), and the lane also takes device (non-host) work. In-order items accept extra event dependencies, and the global wait covers the lane. Why: the primitive for the push hooks below.
+- [x] ~~SlabKit queue: one queue, one mental model.~~ Superseded (D144): `sk::unordered_queue`, fully out of order, is a separate type next to `sk::queue`; CoSpan submits kernels to it. (~~In-order items and parallel task graphs as the backbone~~: not built.)
+- [x] ~~SlabKit out-of-order lane:~~ Superseded by `sk::unordered_queue` (D144). Original note: async_host is fully asynchronous again (unordered except by the events passed in; async_host_in_order is the ordered form), and the lane also takes device (non-host) work. In-order items accept extra event dependencies, and the global wait covers the lane. Why: the primitive for the push hooks below.
 - [ ] SlabKit: remove the async_host keep-alive task in from_host. Why: it puts a host callback in the stream only to keep a buffer alive.
 - [x] usm_vector operations (assignment, move, copy, resize, from_host) accept dependent events. Done: SlabKit 572b581 (register_events and event-taking mutations).
-- [ ] Push pattern: consumer-side work is registered on a root at setup (cross-device copies for connections, initializers, a device-side scan for chunked topology) and is submitted from the producer's event as soon as the producer is submitted. Why: that work finishes long before the consumer is reached.
-- [ ] Remove ParallelSystem: independent sibling subsystems (including whole Systems) are detected and submitted as a parallel task graph. FusedSystem stays as the one special flavor (components only, sequential and parallel waves). Why: concurrency follows from the dependency graph, not from a user-chosen flavor.
+- [x] ~~Push pattern: consumer-side work is registered on a root at setup~~ Superseded (D144): the producer pushes to the variable's other placements after its launch; nothing is registered at setup. 
+- [x] Remove ParallelSystem. Done (D144): concurrency follows from data dependencies (events) and `depends_on`, not from a user-chosen flavor. ~~FusedSystem stays as the one special flavor~~: superseded, a fused group is a component built by `fuse_components<seq|par>`.
 - [x] Lifetime is scope: shared ownership of variables (a variable lives while some port that uses it exists); parents own their children, delete them when their run policy ends, and rebuild them by name (D143).
 - [ ] Visibility for those trade-offs: a user-facing per-forward report of allocations, frees and waits per subsystem (from memory_report and the diag counters). Why: the modeler can only choose scopes from a profile.
 - [ ] Design guidance to document: prefer shapes inherited from connections, keep connected components on one device, and treat repeatedly resizing value-driven shapes as a cost. Why: these avoid reallocation churn.

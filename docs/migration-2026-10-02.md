@@ -1,3 +1,5 @@
+> **Superseded by docs/rework-migration-2026-10-03.md and spec r02** (docs/spec/revisions/r02-2026-10-03-the-design-as-built.md). Kept as history.
+
 # Migration notes, 2026-10-02 (for nlmflbm-light-transport)
 
 Two decisions land together: D141 (run policy and lifetime by counting) and D142 (shape authority). Both change what existing code means, so read the lists below against your components.

@@ -1,18 +1,19 @@
 // Model tests, every case through a cospan::Model (create_model / setup / forward /
-// wait / view_* / set_*); the only reach past those is the Model's own retrieval
-// (root().entry_at).
+// wait / view_* / update_input); the only reach past those is the Model's own retrieval
+// (root().instance_at, get_subsystem).
+//
+// Reading results (docs/design-review-2026-10-03.md, section 5): forward() only enqueues; a host view is obtained
+// after the first forward and sync()ed before it is read (cst::synced_output and friends do both).
 //
 //   1. Sellar forward   the same Systems templated on the dtype, run in f32 and f64
 //                       over several design points against a host reference in double
 //   2. Marks            design variables, objective, constraints: counts, bounds, and
 //                       the tied z appearing once (one record per root)
 //   3. Lifecycle        forward / view_output before setup, setup twice, a moved-from
-//                       Model, a default_device outside the context (skipped when the
-//                       runtime enumerates one device)
-//   4. Host access      unknown path, view_input on an output, init_input on an output
-//   5. Memory report    a small static model: arena capacity (less the setup slack)
-//                       against the sum of flat_size x dtype_size over distinct roots
-//   6. Pool             a pool on the device and a value-driven (FromInput) output root
+//                       Model
+//   4. Host access      unknown path, view_input on an output, update_input on an output
+//   5. Memory report    a small static model computes; the pool report (there is no arena)
+//   6. Pool             a pool on the device and a value-driven (shape hook) output root
 //   7. Two devices      producer and consumer on different devices of one context
 //
 // The components live in namespace tmod.
@@ -223,14 +224,14 @@ template <DType DT>
 class SellarTop : public cs::System {
 public:
     void setup() override {
-        add_subsystem<D1<DT>>("d1");
-        add_subsystem<D2<DT>>("d2");
-        add_subsystem<Obj<DT>>("obj");
-        add_subsystem<G1<DT>>("g1");
-        add_subsystem<G2<DT>>("g2");
+        add_subsystem(cs::subsystem_desc<D1<DT>>("d1"));
+        add_subsystem(cs::subsystem_desc<D2<DT>>("d2"));
+        add_subsystem(cs::subsystem_desc<Obj<DT>>("obj"));
+        add_subsystem(cs::subsystem_desc<G1<DT>>("g1"));
+        add_subsystem(cs::subsystem_desc<G2<DT>>("g2"));
 
-        tie_inputs<DT, 1>({"d1.z", "d2.z", "obj.z"}, "z", cs::alias::fixed(2));
-        tie_inputs<DT, 1>({"d1.x", "obj.x"}, "x", cs::alias::fixed(1));
+        tie_inputs<DT, 1>({"d1.z", "d2.z", "obj.z"}, "z", cs::shape(2));
+        tie_inputs<DT, 1>({"d1.x", "obj.x"}, "x", cs::shape(1));
         connect("d1.y1", "d2.y1");
         connect("d1.y1", "obj.y1");
         connect("d2.y2", "obj.y2");
@@ -275,7 +276,7 @@ Ref sellar_ref(double z0, double z1, double x, double y2_in) {
 /// One value of a rank-1 output.
 template <DType DT>
 T_<DT> scalar_out(cs::Model& m, const char* path) {
-    auto v = m.view_output<DT, 1>(path);
+    auto v = cst::synced_output<DT, 1>(m, path);
     REQUIRE(v.size() == 1);
     return v[std::size_t{0}];
 }
@@ -305,13 +306,12 @@ void sellar_forward(double abs_tol, double rel_tol) {
     for (const Point& p : points) {
         const std::array<T, 2> z{static_cast<T>(p.z0), static_cast<T>(p.z1)};
         const T                x = static_cast<T>(p.x), y2 = static_cast<T>(p.y2);
-        model.init_input("z", cs::init::from_host(std::vector<T>{z.begin(), z.end()}));
-        model.init_input("x", cs::init::from_host(std::vector<T>{x}));
-        model.init_input("d1.y2", cs::init::from_host(std::vector<T>{y2}));
-        model.forward();
-        model.wait();
-        CHECK(model.view_input<DT, 1>("d2.z")[std::size_t{1}] == z[1]);  // the tie reads back everywhere
-        CHECK(model.view_input<DT, 1>("obj.x")[std::size_t{0}] == x);
+        model.update_input("z", cs::init::from_host(std::vector<T>{z.begin(), z.end()}));
+        model.update_input("x", cs::init::from_host(std::vector<T>{x}));
+        model.update_input("d1.y2", cs::init::from_host(std::vector<T>{y2}));
+        cst::forward_and_wait(model);
+        CHECK(cst::synced_input<DT, 1>(model, "d2.z")[std::size_t{1}] == z[1]);  // the tie reads back everywhere
+        CHECK(cst::synced_input<DT, 1>(model, "obj.x")[std::size_t{0}] == x);
 
         // The reference runs in double on the values the device actually saw.
         const Ref r = sellar_ref(static_cast<double>(z[0]), static_cast<double>(z[1]), static_cast<double>(x),
@@ -339,7 +339,6 @@ constexpr std::size_t kCvtBytes = 64 * sizeof(double);
 constexpr std::size_t kBcBytes  = 8 * sizeof(float);
 constexpr std::size_t kOutBytes = 16 * sizeof(float);
 constexpr std::size_t kExpectedStatic = kGenBytes + kCvtBytes + kBcBytes + kOutBytes;  // 1008
-constexpr std::size_t kArenaSlack     = 4096 * 64;
 
 struct GenBody {
     struct Inputs {};
@@ -415,10 +414,10 @@ public:
 class MemTop : public cs::System {
 public:
     void setup() override {
-        add_subsystem<Gen>("gen");
-        add_subsystem<Cvt>("cvt");
-        add_subsystem<Comb>("comb");
-        tie_inputs<DType::f32, 1>({"comb.b", "comb.c"}, "bc", cs::alias::fixed(8));
+        add_subsystem(cs::subsystem_desc<Gen>("gen"));
+        add_subsystem(cs::subsystem_desc<Cvt>("cvt"));
+        add_subsystem(cs::subsystem_desc<Comb>("comb"));
+        tie_inputs<DType::f32, 1>({"comb.b", "comb.c"}, "bc", cs::shape(8));
         connect("gen.y", "cvt.a");
         connect("cvt.d", "comb.e");
         promote<DType::f32, 1>("comb.o", "out");
@@ -427,9 +426,12 @@ public:
 
 // ---- Value-driven size on a pool (case 6) -----------------------------------------------------------
 // Bins: a free u32 input n and an output of n floats (bins[i] = i + 1).
+// REVIEW: a component cannot read a value and a hook cannot target an output (section 10), so Bins takes a free input `ref`
+// that its System hooks with from_value(n) (hook_bins) and copies its shape in pre_forward.
 struct BinsBody {
     struct Inputs {
         cs::Input<DType::u32, 1> n;
+        cs::Input<DType::f32, 1> ref;
     };
     struct Outputs {
         cs::Output<DType::f32, 1> bins;
@@ -438,20 +440,26 @@ struct BinsBody {
 };
 class Bins : public cs::Component<BinsBody> {
     cs::Input<DType::u32, 1>  n_;
+    cs::Input<DType::f32, 1>  ref_;
     cs::Output<DType::f32, 1> bins_;
 
 public:
     void setup() override {
         declare_input(n_, "n", 1);
-        declare_output(bins_, "bins", cs::FromInput{"n", 0});
+        declare_input(ref_, "ref", cs::unspecified);
+        declare_output(bins_, "bins", cs::unspecified);
     }
+    void pre_forward() override { set_shape(bins_, shape_of(ref_)); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(bins_.shape(), {n_}, {bins_}, {});
+        return create_launch_config(bins_.shape(), {n_, ref_}, {bins_}, {});
     }
 };
 class PoolTop : public cs::System {
 public:
-    void setup() override { add_subsystem<Bins>("bins"); }
+    void setup() override {
+        add_subsystem(cs::subsystem_desc<Bins>("bins"));
+        shape_hook("bins.ref", cs::dim::from_value("bins.n", 0));
+    }
 };
 
 // ---- Two devices (case 7) ---------------------------------------------------------------------------
@@ -501,8 +509,9 @@ class Scale : public cs::Component<ScaleBody> {
 public:
     void setup() override {
         declare_input(x_, "x", cs::unspecified_shape<1>());
-        declare_output(y_, "y", cs::from_input_shape<1>("x"));
+        declare_output(y_, "y", cs::unspecified_shape<1>());
     }
+    void pre_forward() override { set_shape(y_, shape_of(x_)); }  // the output follows the input (section 10: no derived dims)
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return create_launch_config(y_.shape(), {x_}, {y_}, {});
     }
@@ -511,8 +520,9 @@ public:
 class EmptyTop : public cs::System {
 public:
     void setup() override {
-        add_subsystem<Bins>("bins");
-        add_subsystem<Scale>("sc");
+        add_subsystem(cs::subsystem_desc<Bins>("bins"));
+        shape_hook("bins.ref", cs::dim::from_value("bins.n", 0));
+        add_subsystem(cs::subsystem_desc<Scale>("sc"));
         connect("bins.bins", "sc.x");
     }
 };
@@ -520,7 +530,7 @@ public:
 // One Axpb (y = x) with a free input a.x.
 class OneAxTop : public cs::System {
 public:
-    void setup() override { add_subsystem<Axpb>("a", 1.0f, 0.0f); }
+    void setup() override { add_subsystem(cs::subsystem_desc<Axpb>("a", 1.0f, 0.0f)); }
 };
 
 // An Axpb that declares its own initial value 1.
@@ -536,7 +546,7 @@ public:
 class DeclaredTop : public cs::System {
 public:
     void setup() override {
-        add_subsystem<AxpbInit1>("a", 1.0f, 0.0f);
+        add_subsystem(cs::subsystem_desc<AxpbInit1>("a", 1.0f, 0.0f));
         init_input("a.x", cs::init::fill(2.0f));
     }
 };
@@ -545,8 +555,8 @@ public:
 class ChainTop : public cs::System {
 public:
     void setup() override {
-        add_subsystem<Axpb>("p", 1.0f, 1.0f);
-        add_subsystem<Axpb>("q", 1.0f, 0.0f);
+        add_subsystem(cs::subsystem_desc<Axpb>("p", 1.0f, 1.0f));
+        add_subsystem(cs::subsystem_desc<Axpb>("q", 1.0f, 0.0f));
         connect("p.y", "q.x");
     }
 };
@@ -560,9 +570,9 @@ class TwoDevTop : public cs::System {
 public:
     explicit TwoDevTop(const sycl::device& other) : other_{other} {}
     void setup() override {
-        add_subsystem<Axpb>("src", 1.0f, 0.0f);
-        add_subsystem<Axpb>("mid", cs::property_list{cs::property::device{other_}}, 2.0f, 1.0f);
-        add_subsystem<Axpb>("out", 1.0f, 2.0f);
+        add_subsystem(cs::subsystem_desc<Axpb>("src", 1.0f, 0.0f));
+        add_subsystem(other_, cs::subsystem_desc<Axpb>("mid", 2.0f, 1.0f));  // the device is an add_subsystem argument (section 2)
+        add_subsystem(cs::subsystem_desc<Axpb>("out", 1.0f, 2.0f));
         connect("src.y", "mid.x");
         connect("mid.y", "out.x");
     }
@@ -582,65 +592,6 @@ bool pick_two(sycl::device& first, sycl::device& host) {
     }
     return have_first && have_host;
 }
-
-// ---- A partial writer (case 4): Hold writes only y[0]; the host owns y[1..3] ----------------------------
-struct HoldBody {
-    struct Inputs {
-        cs::Input<DType::f32, 1> x;
-    };
-    struct Outputs {
-        cs::Output<DType::f32, 1> y;
-    };
-    void operator()(sycl::id<1> i, Inputs in, Outputs out) const { out.y[i] = in.x[i]; }
-};
-class Hold : public cs::Component<HoldBody> {
-    cs::Input<DType::f32, 1>  x_;
-    cs::Output<DType::f32, 1> y_;
-
-public:
-    void setup() override {
-        declare_input(x_, "x", 1);
-        declare_output(y_, "y", 4);
-    }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(x_.shape(), {x_}, {y_}, {});  // launches over x: one item
-    }
-};
-
-struct SumBody {
-    struct Inputs {
-        cs::Input<DType::f32, 1> y;
-    };
-    struct Outputs {
-        cs::Output<DType::f32, 1> s;
-    };
-    void operator()(sycl::id<1> i, Inputs in, Outputs out) const {
-        float t = 0.0f;
-        for (std::size_t k = 0; k < in.y.shape()[0]; ++k) t += in.y[k];
-        out.s[i] = t;
-    }
-};
-class SumY : public cs::Component<SumBody> {
-    cs::Input<DType::f32, 1>  y_;
-    cs::Output<DType::f32, 1> s_;
-
-public:
-    void setup() override {
-        declare_input(y_, "y", cs::unspecified_shape<1>());
-        declare_output(s_, "s", 1);
-    }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(s_.shape(), {y_}, {s_}, {});
-    }
-};
-class HoldTop : public cs::System {
-public:
-    void setup() override {
-        add_subsystem<Hold>("p");
-        add_subsystem<SumY>("c");
-        connect("p.y", "c.y");
-    }
-};
 
 cs::Model::MemoryReport::PerDevice report_on(const cs::Model& m, const sycl::device& dev) {
     const auto rep = m.memory_report();
@@ -671,57 +622,136 @@ TEST_CASE("Marks: design variables, objective, constraints, one record per root"
     REQUIRE(model.objectives().size() == 1);
     REQUIRE(model.constraints().size() == 2);
 
-    const auto* zr = sys.entry_at("z").root();
-    const auto* xr = sys.entry_at("x").root();
-    // The three components' z entries share the one root, so one record serves all three.
-    CHECK(sys.entry_at("d1.z").root() == zr);
-    CHECK(sys.entry_at("d2.z").root() == zr);
-    CHECK(sys.entry_at("obj.z").root() == zr);
-    CHECK(sys.entry_at("d1.x").root() == xr);
-    CHECK(sys.entry_at("obj.x").root() == xr);
+    // A Mark is {path, inst, rec}; the instance is held weakly (design review, section 1) and the variable it names
+    // is its `meta`, shared by every instance of the variable. This replaces the old per-root entry comparison.
+    const auto zr = sys.instance_at("z")->meta;
+    const auto xr = sys.instance_at("x")->meta;
+    // The three components' z entries share the one variable, so one record serves all three.
+    CHECK(sys.instance_at("d1.z")->meta == zr);
+    CHECK(sys.instance_at("d2.z")->meta == zr);
+    CHECK(sys.instance_at("obj.z")->meta == zr);
+    CHECK(sys.instance_at("d1.x")->meta == xr);
+    CHECK(sys.instance_at("obj.x")->meta == xr);
 
     std::size_t on_z = 0, on_x = 0;
     for (const auto& d : model.design_vars()) {
-        if (d.root == zr) ++on_z;
-        if (d.root == xr) ++on_x;
+        const auto inst = d.inst.lock();
+        REQUIRE(inst);
+        if (inst->meta == zr) ++on_z;
+        if (inst->meta == xr) ++on_x;
     }
     CHECK(on_z == 1);
     CHECK(on_x == 1);
 
     for (const auto& d : model.design_vars()) {
-        REQUIRE(d.bounds.lower.has_value());
-        REQUIRE(d.bounds.upper.has_value());
-        if (d.root == zr) {
-            CHECK(*d.bounds.lower == std::vector<double>{-10.0, 0.0});
-            CHECK(*d.bounds.upper == std::vector<double>{10.0, 10.0});
+        const auto inst = d.inst.lock();
+        REQUIRE(inst);
+        REQUIRE(d.rec.bounds.lower.has_value());
+        REQUIRE(d.rec.bounds.upper.has_value());
+        if (inst->meta == zr) {
+            CHECK(*d.rec.bounds.lower == std::vector<double>{-10.0, 0.0});
+            CHECK(*d.rec.bounds.upper == std::vector<double>{10.0, 10.0});
         } else {
-            CHECK(*d.bounds.lower == std::vector<double>{0.0});
-            CHECK(*d.bounds.upper == std::vector<double>{10.0});
+            CHECK(*d.rec.bounds.lower == std::vector<double>{0.0});
+            CHECK(*d.rec.bounds.upper == std::vector<double>{10.0});
         }
-        CHECK_FALSE(d.equals.has_value());
+        CHECK_FALSE(d.rec.equals.has_value());
     }
 
-    CHECK(model.objectives()[0].root == sys.entry_at("obj.f").root());
+    {
+        const auto inst = model.objectives()[0].inst.lock();
+        REQUIRE(inst);
+        CHECK(inst->meta == sys.instance_at("obj.f")->meta);
+    }
 
-    const auto* g1 = sys.entry_at("g1.g").root();
-    const auto* g2 = sys.entry_at("g2.g").root();
+    const auto g1 = sys.instance_at("g1.g")->meta;
+    const auto g2 = sys.instance_at("g2.g")->meta;
     std::size_t on_g1 = 0, on_g2 = 0;
     for (const auto& c : model.constraints()) {
-        if (c.root == g1) ++on_g1;
-        if (c.root == g2) ++on_g2;
-        REQUIRE(c.bounds.upper.has_value());
-        CHECK(*c.bounds.upper == std::vector<double>{0.0});
-        CHECK_FALSE(c.bounds.lower.has_value());
+        const auto inst = c.inst.lock();
+        REQUIRE(inst);
+        if (inst->meta == g1) ++on_g1;
+        if (inst->meta == g2) ++on_g2;
+        REQUIRE(c.rec.bounds.upper.has_value());
+        CHECK(*c.rec.bounds.upper == std::vector<double>{0.0});
+        CHECK_FALSE(c.rec.bounds.lower.has_value());
     }
     CHECK(on_g1 == 1);
     CHECK(on_g2 == 1);
-    model.wait();  // setup() submitted initializer work; wait before the Model goes out of scope
+}
+
+namespace tmod {
+/// Marks under a run policy (design review, section 9). `mode`: 0 eternal; 1 transient; 2 do_once; 3 run_n{2};
+/// 4 an eternal System `in` (marking its own Axpb) under a transient `outer`.
+class MarkInner : public cs::System {
+public:
+    void setup() override {
+        add_subsystem(cs::subsystem_desc<Axpb>("a", 1.0f, 0.0f));
+        add_design_var("a.x");
+    }
+};
+class MarkOuter : public cs::System {
+public:
+    void setup() override { add_subsystem(cs::subsystem_desc<MarkInner>("in")); }
+};
+class MarkScopeTop : public cs::System {
+    int  mode_;
+    char kind_;  // 'd' design var, 'c' constraint
+
+public:
+    MarkScopeTop(int mode, char kind) : mode_{mode}, kind_{kind} {}
+    void setup() override {
+        if (mode_ == 4) {
+            add_subsystem(cs::property_list{cs::property::transient{}}, cs::subsystem_desc<MarkOuter>("outer"));
+            return;
+        }
+        const cs::property_list props = mode_ == 1   ? cs::property_list{cs::property::transient{}}
+                                        : mode_ == 2 ? cs::property_list{cs::property::do_once{}}
+                                        : mode_ == 3 ? cs::property_list{cs::property::run_n{2}}
+                                                     : cs::property_list{};
+        add_subsystem(props, cs::subsystem_desc<Axpb>("a", 1.0f, 0.0f));
+        if (kind_ == 'd')
+            add_design_var("a.x");
+        else
+            add_constraint("a.y");
+    }
+};
+}  // namespace tmod
+
+TEST_CASE("Marks: only on subsystems that never go out of scope", "[model][marks][errors]") {
+    // Design review, section 9 (Jack, 2026-10-03): Model::setup's finalize walks the slots from the root to the mark's
+    // declaring subsystem and refuses a run policy (transient, do_once, run_n) on the way.
+    SECTION("an eternal subsystem: fine") {
+        auto model = cs::create_model<tmod::MarkScopeTop>(default_config(), 0, 'd');
+        CHECK_NOTHROW(model.setup());
+        CHECK(model.design_vars().size() == 1);
+    }
+    SECTION("a transient subsystem") {
+        auto model = cs::create_model<tmod::MarkScopeTop>(default_config(), 1, 'd');
+        tmod::expect_throws([&] { model.setup(); },
+                            {"'a.x' is a design variable on a subsystem that can go out of scope", "('a' has a run policy)",
+                             "marks must live on subsystems that never go out of scope"});
+    }
+    SECTION("a do_once subsystem, a constraint") {
+        auto model = cs::create_model<tmod::MarkScopeTop>(default_config(), 2, 'c');
+        tmod::expect_throws([&] { model.setup(); },
+                            {"'a.y' is a constraint on a subsystem that can go out of scope", "('a' has a run policy)"});
+    }
+    SECTION("a run_n subsystem") {
+        auto model = cs::create_model<tmod::MarkScopeTop>(default_config(), 3, 'd');
+        tmod::expect_throws([&] { model.setup(); }, {"design variable", "('a' has a run policy)"});
+    }
+    SECTION("an eternal System under a transient one: the walk starts at the root") {
+        auto model = cs::create_model<tmod::MarkScopeTop>(default_config(), 4, 'd');
+        tmod::expect_throws([&] { model.setup(); },
+                            {"'outer.in.a.x' is a design variable", "('outer' has a run policy)"});
+    }
 }
 
 // =============================================================================================
 // 3. Lifecycle errors
 // =============================================================================================
-TEST_CASE("Lifecycle: errors before setup, setup twice, moved-from, default_device", "[model][lifecycle]") {
+TEST_CASE("Lifecycle: errors before setup, setup twice, moved-from", "[model][lifecycle]") {
     using Top = tmod::SellarTop<DType::f32>;
 
     SECTION("forward before setup throws") {
@@ -736,7 +766,6 @@ TEST_CASE("Lifecycle: errors before setup, setup twice, moved-from, default_devi
         auto m = cs::create_model<Top>(default_config());
         m.setup();
         tmod::expect_throws([&] { m.setup(); }, {"runs once"});
-        m.wait();  // the first setup() submitted initializer work
     }
     SECTION("forward on a moved-from Model throws; the moved-to Model runs") {
         auto m = cs::create_model<Top>(default_config());
@@ -746,23 +775,20 @@ TEST_CASE("Lifecycle: errors before setup, setup twice, moved-from, default_devi
         CHECK_NOTHROW(moved.forward());
         CHECK_NOTHROW(moved.wait());
     }
-    SECTION("a default_device outside the context throws at construction") {
-        const auto all = sycl::device::get_devices();
-        if (all.size() < 2) SKIP("only one device is visible (" << all.size() << "); nothing to name outside the context");
-        cs::ModelConfig cfg{std::span<const sycl::device>{all.data(), 1}};
-        cfg.default_device = all[1];
-        tmod::expect_throws([&] { auto bad = cs::create_model<Top>(std::move(cfg)); }, {"default_device"});
-    }
 }
 
 // =============================================================================================
 // 4. Host access errors
 // =============================================================================================
-TEST_CASE("Host access: errors name the path; init_input on an output throws", "[model][host]") {
+TEST_CASE("Host access: errors name the path; update_input on an output throws", "[model][host]") {
     SECTION("errors") {
         auto model = cs::create_model<tmod::SellarTop<DType::f32>>(default_config());
         model.setup();
         const std::vector<float> two{1.0f, 2.0f};
+
+        // A view can be obtained only after a run (design review, section 5): these cases were about what a view
+        // names, so the model runs once first (the old order, a view straight after setup, now throws).
+        model.forward();
 
         // Unknown path: the message carries the path it could not resolve.
         tmod::expect_throws([&] { (void)model.view_output<DType::f32, 1>("nope.y"); }, {"nope.y"});
@@ -770,35 +796,36 @@ TEST_CASE("Host access: errors name the path; init_input on an output throws", "
         // The wrong kind of entry.
         tmod::expect_throws([&] { (void)model.view_input<DType::f32, 1>("obj.f"); }, {"obj.f", "an output"});
         tmod::expect_throws([&] { (void)model.view_output<DType::f32, 1>("d1.z"); }, {"d1.z", "an input"});
-        // An initial value on an output is an error.
-        tmod::expect_throws([&] { model.init_input("obj.f", cs::init::from_host(two)); }, {"obj.f", "an output"});
+        // An update on an output is an error.
+        tmod::expect_throws([&] { model.update_input("obj.f", cs::init::from_host(two)); }, {"obj.f", "an output"});
         // The right call still works after that.
-        CHECK_NOTHROW(model.init_input("z", cs::init::from_host(two)));
-        model.wait();  // setup() submitted work
+        CHECK_NOTHROW(model.update_input("z", cs::init::from_host(two)));
+        model.wait();  // the forward above was enqueued; let it finish before the Model goes out of scope
     }
 }
 
 // =============================================================================================
-// 5. Memory report, measured
+// 5. Memory report
 // =============================================================================================
-TEST_CASE("Memory report: arena capacity against the distinct static roots", "[model][memory]") {
+TEST_CASE("Memory report: a static model computes; the pool report after setup and after a forward", "[model][memory]") {
     const sycl::device dev{sycl::default_selector_v};
-    auto               model = cs::create_model<tmod::MemTop>(default_config());
+    auto               model = cs::create_model<tmod::MemTop>(cst::pooled_config());
     model.setup();
 
+    // Setup allocates nothing (design review, section 2).
     const auto after_setup = tmod::report_on(model, dev);
+    CHECK(after_setup.pool_bytes_in_use == 0);
 
     std::array<float, 8> bc{};
     for (std::size_t i = 0; i < bc.size(); ++i) bc[i] = static_cast<float>(i + 1);
-    model.init_input("bc", cs::init::from_host(std::vector<float>{bc.begin(), bc.end()}));
-    model.forward();
-    model.wait();
-    const auto after_fwd = tmod::report_on(model, dev);
+    model.update_input("bc", cs::init::from_host(std::vector<float>{bc.begin(), bc.end()}));
+    cst::forward_and_wait(model);
+    const auto after_fwd = tmod::report_on(model, dev);  // between runs, before any host view exists
 
     // The model computes what it says (so the roots really hold data).
-    const auto gen = to_vector(model.view_output<DType::f32, 1>("gen.y"));
-    const auto cvt = to_vector(model.view_output<DType::f64, 1>("cvt.d"));
-    const auto out = to_vector(model.view_output<DType::f32, 1>("out"));
+    const auto gen = to_vector(cst::synced_output<DType::f32, 1>(model, "gen.y"));
+    const auto cvt = to_vector(cst::synced_output<DType::f64, 1>(model, "cvt.d"));
+    const auto out = to_vector(cst::synced_output<DType::f32, 1>(model, "out"));
     REQUIRE(gen.size() == 100);
     REQUIRE(cvt.size() == 64);
     REQUIRE(out.size() == 16);
@@ -806,54 +833,71 @@ TEST_CASE("Memory report: arena capacity against the distinct static roots", "[m
     CHECK(cvt[63] == 126.0);
     for (std::size_t i = 0; i < out.size(); ++i) CHECK(out[i] == 2.0f * bc[i % 8]);  // e[0] = cvt.d[0] = 0
 
-    const std::size_t cap      = after_fwd.arena_bytes;
-    const std::size_t measured = cap >= tmod::kArenaSlack ? cap - tmod::kArenaSlack : 0;
     std::printf("[memory] expected static %zu B (gen.y %zu + cvt.d %zu + bc %zu + comb.o %zu)\n"
-                "[memory] arena capacity %zu B; minus slack %zu B = %zu B (difference to expected: %+lld B)\n"
-                "[memory] arena in use: %zu B after setup, %zu B after a forward; pool %zu B\n",
-                tmod::kExpectedStatic, tmod::kGenBytes, tmod::kCvtBytes, tmod::kBcBytes, tmod::kOutBytes, cap,
-                tmod::kArenaSlack, measured, static_cast<long long>(measured) - static_cast<long long>(tmod::kExpectedStatic),
-                after_setup.arena_bytes_in_use, after_fwd.arena_bytes_in_use, after_fwd.pool_bytes);
+                "[memory] pool %zu B, in use after setup %zu B, after a forward %zu B; OS allocations %zu (%zu B live)\n",
+                tmod::kExpectedStatic, tmod::kGenBytes, tmod::kCvtBytes, tmod::kBcBytes, tmod::kOutBytes, after_fwd.pool_bytes,
+                after_setup.pool_bytes_in_use, after_fwd.pool_bytes_in_use, after_fwd.os_allocations, after_fwd.os_bytes_in_use);
 
-    CHECK(cap >= tmod::kArenaSlack);
-    CHECK(measured == tmod::kExpectedStatic);
-    CHECK(after_fwd.arena_bytes_in_use <= cap);
-    CHECK(after_fwd.arena_bytes_in_use >= tmod::kExpectedStatic);
+    // REVIEW: the old equality (arena capacity less the setup slack == the sum of the distinct static roots) has no
+    // counterpart. The pool counts nodes (1024 B), so whether in-use bytes equal, or only bound, the sum of the roots
+    // depends on node rounding and on which allocations the pool serves; the headers do not settle it. Only "in use > 0"
+    // and "in use <= capacity" are asserted.
+    CHECK(after_fwd.pool_bytes_in_use > 0);
+    CHECK(after_fwd.pool_bytes >= after_fwd.pool_bytes_in_use);
+}
+
+TEST_CASE("Memory report: a device without a configured pool is a zero-byte pool, and its allocations count as OS ones",
+          "[model][memory]") {
+    // Design review, section 9: every context device gets a pool, possibly of 0 bytes (default_config() sets no size).
+    const sycl::device dev{sycl::default_selector_v};
+    auto               model = cs::create_model<tmod::MemTop>(default_config());
+    model.setup();
+    const auto before = tmod::report_on(model, dev);  // an entry exists before anything ran
+    CHECK(before.pool_bytes == 0);
+    CHECK(before.os_allocations == 0);
+    std::array<float, 8> bc{};
+    model.update_input("bc", cs::init::from_host(std::vector<float>{bc.begin(), bc.end()}));
+    cst::forward_and_wait(model);
+    const auto after = tmod::report_on(model, dev);
+    CHECK(after.pool_bytes == 0);
+    CHECK(after.pool_bytes_in_use == 0);
+    CHECK(after.os_allocations > 0);
+    CHECK(after.os_bytes_in_use > 0);
 }
 
 // =============================================================================================
 // 6. Pool
 // =============================================================================================
-TEST_CASE("Pool: a value-driven root allocates from the pool and follows init_input", "[model][pool]") {
+TEST_CASE("Pool: a value-driven root allocates from the pool and follows update_input", "[model][pool]") {
     const sycl::device dev{sycl::default_selector_v};
     cs::ModelConfig    cfg = default_config();
     cfg.default_pool_bytes = std::size_t{1} << 20;  // 1 MiB, in nodes of the default 1024 B
     auto model             = cs::create_model<tmod::PoolTop>(std::move(cfg));
     model.setup();
+    // REVIEW: asserted after setup in the old case (arena era). A pool is sized up front (section 2), so its capacity
+    // should already be reported; not settled from the headers whether slot_count() is nonzero before the first allocation.
     CHECK(tmod::report_on(model, dev).pool_bytes > 0);
 
     std::uint32_t n = 8;
-    model.init_input("bins.n", cs::init::from_host(std::vector<std::uint32_t>{n}));
-    model.forward();
-    model.wait();
+    model.update_input("bins.n", cs::init::from_host(std::vector<std::uint32_t>{n}));
+    cst::forward_and_wait(model);
     {
         const auto rep = tmod::report_on(model, dev);
         std::printf("[pool] n=%u: pool %zu B, in use %zu B\n", n, rep.pool_bytes, rep.pool_bytes_in_use);
         CHECK(rep.pool_bytes_in_use > 0);
-        const auto bins = to_vector(model.view_output<DType::f32, 1>("bins.bins"));
+        const auto bins = to_vector(cst::synced_output<DType::f32, 1>(model, "bins.bins"));
         REQUIRE(bins.size() == n);
         for (std::size_t i = 0; i < bins.size(); ++i) CHECK(bins[i] == static_cast<float>(i + 1));
     }
 
     n = 3000;  // 12000 B: several nodes
-    model.init_input("bins.n", cs::init::from_host(std::vector<std::uint32_t>{n}));
-    model.forward();
-    model.wait();
+    model.update_input("bins.n", cs::init::from_host(std::vector<std::uint32_t>{n}));
+    cst::forward_and_wait(model);
     {
         const auto rep = tmod::report_on(model, dev);
         std::printf("[pool] n=%u: pool %zu B, in use %zu B\n", n, rep.pool_bytes, rep.pool_bytes_in_use);
         CHECK(rep.pool_bytes_in_use > 0);
-        const auto bins = to_vector(model.view_output<DType::f32, 1>("bins.bins"));
+        const auto bins = to_vector(cst::synced_output<DType::f32, 1>(model, "bins.bins"));
         REQUIRE(bins.size() == n);
         bool ok = true;
         for (std::size_t i = 0; i < bins.size(); ++i) ok = ok && bins[i] == static_cast<float>(i + 1);
@@ -868,18 +912,22 @@ TEST_CASE("Two devices: a producer on one, its consumer on the other", "[model][
     sycl::device first, host;
     if (!tmod::pick_two(first, host)) SKIP("a non-OpenMP device and the OpenMP host device are not both visible");
 
+    // REVIEW: ModelConfig has no default_device (design review, section 2): every instance takes AdaptiveCpp's default
+    // and a device given to add_subsystem overrides a subtree. The old case made `first` the default and put `mid` on
+    // `host`. Here the default-selector device must be one of the two, and `mid` goes to the other one; the case skips
+    // otherwise. Whether that is the intended replacement is not settled.
+    const sycl::device dflt = cs::detail::default_device();
+    if (dflt != first && dflt != host) SKIP("the default device is neither of the two devices picked");
+    const sycl::device other = (dflt == first) ? host : first;
+
     const std::array<sycl::device, 2> devs{first, host};
     cs::ModelConfig                   cfg{std::span<const sycl::device>{devs}};
-    cfg.default_device = first;
-    auto model         = cs::create_model<tmod::TwoDevTop>(std::move(cfg), host);
+    cfg.default_pool_bytes = std::size_t{1} << 20;  // a real pool on each device, so both report pool bytes in use
+    auto model             = cs::create_model<tmod::TwoDevTop>(std::move(cfg), other);
     model.setup();
 
-    CHECK(model.root().entry_at("src.y").placement().device == first);
-    CHECK(model.root().entry_at("mid.y").placement().device == host);
-    const auto rep = model.memory_report();
-    CHECK(rep.devices.size() == 2);
-    CHECK(rep.devices.at(first).arena_bytes > 0);
-    CHECK(rep.devices.at(host).arena_bytes > 0);
+    CHECK(model.root().instance_at("src.y")->device == dflt);
+    CHECK(model.root().instance_at("mid.y")->device == other);
 
     for (int round = 0; round < 2; ++round) {
         std::vector<float> x(tmod::kLen), want_mid(tmod::kLen), want_out(tmod::kLen);
@@ -889,13 +937,19 @@ TEST_CASE("Two devices: a producer on one, its consumer on the other", "[model][
             want_out[i] = want_mid[i] + 2.0f;
         }
         INFO("round " << round);
-        model.init_input("src.x", cs::init::from_host(x));
-        model.forward();
-        model.wait();
-        CHECK(to_vector(model.view_output<DType::f32, 1>("src.y")) == x);
-        CHECK(to_vector(model.view_output<DType::f32, 1>("mid.y")) == want_mid);
-        CHECK(to_vector(model.view_output<DType::f32, 1>("out.y")) == want_out);
+        model.update_input("src.x", cs::init::from_host(x));
+        cst::forward_and_wait(model);
+        CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "src.y")) == x);
+        CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "mid.y")) == want_mid);
+        CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "out.y")) == want_out);
     }
+
+    // REVIEW: replaces "arena_bytes > 0 on both devices". Assumes a device-kind allocation on each device is served by
+    // that device's pool (so in use > 0 on both after a forward); the headers do not settle which allocations the pool serves.
+    const auto rep = model.memory_report();
+    CHECK(rep.devices.size() == 2);
+    CHECK(rep.devices.at(first).pool_bytes_in_use > 0);
+    CHECK(rep.devices.at(host).pool_bytes_in_use > 0);
 }
 
 // =============================================================================================
@@ -904,66 +958,63 @@ TEST_CASE("Two devices: a producer on one, its consumer on the other", "[model][
 TEST_CASE("empty: a size-0 root is present and empty; its consumer runs as a no-op", "[model][init][empty]") {
     auto model = cs::create_model<tmod::EmptyTop>(default_config());
     model.setup();
-    // Before the owner has run, a view throws.
-    tmod::expect_throws([&] { (void)model.view_output<DType::f32, 1>("bins.bins"); }, {"has no data: it is not materialized"});
+    // Design review, section 5: a host view can be obtained only after a run. Before the first forward a view throws
+    // (it used to throw "has no data: it is not materialized" before the owner had run).
+    tmod::expect_throws([&] { (void)model.view_output<DType::f32, 1>("bins.bins"); }, {"only after a run"});
 
-    model.init_input("bins.n", cs::init::from_host(std::vector<std::uint32_t>{0}));
-    model.forward();
-    model.wait();
+    model.update_input("bins.n", cs::init::from_host(std::vector<std::uint32_t>{0}));
+    cst::forward_and_wait(model);
     {
-        auto bins = model.view_output<DType::f32, 1>("bins.bins");  // present, size 0
+        // REVIEW: "present, size 0" is the old expectation. A host view needs the host copy to have data
+        // (host_view.hpp's host_store throws when it has none); whether a zero-element variable has a host copy is
+        // not settled from the headers.
+        auto bins = cst::synced_output<DType::f32, 1>(model, "bins.bins");  // present, size 0
         CHECK(bins.size() == 0);
         CHECK(bins.shape()[0] == 0);
-        auto y = model.view_output<DType::f32, 1>("sc.y");
+        auto y = cst::synced_output<DType::f32, 1>(model, "sc.y");
         CHECK(y.size() == 0);
         CHECK(y.shape()[0] == 0);
     }
 
     // The empty root grows when its driving value does.
-    model.init_input("bins.n", cs::init::from_host(std::vector<std::uint32_t>{4}));
-    model.forward();
-    model.wait();
-    CHECK(to_vector(model.view_output<DType::f32, 1>("bins.bins")) == std::vector<float>{1, 2, 3, 4});
-    CHECK(to_vector(model.view_output<DType::f32, 1>("sc.y")) == std::vector<float>{2, 4, 6, 8});
+    model.update_input("bins.n", cs::init::from_host(std::vector<std::uint32_t>{4}));
+    cst::forward_and_wait(model);
+    CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "bins.bins")) == std::vector<float>{1, 2, 3, 4});
+    CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "sc.y")) == std::vector<float>{2, 4, 6, 8});
 }
 
-TEST_CASE("init: init_input before the first forward is applied", "[model][init]") {
+TEST_CASE("init: update_input before the first forward is applied", "[model][init]") {
     auto model = cs::create_model<tmod::OneAxTop>(default_config());
     model.setup();
     std::vector<float> x(tmod::kLen);
     for (std::size_t i = 0; i < x.size(); ++i) x[i] = static_cast<float>(i) + 0.5f;
-    model.init_input("a.x", cs::init::from_host(x));
-    model.forward();
-    model.wait();
-    CHECK(to_vector(model.view_input<DType::f32, 1>("a.x")) == x);
-    CHECK(to_vector(model.view_output<DType::f32, 1>("a.y")) == x);
+    model.update_input("a.x", cs::init::from_host(x));
+    cst::forward_and_wait(model);
+    CHECK(to_vector(cst::synced_input<DType::f32, 1>(model, "a.x")) == x);
+    CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "a.y")) == x);
 }
 
-TEST_CASE("init: init_input between runs re-initializes once", "[model][init]") {
+TEST_CASE("init: update_input between runs re-initializes once", "[model][init]") {
     auto model = cs::create_model<tmod::OneAxTop>(default_config());
     model.setup();
     const auto host_init = [](float v) {
-        return cs::init::custom_host<DType::f32, 1>(std::function<void(cs::HostViewMut<DType::f32, 1>&)>{
-            [v](cs::HostViewMut<DType::f32, 1>& h) {
+        return cs::init::custom_host<DType::f32, 1>(std::function<void(cs::HostInit<DType::f32, 1>&)>{
+            [v](cs::HostInit<DType::f32, 1>& h) {
                 ++tmod::g_host_inits;
                 for (std::size_t k = 0; k < h.size(); ++k) h[k] = v;
             }});
     };
     tmod::g_host_inits = 0;
-    model.init_input("a.x", host_init(5.0f));
-    model.forward();
-    model.wait();
+    model.update_input("a.x", host_init(5.0f));
+    cst::forward_and_wait(model);
     CHECK(tmod::g_host_inits == 1);
-    model.forward();
-    model.wait();
+    cst::forward_and_wait(model);
     CHECK(tmod::g_host_inits == 1);  // not re-applied without a new call
-    model.init_input("a.x", host_init(7.0f));
-    model.forward();
-    model.wait();
+    model.update_input("a.x", host_init(7.0f));
+    cst::forward_and_wait(model);
     CHECK(tmod::g_host_inits == 2);
-    CHECK(to_vector(model.view_output<DType::f32, 1>("a.y")) == std::vector<float>(tmod::kLen, 7.0f));
-    model.forward();
-    model.wait();
+    CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "a.y")) == std::vector<float>(tmod::kLen, 7.0f));
+    cst::forward_and_wait(model);
     CHECK(tmod::g_host_inits == 2);
 }
 
@@ -971,23 +1022,21 @@ TEST_CASE("init: Model init beats the Component's and the System's declared init
     {
         auto model = cs::create_model<tmod::DeclaredTop>(default_config());
         model.setup();
-        model.forward();
-        model.wait();
-        CHECK(to_vector(model.view_output<DType::f32, 1>("a.y")) ==
+        cst::forward_and_wait(model);
+        CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "a.y")) ==
               std::vector<float>(tmod::kLen, 2.0f));  // the System over the Component
     }
     {
         auto model = cs::create_model<tmod::DeclaredTop>(default_config());
         model.setup();
-        model.init_input("a.x", cs::init::fill(3.0f));
-        model.forward();
-        model.wait();
-        CHECK(to_vector(model.view_output<DType::f32, 1>("a.y")) ==
+        model.update_input("a.x", cs::init::fill(3.0f));
+        cst::forward_and_wait(model);
+        CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "a.y")) ==
               std::vector<float>(tmod::kLen, 3.0f));  // the Model over both
     }
 }
 
-TEST_CASE("init: init_input on a connected input warns and is not applied; on an output it throws",
+TEST_CASE("init: update_input on a connected input warns and is not applied; on an output it throws",
           "[model][init]") {
     auto model = cs::create_model<tmod::ChainTop>(default_config());
     model.setup();
@@ -995,19 +1044,19 @@ TEST_CASE("init: init_input on a connected input warns and is not applied; on an
     std::ostringstream captured;
     std::streambuf*    old = std::cerr.rdbuf(captured.rdbuf());
     try {
-        model.init_input("q.x", cs::init::fill(9.0f));
+        model.update_input("q.x", cs::init::fill(9.0f));
     } catch (...) {
         std::cerr.rdbuf(old);
         throw;
     }
     std::cerr.rdbuf(old);
+    // The warning's wording changed with the rework: it names update_input (model.hpp, per design review section 5).
     CHECK(captured.str() ==
-          "naga::cospan: warning: input 'q.x' is connected to an output; your initializer may not run\n");
+          "naga::cospan: warning: input 'q.x' is connected to an output; update_input is never applied\n");
 
-    model.forward();
-    model.wait();
-    CHECK(to_vector(model.view_output<DType::f32, 1>("q.y")) ==
+    cst::forward_and_wait(model);
+    CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "q.y")) ==
           std::vector<float>(tmod::kLen, 1.0f));  // p.y = 1, not 9
 
-    CHECK_THROWS_AS(model.init_input("p.y", cs::init::fill(1.0f)), std::invalid_argument);
+    CHECK_THROWS_AS(model.update_input("p.y", cs::init::fill(1.0f)), std::invalid_argument);
 }
