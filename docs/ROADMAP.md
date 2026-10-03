@@ -4,14 +4,14 @@ Messy by design. Checkboxes, notes, strike-throughs welcome. Each item points at
 
 ## Before any code (spec drafts still needed)
 
-- [ ] Chunked systems — a system flavour with a scratch budget; nesting and sub-chunking are required; the chunk axis and the sub-chunk declaration are open. (absorbed by: r02)
+- [x] Chunked systems — a system flavour with a scratch budget; nesting and sub-chunking are required; the chunk axis and the sub-chunk declaration are open. (absorbed by: r02)
 - [ ] Cycles, solvers and implicit components — cycles by registration order; an implicit component is a self-connection with its own buffer; a balance helper. (absorbed by: r02)
 - [ ] A "proven by" list per r01 section — the order-sensitive tests each contract needs. (absorbed by: r02)
 
 ## Build order (forward-complete first)
 
 1. [ ] SlabKit on the fork — repin, six gap tests, spec/README refresh.
-2. [ ] CoSpan skeleton, including chunked systems — forward passes for every non-cyclic pattern.
+2. [x] CoSpan skeleton, including chunked systems — forward passes for every non-cyclic pattern.
 3. [ ] Forward time stepping (MLS-MPM).
 4. [ ] Cycles, solvers, implicit components — Sellar converges.
 5. [ ] Implicit time stepping (FE heat conduction; steady state matches the solver).
@@ -58,9 +58,9 @@ Topics learned while building the light-transport forcing case (2026-09-30). Eac
 
 ## Housekeeping
 
-- [ ] CoSpan pixi manifest repinned to the naga toolchain (full previous manifest at dbebc3a:pixi.toml).
+- [x] CoSpan pixi manifest repinned to the naga toolchain (full previous manifest at dbebc3a:pixi.toml).
 - [ ] README.md rewrite (it still describes the first-pass framework).
-- [ ] Tests from the first code commit.
+- [x] Tests from the first code commit.
 - [ ] Clean up tests/smoke and tests/spike: standalone, unbuilt, and stale after D138 (they use init() hooks, initializers, EntryAccess/RootDriver). Fold anything still worth checking into the Catch2 suite, then remove them (Jack decides at cleanup time).
 
 ## After the 2026-10-01 checkpoint (D140 rework)
@@ -90,7 +90,7 @@ CoSpan's differentiator is orchestration on top of AdaptiveCpp's JIT and fusion.
 - [ ] usm_vector operations (assignment, move, copy, resize, from_host) accept dependent events. Why: containers take part in the event graph instead of forcing waits.
 - [ ] Push pattern: consumer-side work is registered on a root at setup (cross-device copies for connections, initializers, a device-side scan for chunked topology) and is submitted from the producer's event as soon as the producer is submitted. Why: that work finishes long before the consumer is reached.
 - [ ] Remove ParallelSystem: independent sibling subsystems (including whole Systems) are detected and submitted as a parallel task graph. FusedSystem stays as the one special flavor (components only, sequential and parallel waves). Why: concurrency follows from the dependency graph, not from a user-chosen flavor.
-- [ ] Lifetime is scope: eternal by default; do-once / do-N (transient) subsystems are the special cases, and when one goes out of scope everything it produced that nothing downstream uses is freed. Frees stay synchronous on the main loop and should be rare. Reviving re-creates memory; if that happens often the modeler makes the subsystem eternal. Why: free timing must be deterministic, and the memory/compute trade-off is the modeler's decision.
+- [x] Lifetime is scope: eternal by default; do-once / do-N (transient) subsystems are the special cases, and when one goes out of scope everything it produced that nothing downstream uses is freed. Frees stay synchronous on the main loop and should be rare. Reviving re-creates memory; if that happens often the modeler makes the subsystem eternal. Why: free timing must be deterministic, and the memory/compute trade-off is the modeler's decision.
 - [ ] Visibility for those trade-offs: a user-facing per-forward report of allocations, frees and waits per subsystem (from memory_report and the diag counters). Why: the modeler can only choose scopes from a profile.
 - [ ] Design guidance to document: prefer shapes inherited from connections, keep connected components on one device, and treat repeatedly resizing value-driven shapes as a cost. Why: these avoid reallocation churn.
 - [ ] Ergonomics pass over model building (declaration forms, aliases, task-graph construction). Why: the demo has to look as good to write as it runs.
