@@ -89,12 +89,6 @@ inline std::shared_ptr<Instance> first_of_kind(const VarMeta& m, IOKind k) {
     return {};
 }
 
-/// Integer value dtype (not f32 / f64, plain or atomic).
-constexpr bool is_integer_value_dtype(DType dt) noexcept {
-    const DType v = value_dtype(dt);
-    return v != DType::f32 && v != DType::f64;
-}
-
 // -----------------------------------------------------------------------------
 // Compatibility
 // -----------------------------------------------------------------------------

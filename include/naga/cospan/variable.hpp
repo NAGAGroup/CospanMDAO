@@ -27,6 +27,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <optional>
 #include <set>
@@ -144,34 +145,78 @@ struct RaggedDeviceData : DeviceData<T> {
 };
 
 // -----------------------------------------------------------------------------
+// Device columns and the resolved shape
+// -----------------------------------------------------------------------------
+
+/// Integer value dtype (not f32 / f64, plain or atomic): what a size may be read from.
+constexpr bool is_integer_value_dtype(DType dt) noexcept {
+    const DType v = value_dtype(dt);
+    return v != DType::f32 && v != DType::f64;
+}
+
+/// A driving column's per-index extents and their exclusive scan, on the DRIVER's device (docs/design-review-2026-10-03.md,
+/// section 6): built once per write of the driving variable, by one device task, and read by the consumers' index arrays
+/// (and by nothing on the host but the total and a negative-value flag). The vectors are `mutable` so that a holder of a
+/// const pointer can register the event of its own read on them.
+struct DeviceColumn {
+    DataKey                                          key;      ///< where the column lives (the driver's device)
+    std::size_t                                      n = 0;    ///< the number of indices
+    mutable std::optional<sk::usm_vector<std::uint64_t>> extents;     ///< n entries
+    mutable std::optional<sk::usm_vector<std::uint64_t>> offs;        ///< n + 1 entries: the exclusive scan
+    std::optional<sk::usm_vector<std::uint64_t>>     host_total;  ///< host kind, 2 elements: [total, negative flag]
+    std::uint64_t                                    total   = 0;     ///< read from host_total once the task is done
+    std::uint64_t                                    version = ~0ull; ///< the driver's write_count() when it was built
+    sycl::event                                      ev;              ///< the task that built it
+};
+
+// -----------------------------------------------------------------------------
 // The resolved shape
 // -----------------------------------------------------------------------------
 
-/// The shape a variable has NOW, as numbers. A per-index dimension reports extent 0 and carries its array.
+/// The shape a variable has NOW, as numbers. A per-index dimension reports extent 0 and is sourced from the host
+/// (`per_index[d]`) OR from the device (`dev_per[d]`, a DeviceColumn), never both. The device path covers ONE
+/// per-index dimension (the common CSR case); with two, normalize() brings them to the host.
 struct ResolvedShape {
     bool                                    known = false;
     std::array<std::size_t, 3>              extents{1, 1, 1};  ///< 1-padded past the rank
     std::array<std::vector<std::size_t>, 3> per_index{};
     std::array<bool, 3>                     per{};
+    std::array<std::shared_ptr<const DeviceColumn>, 3> dev_per{};      ///< device-sourced per-index dimensions
+    std::array<std::uint64_t, 3>            dev_version{};            ///< the column's version when this shape was built
+    std::uint64_t                           total = 0;                ///< a ragged shape's number of elements
 
     bool ragged() const noexcept { return per[1] || per[2]; }
+    bool device_sourced() const noexcept { return dev_per[1] || dev_per[2]; }
 
-    /// The number of elements: the product of the extents, or, for a ragged shape, the sum of the block sizes
-    /// (the same arithmetic as InitShape::elements()). 0 while the shape is not known.
-    std::size_t elements() const {
-        if (!known) return 0;
-        if (!ragged()) return extents[0] * extents[1] * extents[2];
-        std::size_t total = 0;
+    /// The sum of the block sizes, from the host arrays (no device-sourced dimension).
+    std::size_t host_sum() const {
+        std::size_t sum = 0;
         for (std::size_t i = 0; i < extents[0]; ++i) {
             std::size_t block = 1;
             for (std::size_t d = 1; d < 3; ++d) block *= per[d] ? per_index[d][i] : extents[d];
-            total += block;
+            sum += block;
         }
-        return total;
+        return sum;
     }
 
-    /// The N + 1 block offsets of a ragged shape: offsets[i + 1] = offsets[i] + the size of block i.
+    /// The number of elements: the product of the extents, or, for a ragged shape, `total` when a dimension is
+    /// device-sourced, else the sum of the block sizes (the same arithmetic as InitShape::elements()). 0 while the
+    /// shape is not known.
+    std::size_t elements() const {
+        if (!known) return 0;
+        if (!ragged()) return extents[0] * extents[1] * extents[2];
+        if (device_sourced()) return static_cast<std::size_t>(total);
+        return host_sum();
+    }
+
+    /// Sets `total` of a host-only ragged shape (a dense or device-sourced one is left alone).
+    void settle_host_total() {
+        if (!device_sourced()) total = ragged() ? static_cast<std::uint64_t>(host_sum()) : 0;
+    }
+
+    /// The N + 1 block offsets of a ragged shape: offsets[i + 1] = offsets[i] + the size of block i. Host arrays only.
     std::vector<std::uint64_t> block_offsets() const {
+        if (device_sourced()) throw std::logic_error("naga::cospan: its block offsets live on the device (a value-driven ragged shape)");
         std::vector<std::uint64_t> offs(extents[0] + 1, 0);
         for (std::size_t i = 0; i < extents[0]; ++i) {
             std::uint64_t block = 1;
@@ -181,8 +226,65 @@ struct ResolvedShape {
         return offs;
     }
 
-    friend bool operator==(const ResolvedShape&, const ResolvedShape&) = default;
+    /// Dimension `d`'s per-index extents on the host: its host array, or the device column copied down (waiting on it).
+    std::vector<std::size_t> per_index_on_host(std::size_t d, Runtime& rt) const {
+        if (!dev_per[d]) return per_index[d];
+        const DeviceColumn&      col = *dev_per[d];
+        std::vector<std::uint64_t> h(col.n);
+        std::vector<sycl::event>   deps{col.ev};
+        const std::vector<sycl::event> own = col.extents->events();
+        deps.insert(deps.end(), own.begin(), own.end());
+        if (col.n != 0) rt.q.copy(col.key.dev, deps, static_cast<const std::uint64_t*>(col.extents->data()), h.data(), col.n).wait();
+        return std::vector<std::size_t>(h.begin(), h.end());
+    }
+
+    /// The fallback for TWO per-index dimensions: when one is device-sourced, every device-sourced dimension becomes a host
+    /// array (the device path covers one per-index dimension, the common CSR case; a later phase may extend it), and the
+    /// total is recomputed from the host arrays.
+    void normalize(Runtime& rt) {
+        if (!device_sourced() || !(per[1] && per[2])) return;
+        for (std::size_t d = 1; d < 3; ++d) {
+            if (!dev_per[d]) continue;
+            per_index[d] = per_index_on_host(d, rt);
+            dev_per[d].reset();
+            dev_version[d] = 0;
+        }
+        settle_host_total();
+    }
+
+    friend bool operator==(const ResolvedShape& a, const ResolvedShape& b) {
+        return a.known == b.known && a.extents == b.extents && a.per_index == b.per_index && a.per == b.per &&
+               a.dev_per == b.dev_per && a.dev_version == b.dev_version && a.total == b.total;
+    }
 };
+
+/// Finishes a ragged shape that was built dimension by dimension: per-index dimensions get extent 0; with two per-index
+/// dimensions a device-sourced one is brought to the host (normalize); and the total is set: the column's total times
+/// the scalar dimensions when exactly one dimension is device-sourced, else the sum of the host arrays. `who` names the
+/// variable in messages. One place, used by every path that builds a value-driven shape.
+inline void finish_ragged_total(ResolvedShape& s, Runtime& rt, const std::string& who) {
+    for (std::size_t u = 0; u < 3; ++u)
+        if (s.per[u]) s.extents[u] = 0;
+    if (!s.ragged()) {
+        s.total = 0;
+        return;
+    }
+    s.normalize(rt);
+    if (!s.device_sourced()) {
+        s.settle_host_total();
+        return;
+    }
+    const std::size_t dd = s.dev_per[1] ? 1 : 2;  // exactly one per-index dimension, device-sourced
+    const DeviceColumn& col = *s.dev_per[dd];
+    if (col.n != s.extents[0])
+        throw std::invalid_argument("naga::cospan: '" + who + "': per-index dimension " + std::to_string(dd) + " has " +
+                                    std::to_string(col.n) + " extents but dimension 0 has " + std::to_string(s.extents[0]));
+    std::uint64_t prod = 1;
+    for (std::size_t d = 1; d < 3; ++d)
+        if (d != dd) prod *= s.extents[d];
+    s.dev_version[dd] = col.version;
+    s.total           = col.total * prod;
+}
 
 // -----------------------------------------------------------------------------
 // Event lists
@@ -319,6 +421,17 @@ public:
     std::uint64_t        shape_write_count_ = ~0ull;      ///< events.write_count() when the copy was queued
     sycl::event          shape_event_;                    ///< the copy of the driving elements
     bool                 shape_valid_ = false;            ///< the host buffer holds the values of the last write
+
+    /// Per-index extents (section 6, ragged): for each requested column of this variable, the extents and their scan on
+    /// the DEVICE, built once per write of this variable (do_column_work), so the consumers' offsets never touch the host.
+    std::map<std::size_t, std::shared_ptr<DeviceColumn>> columns_;
+    std::set<std::size_t>                                columns_requested_;
+
+    /// What driving_values returns: the column (shared with this variable's cache) and the version it has now.
+    struct PerIndexSource {
+        std::shared_ptr<const DeviceColumn> col;
+        std::uint64_t                       version = 0;
+    };
 
     /// The instances that share this metadata (weak; used by merges and to answer where the variable lives).
     std::vector<std::weak_ptr<Instance>> instances;
@@ -457,6 +570,7 @@ public:
                                             std::to_string(s.extents[0]));
         }
         if (is != nullptr) check_init_shape(*this, s, *is);
+        s.settle_host_total();
         shape = std::move(s);
     }
 
@@ -487,11 +601,22 @@ public:
         shape_event_.wait();
         return read_shape_host(index);
     }
-    /// The same for per-index extents: the values of column `column` (rank 1 [N]: column 0; rank 2 [N, k]) as an
-    /// array of N extents. Implemented in Phase 8b.
-    virtual std::vector<std::size_t> driving_values(Runtime&, std::size_t column) {
-        (void)column;
-        throw std::logic_error("naga::cospan: driving_values: not implemented until Phase 8b");
+    /// The same for per-index extents: the values of column `column` (rank 1 [N]: column 0; rank 2 [N, k]) as N extents
+    /// and their exclusive scan, computed ON THE DEVICE by the producer's shape work (section 6); only the total is
+    /// copied to the host, and the host waits on that small copy alone. A negative value is an error.
+    PerIndexSource driving_values(Runtime& rt, std::size_t column) {
+        shape_driving_ = true;
+        columns_requested_.insert(column);
+        if (is_stale()) materialize(rt);
+        const auto it = columns_.find(column);
+        if (it == columns_.end() || it->second->version != events.write_count()) do_column_work(rt, column);
+        DeviceColumn& col = *columns_.at(column);
+        col.ev.wait();
+        col.total = (*col.host_total).data()[0];
+        if ((*col.host_total).data()[1] != 0)
+            throw std::invalid_argument("naga::cospan: '" + display_path() + "': column " + std::to_string(column) +
+                                        " holds a negative value; a size cannot be negative");
+        return PerIndexSource{columns_.at(column), col.version};
     }
 
     /// "2x(per-index)x4": a shape as text, for messages.
@@ -545,10 +670,13 @@ public:
                         case AliasDim::How::output_value:
                             s.extents[u] = alias_source(rt, sp.src, false)->driving_value(rt, sp.index);
                             break;
-                        case AliasDim::How::output_values:
-                            s.per[u]       = true;
-                            s.per_index[u] = alias_source(rt, sp.src, false)->driving_values(rt, sp.index);
+                        case AliasDim::How::output_values: {
+                            const PerIndexSource src = alias_source(rt, sp.src, false)->driving_values(rt, sp.index);
+                            s.per[u]         = true;
+                            s.dev_per[u]     = src.col;
+                            s.dev_version[u] = src.version;
                             break;
+                        }
                         case AliasDim::How::output_dim: {
                             const std::shared_ptr<VarMeta> up = alias_source(rt, sp.src, true);
                             copy_alias_dim(s, u, up->shape, sp.index, sp.src);
@@ -558,17 +686,17 @@ public:
                 }
                 break;
         }
-        // A per-index dim has no scalar extent, whichever spec made it.
-        for (std::size_t u = 0; u < 3; ++u)
-            if (s.per[u]) s.extents[u] = 0;
-        // every per-index array has one entry per index of dimension 0
+        // every host-sourced per-index array has one entry per index of dimension 0 (a device column's is checked below)
         for (int d = 1; d < rank; ++d) {
             const auto u = static_cast<std::size_t>(d);
-            if (s.per[u] && s.per_index[u].size() != s.extents[0])
+            if (s.per[u] && !s.dev_per[u] && s.per_index[u].size() != s.extents[0])
                 throw std::invalid_argument("naga::cospan: tie alias '" + display_path() + "': per-index dimension " + std::to_string(d) +
                                             " has " + std::to_string(s.per_index[u].size()) + " extents but dimension 0 has " +
                                             std::to_string(s.extents[0]) + " (the shape is " + alias_shape_str(s.extents, s.per, rank) + ")");
         }
+        // per-index dimensions have no scalar extent; the total (a device column's times the scalar dimensions, else the
+        // host sum); two per-index dimensions are brought to the host
+        finish_ragged_total(s, rt, display_path());
         set_shape(rt, s);
         alias_forward_ = rt.forward;
     }
@@ -589,6 +717,9 @@ public:
     /// The shape work (section 6): copies the driving elements to a small host buffer, event-ordered. A no-op unless the
     /// variable is shape-driving and materialized.
     virtual void do_shape_work(Runtime& rt) = 0;
+
+    /// Builds (or rebuilds) the device column of `column`: its per-index extents and their scan, by one device task.
+    virtual void do_column_work(Runtime& rt, std::size_t column) = 0;
 
     /// The host buffer of driving elements: its size, and element `index` converted to a size.
     virtual std::size_t shape_host_size() const = 0;
@@ -619,9 +750,11 @@ private:
             if (to == 0)
                 throw std::invalid_argument("naga::cospan: a per-index dimension of '" + src.path +
                                             "' cannot become dimension 0 of the tie alias '" + display_path() + "'");
-            out.per[to]       = true;
-            out.per_index[to] = up.per_index[d];
-            out.extents[to]   = 0;
+            out.per[to]         = true;
+            out.per_index[to]   = up.per_index[d];
+            out.dev_per[to]     = up.dev_per[d];  // a device-sourced dimension stays on the device
+            out.dev_version[to] = up.dev_version[d];
+            out.extents[to]     = 0;
         } else {
             out.extents[to] = up.extents[d];
         }
@@ -796,8 +929,16 @@ public:
         }
     }
 
+    /// The producer's shape work (section 6): the small host copy of the driving elements asked for by value, and the
+    /// device column of every column asked for by per-index values.
     void do_shape_work(Runtime& rt) override {
-        if (!shape_driving_ || value_indices_.empty() || !is_materialized()) return;
+        if (!shape_driving_ || !is_materialized()) return;
+        if (!value_indices_.empty()) do_value_work(rt);
+        for (const std::size_t c : columns_requested_) do_column_work(rt, c);
+    }
+
+    /// The driving elements, copied to the host buffer.
+    void do_value_work(Runtime& rt) {
         const std::size_t n = *value_indices_.rbegin() + 1;
         if (n > shape.elements())
             throw std::invalid_argument("naga::cospan: '" + display_path() + "' drives a size from element " +
@@ -836,6 +977,81 @@ public:
                                             std::to_string(v) + "; a size cannot be negative");
         }
         return static_cast<std::size_t>(v);
+    }
+
+    /// ONE serial device task for now (section 6: "possibly optimized later"): for i in [0, n): v = data[i * k + column];
+    /// a negative value sets the flag (and counts as 0); extents[i] = v; offs[i + 1] = offs[i] + extents[i]; finally the
+    /// total and the flag go to the host buffer. The producer queues this in its postcompute (do_shape_work), once per
+    /// write; a consumer that asks first does it itself. The column held in columns_ keeps the containers alive.
+    void do_column_work(Runtime& rt, std::size_t column) override {
+        if (!is_materialized()) return;
+        if (!is_integer_value_dtype(dtype))
+            throw std::invalid_argument("naga::cospan: '" + display_path() + "' drives per-index extents by value and must have an integer dtype");
+        if (rank > 2)
+            throw std::invalid_argument("naga::cospan: '" + display_path() +
+                                        "' drives per-index extents by value and must be rank 1 [N] or rank 2 [N,k]");
+        const std::size_t n = shape.extents[0];
+        const std::size_t k = rank == 2 ? shape.extents[1] : 1;
+        if (column >= k)
+            throw std::invalid_argument("naga::cospan: '" + display_path() + "' drives per-index extents from column " +
+                                        std::to_string(column) + " but has only " + std::to_string(k) + " column(s)");
+        // The source: a live device-kind data if there is one, else any live data.
+        std::shared_ptr<Data> src;
+        for (const auto& p : data) {
+            const std::shared_ptr<DeviceDataBase> b = p.second.lock();
+            if (!b) continue;
+            if (!src || (b->key.kind == sk::kind::device && src->key.kind != sk::kind::device)) src = std::static_pointer_cast<Data>(b);
+        }
+        std::shared_ptr<DeviceColumn>& slot = columns_[column];
+        if (!slot) slot = std::make_shared<DeviceColumn>();
+        DeviceColumn&      col = *slot;
+        const sycl::device dev = src->key.dev;
+        // The vectors are reused while they live on the same device; their size follows n (a resize within capacity).
+        if (!(col.key.dev == dev) || !col.extents || !col.offs || !col.host_total) {
+            col.key        = DataKey{dev, sk::kind::device};
+            col.extents.emplace(n, rt.allocator_for<std::uint64_t>(dev, sk::kind::device));
+            col.offs.emplace(n + 1, rt.allocator_for<std::uint64_t>(dev, sk::kind::device));
+            col.host_total.emplace(2, rt.allocator_for<std::uint64_t>(dev, sk::kind::host));
+        } else {
+            if (col.extents->size() != n) col.extents->resize(n, std::span<const sycl::event>{col.extents->events()});
+            if (col.offs->size() != n + 1) col.offs->resize(n + 1, std::span<const sycl::event>{col.offs->events()});
+        }
+        col.n = n;
+
+        std::vector<sycl::event> deps = events.read_deps();
+        for (const std::vector<sycl::event>& v : {src->events(), col.extents->events(), col.offs->events(), col.host_total->events()})
+            deps.insert(deps.end(), v.begin(), v.end());
+
+        const T*             in  = static_cast<const T*>(src->raw());
+        std::uint64_t*       ex  = col.extents->data();
+        std::uint64_t*       of  = col.offs->data();
+        std::uint64_t*       tot = col.host_total->data();
+        const std::size_t    nn = n, kk = k, cc = column;
+        const sycl::event e = rt.uq.single_task(dev, deps, [=]() {
+            std::uint64_t flag = 0;
+            of[0]              = 0;
+            for (std::size_t i = 0; i < nn; ++i) {
+                const T       v = in[i * kk + cc];
+                std::uint64_t x = 0;
+                if constexpr (std::is_signed_v<T>) {
+                    if (v < T{0}) flag = 1;
+                    else x = static_cast<std::uint64_t>(v);
+                } else {
+                    x = static_cast<std::uint64_t>(v);
+                }
+                ex[i]     = x;
+                of[i + 1] = of[i] + x;
+            }
+            tot[0] = of[nn];
+            tot[1] = flag;
+        });
+        src->register_event(e);
+        col.extents->register_event(e);
+        col.offs->register_event(e);
+        col.host_total->register_event(e);
+        events.record_read(e);  // a later writer waits until the task has read
+        col.ev      = e;
+        col.version = events.write_count();
     }
 
 protected:
@@ -930,22 +1146,53 @@ protected:
         return d;
     }
 
-    /// The offsets and the per-index arrays from the host shape (from_host: the same rules as the dense path).
+    /// The offsets and the per-index arrays, from the resolved shape: a host-sourced dimension from its host array
+    /// (from_host: the same rules as the dense path); a device-sourced one from its DeviceColumn, assigned across
+    /// (SlabKit routes it between devices) after the column's event (section 6). Nothing here touches the host for a
+    /// value-driven shape.
     void fill_index(Runtime& rt, Data& base, const DataKey& key) override {
-        if (!this->shape.ragged()) return;
+        const ResolvedShape& s = this->shape;
+        if (!s.ragged()) return;
         auto&      d     = static_cast<RaggedDeviceData<T>&>(base);
         const auto alloc = rt.allocator_for<std::uint64_t>(key.dev, key.kind);
         if (!d.offs) d.offs.emplace(alloc);
-        const std::vector<std::uint64_t> offs = this->shape.block_offsets();
-        d.offs->from_host(std::span<const std::uint64_t>{offs});
         for (int dd = 1; dd < this->rank; ++dd) {
             const auto u = static_cast<std::size_t>(dd);
-            if (!this->shape.per[u]) continue;
+            if (!s.per[u]) continue;
             auto& slot = d.per[u - 1];
             if (!slot) slot.emplace(alloc);
-            const std::vector<std::uint64_t> conv(this->shape.per_index[u].begin(), this->shape.per_index[u].end());
-            slot->from_host(std::span<const std::uint64_t>{conv});
+            if (s.dev_per[u]) {
+                const DeviceColumn&             col = *s.dev_per[u];
+                const std::array<sycl::event, 1> dep{col.ev};
+                const sycl::event e = slot->assign(*col.extents, std::span<const sycl::event>{dep});
+                col.extents->register_event(e);  // a later rebuild of the column waits for this read
+            } else {
+                const std::vector<std::uint64_t> conv(s.per_index[u].begin(), s.per_index[u].end());
+                slot->from_host(std::span<const std::uint64_t>{conv});
+            }
         }
+        if (!s.device_sourced()) {
+            const std::vector<std::uint64_t> offs = s.block_offsets();
+            d.offs->from_host(std::span<const std::uint64_t>{offs});
+            return;
+        }
+        // Exactly one device-sourced per-index dimension (finish_ragged_total guarantees it): its scan, times the scalar
+        // dimensions. A product of 1 is the column's scan itself; otherwise it is scaled in place on this key's device.
+        const std::size_t   dd  = s.dev_per[1] ? 1 : 2;
+        const DeviceColumn& col = *s.dev_per[dd];
+        std::uint64_t       prod = 1;
+        for (std::size_t x = 1; x < 3; ++x)
+            if (x != dd) prod *= s.extents[x];
+        const std::array<sycl::event, 1> dep{col.ev};
+        const sycl::event                a = d.offs->assign(*col.offs, std::span<const sycl::event>{dep});  // resizes to n + 1
+        col.offs->register_event(a);
+        if (prod == 1) return;
+        std::vector<sycl::event> deps{a};
+        const std::vector<sycl::event> own = d.offs->events();
+        deps.insert(deps.end(), own.begin(), own.end());
+        std::uint64_t* o = d.offs->data();
+        const sycl::event scaled = rt.uq.parallel_for(key.dev, deps, sycl::range<1>{col.n + 1}, [=](sycl::id<1> i) { o[i] = o[i] * prod; });
+        d.offs->register_event(scaled);
     }
 
     void copy_index(Data& dst, Data& src) override {

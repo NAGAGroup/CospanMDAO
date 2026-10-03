@@ -267,9 +267,14 @@ public:
                     s.extents[u] = ex.extent[u];
                     if (d >= 1 && ex.per[u]) {
                         s.per[u]       = true;
-                        s.per_index[u] = ex.per_index[u];
+                        s.per_index[u]   = ex.per_index[u];
+                        s.dev_per[u]     = ex.dev_per[u];
+                        s.dev_version[u] = ex.dev_version[u];
                     }
                 }
+                // per-index dimensions have no scalar extent; the total (a device column's times the scalar dimensions,
+                // else the host sum); two per-index dimensions are brought to the host
+                detail::finish_ragged_total(s, rt, inst->full_path());
                 check_dense(*inst, s);
                 inst->meta->set_shape(rt, s);
             }
@@ -289,7 +294,7 @@ public:
         // in pre_forward is the user's decision and is not checked against its declaration.
         for (const auto& [inst, ex] : expects) {
             if (std::find(reshaped_.begin(), reshaped_.end(), inst->meta.get()) != reshaped_.end()) continue;
-            check_expected(*inst, ex);
+            check_expected(*inst, ex, rt);
         }
         for (const auto& inst : order_) check_dense(*inst, inst->meta->shape);
 
@@ -414,6 +419,8 @@ private:
         std::array<std::size_t, 3>              extent{1, 1, 1};
         std::array<bool, 3>                     per{false, false, false};
         std::array<std::vector<std::size_t>, 3> per_index{};
+        std::array<std::shared_ptr<const detail::DeviceColumn>, 3> dev_per{};  ///< a per-index dimension sourced from a device column
+        std::array<std::uint64_t, 3>            dev_version{};
     };
 
     /// Sets a pointer for a scope, clears it on every exit.
@@ -554,9 +561,11 @@ private:
                     ex.extent[u] = sh.extents[r.dim];
                     // a per-index source dimension passes its array on (dimension 0 is never per-index)
                     if (d >= 1 && sh.per[r.dim]) {
-                        ex.per[u]       = true;
-                        ex.per_index[u] = sh.per_index[r.dim];
-                        ex.extent[u]    = 0;
+                        ex.per[u]         = true;
+                        ex.per_index[u]   = sh.per_index[r.dim];
+                        ex.dev_per[u]     = sh.dev_per[r.dim];
+                        ex.dev_version[u] = sh.dev_version[r.dim];
+                        ex.extent[u]      = 0;
                     }
                     break;
                 }
@@ -568,10 +577,13 @@ private:
                 }
                 case detail::DimRecord::How::per_index_from_input: {
                     const detail::Instance& src = sibling_input(inst, r.input);
-                    ex.has[u]       = true;
-                    ex.per[u]       = true;
-                    ex.per_index[u] = src.meta->driving_values(rt, r.value_index);
-                    ex.extent[u]    = 0;
+                    // the per-index extents are computed ON THE DEVICE (section 6): the expectation is a column, not an array
+                    const detail::VarMeta::PerIndexSource col = src.meta->driving_values(rt, r.value_index);
+                    ex.has[u]         = true;
+                    ex.per[u]         = true;
+                    ex.dev_per[u]     = col.col;
+                    ex.dev_version[u] = col.version;
+                    ex.extent[u]      = 0;
                     break;
                 }
                 case detail::DimRecord::How::per_index_host:
@@ -599,7 +611,7 @@ private:
     }
 
     /// Every dimension an instance declared (or derived) against what its variable has.
-    void check_expected(const detail::Instance& inst, const Expected& ex) const {
+    void check_expected(const detail::Instance& inst, const Expected& ex, detail::Runtime& rt) const {
         const detail::ResolvedShape& s = inst.meta->shape;
         for (int d = 0; d < inst.meta->rank; ++d) {
             const auto u = static_cast<std::size_t>(d);
@@ -612,9 +624,23 @@ private:
                 throw std::invalid_argument(head + (ep ? "per-index" : std::to_string(ex.extent[u])) + " but the variable's dimension " +
                                             std::to_string(d) + " is " + (vp ? "per-index" : std::to_string(s.extents[u])));
             if (ep) {
-                if (ex.per_index[u] != s.per_index[u])
-                    throw std::invalid_argument(head + detail::extents_str(ex.per_index[u]) + " but the variable's dimension " +
-                                                std::to_string(d) + " is " + detail::extents_str(s.per_index[u]));
+                // The same device column (and version) on both sides is the same extents: nothing to read. Host arrays compare
+                // element-wise. Anything else (a column against an array, or two different columns) is brought to the host
+                // first, on this path only.
+                const bool same_column = ex.dev_per[u] && s.dev_per[u] && ex.dev_per[u] == s.dev_per[u] && ex.dev_version[u] == s.dev_version[u];
+                if (!same_column) {
+                    std::vector<std::size_t> want = ex.per_index[u], have = s.per_index[u];
+                    if (ex.dev_per[u] || s.dev_per[u]) {
+                        detail::ResolvedShape w;
+                        w.dev_per[u]   = ex.dev_per[u];
+                        w.per_index[u] = ex.per_index[u];
+                        want           = w.per_index_on_host(u, rt);
+                        have           = s.per_index_on_host(u, rt);
+                    }
+                    if (want != have)
+                        throw std::invalid_argument(head + detail::extents_str(want) + " but the variable's dimension " + std::to_string(d) +
+                                                    " is " + detail::extents_str(have));
+                }
             } else if (ex.extent[u] != s.extents[u]) {
                 throw std::invalid_argument(head + std::to_string(ex.extent[u]) + " but the variable's dimension " + std::to_string(d) +
                                             " is " + std::to_string(s.extents[u]));
