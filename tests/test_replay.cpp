@@ -161,7 +161,7 @@ TEST_CASE("Replay: the topology is built by ONE full pass, cached, and the outpu
 
     cs::Model m = cs::create_model<trp::Top>(default_config(), n, budget);
     m.setup();
-    auto& sys = dynamic_cast<cs::ChunkedSystem&>(m.get_subsystem("inner"));
+    auto& sys = dynamic_cast<cs::ChunkedSystem&>((*m.get_subsystem("inner")));
     CHECK_FALSE(sys.topology_cached());
     const auto a = trp::fwd(m);
     CHECK(a.full_passes == 1);  // the one build
@@ -177,7 +177,7 @@ TEST_CASE("Replay: the before-launch hook sees every chunk's cached shape and le
     constexpr std::size_t n = 10, budget = 56;
     cs::Model             m = cs::create_model<trp::Top>(default_config(), n, budget);
     m.setup();
-    auto&                                           sys = dynamic_cast<cs::ChunkedSystem&>(m.get_subsystem("inner"));
+    auto&                                           sys = dynamic_cast<cs::ChunkedSystem&>((*m.get_subsystem("inner")));
     std::vector<std::size_t>                        t_rows, in_a, in_b;
     std::vector<std::pair<std::size_t, std::size_t>> ranges;
     sys.set_chunk_hooks(
@@ -207,7 +207,7 @@ TEST_CASE("Replay: the resize counter is 0 in the chunk loop's window and a chun
     constexpr std::size_t n = 10, budget = 56;  // chunks of 3, 3, 3, 1; t is [N,4] f32: 16 B per index
     cs::Model             m = cs::create_model<trp::Top>(default_config(), n, budget);
     m.setup();
-    auto& sys = dynamic_cast<cs::ChunkedSystem&>(m.get_subsystem("inner"));
+    auto& sys = dynamic_cast<cs::ChunkedSystem&>((*m.get_subsystem("inner")));
     for (int rep = 0; rep < 3; ++rep) {
         trp::fwd(m);
         CHECK(cs::diag::last_window().resizes == 0);

@@ -11,8 +11,8 @@
 //
 //   classification (once, at the end of setup, System::resolve):
 //     INTERNAL  every member of the root's aliasing set is declared inside the subtree: the root lives by
-//               its partners' counts like any other; inside the chunk loop their decrements are
-//               deferred to after the last chunk.
+//               its ports hold it like any other variable; inside the chunk loop the counter moves and
+//               deletions of its children are deferred to after the last chunk.
 //     BOUNDARY  the set has members inside and outside (a producer outside, a consumer outside, a
 //               promotion at this level or above). A boundary root that is itself INSIDE (an inside
 //               output consumed outside, an inside free input promoted out) is RE-ROOTED: a new alias
@@ -111,7 +111,6 @@ class ChunkedSystem : public System {
     std::function<void(std::size_t)>     chunk_hook_, chunk_post_hook_;
     std::vector<System*>                 systems_;       ///< this system and every descendant System (chunk_replay_ is set on them)
     std::vector<std::pair<detail::IOEntry*, ComponentBase*>> internal_ties_;  ///< internal tie roots, with the first Component that uses each
-    detail::DeferSink                    sink_;  ///< decrements and run-counter moves, deferred to after the last chunk
 
 public:
     /// `budget_bytes` bounds the sum, over one chunk, of the bytes of the INTERNAL ports.
@@ -148,8 +147,12 @@ public:
     std::unique_ptr<LaunchDescription> run_compute_forward() override {
         Chunks                     chunks;
         std::optional<std::size_t> known_n;
+        build_missing_transients(/*deep=*/true);  // transient children below exist for this whole forward, chunks included
+        if (stale_) {  // a child under this system was deleted or rebuilt: classify again, build the topology again
+            stale_ = false;
+            chunk_classify();
+        }
         try {
-            sink_.clear();
             resolve_outside_ties(false);  // their shapes are known before the chunk length is
             const std::size_t n = leading_length();
             known_n             = n;
@@ -172,7 +175,7 @@ public:
             // The internal roots' device metadata is uploaded ONCE, at the full range, before the window
             // (version-gated: unchanged metadata is not sent again). Per chunk only meta_shift_ moves.
             for (detail::IOEntry* r : internal_) r->upload_ragged(q());
-            sink_.active = true;  // the chunk loop: decrements and counter moves are deferred
+            for (System* s : systems_) s->defer_finishes(true);  // the chunk loop: counter moves and deletions wait
             diag::window_begin();
             run_chunks(chunks);
             diag::window_end();
@@ -180,9 +183,12 @@ public:
             for (detail::IOEntry* r : internal_) r->meta_shift_ = 0;
             for (Boundary& b : boundary_)
                 for (detail::IOEntry* p : b.peers) detail::LeadingRangeAccess::clear_no_refresh(*p);
-            finish_lifetimes();  // the deferred decrements, once; ONE queue wait if any root reaches 0
             release_held();
             clear_dim0();
+            // The turns that ended, once, after the last chunk, and LAST: a deletion drops ports this system points
+            // at (subtree_changed then clears them). Descendants first: a parent's deletion takes them with it.
+            const std::vector<System*> flush = systems_;
+            for (auto it = flush.rbegin(); it != flush.rend(); ++it) (*it)->flush_finishes();
         } catch (...) {
             topo_.valid = false;  // whatever failed, the next forward builds the topology again
             recording_  = false;
@@ -196,7 +202,7 @@ public:
                 for (detail::IOEntry* r : internal_) r->meta_shift_ = 0;
                 if (known_n) set_dim0(*known_n);
                 clear_ranges();
-                abort_lifetimes();
+                for (System* s : systems_) s->defer_finishes(false);  // a failed forward applies nothing deferred
                 release_held();
                 clear_dim0();
             } catch (...) {  // the original error is the one to report
@@ -207,6 +213,22 @@ public:
     }
 
 protected:
+    /// A child under this system was deleted or rebuilt: everything held by raw pointer goes, and the next forward
+    /// classifies again and drops the topology cache. Not while the chunk loop runs (deletions are deferred past it).
+    void subtree_changed() override {
+        stale_      = true;
+        topo_.valid = false;
+        topo_.entries.clear();
+        topo_.values.clear();
+        topo_.shapes.clear();
+        comps_.clear();
+        boundary_.clear();
+        internal_.clear();
+        internal_ties_.clear();
+        systems_.clear();
+    }
+    bool stale_ = false;
+
     // ---- classification --------------------------------------------------------------------
     void chunk_classify() override {
         boundary_.clear();
@@ -219,7 +241,6 @@ protected:
         for (detail::IOEntry* a : outside_ties_) a->chunk_outside_tie_ = false;
         outside_ties_.clear();
         for (ComponentBase* c : comps_) c->chunk_inside_ = true;
-        set_sinks(*this);
         systems_.clear();
         collect_systems(*this);
 
@@ -231,22 +252,25 @@ protected:
 
         for (detail::IOEntry* r : roots) {
             std::size_t in = 0, out = 0;
-            (inside(*r) ? in : out)++;
-            for (const detail::IOEntry* p : r->peers_) (inside(*p) ? in : out)++;
+            for (const detail::IOEntry* p : r->peers()) (inside(*p) ? in : out)++;  // the shadow itself is no participant
             if (out == 0) {
                 r->chunk_internal_by_ = path();
                 internal_.push_back(r);
-                if (r->alias_shape_) internal_ties_.emplace_back(r, nullptr);
-            } else if (inside(*r)) {
+                if (r->alias_shape()) internal_ties_.emplace_back(r, nullptr);
+            } else if (const detail::IOEntry* auth = r->variable().authority; auth != nullptr && inside(*auth)) {
+                // The variable's shape authority is inside: the SHADOW is the boundary root (it is neutral storage, so no
+                // new root is needed) and the authority port is the member whose resolved shape it adopts. This system
+                // takes its OWN port on the variable (what it materializes through, and what holds it for the loop).
                 Boundary b;
-                b.member = r;
-                b.root   = reroot(*r);
+                b.member = const_cast<detail::IOEntry*>(auth);
+                b.root   = r;
+                own_port(*r);
                 boundary_.push_back(std::move(b));
             } else {
                 Boundary b;
                 b.root = r;
                 boundary_.push_back(std::move(b));
-                if (r->alias_shape_ && r->is_root()) {  // a tie declared above this system, with inside members
+                if (r->alias_shape() && r->local_shape()) {  // a tie declared above this system, with inside members
                     r->chunk_outside_tie_ = true;
                     outside_ties_.push_back(r);
                 }
@@ -262,7 +286,7 @@ protected:
                     }
             }
         for (Boundary& b : boundary_) {
-            for (detail::IOEntry* p : b.root->peers_)
+            for (detail::IOEntry* p : b.root->peers())
                 if (inside(*p) && p->mirror_of_ == nullptr && dynamic_cast<const ComponentBase*>(p->declarer()) != nullptr)
                     b.peers.push_back(p);
         }
@@ -287,31 +311,21 @@ private:
         return false;
     }
 
-    /// Insert a new root at this system's level and merge the old root's set into it: every inside member
-    /// becomes a non-root peer, the outside members peers of the new root. The new root's dims are inert
-    /// markers (the root is dynamic, and its shape is adopted from the old root each forward).
-    detail::IOEntry* reroot(detail::IOEntry& r) {
-        std::vector<detail::DimRecord> dims(static_cast<std::size_t>(r.rank()));
+    /// This system's own PORT on a boundary variable (spec §4.5, §7): an alias entry declared here, inert dims, joined to
+    /// the variable (it keeps no shape of its own: the shadow adopts the authority's each forward). The shadow is flagged
+    /// as a boundary variable materialized by this system.
+    void own_port(detail::IOEntry& shadow) {
+        std::vector<detail::DimRecord> dims(static_cast<std::size_t>(shadow.rank()));
         for (detail::DimRecord& d : dims) d.how = detail::DimRecord::How::from_input;
-        const std::string base = "chunk_" + std::string{r.name()};
+        const std::string base = "chunk_" + std::string{shadow.name()};
         std::string       name = base;
         for (int k = 1; aliases_.contains(name); ++k) name = base + "_" + std::to_string(k);
-        auto a = detail::make_alias_entry(r.dtype(), name, r.kind(), dims, r.can_be_source(), r.can_be_target());
-        detail::IOEntry* p = a.get();
-        p->declarer_       = this;
-        const auto move_mark = [&](std::optional<MarkRecord>& from, std::optional<MarkRecord>& to) {
-            if (!from) return;
-            to        = std::move(from);
-            to->root  = p;
-            from.reset();
-        };
-        move_mark(r.design_var_, p->design_var_);
-        move_mark(r.constraint_, p->constraint_);
-        move_mark(r.objective_, p->objective_);
-        detail::IOEntry::merge(*p, r);
-        p->chunk_rerooted_ = true;
+        auto a = detail::make_alias_entry(shadow.dtype(), name, shadow.kind(), dims, shadow.can_be_source(), shadow.can_be_target());
+        a->declarer_ = this;
+        detail::IOEntry* port = a.get();
+        detail::IOEntry::merge(*shadow.variable().authority, *port);  // the existing variable survives (marks, init, source)
+        shadow.chunk_rerooted_ = true;
         register_alias(std::move(a));
-        return p;
     }
 
     // ---- the topology cache -----------------------------------------------------------------
@@ -486,15 +500,10 @@ private:
     // ---- the per-forward steps ---------------------------------------------------------------
     sk::queue& q() const { return queue_ref(); }
 
-    /// A re-rooted root: allocate at its current size if absent; apply a free input's pending init.
+    /// A re-rooted root: materialize its variable on need (allocate at its current size if absent; a free input takes
+    /// its init); the ragged index arrays follow.
     void allocate_rerooted(detail::IOEntry& root) {
-        detail::revive(root, *this);   // this System is the root's partner and owner: its materialization
-        sink_.record(root, *this);     // ... whose decrement waits for the end of the chunk loop
-        root.allocate_if_absent(q());
-        if (root.kind() == IOKind::input && root.init_pending()) {
-            detail::apply_root_init(root, q());
-            root.clear_init_pending();
-        }
+        root.variable().materialize(q(), nullptr);
         root.upload_ragged(q());
     }
 
@@ -509,15 +518,14 @@ private:
             std::size_t most = 0;
             for (const auto& [a, b] : chunks)
                 most = std::max(most, static_cast<std::size_t>(r->block_offset_at(b) - r->block_offset_at(a)));
-            if (r->present_ && r->capacity_elems() < most) {
-                diag::count_queue_waits();
-                q().wait();
-                r->release_storage();
-                detail::LifetimeOps::reset(*r);
+            if (r->present() && r->capacity_elems() < most) {
+                // too small: drop it (the ports let go of their bundles; the last holder's free waits on the events
+                // registered on that storage) and allocate again
+                for (detail::IOEntry* p : r->variable().ports) p->bundle_.reset();
             }
             r->reserve_elems_ = most;
             r->held_          = true;
-            r->allocate_if_absent(q());
+            r->variable().materialize(q(), nullptr, false, /*apply_init=*/false);  // each chunk's init is the only one
         }
     }
 
@@ -527,34 +535,6 @@ private:
             r->held_          = false;
             r->reserve_elems_ = 0;
         }
-    }
-
-    /// After the last chunk: the run counters of the children that ran move once, every deferred decrement is
-    /// applied once, and the roots that reached 0 are freed behind ONE queue wait.
-    void finish_lifetimes() {
-        sink_.active = false;
-        for (Subsystem* c : sink_.ran)
-            if (c->run_counter_ > 0) --c->run_counter_;
-        std::vector<detail::IOEntry*> batch;
-        for (const auto& [r, p] : sink_.items) detail::decrement(*r, *p, batch);
-        sink_.items.clear();
-        sink_.ran.clear();
-        detail::release(batch, q());
-    }
-
-    /// A failed forward: nothing deferred is applied; the internal roots go back out of scope (one wait if any
-    /// has storage), so the next forward starts clean.
-    void abort_lifetimes() {
-        sink_.clear();
-        std::vector<detail::IOEntry*> present;
-        for (detail::IOEntry* r : internal_)
-            if (r->present_) present.push_back(r);
-        if (!present.empty()) {
-            diag::count_queue_waits();
-            q().wait();
-            for (detail::IOEntry* r : present) r->release_storage();
-        }
-        for (detail::IOEntry* r : internal_) detail::LifetimeOps::reset(*r);
     }
 
     void collect_systems(System& s) {
@@ -568,7 +548,7 @@ private:
 
     /// The System that declared a tie alias evaluates its shape rule (it owns the root).
     static System& tie_owner(const detail::IOEntry& a) {
-        auto* s = const_cast<System*>(dynamic_cast<const System*>(a.declarer()));
+        auto* s = const_cast<System*>(dynamic_cast<const System*>(a.shape_holder()->declarer()));  // the tie alias PORT's declarer
         if (s == nullptr) throw std::logic_error("naga::cospan: internal error: tie alias '" + a.full_path() + "' has no declaring System");
         return *s;
     }
@@ -581,15 +561,6 @@ private:
         owner.ev_.resolve_alias_root(r, recording_ ? &dep_roots_ : nullptr, recording_ ? &shape_roots_ : nullptr);
         reads_.insert(reads_.end(), owner.ev_.read_log_.begin(), owner.ev_.read_log_.end());
         owner.ev_.read_log_.clear();
-    }
-
-    /// Every descendant (Systems and Components) defers its decrements to this system's sink.
-    void set_sinks(System& s) {
-        s.defer_sink_ = &sink_;
-        for (Subsystem* c : s.child_ptrs_) {
-            c->defer_sink_ = &sink_;
-            if (auto* sub = dynamic_cast<System*>(c)) set_sinks(*sub);
-        }
     }
 
     void clear_ranges() {
@@ -685,13 +656,13 @@ private:
         for (ComponentBase* c : comps_)
             for (detail::IOEntry* e : c->order_) e->dim0_override_ = n;
         for (detail::IOEntry* r : internal_)
-            if (r->alias_shape_) r->dim0_override_ = n;
+            if (r->alias_shape()) const_cast<detail::IOEntry*>(r->shape_holder())->dim0_override_ = n;  // the tie alias port
     }
     void clear_dim0() {
         for (ComponentBase* c : comps_)
             for (detail::IOEntry* e : c->order_) e->dim0_override_.reset();
         for (detail::IOEntry* r : internal_)
-            if (r->alias_shape_) r->dim0_override_.reset();
+            if (r->alias_shape()) const_cast<detail::IOEntry*>(r->shape_holder())->dim0_override_.reset();
     }
 
     /// Pricing from the declared shape rules (resolved over the full range) and the greedy scan.

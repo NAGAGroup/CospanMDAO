@@ -48,7 +48,7 @@ struct Capture {
 };
 
 inline Capture capture_forward(cs::Model& m, const char* chunked_path, const std::function<std::vector<float>(cs::Model&)>& read) {
-    auto&   sys = dynamic_cast<cs::ChunkedSystem&>(m.get_subsystem(chunked_path));
+    auto&   sys = dynamic_cast<cs::ChunkedSystem&>((*m.get_subsystem(chunked_path)));
     Capture c;
     sys.set_chunk_hooks(nullptr, [&](std::size_t) {
         std::string s;
@@ -94,7 +94,7 @@ std::vector<Capture> against_plain(const char* chunked_path, MakeChunked&& make_
         CHECK(c.window.allocations == 0);
         CHECK(c.window.frees == 0);
         CHECK(c.window.queue_waits == 0);
-        CHECK(dynamic_cast<cs::ChunkedSystem&>(chunked.get_subsystem(chunked_path)).topology_cached());
+        CHECK(dynamic_cast<cs::ChunkedSystem&>((*chunked.get_subsystem(chunked_path))).topology_cached());
         caps.push_back(std::move(c));
     }
     return caps;

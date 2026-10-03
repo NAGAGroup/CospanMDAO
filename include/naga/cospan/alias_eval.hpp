@@ -95,14 +95,14 @@ public:
     /// it never reads a value, so an internal entry of a ChunkedSystem is a fine source. `input`: `up` is an
     /// INPUT source, whose ROOT is read (the input's own shape may not be resolved yet); a sliced input
     /// contributes its view's extents.
-    void copy_alias_dim(AliasEval& out, std::size_t to, const detail::IOEntry& src, int d, const detail::IOEntry& a,
+    void copy_alias_dim(AliasEval& out, std::size_t to, const AliasSrc& src, int d, const detail::IOEntry& a,
                         bool input) const {
-        if (input && src.view()) {
-            note_shape_dep(src.root());
-            out.ext[to] = src.view()->extents[static_cast<std::size_t>(d)];
+        if (input && src.view_extents) {
+            note_shape_dep(src.shadow());
+            out.ext[to] = (*src.view_extents)[static_cast<std::size_t>(d)];
             return;
         }
-        const detail::IOEntry& up = input ? *src.root() : src;
+        const detail::IOEntry& up = *src.shadow();  // the source's Variable: its shadow carries the adopted shape
         note_shape_dep(up.root());  // a SHAPE dependency of the topology cache
         if (up.dim_is_per(d)) {
             if (to == 0)
@@ -120,20 +120,21 @@ public:
     /// already run (checked at setup: it is earlier in registration order); the value reads happen on the
     /// host from a snapshot, as FromInputValues does.
     AliasEval alias_eval(const detail::IOEntry& a) {
-        const AliasShape& s = *a.alias_shape_;
+        const IOEntry*    holder = a.shape_holder();  // the tie alias port (a may be its shadow)
+        const AliasShape& s      = *holder->alias_shape_;
         AliasEval         out;
         resolving_ = &a;  // names the alias in a "computed inside a chunked system" error
         switch (s.kind) {
             case AliasShape::Kind::fixed: out.ext = s.extents; break;
             case AliasShape::Kind::from_output_shape:
-                for (int d = 0; d < a.rank(); ++d) copy_alias_dim(out, static_cast<std::size_t>(d), *a.alias_src_, d, a, false);
+                for (int d = 0; d < a.rank(); ++d) copy_alias_dim(out, static_cast<std::size_t>(d), holder->alias_src_, d, a, false);
                 break;
             case AliasShape::Kind::from_input_shape:
-                for (int d = 0; d < a.rank(); ++d) copy_alias_dim(out, static_cast<std::size_t>(d), *a.alias_src_, d, a, true);
+                for (int d = 0; d < a.rank(); ++d) copy_alias_dim(out, static_cast<std::size_t>(d), holder->alias_src_, d, a, true);
                 break;
             case AliasShape::Kind::from_output_values:
                 for (int d = 0; d < a.rank(); ++d)
-                    out.ext[static_cast<std::size_t>(d)] = read_value(*a.alias_src_, static_cast<std::size_t>(d));
+                    out.ext[static_cast<std::size_t>(d)] = read_value(*holder->alias_src_.shadow(), static_cast<std::size_t>(d));
                 break;
             case AliasShape::Kind::dims:
                 for (int d = 0; d < a.rank(); ++d) {
@@ -158,14 +159,14 @@ public:
                         }
                         // An input source is read through its ROOT (host snapshot), as an output is.
                         case AliasDim::How::output_value:
-                            out.ext[u] = read_value(sp.input ? *sp.src->root() : *sp.src, sp.index);
+                            out.ext[u] = read_value(*sp.src.shadow(), sp.index);
                             break;
                         case AliasDim::How::output_values:
                             out.per[u]       = true;
-                            out.per_index[u] = chunk_slice(a, read_values(sp.input ? *sp.src->root() : *sp.src, sp.index));
+                            out.per_index[u] = chunk_slice(a, read_values(*sp.src.shadow(), sp.index));
                             break;
                         case AliasDim::How::output_dim:
-                            copy_alias_dim(out, u, *sp.src, static_cast<int>(sp.index), a, sp.input);
+                            copy_alias_dim(out, u, sp.src, static_cast<int>(sp.index), a, sp.input);
                             break;
                     }
                 }
@@ -208,8 +209,10 @@ public:
     /// A ROOT tie alias takes the shape its rule gives now. Per-index dims are resolved on the host and applied like
     /// any ragged root's: update_shape computes the block offsets and resizes the storage; the owner uploads the
     /// device copies (run_pre_compute) once the root is allocated.
-    void apply_alias_root(detail::IOEntry& a) {
-        const AliasEval ev = alias_eval(a);
+    void apply_alias_root(detail::IOEntry& shape_of) {
+        // the rule lives on the tie alias PORT (the authority); its update_shape pushes the shape to the shadow
+        detail::IOEntry& a  = *const_cast<detail::IOEntry*>(shape_of.shape_holder());
+        const AliasEval  ev = alias_eval(a);
         for (int d = 0; d < a.rank(); ++d) {
             const auto         u = static_cast<std::size_t>(d);
             detail::DimRecord& r = a.dims_[u];

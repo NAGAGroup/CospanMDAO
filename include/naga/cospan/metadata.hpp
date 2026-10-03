@@ -52,7 +52,6 @@ class Subsystem;
 
 namespace detail {
 class IOEntry;
-struct LifetimeOps;  // lifetime.hpp: the one place a root's count is changed
 class AliasEvaluator;  // alias_eval.hpp
 struct EntryAccess;
 }  // namespace detail
@@ -154,6 +153,23 @@ concept AliasDimSpec = std::integral<T> || std::same_as<T, PerIndex> || std::sam
                        std::same_as<T, alias::InputValue> || std::same_as<T, alias::InputValues> ||
                        std::same_as<T, alias::InputDim>;
 
+namespace detail {
+class Variable;
+}
+
+/// An upstream entry an alias shape reads (or a tie member). It holds the entry's VARIABLE, never a raw
+/// port, so a child's deletion cannot dangle it. `port` is the declared port, kept ONLY for the setup-time
+/// ordering checks (declarer, registration order); alias_sources() hands it out only while it is still a live
+/// port of the variable. `view_extents`: an input source's view, captured at declaration.
+struct AliasSrc {
+    std::shared_ptr<detail::Variable>        var;
+    const detail::IOEntry*                   port = nullptr;
+    std::optional<std::array<std::size_t, 3>> view_extents;
+    explicit operator bool() const noexcept { return var != nullptr; }
+    detail::IOEntry*       shadow() const;     // the variable's shadow (its shape and data)
+    const detail::IOEntry* live_port() const;  // `port` while registered, else the shadow
+};
+
 /// One dimension of an alias::dims shape, type-erased.
 struct AliasDim {
     enum class How : uint8_t { fixed, per_index_host, output_value, output_values, output_dim };
@@ -163,7 +179,7 @@ struct AliasDim {
     std::string              path;         ///< output_*: the upstream output (input = true: the System's input)
     std::size_t              index  = 0;   ///< output_value: the element; output_values: the column; output_dim: the dim
     bool                     input  = false;  ///< the path names an INPUT entry (input_value / input_values / input_dim)
-    detail::IOEntry*         src    = nullptr;  ///< output_*: resolved by the System at setup
+    AliasSrc                 src;               ///< output_*: resolved by the System at setup
 };
 
 template <AliasDimSpec S>
@@ -437,7 +453,14 @@ std::array<DimRecord, Rank> expand_from_input_array(const FromInputArray& m) {
     return a;
 }
 
+}  // namespace detail
+}  // namespace naga::cospan
 
+// The Variable holds types defined above and needs IOEntry only by pointer.
+#include "naga/cospan/variable.hpp"
+
+namespace naga::cospan {
+namespace detail {
 
 /// Row-major strides of a 1-padded extents triple. For a rank-R entry the
 /// first R strides are exactly rank-R row-major strides.
@@ -457,7 +480,9 @@ public:
         std::size_t                offset = 0;
     };
 
-    virtual ~IOEntry() = default;
+    virtual ~IOEntry() {
+        if (var_) var_->unregister_port(this);
+    }
     IOEntry(const IOEntry&)            = delete;
     IOEntry& operator=(const IOEntry&) = delete;
 
@@ -465,6 +490,11 @@ public:
     std::string_view name() const noexcept { return name_; }
     /// The entry's dotted path from the root System: its declarer's path plus its name, or the name alone at the root.
     std::string full_path() const {
+        if (home_ != nullptr) {  // a shadow answers with a port's path: the authority's, else the one it had, else any
+            if (home_->authority != nullptr) return home_->authority->full_path();
+            if (!home_->authority_path.empty()) return home_->authority_path;
+            if (!home_->ports.empty()) return home_->ports.front()->full_path();
+        }
         return (declarer_ == nullptr || declarer_->path().empty())
                    ? std::string{name()}
                    : declarer_->path() + "." + std::string{name()};
@@ -545,6 +575,7 @@ public:
     }
     /// How this entry's dimension d was declared, for an error message.
     std::string declared_rule(int d) const {
+        if (is_root() && home_->authority != nullptr) return home_->authority->declared_rule(d);  // the shadow's dims are inert
         const DimRecord& r = dims_[static_cast<std::size_t>(d)];
         switch (r.how) {
             case DimRecord::How::fixed: return "fixed";
@@ -571,16 +602,28 @@ public:
     /// The tie alias this entry was tied into (members, and their promotions); null if untied.
     const IOEntry* tie_alias() const noexcept { return tie_alias_; }
     /// A tie alias: how its shape is made, and the upstream output a from_output_* shape reads.
-    const std::optional<AliasShape>& alias_shape() const noexcept { return alias_shape_; }
-    const IOEntry*                   alias_source() const noexcept { return alias_src_; }
+    /// On the shadow they answer for its Variable's authority port (the tie alias).
+    const std::optional<AliasShape>& alias_shape() const noexcept {
+        static const std::optional<AliasShape> none;
+        if (is_root()) return home_->authority != nullptr ? home_->authority->alias_shape_ : none;
+        return alias_shape_;
+    }
+    const IOEntry* alias_source() const noexcept {
+        return alias_shape().has_value() ? shape_holder()->alias_src_.live_port() : nullptr;
+    }
+    /// The port that holds the tie's rule: itself, or (on the shadow) the Variable's authority.
+    const IOEntry* shape_holder() const noexcept {
+        return is_root() && home_->authority != nullptr ? home_->authority : this;
+    }
     /// Every upstream output a tie alias's shape reads (path, entry): one for from_output_*, one per
     /// output-reading dim of an alias::dims shape.
     std::vector<std::pair<std::string_view, const IOEntry*>> alias_sources() const {
         std::vector<std::pair<std::string_view, const IOEntry*>> out;
-        if (!alias_shape_) return out;
-        if (alias_src_ != nullptr) out.emplace_back(alias_shape_->path, alias_src_);
-        for (const AliasDim& d : alias_shape_->dim_specs)
-            if (d.src != nullptr) out.emplace_back(d.path, d.src);
+        const IOEntry* h = shape_holder();
+        if (!h->alias_shape_) return out;
+        if (h->alias_src_) out.emplace_back(h->alias_shape_->path, h->alias_src_.live_port());
+        for (const AliasDim& d : h->alias_shape_->dim_specs)
+            if (d.src) out.emplace_back(d.path, d.src.live_port());
         return out;
     }
     /// Dimension d >= 1 is per-index and resolved (a promoted alias asks its member).
@@ -618,13 +661,21 @@ public:
     const std::optional<MarkRecord>& objective() const { return root_->objective_; }
 
     // ---- the aliasing set (§4) -----------------------------------------------
+    /// The set's ROOT is its Variable's SHADOW (internal plumbing); every declared entry is a port.
     IOEntry*       root() noexcept { return root_; }
     const IOEntry* root() const noexcept { return root_; }
     bool           is_root() const noexcept { return root_ == this; }
     bool           owns_data() const noexcept { return is_root(); }
-    /// Root only; empty otherwise. The root itself is not in its own list.
+    /// The port the shadow's shape is adopted from (the entry that was the set's root before the split).
+    bool is_authority() const noexcept { return var_ && var_->authority == this; }
+    /// Computes its shape locally, as a root did: the shadow, or the authority port.
+    bool local_shape() const noexcept { return is_root() || is_authority(); }
+    /// The shared Variable: a port holds it; the shadow points at its home.
+    Variable& variable() noexcept { return home_ != nullptr ? *home_ : *var_; }
+    const Variable& variable() const noexcept { return home_ != nullptr ? *home_ : *var_; }
+    /// Root (shadow) only; empty otherwise: the Variable's live ports.
     std::span<IOEntry* const> peers() const noexcept {
-        return is_root() ? std::span<IOEntry* const>{peers_} : std::span<IOEntry* const>{};
+        return is_root() ? std::span<IOEntry* const>{home_->ports} : std::span<IOEntry* const>{};
     }
     bool can_be_source() const noexcept { return can_be_source_; }
     bool can_be_target() const noexcept { return can_be_target_; }
@@ -642,27 +693,20 @@ public:
     /// component's I/O (D3).
     sk::kind storage_kind() const noexcept { return storage_kind_; }
     // ---- registration metadata (ROOTS; recorded by System::resolve, r01 §4.4) ----
-    /// The root's storage was dropped by a count reaching 0 (its last partner finished). Host access
-    /// to a released root throws.
-    bool released() const noexcept { return root_->released_; }
-    /// Lifetime by counting: 0 out of scope, -1 eternal, > 0 decrements owed.
-    long lifetime_count() const noexcept { return root_->count_; }
-    /// Path of the subsystem whose decrement released the root last; empty if never released.
-    std::string_view released_by() const noexcept { return root_->released_by_; }
     /// The winning initial value of a free input root (highest level; none = zeros).
     const std::optional<InitSpec>& init_spec() const noexcept { return root_->init_spec_; }
-    /// The OWNER: the first Component, in depth-first registration order, that touches the root (a
-    /// re-rooted root: its ChunkedSystem). It alone allocates the root and applies its init.
-    const Subsystem* owner() const noexcept { return root_->owner_; }
 
     /// Roots: the memory substrates allocation draws on (bound at prepare_exec).
-    void bind_substrates(Substrates& s) noexcept { substrates_ = &s; }
+    void bind_substrates(Substrates& s) noexcept {
+        substrates_ = &s;
+        if (root_ != nullptr) root_->substrates_ = &s;  // the shadow materializes: it needs them
+    }
     /// PRESENT: the root's storage state. True once its owner has run the allocation path
     /// (even for a size-0 root, whose storage is empty) until a transient root is released. Host
     /// views of a root that is not present throw.
-    bool present() const noexcept { return root_->present_; }
+    bool present() const noexcept { return variable().any_live(); }
     /// Whether the ROOT of this entry's set is present.
-    bool has_storage() const noexcept { return root_->present_; }
+    bool has_storage() const noexcept { return variable().any_live(); }
     /// An initial value waiting to be applied by the owner: set when a free input root is
     /// allocated from nothing, and by Model::init_input. It stays set while the root has no elements.
     bool init_pending() const noexcept { return root_->init_pending_; }
@@ -675,19 +719,6 @@ public:
         root_->init_pending_ = true;
     }
 
-    /// THE ONE ALLOCATION ROUTINE of the root of this entry (route: arena, pool, OS), run by the
-    /// owner in its pre_compute. When the root is not present it allocates (an empty storage for a
-    /// size-0 root), marks it present and, for a free input root, marks its init pending; returns
-    /// whether it did.
-    bool allocate_if_absent(sk::queue& q) {
-        IOEntry& r = *root_;
-        if (r.present_) return false;
-        if (r.substrates_ == nullptr)
-            throw std::logic_error("naga::cospan: '" + r.full_path() + "' cannot be allocated before setup() completes");
-        r.allocate(q, *r.substrates_);
-        if (r.io_kind_ == IOKind::input) r.init_pending_ = true;
-        return true;
-    }
     /// this root's capacity is RESERVED by its ChunkedSystem for the chunk loop (capacity role only).
     bool held() const noexcept { return root_->held_; }
     /// The elements the root's primary storage can hold without reallocating (0 when not present).
@@ -793,21 +824,23 @@ public:
     /// (0 when the root has no storage at this entry's placement).
     std::size_t registered_event_count() const { return root_->registered_events_on(placement()); }
 
-    /// Arena route: a root, fully fixed, in device-kind storage (arenas are device-kind), that is
-    /// marked or whose every partner runs eternally (setup_run_ == -1), and that is not internal to
-    /// a ChunkedSystem (those are sized per chunk).
+    /// Arena route (r01 §4.4): a root, fully static, in device-kind storage (arenas are device-kind), that every
+    /// PORT holding it holds eternally (the holder and every subsystem above it run every forward, never
+    /// deleted), and that is not internal to a ChunkedSystem (those are sized per chunk). Marks keep nothing alive.
     bool arena_eligible() const noexcept {
         if (!is_root() || is_dynamic() || storage_kind_ != sk::kind::device || !chunk_internal_by_.empty()) return false;
-        if (design_var_ || constraint_ || objective_) return true;
-        for (const Partner& p : partners_)
-            if (p.holder != nullptr && p.holder->setup_run() != -1) return false;
+        for (const IOEntry* p : home_->ports)
+            if (p->declarer_ != nullptr && !p->declarer_->runs_eternally()) return false;
         return true;
     }
     /// The bytes ONE device's arena must hold for this root; 0 when the root
     /// takes another route. get_exec_info counts this once per device.
     std::size_t static_bytes() const noexcept {
-        return arena_eligible() ? flat_size() * dtype_size(dtype_) : 0;
+        if (!arena_eligible()) return 0;
+        arena_planned_ = true;  // the arena is sized once, at setup, with these bytes: only a planned variable may use it
+        return flat_size() * dtype_size(dtype_);
     }
+    mutable bool arena_planned_ = false;
 
     // ---- capabilities --------------------------------------------------------
 
@@ -830,7 +863,7 @@ public:
     /// ROOTS ONLY (no-op on peers): one usm_vector per placement in
     /// storage_placements(), each from that placement's device substrate
     /// (host-kind placements take the OS host route on the device).
-    virtual void allocate(sk::queue& q, Substrates& substrates) = 0;
+    virtual bool allocate_missing(sk::queue& q, Substrates& substrates, std::vector<std::shared_ptr<void>>& fresh) = 0;
 
     /// Write {data pointer, shape, stride} into the registered member wrapper.
     virtual void point_wrapper() = 0;
@@ -852,12 +885,13 @@ public:
     /// ROOTS ONLY (no-op on peers): drop the storage of a transient root (§4.4). The CALLER
     /// waits the stream first (synchronous frees): a releasing Component waits once
     /// for its whole batch.
-    virtual void release_storage() = 0;
     virtual std::size_t capacity_elems_impl() const noexcept = 0;
 
 protected:
+    /// `shadow_home` non-null makes this entry the SHADOW of that Variable; otherwise it is a port and
+    /// gets a fresh Variable of its own (its typed factory then makes the shadow).
     IOEntry(std::string name, IOKind k, DType dt, int rank, std::vector<DimRecord> dims,
-            bool can_source, bool can_target)
+            bool can_source, bool can_target, Variable* shadow_home = nullptr)
         : name_{std::move(name)}
         , io_kind_{k}
         , dtype_{dt}
@@ -880,7 +914,19 @@ protected:
                                             "': a dimension index is out of range");
             extents_[static_cast<std::size_t>(d)] = r.extent;  // derived dims start at 0
         }
+        if (shadow_home != nullptr) {
+            home_ = shadow_home;
+            root_ = this;
+        } else {
+            var_ = std::make_shared<Variable>();
+            var_->register_port(this);
+            var_->authority = this;
+        }
     }
+
+    /// A port's factory step: make this Variable's SHADOW (a typed entry with this port's shape state, no
+    /// declarer and no wrapper) and root the port at it. Defined after make_alias_entry.
+    void install_shadow();
 
     virtual void* raw_storage_on(const Placement& p) const = 0;
 
@@ -962,9 +1008,7 @@ protected:
     std::vector<Placement>     placements_;        ///< roots; primary first
     std::optional<sycl::device> device_;
     sk::kind                   storage_kind_ = sk::kind::device;
-    bool                       released_ = false;     ///< roots: storage dropped by a count reaching 0
-    bool                       present_  = false;     ///< roots: allocated; cleared by release
-    std::string                released_by_;          ///< roots: the subsystem whose decrement released the root
+    std::shared_ptr<void>      bundle_;               ///< a port: the bundle of ITS placement (null while not materialized); keeps it alive
 
 private:
     /// The four structural operations and placement are System's (r01 §4.2);
@@ -974,8 +1018,10 @@ private:
     friend struct EntryAccess;
     friend struct LeadingRangeAccess;
     friend class naga::cospan::ChunkedSystem;
-    friend struct LifetimeOps;
     friend class AliasEvaluator;
+    friend class Variable;
+    template <class T>
+    friend class StorageEntry;
 
     /// Framework only (through LeadingRangeAccess). A NON-root input peer sees rows / blocks
     /// [a, b) of its root along dim 0. Dense root: its view becomes the SubarrayRef with dim-0 offset a
@@ -984,7 +1030,9 @@ private:
     /// the root's [a, b) slice, and point_ragged shifts the device pointers by a. Re-runs the peer's shape
     /// update and validate_connection and re-points its wrapper, so the next forward uses the range.
     void set_leading_range(std::size_t a, std::size_t b, bool refresh = true) {
-        if (is_root() || mirror_of_ != nullptr)
+        // what used to be the root: the shadow, or the authority port (the source output, a tie, a free input), except
+        // under a chunked boundary, where the inside member is the authority and is ranged like any peer
+        if (is_root() || mirror_of_ != nullptr || (is_authority() && !root_->chunk_rerooted_))
             throw std::logic_error("naga::cospan: '" + name_ + "': a leading range is set on a connected input (or an output peer of a root at a chunked system's level), not on a root");
         const IOEntry&                    r    = *root_;
         const std::optional<SubarrayRef>& base = lead_ ? pre_lead_view_ : view_;
@@ -1032,7 +1080,7 @@ private:
             update_shape();
             validate_connection();
         }  // an output peer's shape is its component's to resolve (from its inputs) at the next forward
-        if (root_->present_) point_wrapper();
+        if (root_->present()) point_wrapper();
     }
 
     /// ChunkedSystem, on an alias ROOT at its level: take the full resolved shape of `m`, the
@@ -1058,19 +1106,17 @@ private:
         update_shape();
     }
 
-    /// merge(into, from): `from` and its peers become peers of `into`.
+    /// The authority port, after its shape changed: the shadow takes it (a no-op for any other entry).
+    void push_shape_to_shadow() {
+        if (is_authority() && root_ != nullptr && root_->rank_ == rank_) root_->adopt_shape(*this);
+    }
+
+    /// merge(into, from): the two entries' Variables become one (into's survives).
     static void merge(IOEntry& into, IOEntry& from) {
-        if (!into.is_root() || !from.is_root())
-            throw std::logic_error("naga::cospan: merge takes two set roots");
-        if (&into == &from) return;
-        into.peers_.reserve(into.peers_.size() + from.peers_.size() + 1);
-        for (IOEntry* p : from.peers_) {
-            p->root_ = &into;
-            into.peers_.push_back(p);
-        }
-        from.peers_.clear();
-        from.root_ = &into;
-        into.peers_.push_back(&from);
+        Variable& a = into.variable();
+        Variable& b = from.variable();
+        if (&a == &b) return;
+        a.absorb(b);
     }
 
     std::string name_;
@@ -1078,8 +1124,9 @@ private:
     DType       dtype_;
     int         rank_;
 
-    IOEntry*              root_ = this;
-    std::vector<IOEntry*> peers_;  // meaningful iff root_ == this
+    IOEntry*              root_ = nullptr;   ///< the Variable's shadow (a shadow points at itself)
+    std::shared_ptr<Variable> var_;           ///< a port: its Variable (null on a shadow)
+    Variable*             home_ = nullptr;   ///< a shadow: the Variable it belongs to
     bool                  can_be_source_;
     bool                  can_be_target_;
     std::optional<SubarrayRef> view_;
@@ -1093,33 +1140,18 @@ private:
     const IOEntry*            mirror_of_ = nullptr;  ///< a promoted alias: the entry it was made from
     IOEntry*                  tie_alias_ = nullptr;  ///< members of a tie (and their set): the tie alias
     std::optional<AliasShape> alias_shape_;          ///< a tie alias: where its shape comes from
-    IOEntry*                  alias_src_ = nullptr;  ///< a tie alias: the upstream output of a from_output_* shape
-    std::vector<IOEntry*>     tie_members_;          ///< a tie alias: the member entries, as given
+    AliasSrc                  alias_src_;            ///< a tie alias: the upstream entry of a from_output_* / from_input_shape shape
+    std::vector<AliasSrc>     tie_members_;          ///< a tie alias: the members' variables (and ports, for setup checks), as given
     bool                      alias_checked_ = false;  ///< a connected tie_inputs alias: its AliasShape was checked
 
     /// An initial value declared on THIS entry (ComponentBase::init_input / System::init_input),
     /// with the depth of the declaring subsystem (root System = 0). resolve() picks, per root,
     /// the declaration of the smallest depth.
-    struct InitDecl {
-        InitSpec    spec;
-        std::size_t depth = 0;
-        std::string by;  ///< the declaring subsystem's path, for errors
-    };
+    using InitDecl = ::naga::cospan::detail::InitDecl;  // variable.hpp
     std::vector<InitDecl>     init_decls_;
     std::optional<InitSpec>   init_spec_;        ///< roots, set by System::resolve or Model::init_input
     bool                      model_init_   = false;  ///< roots: init_spec_ came from Model::init_input (resolve keeps it)
     bool                      init_pending_ = false;  ///< roots: the init is to be applied at the owner's next run
-    const Subsystem*          owner_     = nullptr;  ///< roots, set by System::resolve: the first toucher
-    /// LIFETIME BY COUNTING (roots only). count_: 0 out of scope (every root starts there), -1
-    /// eternal, > 0 decrements owed. partners_: who holds the root (set by System::resolve); `owed` is the
-    /// decrements this partner still owes while the root is in scope.
-    struct Partner {
-        const Subsystem* holder = nullptr;
-        bool             writer = false;
-        long             owed   = 0;
-    };
-    long                 count_ = 0;
-    std::vector<Partner> partners_;
     bool                      chunk_outside_tie_ = false;  ///< a tie alias declared outside a ChunkedSystem whose inside members make it a boundary root: the chunked system resolves its shape
     bool                      chunk_rerooted_ = false;  ///< a root made at a ChunkedSystem's level (its owner allocates it)
     std::string               chunk_internal_by_;       ///< roots internal to the named ChunkedSystem
@@ -1134,6 +1166,11 @@ template <class T>
 class StorageEntry : public IOEntry {
 public:
     void update_shape() override {
+        update_shape_local();
+        push_shape_to_shadow();
+    }
+
+    void update_shape_local() {
         std::array<std::size_t, 3> next = extents_;
         for (int d = 0; d < rank(); ++d) {
             DimRecord& r = dims_[static_cast<std::size_t>(d)];
@@ -1146,7 +1183,7 @@ public:
                 case DimRecord::How::unspecified:
                     // a free input root, or the inside member of one a ChunkedSystem re-rooted: its initializer's shape
                     // (setup guarantees one exists)
-                    if (is_root() || (root()->is_rerooted() && root()->kind() == IOKind::input)) {
+                    if (local_shape() || (root()->is_rerooted() && root()->kind() == IOKind::input)) {
                         if (const auto& is = init_spec(); is && is->shape() && is->shape()->rank == rank()) {
                             const InitShape&  s = *is->shape();
                             const auto        u = static_cast<std::size_t>(d);
@@ -1271,7 +1308,7 @@ public:
 
     /// The rank must always match the supplier's (a view has its root's rank).
     void check_rank() const {
-        if (is_root()) return;
+        if (local_shape()) return;
         const auto v   = view();
         const int  sup = v ? v->rank : root()->rank();
         if (sup != rank())
@@ -1281,7 +1318,7 @@ public:
     }
 
     void check_constraints(bool fixed_only) const override {
-        if (is_root()) return;
+        if (local_shape()) return;
         check_rank();
         const IOEntry&  r   = *root();
         const auto      v   = view();
@@ -1322,7 +1359,7 @@ public:
     }
 
     void validate_connection() const override {
-        if (kind() != IOKind::input || is_root()) return;
+        if (kind() != IOKind::input || local_shape()) return;
         const IOEntry& r        = *root();
         if (r.is_ragged() || is_ragged()) {  // the per-index extents must match dim by dim, and the totals
             if (r.is_ragged() != is_ragged())
@@ -1377,46 +1414,60 @@ public:
                 std::string{r.name()} + "' (" + std::to_string(expected) + ")");
     }
 
-    void allocate(sk::queue& q, Substrates& subs) override {
-        if (!is_root()) return;
+    /// Create a Bundle for every registered placement that has no live one (r01 §4.5). A placement that comes
+    /// back copies from a live one (no init here). The new bundles go into `fresh`, which the caller holds until
+    /// every port has taken its own. Returns whether any bundle was created.
+    bool allocate_missing(sk::queue& q, Substrates& subs, std::vector<std::shared_ptr<void>>& fresh) override {
+        if (!is_root()) return false;
         if (placements_.empty())
             register_placement(Placement{device_ ? *device_ : q.get_device(), storage_kind_});
         subs_ = &subs;
+        std::shared_ptr<void> donor_hold;  // a live placement to copy from
+        for (const Placement& p : placements_)
+            if ((donor_hold = variable().live_bundle(p))) break;
+        auto* donor = static_cast<Bundle<T>*>(donor_hold.get());
+        bool  any   = false;
         for (const Placement& p : placements_) {
-            if (find_slot(p) != nullptr) continue;
+            if (variable().live_bundle(p)) continue;
             // A size-0 root gets an empty vector (usm_vector(0, ...) allocates nothing). A HELD root
             // takes its reserved capacity: per chunk it is resized within it, which never reallocates.
             const std::size_t n = held_ ? reserve_elems_ : flat_size();
-            slots_.push_back(std::make_unique<Slot>(p, sk::usm_vector<T>(n, route(q, subs, p, n))));
+            auto b = std::make_shared<Bundle<T>>(p, sk::usm_vector<T>(n, route(q, subs, p, n)));
             ++allocations_;
             diag::count_allocations();
-            bump_write();  // a new slot: whatever a cache held is gone
+            bump_write();  // a new bundle: whatever a cache held is gone
+            if (donor != nullptr && flat_size() != 0) b->data = donor->data;  // routed, ordered copy
+            variable().set_live(p, b);
+            fresh.push_back(b);
+            any = true;
         }
-        released_ = false;
-        present_  = true;
-        upload_ragged(q);
+        if (any) upload_ragged(q);
+        return any;
+    }
+
+    /// Every live bundle of the Variable (typed).
+    std::vector<std::shared_ptr<Bundle<T>>> bundles() const {
+        std::vector<std::shared_ptr<Bundle<T>>> out;
+        for (const auto& l : variable().live)
+            if (auto b = l.bundle.lock()) out.push_back(std::static_pointer_cast<Bundle<T>>(b));
+        return out;
     }
 
     void upload_ragged(sk::queue& q) override {
-        if (!is_root() || !present_ || subs_ == nullptr) return;
-        for (auto& s : slots_) {
+        if (!is_root() || !present() || subs_ == nullptr) return;
+        for (const auto& sp : bundles()) {
+            Bundle<T>* s = sp.get();
             if (s->version == ragged_version_) continue;
             diag::count_ragged_uploads();
             // The ragged index arrays follow the DENSE storage rules: a vector is created once (empty), kept, and
             // rewritten in place. from_host into the existing capacity is a memory task the in-order stream orders
             // after any kernel still reading the old values, so it needs no wait. Only GROWTH past the capacity
-            // releases the old storage, and only then are its readers waited for (once per slot).
-            bool waited = false;
+            // releases the old storage, and only then are its readers waited for (once per bundle).
             const auto upload = [&](std::optional<sk::usm_vector<std::uint64_t>>& v, std::span<const std::uint64_t> src) {
                 if (!v) v.emplace(0, route_as<std::uint64_t>(q, *subs_, s->pl));  // empty: nothing allocated yet
                 if (src.size() > v->capacity()) {                                  // growth, as for a dense root
                     if (v->capacity() > 0) {                                       // existing storage is released
-                        if (!waited) {
-                            diag::count_queue_waits();
-                            q.wait();
-                            waited = true;
-                        }
-                        diag::count_frees();
+                        diag::count_frees();  // the old storage's free waits on its registered events
                     }
                     diag::count_allocations();
                 }
@@ -1438,7 +1489,7 @@ public:
     }
 
     const std::uint64_t* ragged_ptr_on(const Placement& p, int which) const override {
-        Slot* s = find_slot(p);
+        Bundle<T>* s = find_slot(p);
         if (s == nullptr) return nullptr;
         if (which == 0) return s->offs ? s->offs->data() : nullptr;
         if (which < 1 || which > 2) return nullptr;
@@ -1447,33 +1498,16 @@ public:
     }
 
     std::size_t capacity_elems_impl() const noexcept override {
-        return slots_.empty() ? 0 : slots_.front()->data.capacity();
-    }
-
-    void release_storage() override {
-        if (!is_root() || !present_) return;
-        // Synchronous frees: the stream's kernels may still read these roots and a usm_vector waits
-        // only for its own tasks, so the CALLER has waited the stream (once per releasing Component's
-        // batch); the vectors free here.
-        diag::count_frees(slots_.size());
-        for (const auto& s : slots_) {  // the metadata vectors that hold real storage go with the slot
-            if (s->offs && s->offs->capacity() > 0) diag::count_frees();
-            for (const auto& a : s->per)
-                if (a && a->capacity() > 0) diag::count_frees();
-        }
-        if (!slots_.empty()) bump_write();
-        host_cache_  = std::vector<T>{};  // free the cached copy with the storage
-        cache_epoch_ = ~std::uint64_t{0};
-        slots_.clear();
-        released_ = true;
-        present_  = false;
+        const auto bs = bundles();
+        return bs.empty() ? 0 : bs.front()->data.capacity();
     }
 
     void sync_other_placements(sk::queue&) override {
         if (!is_root()) throw std::logic_error("naga::cospan: sync_other_placements is for roots");
-        if (slots_.size() < 2 || flat_size() == 0) return;
-        Slot& primary = primary_slot();
-        for (auto& s : slots_)
+        const auto bs = bundles();
+        if (bs.size() < 2 || flat_size() == 0) return;
+        Bundle<T>& primary = primary_slot();
+        for (const auto& s : bs)
             if (s.get() != &primary) s->data = primary.data;  // routed, ordered copy
     }
 
@@ -1488,7 +1522,7 @@ public:
     /// root that refreshes, or its release; copy it if you need to keep it. Single-threaded use is assumed
     /// (as everywhere in CoSpan today: submission and host reads come from one thread).
     const std::vector<T>& read_primary(sk::queue& q) const {
-        Slot& s = primary_slot();
+        Bundle<T>& s = primary_slot();
         const std::uint64_t e = write_epoch();
         if (cache_epoch_ == e) {
             diag::count_host_read_hits();
@@ -1519,12 +1553,13 @@ public:
 
 protected:
     StorageEntry(std::string name, IOKind k, DType dt, int rank, std::vector<DimRecord> dims,
-                 bool can_source, bool can_target)
-        : IOEntry{std::move(name), k, dt, rank, std::move(dims), can_source, can_target} {}
+                 bool can_source, bool can_target, Variable* shadow_home = nullptr)
+        : IOEntry{std::move(name), k, dt, rank, std::move(dims), can_source, can_target, shadow_home} {}
+
 
     void register_events_on(const Placement& p, std::span<const sycl::event> events) override {
-        if (!is_root() || !present_) return;
-        Slot* s = find_slot(p);
+        if (!is_root() || !present()) return;
+        Bundle<T>* s = find_slot(p);
         if (s == nullptr) return;
         s->data.register_events(events);
         if (s->offs) s->offs->register_events(events);  // the kernel reads the index arrays too
@@ -1533,57 +1568,37 @@ protected:
     }
 
     std::size_t registered_events_on(const Placement& p) const override {
-        if (!is_root() || !present_) return 0;
-        const Slot* s = find_slot(p);
+        if (!is_root() || !present()) return 0;
+        const Bundle<T>* s = find_slot(p);
         return s == nullptr ? 0 : s->data.registered_event_count();
     }
 
     void* raw_storage_on(const Placement& p) const override {
-        Slot* s = find_slot(p);
-        if (s == nullptr) {
-            if (released_) throw_released();
+        Bundle<T>* s = find_slot(p);
+        if (s == nullptr)
             throw std::logic_error("naga::cospan: '" + full_path() +
-                                   "' has no storage on that placement");
-        }
+                                   "' has no storage on that placement (it is not materialized)");
         return s->data.data();
     }
 
-    /// Host access to a released root: the error names the root and who released it.
-    [[noreturn]] void throw_released() const {
-        throw std::logic_error("naga::cospan: '" + full_path() + "' was released after its last use (by '" +
-                               released_by_ + "'); it exists only while something that uses it runs");
-    }
-
 private:
-    struct Slot {
-        Slot(Placement p, sk::usm_vector<T> v) : pl{std::move(p)}, data{std::move(v)} {}
-        Placement         pl;
-        sk::usm_vector<T> data;
-        // the device copies of the ragged index arrays, allocated with this slot's placement and
-        // released with it. `version` is the ragged_version_ they were built for (0 = none).
-        std::optional<sk::usm_vector<std::uint64_t>>               offs;
-        std::array<std::optional<sk::usm_vector<std::uint64_t>>, 2> per;  // dims 1 and 2
-        std::uint64_t                                              version = 0;
-    };
-
     /// Resize the root's storage to flat_size(); growing waits the stream first (synchronous frees).
     void resize_storage() {
         if (!is_root()) return;
-        if (!slots_.empty()) diag::count_resizes();
-        if (!slots_.empty() && flat_size() > slots_.front()->data.capacity()) {
-            diag::count_queue_waits();
-            slots_.front()->data.get_queue().wait();
+        const auto bs = bundles();
+        if (!bs.empty()) diag::count_resizes();
+        if (!bs.empty() && flat_size() > bs.front()->data.capacity()) {
             ++allocations_;  // a usm_vector resize within its capacity never reallocates; this one does
             diag::count_allocations();
         }
-        const bool size_changes = !slots_.empty() && slots_.front()->data.size() != flat_size();
-        for (auto& s : slots_) s->data.resize(flat_size());
+        const bool size_changes = !bs.empty() && bs.front()->data.size() != flat_size();
+        for (const auto& s : bs) s->data.resize(flat_size());
         if (size_changes) bump_write();
     }
 
     /// A per-index array of the SOURCE's dimension d (empty: scalar), for an unspecified dim.
     std::vector<std::size_t> source_per_index(uint8_t d) const {
-        if (is_root()) return {};  // source_extent throws for it before this is reached
+        if (local_shape()) return {};  // source_extent throws for it before this is reached
         if (view()) return {};
         const std::vector<std::size_t>& full = root()->per_index_raw(d);
         if (const auto lr = leading_range(); lr && source_per_flag(d)) {  // the root's [a, b) slice
@@ -1601,7 +1616,7 @@ private:
     /// index of dim 0): before its owner resolves a FromInputValues dim the array is empty, and a peer
     /// updating its shape at setup must not read that as a length mismatch.
     bool source_per_flag(uint8_t d) const {
-        if (is_root() || view()) return false;
+        if (local_shape() || view()) return false;
         const DimRecord& rd = root()->dim(d);
         return rd.per && rd.per_index.size() == root()->extents()[0];
     }
@@ -1611,26 +1626,22 @@ private:
     /// an inside peer of a boundary root in a ChunkedSystem) it is the root's [a, b) slice, exactly as
     /// source_per_index gives it.
     std::vector<std::size_t> root_per_index(uint8_t d) const {
-        if (is_root()) return {};
+        if (local_shape()) return {};
         if (view()) return {};
         return source_per_index(d);
     }
 
-    Slot* find_slot(const Placement& p) const {
-        for (const auto& s : slots_)
-            if (s->pl == p) return s.get();
-        return nullptr;
-    }
+    /// The bundle at a placement; valid while a port (or a caller's shared_ptr) holds it.
+    Bundle<T>* find_slot(const Placement& p) const { return static_cast<Bundle<T>*>(variable().live_bundle(p).get()); }
 
-    Slot& primary_slot() const {
-        if (released_) throw_released();
+    Bundle<T>& primary_slot() const {
         const auto no_data = [&] {
             return std::logic_error("naga::cospan: '" + full_path() +
-                                    "' has no data until its owner component runs (it is allocated in the owner's "
-                                    "first forward)");
+                                    "' has no data: it is not materialized (it comes into being when something that "
+                                    "uses it runs)");
         };
-        if (!is_root() || !present_ || placements_.empty()) throw no_data();
-        Slot* s = find_slot(placements_.front());
+        if (!is_root() || !present() || placements_.empty()) throw no_data();
+        Bundle<T>* s = find_slot(placements_.front());
         if (s == nullptr) throw no_data();
         return *s;
     }
@@ -1639,7 +1650,7 @@ private:
     /// tied entry is a tie alias (or the output a tie_inputs alias is connected to), whose shape
     /// the root's owner resolved before this entry's Component runs.
     std::size_t root_extent(uint8_t d) const {
-        if (is_root())
+        if (local_shape())
             throw std::logic_error("naga::cospan: '" + full_path() + "' takes a dimension from a tie but is not in a tie");
         if (const auto v = view()) return v->extents[d];
         if (const auto lr = leading_range(); lr && d == 0) return lr->second - lr->first;  // under a range
@@ -1647,7 +1658,7 @@ private:
     }
 
     std::size_t source_extent(uint8_t d) const {
-        if (is_root())
+        if (local_shape())
             throw std::logic_error("naga::cospan: unspecified dimension on the root '" + std::string{name()} + "'");
         if (const auto v = view()) {
             if (d >= v->rank) throw std::out_of_range("naga::cospan: an unspecified dimension is past its supplier's rank");
@@ -1671,7 +1682,7 @@ private:
         if (elems == 0) return sk::allocator<T>{q, sk::kind::device, p.device};
         const sycl::device& d = p.device;
         const auto it = subs.find(d);
-        if (arena_eligible()) {
+        if (arena_planned_ && arena_eligible()) {
             if (it == subs.end() || !it->second.arena)
                 throw std::logic_error("naga::cospan: '" + std::string{name()} +
                                        "' takes the arena route but its device has no arena");
@@ -1690,11 +1701,70 @@ private:
         return sk::allocator<U>{q, sk::kind::device, p.device};
     }
 
-    std::vector<std::unique_ptr<Slot>> slots_;  // parallel to placements_ once allocated
     mutable std::vector<T>             host_cache_;                      // the primary's host copy, valid at cache_epoch_
     mutable std::uint64_t              cache_epoch_ = ~std::uint64_t{0};  // the write epoch host_cache_ was read at
     Substrates*                        subs_ = nullptr;  // bound at allocate (the ragged arrays route through it)
 };
+
+inline Variable::~Variable() = default;
+
+/// A port leaves (its destructor). The authority and the source stay NAMED (authority_path, source_path): a
+/// rebuilt port with that path takes the role again when it joins.
+inline void Variable::unregister_port(IOEntry* p) {
+    std::erase(ports, p);
+    if (authority == p) {
+        authority      = nullptr;
+        authority_path = p->full_path();
+    }
+    if (source_port == p) source_port = nullptr;  // source_path keeps naming it
+    for (IOEntry* q : ports)
+        if (q->mirror_of_ == p) q->mirror_of_ = nullptr;  // a promotion never points at a deleted port
+}
+
+inline void Variable::absorb(Variable& other) {
+    if (&other == this) return;
+    const auto keep = other.shared_from_this();  // the last port leaving must not free `other` mid-loop
+    const auto self = shared_from_this();
+    for (IOEntry* p : other.ports) {
+        p->var_  = self;
+        p->root_ = shadow.get();
+        ports.push_back(p);
+        if (authority == nullptr && !authority_path.empty() && p->full_path() == authority_path) authority = p;
+    }
+    users.insert(users.end(), other.users.begin(), other.users.end());
+    other.users.clear();
+    other.ports.clear();
+    other.authority   = nullptr;
+    other.merged_into = self;
+    // Fold the root-only state of the dying shadow into the survivor's (a mark or a Model init the survivor
+    // lacks moves over; a MarkRecord keeps naming the set's root, which is now the surviving shadow).
+    if (shadow && other.shadow) {
+        IOEntry&       to   = *shadow;
+        IOEntry&       from = *other.shadow;
+        const auto     mv   = [&](std::optional<MarkRecord>& dst, std::optional<MarkRecord>& src) {
+            if (!dst && src) {
+                dst       = std::move(src);
+                dst->root = shadow.get();
+            }
+        };
+        mv(to.design_var_, from.design_var_);
+        mv(to.constraint_, from.constraint_);
+        mv(to.objective_, from.objective_);
+        if (!to.model_init_ && from.model_init_) {
+            to.init_spec_    = std::move(from.init_spec_);
+            to.model_init_   = true;
+            to.init_pending_ = from.init_pending_;
+        }
+        to.chunk_outside_tie_ = to.chunk_outside_tie_ || from.chunk_outside_tie_;
+        to.chunk_rerooted_    = to.chunk_rerooted_ || from.chunk_rerooted_;
+        if (to.chunk_internal_by_.empty()) to.chunk_internal_by_ = from.chunk_internal_by_;
+    }
+    if (source_port == nullptr && other.source_port != nullptr) {
+        source_port = other.source_port;
+        source_path = other.source_path;
+    }
+    other.shadow.reset();
+}
 
 /// The rank/dtype-typed layer: the wrapper pointer helpers.
 template <DType DT, int Rank>
@@ -1711,11 +1781,14 @@ public:
     }
 
 protected:
+    /// `home` non-null: this entry is that Variable's SHADOW (no shadow of its own).
     TypedEntry(std::string name, IOKind k, const std::array<DimRecord, Rank>& dims,
-               bool can_source, bool can_target)
+               bool can_source, bool can_target, Variable* home = nullptr)
         : StorageEntry<value_type>{std::move(name), k, DT, Rank,
                                    std::vector<DimRecord>(dims.begin(), dims.end()), can_source,
-                                   can_target} {}
+                                   can_target, home} {
+        if (home == nullptr) this->install_shadow();
+    }
 
     template <class W>
     void point(W& w) const {
@@ -1855,8 +1928,8 @@ template <DType DT, int Rank>
 class AliasEntry final : public TypedEntry<DT, Rank> {
 public:
     AliasEntry(std::string name, IOKind k, const std::array<DimRecord, Rank>& dims,
-               bool can_source, bool can_target)
-        : TypedEntry<DT, Rank>{std::move(name), k, dims, can_source, can_target} {}
+               bool can_source, bool can_target, Variable* home = nullptr)
+        : TypedEntry<DT, Rank>{std::move(name), k, dims, can_source, can_target, home} {}
 
     void point_wrapper() override {}
 };
@@ -1865,29 +1938,29 @@ namespace alias_factory {
 
 template <DType DT, int R>
 std::unique_ptr<IOEntry> make_typed(std::string name, IOKind k, const std::vector<DimRecord>& dims,
-                                    bool can_source, bool can_target) {
+                                    bool can_source, bool can_target, Variable* home) {
     std::array<DimRecord, R> a{};
     for (int d = 0; d < R; ++d) a[static_cast<std::size_t>(d)] = dims[static_cast<std::size_t>(d)];
-    return std::make_unique<AliasEntry<DT, R>>(std::move(name), k, a, can_source, can_target);
+    return std::make_unique<AliasEntry<DT, R>>(std::move(name), k, a, can_source, can_target, home);
 }
 
 template <DType DT>
 std::unique_ptr<IOEntry> make_ranked(std::string name, IOKind k, const std::vector<DimRecord>& dims,
-                                     bool can_source, bool can_target) {
+                                     bool can_source, bool can_target, Variable* home) {
     switch (dims.size()) {
-        case 1: return make_typed<DT, 1>(std::move(name), k, dims, can_source, can_target);
-        case 2: return make_typed<DT, 2>(std::move(name), k, dims, can_source, can_target);
-        default: return make_typed<DT, 3>(std::move(name), k, dims, can_source, can_target);
+        case 1: return make_typed<DT, 1>(std::move(name), k, dims, can_source, can_target, home);
+        case 2: return make_typed<DT, 2>(std::move(name), k, dims, can_source, can_target, home);
+        default: return make_typed<DT, 3>(std::move(name), k, dims, can_source, can_target, home);
     }
 }
 
 template <std::size_t... I>
 std::unique_ptr<IOEntry> make_impl(DType dt, std::string name, IOKind k,
                                    const std::vector<DimRecord>& dims, bool can_source,
-                                   bool can_target, std::index_sequence<I...>) {
+                                   bool can_target, Variable* home, std::index_sequence<I...>) {
     std::unique_ptr<IOEntry> out;
     (void)((static_cast<std::size_t>(dt) == I
-                ? (out = make_ranked<static_cast<DType>(I)>(std::move(name), k, dims, can_source, can_target),
+                ? (out = make_ranked<static_cast<DType>(I)>(std::move(name), k, dims, can_source, can_target, home),
                    true)
                 : false) ||
            ...);
@@ -1901,11 +1974,20 @@ std::unique_ptr<IOEntry> make_impl(DType dt, std::string name, IOKind k,
 /// entries, whose dtype and rank are runtime values.
 inline std::unique_ptr<IOEntry> make_alias_entry(DType dt, std::string name, IOKind k,
                                                  const std::vector<DimRecord>& dims, bool can_source,
-                                                 bool can_target) {
+                                                 bool can_target, Variable* home = nullptr) {
     if (dims.empty() || dims.size() > 3)
         throw std::invalid_argument("naga::cospan: '" + name + "': rank must be 1..3");
-    return alias_factory::make_impl(dt, std::move(name), k, dims, can_source, can_target,
+    return alias_factory::make_impl(dt, std::move(name), k, dims, can_source, can_target, home,
                                     std::make_index_sequence<13>{});
+}
+
+/// The shadow of this port's Variable: inert dims (its shape is ADOPTED from the authority port).
+inline void IOEntry::install_shadow() {
+    std::vector<DimRecord> inert = dims_;
+    for (DimRecord& r : inert)
+        if (r.how != DimRecord::How::fixed) r.how = DimRecord::How::from_input;  // a static shape stays static
+    var_->shadow = make_alias_entry(dtype_, name_, io_kind_, inert, can_be_source_, can_be_target_, var_.get());
+    root_        = var_->shadow.get();
 }
 
 /// INTERNAL / TEST-ONLY. The structural and placement mutators are System's
@@ -1937,4 +2019,24 @@ struct LeadingRangeAccess {
 };
 
 }  // namespace detail
+
+namespace {
+// The variable a (possibly retired) one was folded into.
+inline detail::Variable* surviving(detail::Variable* v) {
+    while (v != nullptr && v->merged_into) v = v->merged_into.get();
+    return v;
+}
+}  // namespace
+inline detail::IOEntry* AliasSrc::shadow() const {
+    detail::Variable* v = surviving(var.get());
+    return v ? v->shadow.get() : nullptr;
+}
+inline const detail::IOEntry* AliasSrc::live_port() const {
+    detail::Variable* v = surviving(var.get());
+    if (v == nullptr) return nullptr;
+    for (const detail::IOEntry* p : v->ports)
+        if (p == port) return port;
+    return v->shadow.get();
+}
+
 }  // namespace naga::cospan

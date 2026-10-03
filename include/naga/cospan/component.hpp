@@ -33,7 +33,6 @@
 #include "naga/cospan/host_view.hpp"
 #include "naga/cospan/init.hpp"
 #include "naga/cospan/kernel.hpp"
-#include "naga/cospan/lifetime.hpp"
 #include "naga/cospan/metadata.hpp"
 #include "naga/cospan/subsystem.hpp"
 #include "naga/cospan/wrappers.hpp"
@@ -185,9 +184,9 @@ public:
             e->storage_kind_ = default_storage_kind();
             const Placement own = e->placement();
             detail::IOEntry&        root = *e->root();
-            if (e->is_root()) {
-                e->set_primary_placement(own);
-                bytes += e->static_bytes();
+            if (e->local_shape()) {
+                root.set_primary_placement(own);
+                bytes += root.static_bytes();
             } else if (e->kind() == IOKind::input) {
                 // Host-kind placements cost no arena bytes; a device-kind one
                 // costs the root's arena bytes once per device.
@@ -211,17 +210,18 @@ public:
         queue_ = &queue;
         subs_  = &substrates;
         ev_.queue_  = &queue;
-        ev_.ensure_ = [this](detail::IOEntry& r) { allocate_owned(r); };
+        // a shape-driving read may need a variable's storage: materialize it on need (r01 §4.5)
+        ev_.ensure_ = [this](detail::IOEntry& r) { r.variable().materialize(queue_ref(), nullptr, !replay_); };
         for (detail::IOEntry* e : order_)
-            if (e->kind() == IOKind::input && !e->is_root() && e->tie_alias_ == nullptr && e->has_unspecified())
+            if (e->kind() == IOKind::input && !e->local_shape() && e->tie_alias_ == nullptr && e->has_unspecified())
                 e->update_shape();  // takes the connected source's unspecified dims
-        // No allocation at setup: every root is allocated, and its init applied, by its OWNER in
-        // run_pre_compute (r01 §4.4). Roots only learn what to allocate from.
+        // No allocation at setup: a variable is materialized on need, in run_pre_compute (r01 §4.5).
+        // Roots only learn what to allocate from.
         for (detail::IOEntry* e : order_)
-            if (e->is_root()) e->bind_substrates(substrates);
+            if (e->local_shape()) e->bind_substrates(substrates);
         for (detail::IOEntry* e : order_) {
-            if (!e->is_root() && !e->root()->is_dynamic()) e->check_constraints(true);  // fixed dims, at setup
-            if (e->kind() == IOKind::input && !e->is_root() && !e->is_dynamic() &&
+            if (!e->local_shape() && !e->root()->is_dynamic()) e->check_constraints(true);  // fixed dims, at setup
+            if (e->kind() == IOKind::input && !e->local_shape() && !e->is_dynamic() &&
                 !e->root()->is_dynamic())
                 e->validate_connection();
             point_if_stored(*e);
@@ -259,33 +259,23 @@ public:
             detail::FlagScope scope{in_pre_forward_};
             pre_forward();
         }
-        // REVIVE every root this Component touches: a root out of scope comes into scope with the
-        // answers of its partners; an in-scope root is left alone. Before any allocation.
-        for (detail::IOEntry* e : order_) detail::revive(*e->root(), *this);
-        // ALLOCATE every root this Component OWNS (inputs and outputs) that has no storage, and
-        // apply a free input root's init at the allocation (r01 §4.4). A root it
-        // does not own is only pointed at, below.
-        for (detail::IOEntry* e : order_) allocate_owned(*e->root());
-        // A free input root whose owner has stopped (its run counter is 0) has no one left to allocate it:
-        // the next Component that needs it allocates it and applies its init.
-        for (detail::IOEntry* e : order_) {
-            detail::IOEntry& r = *e->root();
-            if (r.kind() == IOKind::input && !r.has_storage() && r.owner() != nullptr && r.owner() != this &&
-                r.owner()->run_counter() == 0) {
-                r.allocate_if_absent(queue_ref());
-                if (r.init_pending()) {
-                    detail::apply_root_init(r, queue_ref(), !replay_);
-                    r.clear_init_pending();
-                }
+        // MATERIALIZE every variable this Component touches that is not live (r01 §4.5): a free input takes
+        // its init at the allocation; a variable live nowhere else is only pointed at. A pending Model::init_input
+        // is applied here too. Then a ragged variable's device index arrays follow its (possibly changed)
+        // description (version-gated, so unchanged metadata is not sent again).
+        {
+            std::vector<detail::Variable*> seen;
+            for (detail::IOEntry* e : order_) {
+                detail::Variable* v = &e->variable();
+                if (std::find(seen.begin(), seen.end(), v) != seen.end()) continue;
+                seen.push_back(v);
+                v->materialize(queue_ref(), nullptr, !replay_);
+                if (!replay_) e->root()->upload_ragged(queue_ref());
             }
         }
-        // a ragged root's device index arrays follow its (possibly changed) description.
-        if (!replay_)
-            for (detail::IOEntry* e : order_)
-                if (e->root()->owner() == this && e->root()->has_storage()) e->root()->upload_ragged(queue_ref());
         for (detail::IOEntry* e : order_) {
-            if (!replay_ && !e->is_root()) e->check_constraints(false);  // specified dims against their supplier
-            if (!replay_ && e->kind() == IOKind::input && !e->is_root() &&
+            if (!replay_ && !e->local_shape()) e->check_constraints(false);  // specified dims against their supplier
+            if (!replay_ && e->kind() == IOKind::input && !e->local_shape() &&
                 (e->is_dynamic() || e->root()->is_dynamic()))
                 e->validate_connection();
             point_if_stored(*e);
@@ -306,12 +296,13 @@ public:
             seen.push_back(r);  // one placement per Component, so the root alone identifies the pair
             e->register_launch_events(events);
         }
+        last_events_.assign(events.begin(), events.end());
     }
+    std::vector<sycl::event> last_events_;  ///< the last launch's events (what collect_inflight reports)
 
     /// Refresh the other-placement copies of every output root this Component
     /// produces (routed copies: device<->host, cross-device), ordered after the
-    /// launch by the stream; then DECREMENT every root it touches and RELEASE the
-    /// ones that reached 0: one stream wait for the batch (synchronous frees).
+    /// launch by the stream. Nothing is freed here: a variable lives while a port holds its bundle.
     void run_post_compute(ExecCtx& owner_ctx) override {
         // Write epochs: every launch path ends here, with this Component's kernels submitted. Each OUTPUT's
         // root advances once per call (tied members of one root are separate Components, so N writers give +N).
@@ -325,21 +316,19 @@ public:
                 r->bump_write();
             }
         }
-        for (detail::IOEntry* e : order_)
-            if (e->kind() == IOKind::output && e->is_root() && e->storage_placements().size() > 1 &&
-                e->has_storage())
-                e->sync_other_placements(*owner_ctx.queue);
-
-        // DECREMENT once per distinct root (deferred inside a ChunkedSystem's chunk loop), then free the
-        // roots whose count reached 0 behind ONE queue wait.
-        std::vector<detail::IOEntry*> seen, batch;
-        for (detail::IOEntry* e : order_) {
-            detail::IOEntry* r = e->root();
-            if (std::find(seen.begin(), seen.end(), r) != seen.end()) continue;
-            seen.push_back(r);
-            detail::decrement_or_defer(*r, *this, batch, defer_sink());
+        // The other placements of every output variable this Component wrote follow the primary (once per variable;
+        // the push is done on the variable's shadow, which holds the typed storage).
+        {
+            std::vector<detail::IOEntry*> synced;
+            for (detail::IOEntry* e : order_) {
+                if (e->kind() != IOKind::output) continue;
+                detail::IOEntry* r = e->root();
+                if (std::find(synced.begin(), synced.end(), r) != synced.end()) continue;
+                synced.push_back(r);
+                if (r->storage_placements().size() > 1 && r->has_storage()) r->sync_other_placements(*owner_ctx.queue);
+            }
         }
-        detail::release(batch, *owner_ctx.queue);
+
     }
 
     // ---- what a fused owner needs to know, without knowing the KernelBody type --
@@ -478,24 +467,9 @@ private:
         return false;
     }
 
-    /// The OWNER's allocation of a root (r01 §4.4): through the one allocation routine (a
-    /// size-0 root becomes present with empty storage). For a free input root (an input root: it
-    /// has no source): if it was just allocated its init is applied (else zeros); else if an init
-    /// is pending (Model::init_input) the init is applied to the existing storage. Either way the
-    /// pending flag is cleared. A root this Component does not own is left alone; a connected
-    /// root (an output root) never gets an init applied.
-    void allocate_owned(detail::IOEntry& root) {
-        if (root.owner() != this) return;
-        detail::revive(root, *this);  // idempotent: a shape-driving read may reach the root before pre_compute's revive
-        root.allocate_if_absent(queue_ref());
-        if (root.kind() == IOKind::input && root.init_pending()) {
-            detail::apply_root_init(root, queue_ref(), !replay_);
-            root.clear_init_pending();
-        }
-    }
-
     void point_if_stored(detail::IOEntry& e) {
-        if (e.root()->has_storage()) e.point_wrapper();
+        // only when the variable is live at THIS port's placement (a rebuilt port may sit on a placement that is not live yet)
+        if (e.root()->has_storage() && e.variable().live_bundle(e.placement())) e.point_wrapper();
     }
 
     // ---- shape derivation (r01 §6.5 step 1) ----------------------------------
@@ -564,7 +538,7 @@ private:
             if (a == nullptr || !a->alias_shape_ || std::find(seen.begin(), seen.end(), a) != seen.end()) continue;
             seen.push_back(a);
             const AliasShape& s = *a->alias_shape_;
-            if (a->is_root()) continue;  // a tie root is resolved and allocated by its owner, the declaring System
+            if (a->local_shape()) continue;  // a tie root is resolved and allocated by its owner, the declaring System
             if (!a->alias_checked_) {
                 if (s.kind != AliasShape::Kind::unspecified) {
                     const detail::AliasEvaluator::AliasEval want = ev_.alias_eval(*a);
@@ -842,7 +816,7 @@ public:
             // nothing: no kernel is JIT-specialised for these bodies
         } else {
             constexpr int R = kernel_rank_v<KB>;
-            cfg_            = std::make_unique<Config>();
+            cfg_            = std::make_shared<Config>();
             if constexpr (R == 1)
                 cfg_->define(&kb_entry_r1, &kb_fn<KB>);
             else if constexpr (R == 2)
@@ -934,7 +908,12 @@ private:
                                                           scratch);
     }
 
-    std::unique_ptr<Config> cfg_;
+    std::shared_ptr<Config> cfg_;
+
+public:
+    void collect_inflight(std::vector<Subsystem::InflightKeep>& out) const override {
+        if (cfg_ && !this->last_events_.empty()) out.emplace_back(this->last_events_, cfg_);
+    }
 };
 
 }  // namespace naga::cospan

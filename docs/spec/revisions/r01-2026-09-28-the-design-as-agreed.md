@@ -1006,9 +1006,9 @@ Two kinds of thing carry the model's data. A VARIABLE says what the data is; POR
 | none | ETERNAL: no counter; the child runs every forward |
 | `property::run_n{n}` | the counter starts at n >= 1 (n = 0 throws `invalid_argument`); the child runs n forwards |
 | `property::do_once{}` | `run_n{1}` |
-| `property::transient{}` | runs every forward, and is REBUILT before each one |
+| `property::transient{}` | runs every forward; exists for exactly one forward of its parent: BUILT at the start of the parent's forward, DELETED at its end |
 
-`run_n` with `do_once` is an error; so is `transient` with either (`add_subsystem('x'): transient cannot be combined with run_n or do_once`). The counter moves once per forward (inside a chunked system, once after the last chunk). When it reaches 0 the parent DELETES the child: everything the child held goes with it, and variables survive only through other ports. A child does not know its own lifetime. A parent's limits apply to its children by construction: a deleted parent takes its children with it, and a rebuilt parent rebuilds them. Rebuilding a transient child every forward is an honest cost and is deliberately not optimized.
+`run_n` with `do_once` is an error; so is `transient` with either (`add_subsystem('x'): transient cannot be combined with run_n or do_once`). A `run_n` or `do_once` counter moves after the child's turn (inside a chunked system, once after the last chunk). When it reaches 0 the parent DELETES the child right after that turn: everything the child held goes with it, and variables survive only through other ports. A child does not know its own lifetime. A parent's limits apply to its children by construction: a deleted parent takes its children with it, and a rebuilt parent rebuilds them. A TRANSIENT child exists for exactly one forward of its parent: the parent builds every missing transient child at the START of its forward loop, before any child's turn, and deletes them at the END, after every child's turn (inside a chunked system: built before the first chunk, deleted after the last). So a transient reader's ports exist while its transient producer runs, the ports keep the data, and it is freed at the end of the parent's forward. Rebuilding a transient child every forward is an honest cost and is deliberately not optimized.
 
 **Rearm is a call on the parent, by child name.** `rearm(name)` on a System re-constructs the named child from the constructor arguments the parent stored at `add_subsystem`, runs its setup, replays the parent's own `connect`, `promote`, `tie_*` and `init_input` declarations that touch it, and prepares it for execution. A rebuilt child rejoins the same variables.
 
@@ -2085,8 +2085,9 @@ protected:
     /// Run policy is registration metadata this System keeps for each child (§4.4):
     /// the property from add_subsystem, the stored constructor arguments (for the
     /// rebuild of a transient child and for rearm) and a run counter. This System
-    /// runs each existing child, rebuilds a transient child before its turn, moves
-    /// every counter once per forward and deletes a child whose counter reaches 0.
+    /// builds every missing transient child at the start of its forward, runs each
+    /// existing child, moves a run_n / do_once counter after the child's turn and deletes
+    /// the child when it reaches 0, and deletes every transient child at the end.
     /// The Components under it materialize the variables they access in their own
     /// turns (§6.5); a System materializes the aliases it declares when it reads them.
 
@@ -2116,18 +2117,20 @@ The default loop is per child:
 run_post_compute`; a child that submitted itself needs no owner action.
 
 ```
+for (child : children_)                       // at the START, before any child's turn
+    if (child is transient and deleted) build it;   // re-constructed from its stored arguments (§4.4)
 for (child : children_) {
     if (child is deleted) continue;           // declared, currently deleted (§4.4)
-    if (child is transient) rebuild it;       // deleted and re-constructed from its stored arguments (§4.4)
     child->run_pre_compute(ctx_);             // a Component materializes the variables it accesses here (§4.4, §6.5)
     auto d = child->run_compute_forward();
     if (d) d->submit(ctx_.target());          // WE submit, routed on d->is_custom_op() / d->is_host()
     register the launch's kernel events on the storage of every port the child touched   // §4.4
     child->run_post_compute(ctx_);            // copies AFTER the work they depend on —
                                               //   ordered by the queue and the registered events
+    if (child is run_n or do_once) { move its counter; if (it reaches 0) delete child; }   // right after its turn (§4.4)
 }
-for (child : children_)                       // once per forward, after the last child
-    if (child has a counter) { move it; if (it reaches 0) delete child; }   // §4.4
+for (child : children_)                       // at the END, after the last child's turn
+    if (child is transient) delete child;     // a transient child exists for one forward of its parent (§4.4)
 return nullptr;                               // "I submitted"
 ```
 
@@ -2156,7 +2159,7 @@ namespace naga::cospan {
 namespace property {
     struct device        { sycl::device dev; };            // placement; inherited when absent
     struct parallel      {};                               // flavor
-    struct transient     {};   // run policy: runs every forward and is rebuilt before each (§4.4)
+    struct transient     {};   // run policy: runs every forward; built at the start of its parent's forward, deleted at its end (§4.4)
     struct run_n         { std::size_t n; };   // run policy n >= 1 (n == 0 throws std::invalid_argument)
     struct do_once       {};   // run policy 1; with run_n an error; transient with either is an error
     struct fused         { FusedSystem::Mode mode; std::optional<sycl::range<3>> wg; };
@@ -2919,18 +2922,20 @@ need not wait between them — the stream orders (§7.3).
 #### 11.3.1 A System's turn — the ordering contract (§7.3)
 
 ```
+for (child : children_)                       // at the START, before any child's turn
+    if (child is transient and deleted) build it;   // re-constructed from its stored arguments (§4.4)
 for (child : children_) {
     if (child is deleted) continue;           // declared, currently deleted (§4.4)
-    if (child is transient) rebuild it;       // deleted and re-constructed from its stored arguments (§4.4)
     child->run_pre_compute(ctx_);             // a Component materializes the variables it accesses here (§4.4, §6.5)
     auto d = child->run_compute_forward();
     if (d) d->submit(ctx_.target());          // WE submit, routed on d->is_custom_op() / d->is_host()
     register the launch's kernel events on the storage of every port the child touched   // §4.4
     child->run_post_compute(ctx_);            // copies AFTER the work they depend on —
                                               //   ordered by the queue and the registered events
+    if (child is run_n or do_once) { move its counter; if (it reaches 0) delete child; }   // right after its turn (§4.4)
 }
-for (child : children_)                       // once per forward, after the last child
-    if (child has a counter) { move it; if (it reaches 0) delete child; }   // §4.4
+for (child : children_)                       // at the END, after the last child's turn
+    if (child is transient) delete child;     // a transient child exists for one forward of its parent (§4.4)
 return null
 ```
 

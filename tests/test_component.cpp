@@ -684,7 +684,7 @@ TEST_CASE("custom op: device_ptr at submission is the storage the consumer reads
 
     const sycl::device    dev{sycl::default_selector_v};
     const cs::Placement   dev_pl{dev, sk::kind::device};
-    auto&                 rec      = dynamic_cast<tc::Recorder&>(model.get_subsystem("rec"));
+    auto&                 rec      = dynamic_cast<tc::Recorder&>((*model.get_subsystem("rec")));
     const void*           want_in  = model.root().entry_at("iota.y").root()->storage_on(dev_pl);
     const void*           want_out = model.root().entry_at("rec.y").root()->storage_on(dev_pl);
     CHECK(rec.in_rec.load() != nullptr);
@@ -784,7 +784,7 @@ TEST_CASE("initial values: metadata rules (connected, output, duplicates, highes
 TEST_CASE("phase guards: init_input, reshape and declare outside their phase throw", "[component][init][guards]") {
     auto model = cs::create_model<tc::TopInit>(default_config());
     model.setup();
-    auto& c = dynamic_cast<tc::InitDemo&>(model.get_subsystem("ini"));
+    auto& c = dynamic_cast<tc::InitDemo&>((*model.get_subsystem("ini")));
 
     SECTION("init_input outside setup() throws") {
         tc::expect_throws([&] { c.try_init(); }, "setup() only");

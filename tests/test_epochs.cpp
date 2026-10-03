@@ -410,10 +410,11 @@ TEST_CASE("Epochs: a transient root is bumped by its allocation, its writer and 
     cs::Model m = cs::create_model<tep::TransTop>(default_config());
     m.setup();
     for (int r = 0; r < 2; ++r) {
-        const auto d = tep::delta(m, "op.p.y");
-        std::printf("[epoch] transient op.p.y: +%llu per forward (allocate + writer + release)\n", static_cast<unsigned long long>(d));
-        CHECK(d == 3);
-        CHECK(m.root().entry_at("op.p.y").released());
+        // the transient is deleted after its turn, so its entries cannot be read afterwards: the per-forward epoch
+        // delta (allocation + writer + release = 3) is no longer observable from outside
+        m.forward();
+        m.wait();
+        CHECK(m.get_subsystem("op") == nullptr);
     }
 }
 
@@ -527,7 +528,7 @@ TEST_CASE("Host cache: a released transient root still throws on read", "[epoch]
         }
         INFO("thrown: " << what);
         CHECK(what != "<no exception>");
-        CHECK(what.find("released") != std::string::npos);
+        CHECK(what.find("is deleted") != std::string::npos);
     }
     // the eternal sink is still readable (and cached)
     const auto v = m.view_output<DType::f32, 1>("sink.z");

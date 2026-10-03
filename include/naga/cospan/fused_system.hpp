@@ -89,12 +89,23 @@ public:
     // ---- adding children: Components only, at compile time ----------------------------
     template <class T, class... Args>
         requires(std::derived_from<T, ComponentBase> && !detail::leads_with_props_v<Args...>)
-    T& add_subsystem(std::string name, Args&&... ctor_args) {
-        return System::add_subsystem<T>(std::move(name), std::forward<Args>(ctor_args)...);
+    void add_subsystem(std::string name, Args&&... ctor_args) {
+        System::add_subsystem<T>(std::move(name), std::forward<Args>(ctor_args)...);
     }
 
     /// A FusedSystem has no untyped children to add, and no property overload.
-    System& add_subsystem(std::string, const property_list& = {}) = delete;
+    void add_subsystem(std::string, const property_list& = {}) = delete;
+    /// A flavor keeps its children: no run policies, no deletion, no rearm.
+    bool slots_deletable() const noexcept override { return false; }
+    /// The wave's config is read by the runtime when the wave launches: it is kept with the stages' launch events.
+    void collect_inflight(std::vector<Subsystem::InflightKeep>& out) const override {
+        std::vector<Subsystem::InflightKeep> mine;
+        System::collect_inflight(mine);
+        std::vector<sycl::event> all;
+        for (const auto& [ev, keep] : mine) all.insert(all.end(), ev.begin(), ev.end());
+        if (cfg_ && !all.empty()) out.emplace_back(std::move(all), cfg_);
+        for (auto& m : mine) out.push_back(std::move(m));
+    }
 
     // ---- compile -----------------------------------------------------------------------------
     void compile() override {
@@ -130,7 +141,7 @@ public:
         // The call sequence, built ONCE: the definition ids in child order. No barriers.
         std::vector<detail::JitId> defs;
         for (std::size_t i = 0; i < n; ++i) defs.push_back(stage(i).definition_id());
-        cfg_ = std::make_unique<sycl::AdaptiveCpp_jit::dynamic_function_config>();
+        cfg_ = std::make_shared<sycl::AdaptiveCpp_jit::dynamic_function_config>();
         cfg_->define_as_call_sequence(detail::wave_entry_id(rank_), defs);
     }
 
@@ -332,7 +343,7 @@ private:
     bool                          allow_tied_ = false;  // parallel mode: stages may share an output root
     std::optional<sycl::range<3>> wg_;
     int                           rank_ = 0;
-    std::unique_ptr<sycl::AdaptiveCpp_jit::dynamic_function_config> cfg_;
+    std::shared_ptr<sycl::AdaptiveCpp_jit::dynamic_function_config> cfg_;
 
     // Staging buffers, kept for the System's life; each forward overwrites them
     // (stream-ordered after the previous wave's kernel, SlabKit's contract).

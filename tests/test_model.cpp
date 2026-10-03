@@ -905,7 +905,7 @@ TEST_CASE("empty: a size-0 root is present and empty; its consumer runs as a no-
     auto model = cs::create_model<tmod::EmptyTop>(default_config());
     model.setup();
     // Before the owner has run, a view throws.
-    tmod::expect_throws([&] { (void)model.view_output<DType::f32, 1>("bins.bins"); }, {"no data until its owner"});
+    tmod::expect_throws([&] { (void)model.view_output<DType::f32, 1>("bins.bins"); }, {"has no data: it is not materialized"});
 
     model.init_input("bins.n", cs::init::from_host(std::vector<std::uint32_t>{0}));
     model.forward();

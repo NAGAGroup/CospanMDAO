@@ -127,6 +127,42 @@ inline void apply_root_init(IOEntry& root, sk::queue& q, bool full_range = true)
     if (root.storage_placements().size() > 1) root.sync_other_placements(q);
 }
 
+/// MATERIALIZE ON NEED (r01 §4.5): the one function that brings a Variable's storage into being.
+///  - live nowhere: a bundle for every registered placement; a free input then takes its init (declared, else zeros);
+///  - live on some placements only: the missing ones are allocated and copy from a live one (no init);
+///  - live everywhere: nothing, except a pending Model::init_input, applied now.
+/// Every port then holds the bundle of its own placement, which is what keeps it alive: freeing is the last
+/// holder dropping it. A sourced variable that is live nowhere while its producer does not exist throws.
+inline void Variable::materialize(sk::queue& q, Substrates* subs, bool full_range, bool apply_init) {
+    IOEntry&          r   = *shadow;
+    const std::string who = ports.empty() ? std::string{r.name_} : ports.front()->full_path();
+    if (subs == nullptr) subs = r.substrates_;
+    if (subs == nullptr) throw std::logic_error("naga::cospan: '" + who + "' cannot be allocated before setup() completes");
+    const bool none_live = !any_live();
+    if (none_live && source_port == nullptr && !source_path.empty())
+        throw std::logic_error("naga::cospan: cannot materialize '" + who + "': it is fed by '" + source_path +
+                               "', which does not currently exist (its producer was deleted; rearm it first)");
+    if (!r.placements_.empty()) {  // the shadow acts at the primary placement (an init writes there)
+        r.device_       = r.placements_.front().device;
+        r.storage_kind_ = r.placements_.front().kind;
+    }
+    std::vector<std::shared_ptr<void>> fresh;  // held until every port has taken its own
+    r.allocate_missing(q, *subs, fresh);
+    for (IOEntry* p : ports)
+        if (auto b = live_bundle(p->placement())) p->bundle_ = std::move(b);
+    // The non-port users (a System reading this variable in a tie alias's shape rule) hold the primary placement's
+    // bundle, as a port does. Taken here, so a producer deleted right after its turn does not take the value away.
+    std::erase_if(users, [](const std::weak_ptr<UserHold>& w) { return w.expired(); });
+    if (!users.empty() && !r.placements_.empty())
+        if (auto b = live_bundle(r.placements_.front()))
+            for (const auto& w : users)
+                if (auto h = w.lock()) h->bundle = b;
+    if (apply_init && r.io_kind_ == IOKind::input && (none_live || r.init_pending_)) {
+        apply_root_init(r, q, full_range);
+        r.init_pending_ = false;
+    }
+}
+
 }  // namespace detail
 
 namespace init {

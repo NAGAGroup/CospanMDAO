@@ -288,7 +288,7 @@ void chunked_matches_plain(std::size_t budget) {
 
     cs::Model m = cs::create_model<Top<InnerChunk>>(default_config(), budget, ragged_init());
     m.setup();
-    auto&         sys = dynamic_cast<cs::ChunkedSystem&>(m.get_subsystem("inner"));
+    auto&         sys = dynamic_cast<cs::ChunkedSystem&>((*m.get_subsystem("inner")));
     tcc::Recorder rec;
     rec.attach(sys, {"p.x"});
     m.forward();

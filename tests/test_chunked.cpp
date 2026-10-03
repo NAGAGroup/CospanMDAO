@@ -417,10 +417,10 @@ std::vector<float> forward_out(cs::Model& m, const char* path = "cons.out") {
 /// An entry INSIDE the chunked system 'inner', resolved by the chunked system itself (its own subtree is visible to it;
 /// from outside only its promotions are: the Model's root.entry_at("inner.a.t") is refused).
 cs::detail::IOEntry& inner_entry(cs::Model& m, const char* path) {
-    return dynamic_cast<cs::ChunkedSystem&>(m.get_subsystem("inner")).entry_at(path);
+    return dynamic_cast<cs::ChunkedSystem&>((*m.get_subsystem("inner"))).entry_at(path);
 }
 
-std::size_t chunks_of(cs::Model& m) { return dynamic_cast<cs::ChunkedSystem&>(m.get_subsystem("inner")).last_chunk_count(); }
+std::size_t chunks_of(cs::Model& m) { return dynamic_cast<cs::ChunkedSystem&>((*m.get_subsystem("inner"))).last_chunk_count(); }
 
 }  // namespace tch
 
@@ -509,7 +509,7 @@ TEST_CASE("Chunked: a free input of an inside component, promoted out and set wi
         const auto out  = tch::forward_out(m);
         CHECK(out == pout);
         CHECK(out == ref(w));
-        CHECK(dynamic_cast<cs::ChunkedSystem&>(m.get_subsystem("inner")).last_chunk_count() == 4);
+        CHECK(dynamic_cast<cs::ChunkedSystem&>((*m.get_subsystem("inner"))).last_chunk_count() == 4);
         auto wv = m.view_input<DType::f32, 2>("inner.w");  // the promoted free input holds the whole value
         REQUIRE(wv.size() == n * 3);
         for (std::size_t q = 0; q < w.size(); ++q) CHECK(wv.span()[q] == w[q]);
@@ -1377,10 +1377,10 @@ TEST_CASE("Chunked eternal: the internal roots are allocated once across three f
     CHECK(f2.frees == 0);
     CHECK(f3.frees == 0);
     CHECK(tch::inner_entry(m, "a.t").allocation_count() == 1);
-    CHECK(tch::inner_entry(m, "a.t").lifetime_count() == -1);
+    CHECK(tch::inner_entry(m, "a.t").present());
 }
 
-TEST_CASE("Chunked transient: the internal roots are freed after the last chunk with ONE queue wait per forward",
+TEST_CASE("Chunked transient: the chunked system is deleted after its forward and its internal roots go with it",
           "[chunked][lifetime]") {
     constexpr std::size_t n = 10;
     cs::Model plain = cs::create_model<tch::DenseTop<tch::InnerPlain>>(default_config(), n, std::size_t{0});
@@ -1391,14 +1391,9 @@ TEST_CASE("Chunked transient: the internal roots are freed after the last chunk 
     for (int rep = 0; rep < 3; ++rep) {
         INFO("forward " << rep + 1);
         const auto d = tch::counted_forward(m);
-        CHECK(tch::chunks_of(m) == 10);
-        CHECK(d.frees == 1);         // the one internal root
-        CHECK(d.queue_waits == 2);   // the batch release, plus the Model::wait of this helper
+        CHECK(d.queue_waits <= 1);   // only the Model::wait of this helper: frees order themselves on registered events
         if (rep > 0) CHECK(d.allocations == 1);
-        cs::detail::IOEntry& t = tch::inner_entry(m, "a.t");
-        CHECK_FALSE(t.has_storage());
-        CHECK(t.released());
-        CHECK(t.lifetime_count() == 0);
+        CHECK(m.get_subsystem("inner") == nullptr);  // transient: deleted after its turn (chunks_of / a.t are gone with it)
         const auto v = m.view_output<DType::f32, 1>("cons.out");
         CHECK(std::vector<float>(v.span().begin(), v.span().end()) == pout);
     }
@@ -1408,16 +1403,15 @@ TEST_CASE("Chunked: a run_n child counts forwards, not chunks", "[chunked][lifet
     constexpr std::size_t n = 10;
     cs::Model m = cs::create_model<tch::DenseTop<tch::RunNInner>>(default_config(), n, std::size_t{16});
     m.setup();
-    auto&             inner = dynamic_cast<cs::ChunkedSystem&>(m.get_subsystem("inner"));
-    const cs::Subsystem* b  = inner.children()[1];
-    REQUIRE(b->name() == "b");
-    CHECK(b->run_counter() == 2);
-    const long expected[3] = {1, 0, 0};
+    auto&             inner = dynamic_cast<cs::ChunkedSystem&>((*m.get_subsystem("inner")));
+    REQUIRE(inner.children()[1] != nullptr);
+    REQUIRE(inner.children()[1]->name() == "b");
+    const bool expected[3] = {true, false, false};  // run_n{2}: deleted after the last chunk of forward 2
     for (int rep = 0; rep < 3; ++rep) {
         INFO("forward " << rep + 1);
         (void)tch::forward_out(m);
         CHECK(tch::chunks_of(m) == 10);  // ten chunks every forward, b skipped in all of them once it has run twice
-        CHECK(b->run_counter() == expected[rep]);
+        CHECK((inner.children()[1] != nullptr) == expected[rep]);
     }
 }
 

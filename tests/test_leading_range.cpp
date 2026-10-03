@@ -464,7 +464,7 @@ std::vector<std::vector<tcc::EntryShape>> run_recorded(Kind kind, bool local, st
 
     cs::Model m = cs::create_model<LRChunkTop>(default_config(), kind, local, n, sizes, budget);
     m.setup();
-    auto&         sys = dynamic_cast<cs::ChunkedSystem&>(m.get_subsystem("inner"));
+    auto&         sys = dynamic_cast<cs::ChunkedSystem&>((*m.get_subsystem("inner")));
     tcc::Recorder rec;
     rec.attach(sys, paths);
     m.forward();

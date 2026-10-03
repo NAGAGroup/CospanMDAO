@@ -149,7 +149,9 @@ public:
     /// queue.wait_and_throw(): the caller's choice, never implicit.
     void wait() {
         diag::count_queue_waits();
-        impl("wait").queue.wait_and_throw();
+        Impl& s = impl("wait");
+        s.queue.wait_and_throw();
+        if (s.root) s.root->clear_retired();  // every launch is done: nothing retired is still read
     }
 
     // ---- host access (between runs) ---------------------------------------------
@@ -206,7 +208,7 @@ public:
         return root.template get_output<DT, Rank>(path);
     }
     System&    root() { return *impl("root").root; }
-    Subsystem& get_subsystem(std::string_view path) { return ready("get_subsystem").root->get_subsystem(path, /*outside=*/true); }
+    Subsystem* get_subsystem(std::string_view path) { return ready("get_subsystem").root->get_subsystem(path, /*outside=*/true); }
 
     struct MemoryReport {
         /// A snapshot at the time of the call, between runs.

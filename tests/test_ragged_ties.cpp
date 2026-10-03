@@ -527,7 +527,7 @@ public:
 /// An entry INSIDE the chunked system 'inner', resolved by the chunked system itself (from outside only its promotions
 /// are visible).
 cs::detail::IOEntry& inner_entry(cs::Model& m, const char* path) {
-    return dynamic_cast<cs::ChunkedSystem&>(m.get_subsystem("inner")).entry_at(path);
+    return dynamic_cast<cs::ChunkedSystem&>((*m.get_subsystem("inner"))).entry_at(path);
 }
 
 std::vector<float> forward_out(cs::Model& m) {
@@ -1162,9 +1162,9 @@ TEST_CASE("Ragged ties: tied ragged members of an alias inside a ChunkedSystem s
                 CHECK(c1.span()[i] == 2.0f * s + 1.0f);
                 CHECK(c2.span()[i] == 2.0f * (2.0f * s) + 1.0f);
             }
-            CHECK(dynamic_cast<cs::ChunkedSystem&>(m.get_subsystem("inner")).last_chunk_count() == chunks_for(*counts, budget));
+            CHECK(dynamic_cast<cs::ChunkedSystem&>((*m.get_subsystem("inner"))).last_chunk_count() == chunks_for(*counts, budget));
             std::cout << "[obs] tied ragged members chunked: budget " << budget << ", chunks "
-                      << dynamic_cast<cs::ChunkedSystem&>(m.get_subsystem("inner")).last_chunk_count() << "\n";
+                      << dynamic_cast<cs::ChunkedSystem&>((*m.get_subsystem("inner"))).last_chunk_count() << "\n";
         }
     }
 }
@@ -1188,9 +1188,10 @@ TEST_CASE("Ragged ties: errors", "[ragged][tie]") {
         cs::Model m = cs::create_model<trt::ErrTop>(default_config(), 3);
         trt::expect_throws([&] { m.setup(); }, {"alias::dims, dimension 1", "is not an input"});
     }
-    SECTION("a free input whose owner is registered after the alias's first member") {
+    SECTION("a free input whose owner is registered after the alias's first member is fine: it is materialized on need (r01 4.5)") {
+        // the old 'registered after' setup error is gone with the owner concept: whoever reads the input first materializes it
         cs::Model m = cs::create_model<trt::ErrTop>(default_config(), 4);
-        trt::expect_throws([&] { m.setup(); }, {"free input", "late.raw", "registered after"});
+        CHECK_NOTHROW(m.setup());
     }
     SECTION("a per-index source computed inside a chunked system") {
         cs::Model m = cs::create_model<trt::BadTop>(default_config());
@@ -1414,17 +1415,17 @@ TEST_CASE("Opaque chunked system: a Model reaches its promotions only; the chunk
     exp_open([&] { m.init_input("inner.g.p.in", cs::init::fill(1.0f)); });
     exp_open([&] { (void)m.view_input<DType::f32, 1>("inner.g.p.in"); });
     exp_open([&] { (void)m.view_output<DType::f32, 1>("inner.g.s.sums"); });
-    exp_open([&] { (void)m.get_subsystem("inner.g"); });
+    exp_open([&] { (void)(*m.get_subsystem("inner.g")); });
     exp_open([&] { (void)m.get_output<DType::f32, 1>("inner.g.s.sums"); });
     // a path ending AT its promotion is legal
     CHECK_NOTHROW((void)m.root().entry_at("inner.sums"));
     CHECK_NOTHROW((void)m.root().entry_at("inner.in"));
     // the chunked system itself, and the systems inside it, reach their own subtrees
-    auto& x = dynamic_cast<cs::ChunkedSystem&>(m.get_subsystem("inner"));
+    auto& x = dynamic_cast<cs::ChunkedSystem&>((*m.get_subsystem("inner")));
     CHECK_NOTHROW((void)x.entry_at("g.p.in"));
     CHECK_NOTHROW((void)x.entry_at("g.t"));
-    CHECK_NOTHROW((void)x.get_subsystem("g"));
-    auto& g = dynamic_cast<cs::System&>(x.get_subsystem("g"));
+    CHECK_NOTHROW((void)(*x.get_subsystem("g")));
+    auto& g = dynamic_cast<cs::System&>((*x.get_subsystem("g")));
     CHECK_NOTHROW((void)g.entry_at("s.sums"));
     CHECK_NOTHROW((void)g.entry_at("t"));
     // and the model still runs
@@ -1438,7 +1439,7 @@ TEST_CASE("Opaque chunked system: a Model whose ROOT is a chunked system sees it
     auto exp_open = [&](auto&& f) { trt::expect_throws(f, {"lives inside chunked system", "promote it to use it here"}); };
     exp_open([&] { m.init_input("g.p.in", cs::init::fill(1.0f)); });
     exp_open([&] { (void)m.view_output<DType::f32, 1>("g.s.sums"); });
-    exp_open([&] { (void)m.get_subsystem("g"); });
+    exp_open([&] { (void)(*m.get_subsystem("g")); });
     CHECK_NOTHROW(m.init_input("in", cs::init::fill(1.0f)));  // its own promotion
     // the chunked root itself still reaches its subtree
     CHECK_NOTHROW((void)m.root().entry_at("g.p.in"));
@@ -1647,7 +1648,7 @@ TEST_CASE("Chunked vs plain: cs::per_index host arrays on a tie alias, several b
         // sizes[a..b)
         cs::Model m = cs::create_model<trt::ChunkTop<trt::InnerChunk>>(default_config(), sizes.size(), budget, sizes);
         m.setup();
-        auto&         sys = dynamic_cast<cs::ChunkedSystem&>(m.get_subsystem("inner"));
+        auto&         sys = dynamic_cast<cs::ChunkedSystem&>((*m.get_subsystem("inner")));
         tcc::Recorder rec;
         rec.attach(sys, {"g.p.in", "g.p.t"});
         m.forward();

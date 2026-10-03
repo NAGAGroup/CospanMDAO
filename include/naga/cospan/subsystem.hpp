@@ -77,7 +77,6 @@ public:
 
 namespace detail {
 struct SubsystemAccess;
-struct DeferSink;  // lifetime.hpp: a ChunkedSystem's deferred decrements
 }
 
 /// The ONE contract between an owner and what it owns.
@@ -99,14 +98,14 @@ public:
     virtual void compile() = 0;
 
     // ---- forward (per forward; r01 §6.5) -------------------------------------
-    /// A Component: shapes, pre_forward, then ALLOCATE every root it touches that has no
-    /// storage and apply its init when it is a free input root (r01 §4.4).
+    /// A Component: shapes, pre_forward, then MATERIALIZE every variable it touches that is not live; a free input
+    /// takes its init at the allocation (r01 §4.5).
     virtual void run_pre_compute(ExecCtx& owner_ctx) = 0;
     /// Components return a description and never submit it; Systems submit
     /// their subtree's work themselves and return null.
     virtual std::unique_ptr<LaunchDescription> run_compute_forward() = 0;
-    /// A Component: the other-placement sync, then DECREMENT every root it touches and free the ones that
-    /// reach 0 (one stream wait for the batch; r01 §4.4).
+    /// A Component: the epoch bumps and the other-placement sync. Nothing is freed here: storage lives while a
+    /// port holds its bundle (r01 §4.5).
     virtual void run_post_compute(ExecCtx& owner_ctx) = 0;
 
     /// The owner calls this right after submitting this subsystem's launch, before run_post_compute:
@@ -115,16 +114,19 @@ public:
     /// no launch of their own: the default does nothing.
     virtual void register_launch_events(std::span<const sycl::event> events) { (void)events; }
 
-    /// Run policy (given by the owner at registration): the LIVE counter (-1 eternal, -2 transient,
-    /// n > 0 runs left, 0 skipped) and the value the owner asked for.
-    long run_counter() const noexcept { return run_counter_; }
-    long requested_run() const noexcept { return requested_run_; }
-    long setup_run() const noexcept { return setup_run_; }  ///< the effective value derived at setup
-    /// Inside a ChunkedSystem: where decrements are deferred to (null elsewhere).
-    detail::DeferSink* defer_sink() const noexcept { return defer_sink_; }
+    /// What a launch still in flight needs from this subsystem after it is deleted: the runtime reads a kernel's
+    /// dynamic_function_config on a worker thread when the launch runs. Each entry is (the launch's events, the
+    /// object to keep). The deleting parent hands them to the root's retire list, which holds each until its events
+    /// complete (r01 §7.2). The default has nothing.
+    using InflightKeep = std::pair<std::vector<sycl::event>, std::shared_ptr<void>>;
+    virtual void collect_inflight(std::vector<InflightKeep>& out) const { (void)out; }
 
-    /// Resets run_counter_ to its setup value for this subsystem and every descendant.
-    void rearm();
+    /// The run policy the owner was asked for (-1 eternal, -2 transient, n > 0 turns). The LIVE counter belongs to
+    /// the owner's slot, not to the child (r01 §7.2-7.4).
+    long requested_run() const noexcept { return requested_run_; }
+    /// Eternal: this subsystem and every System above it run every forward and are never deleted or rebuilt
+    /// (the arena route needs it). Defined in system.hpp.
+    bool runs_eternally() const noexcept;
 
 protected:
     Subsystem() = default;
@@ -138,10 +140,7 @@ private:
     std::string   path_;
     const System* owner_ = nullptr;
     long          requested_run_ = -1;     ///< -1 eternal, -2 transient, n > 0 (as asked at registration)
-    bool          run_explicit_  = false;  ///< run_n / do_once was given
-    long          setup_run_     = -1;     ///< the effective value, derived at setup
-    long          run_counter_   = -1;     ///< the live value
-    detail::DeferSink* defer_sink_ = nullptr;  ///< inside a ChunkedSystem: where decrements are deferred to
+    bool          rebuilt_       = false;  ///< built again by its owner (rearm / transient): its allocations take the pool
 };
 
 namespace detail {

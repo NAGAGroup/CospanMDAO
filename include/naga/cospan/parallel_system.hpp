@@ -56,8 +56,8 @@ public:
 
     template <class T, class... Args>
         requires(std::derived_from<T, ComponentBase> && !detail::leads_with_props_v<Args...>)
-    T& add_subsystem(std::string name, Args&&... ctor_args) {
-        return System::add_subsystem<T>(std::move(name), std::forward<Args>(ctor_args)...);
+    void add_subsystem(std::string name, Args&&... ctor_args) {
+        System::add_subsystem<T>(std::move(name), std::forward<Args>(ctor_args)...);
     }
 
     /// property::device only: each child may sit on its own device (the group
@@ -65,17 +65,19 @@ public:
     /// property_list is a runtime value, so any other property throws.
     template <class T, class... Args>
         requires std::derived_from<T, ComponentBase>
-    T& add_subsystem(std::string name, const property_list& props, Args&&... ctor_args) {
+    void add_subsystem(std::string name, const property_list& props, Args&&... ctor_args) {
         if (props.has_property<property::parallel>() || props.has_property<property::transient>() ||
             props.has_property<property::fused>() || props.has_property<property::run_n>() ||
             props.has_property<property::do_once>())
             throw std::invalid_argument("naga::cospan: " + describe() + ": add_subsystem('" + name +
                                         "'): a ParallelSystem child takes property::device only");
-        return System::add_subsystem<T>(std::move(name), props, std::forward<Args>(ctor_args)...);
+        System::add_subsystem<T>(std::move(name), props, std::forward<Args>(ctor_args)...);
     }
 
     /// A ParallelSystem has no untyped children to add.
-    System& add_subsystem(std::string, const property_list& = {}) = delete;
+    void add_subsystem(std::string, const property_list& = {}) = delete;
+    /// A flavor keeps its children: no run policies, no deletion, no rearm.
+    bool slots_deletable() const noexcept override { return false; }
 
     /// ragged ports are not supported in a ParallelSystem yet (a setup error).
     void compile() override {

@@ -323,7 +323,7 @@ Row measure(cs::Model& m) {
     Row r;
     r.whole  = cs::diag::snapshot() - before;
     r.window = cs::diag::last_window();
-    r.chunks = dynamic_cast<cs::ChunkedSystem&>(m.get_subsystem("inner")).last_chunk_count();
+    r.chunks = dynamic_cast<cs::ChunkedSystem&>((*m.get_subsystem("inner"))).last_chunk_count();
     return r;
 }
 

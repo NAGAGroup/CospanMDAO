@@ -541,7 +541,7 @@ TEST_CASE("parallel: helper form, plain + group with scratch + host, three forwa
         s.connect("par.host.z", "sum.h");
     });
     model.setup();
-    CHECK(dynamic_cast<cs::ParallelSystem*>(&model.get_subsystem("par")) != nullptr);
+    CHECK(dynamic_cast<cs::ParallelSystem*>(&(*model.get_subsystem("par"))) != nullptr);
 
     std::vector<float> x(tfl::kLen), want_p(tfl::kLen), want_h(tfl::kLen), want_s(tfl::kLen);
     float              acc = 0.0f;
@@ -574,7 +574,7 @@ TEST_CASE("parallel: typed ParallelSystem, a child on property::device equal to 
     });
     model.setup();
     tfl::run_three(model);
-    CHECK(dynamic_cast<tfl::Par*>(&model.get_subsystem("par")) != nullptr);
+    CHECK(dynamic_cast<tfl::Par*>(&(*model.get_subsystem("par"))) != nullptr);
     const cs::Placement here{dev, sk::kind::device};
     CHECK(model.root().entry_at("par.b.x").placement() == here);
     CHECK(model.root().entry_at("par.a.x").placement() == here);
@@ -1125,10 +1125,10 @@ TEST_CASE("transient: ParallelSystem and FusedSystem children release after the 
     // fuse stages stays. The roots themselves are checked directly after that first forward.
     model.forward();
     model.wait();
+    CHECK(model.get_subsystem("grp") == nullptr);  // the group is deleted after its turn, its roots with it
     for (const char* p : {"grp.a.y", "grp.b.y"}) {
         INFO(p);
-        CHECK(model.root().entry_at(p).root()->lifetime_count() == 0);
-        CHECK(!model.root().entry_at(p).root()->has_storage());
+        tfl::expect_throws([&] { (void)model.root().entry_at(p); }, {"'grp' is deleted"});
     }
     const auto base = cst::pool_in_use(model);
     model.forward();
@@ -1136,6 +1136,36 @@ TEST_CASE("transient: ParallelSystem and FusedSystem children release after the 
     model.wait();
     CHECK(cst::pool_in_use(model) == base);  // every later forward returns what it allocated
     tfl::expect_throws([&] { (void)model.view_output<DType::f32, 1>("grp.a.y"); }, {"grp"});
+}
+
+TEST_CASE("ownership: a placement that comes back is copied from a live one, not recomputed", "[flavors][transient]") {
+    // src.y is written once (do_once, then deleted). The eternal e1 keeps its DEVICE placement live. The transient host-kind
+    // Prefix is rebuilt every forward: its host placement is freed with it and must come back as a COPY of the live device
+    // placement (no producer runs again, and an output is never initialized).
+    cs::Model model = tfl::make([](cs::System& s) {
+        s.add_subsystem<tfl::Src1>("src", cs::property_list{cs::property::do_once{}}, std::array<int, 1>{tfl::kLen});
+        s.add_subsystem<tfl::Elem<0>>("e1");
+        s.add_subsystem<tfl::Prefix>("host", cs::property_list{cs::property::transient{}});
+        s.add_subsystem<tfl::Elem<0>>("e2");
+        s.connect("src.y", "e1.x");
+        s.connect("src.y", "host.x");
+        s.connect("host.z", "e2.x");
+    });
+    model.setup();
+    std::vector<float> want(tfl::kLen);
+    float              acc = 0.0f;
+    for (int i = 0; i < tfl::kLen; ++i) {
+        acc += static_cast<float>(i + 1);
+        want[i] = 2.0f * acc + 1.0f;  // e2.y = 2 z + 1, z = the prefix sum of x = i + 1
+    }
+    for (int fwd = 1; fwd <= 3; ++fwd) {
+        INFO("forward " << fwd);
+        model.forward();
+        model.wait();
+        CHECK(tfl::out_of<1>(model, "e2.y") == want);
+    }
+    CHECK(model.get_subsystem("src") == nullptr);   // the producer ran once and is gone
+    CHECK(model.get_subsystem("host") == nullptr);  // the transient host stage is deleted at the end of each forward
 }
 
 TEST_CASE("write epochs: Fused and Parallel systems give the same deltas as the plain System (+1 per written root per forward)",
