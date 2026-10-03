@@ -1,7 +1,8 @@
 # Migrating to the 2026-10-03 rework
 
-From the API at `c8553f6` to the current headers. Authority: `docs/design-review-2026-10-03.md` (sections 1-8 cited
-below as "section N"). Everything here was checked against the headers; nothing was built or run when this was written.
+From the API at `c8553f6` to the final API of the rework (branch `rework-2026-10-03`). Authority: `docs/design-review-2026-10-03.md`
+(sections 1-10 cited below as "section N"; section 10 wins over 6 and 9). The design as built is
+`docs/spec/revisions/r02-2026-10-03-the-design-as-built.md`. Everything here was checked against the headers.
 
 ## Adding subsystems
 
@@ -60,8 +61,8 @@ Every wiring rule is checked in its own call, inside `setup()`.
 - **Order:** execution order is **data dependencies only** (section 3). Add the real edge, or
   `depends_on("b", "a")` (`a` must be added before `b`): B's submissions then wait on A's events for one forward.
   Tied writers never wait on each other, so a zeroing producer and an accumulator on one `tie_outputs` need
-  `depends_on`. Children are still *called* in declaration order, so a producer whose value is read **on the host** (an
-  `alias::from_output_values` shape, a `FromInput` dimension) must be declared before its reader.
+  `depends_on`. Children are still *called* in declaration order, so a producer whose value is read **on the host** (the
+  source of a `shape_hook`) must be declared before the child that has the hook's target (a setup error otherwise).
 - **Re-running a child:** `rearm("name")` is legal inside `pre_forward()` only.
 
 ```cpp
@@ -74,11 +75,12 @@ void pre_forward() override { if (changed_) rearm("setup_stage"); }
 
 - no `compile()` step and nothing compiled in setup; setup allocates and submits nothing (section 2);
 - no `get_input` / `get_output`: use the declared members (`x_`, `y_`);
-- `reshape(output, range)` is for **outputs only** and legal in `pre_forward()` only; an input's shape is its variable's;
+- `reshape(output, range)` is now `set_shape(output, range)`: **outputs only**, legal in `pre_forward()` only, checked against the
+  variable's definition. An input's shape is its variable's and is never set; read it with `shape_of(port)`;
 - a new `post_forward()` hook runs at the end of postcompute, after the pushes to other placements.
 
 ```cpp
-void pre_forward() override { reshape(y_, sycl::range<1>{n_}); }
+void pre_forward() override { set_shape(y_, sycl::range<1>{n_}); }   // or: set_shape(y_, shape_of(x_));
 void post_forward() override { /* after the pushes */ }
 ```
 
@@ -128,7 +130,7 @@ cs::init::custom_host<DType::f32, 1>(std::function<void(cs::HostInit<DType::f32,
 
 - **Execution order is data dependencies only** (section 3); no queue-wide wait anywhere. Events are kept in two
   generations per variable.
-- **Shape errors are reactive:** thrown at the first forward, not at setup (section 6). Setup checks wiring rules only.
+- **Shape errors are reactive:** thrown at the first forward, not at setup (section 10). Setup checks wiring rules only.
 - **No write epochs, no host read cache, no arena** (sections 3 and 5). Memory comes from the per-device pools, then the OS.
 - **Lifetime:** a deleted child's data lives while any instance holds it (a connected consumer, an alias, a view).
   Instances are owned by their component or System; the shared variable metadata holds only weak pointers (section 1).
@@ -150,7 +152,7 @@ the retire list, setup-time shape checks, `fused_system.hpp`, `wave_rules.hpp`, 
 ## Corrections during implementation (design review, section 9)
 
 - **Initializers:** the last declaration wins; no same-level error.
-- **Ties and shapes:** a tie keeps its shape rule as a constraint when a connect makes the source's variable the survivor; a mismatch throws at the forward ("tie alias '<path>' declares the shape ... but is connected to a source whose shape is ..."). Promotions take no shape rule. A shape source that is gone keeps its last shape.
+- **Ties and shapes:** superseded by section 10 (see Shapes below): a tie's shape is a definition merged at the call, not a constraint kept per forward. Promotions take no shape. A hook whose source is gone keeps the last shape.
 - **Durability:** a rebuilt consumer whose producer is gone, with nothing holding its data, is a user error: promote what must stay durable.
 - **Par fused components** add no tie check of their own: use `tie_outputs` with atomic members, or `allow_plain` for disjoint writers.
 - **Pools:** every context device has a pool (0 bytes if unconfigured, then every allocation is an OS allocation, counted); `memory_report().devices` has an entry for every device.
@@ -158,4 +160,50 @@ the retire list, setup-time shape checks, `fused_system.hpp`, `wave_rules.hpp`, 
 
 ## Shapes (section 10)
 
-The shape API is being reworked (definitions merged at setup, shape hooks, no value-driven specs). Section 10 of docs/design-review-2026-10-03.md is authoritative; anything here about value-driven shapes or tie shape constraints is superseded.
+A declaration says only *specified* (an integer) or *unspecified* (`cs::unspecified`) per dimension. A shape is supplied from
+outside: by a connection, an initializer, the producer's `pre_forward()`, or a System's `shape_hook`. Shape errors are thrown
+at the forward; setup checks wiring rules and the merged definitions only.
+
+**No derived dimension specs.** `FromInputDim`, `FromInput`, `FromInputValues`, `FromInputArray` and `alias::from_output_values`
+are removed (and `alias::fixed`, `alias::dims` and the other alias shape kinds with them).
+
+Where an output's length was derived from an input's dimension or value, declare it unspecified and let the component set it:
+
+```cpp
+declare_input(x_, "x", cs::unspecified);
+declare_output(y_, "y", cs::unspecified);
+void pre_forward() override { set_shape(y_, shape_of(x_)); }
+```
+
+Where an input's length came from another variable's value or shape, a System now declares a hook on that input (below).
+
+**Reading and setting a shape** (in `pre_forward()` only): `shape_of(port)` gives the shape of one of the component's own ports
+(`sycl::range<R>`; a `cs::RaggedShape` for a ragged port), and `set_shape(output, shape)` sets an output's shape. Inputs are
+never reshaped, and a member of a `tie_outputs` cannot reshape its output. Outside `pre_forward()` both throw "legal inside
+pre_forward() only".
+
+**Tie shapes.** `tie_inputs` and `tie_outputs` take `cs::shape(...)`: one specified or unspecified value per dimension, `cs::shape()`
+for all unspecified. A tie keeps no shape rule after a connect: the definitions merge at the call (unspecified absorbs
+specified; two specified values that differ are a setup error).
+
+**Shape hooks** replace every value-driven dimension. A System declares, in `setup()`:
+
+```cpp
+shape_hook("c.x", cs::dim::from_shape("p.y", 0));                         // dimension 0 of p.y
+shape_hook("m.a", cs::dim::from_value("cfg.rows", 0), cs::dim::fixed_at_run(16));
+shape_hook("d.x", cs::dim::custom([](cs::ShapeHookCtx& c) { return c.value_of("n", 0) * 2; }));
+shape_hook("r.x", cs::ragged::counts_from("counts.n"));                   // ragged target: one descriptor for both dims
+shape_hook("s.x", cs::ragged::offsets_from("offs.o"));
+```
+
+One descriptor per dimension (`cs::dim::as_is()` leaves a dimension alone). Targets: an input, an input tie alias, or an output
+tie alias (the one output-side hook; it sets any dimension a `tie_outputs` leaves unspecified). Each hooked dimension must be
+unspecified and owned by one hook. A hook and a connection exclude each other. The hook runs immediately before the first child
+that has the target, and every source must be produced by an earlier child.
+
+**Ragged is rank 2 only**, with the leading dimension N and one per-index dimension. Declare it with nothing, `n`,
+`cs::counts(v)` or `cs::offsets(v)` (the last two also define N), and size it by hook with `counts_from` or `offsets_from`
+(a parallel device scan; only the total comes to the host). Rank 3 ragged is removed.
+
+Sizing an output from a value on the host is the component's own business (for example through a host view kept as a
+member); there is no framework helper.

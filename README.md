@@ -1,84 +1,103 @@
 # CospanMDAO
 
-**GPU-native differentiable modeling and optimization.** Compose systems of
-components, connect them by zero-copy pointer aliasing, settle coupled
-systems to equilibrium, and differentiate through the fixed point — all on
-the GPU, all through open standards (SYCL via
-[AdaptiveCpp](https://github.com/AdaptiveCpp/AdaptiveCpp)).
+**GPU-native modeling for multidisciplinary design.** Compose systems of components, connect them by shared variables,
+and run them on the GPU (or any SYCL device) through open standards: SYCL via
+[AdaptiveCpp](https://github.com/AdaptiveCpp/AdaptiveCpp). C++20, header-only, namespace `naga::cospan` (`cs::`).
 
-CospanMDAO is part of the **NAGA ecosystem**
-([NAGAGroup](https://github.com/NAGAGroup)) — ecosystem code shares the
-`naga::` namespace umbrella and `include/naga/` root; this framework is
-`naga::cospan`.
+CospanMDAO is part of the **NAGA ecosystem** ([NAGAGroup](https://github.com/NAGAGroup)): ecosystem code shares the
+`naga::` namespace and the `include/naga/` root.
 
 ## Lineage
 
-CospanMDAO is a GPU-native successor to the ideas in
-[OpenMDAO](https://openmdao.org/): components declaring typed I/O, systems
-composing them with promotions and connections, coupled models driven to
-consistency, and gradients propagated through the whole structure. The name
-says both halves out loud — *cospans* are category theory's formalism for
-composing open systems along shared boundaries, and the *MDAO* suffix
-credits the multidisciplinary-design lineage the ML world usually ignores.
+CospanMDAO is a GPU-native successor to the ideas in [OpenMDAO](https://openmdao.org/): components declaring typed I/O,
+systems composing them with promotions and connections. The name says both halves: *cospans* are category theory's
+formalism for composing open systems along shared boundaries, and *MDAO* credits the multidisciplinary-design lineage.
 
-Where OpenMDAO orchestrates Python components on CPUs, CospanMDAO is C++20
-on device: connected ports share one variable's storage (copies happen only
-between placements, e.g. host and device), execution is
-layered and concurrent, and adjoints are hand-written SYCL kernels flowing
-through the same aliased storage.
+## Core concepts
 
-## Key ideas
+- **Component.** A leaf that does work. It declares typed inputs and outputs (`cs::Input`, `cs::Output`), and its kernel
+  body is one function whose signature fixes its kind: plain, group (work-groups, local memory), custom-op or host.
+- **System.** A node that orders work. It adds children with `add_subsystem`, wires them with `connect`, `promote`,
+  `tie_inputs` and `tie_outputs`, and has no I/O of its own beyond those aliases.
+- **Variable.** Everything joined by wiring is one variable. Its metadata is shared by all of its ports, and its memory lives
+  while some port on that device holds it. A connection costs nothing at run time.
+- **Shapes.** A component says per dimension only "specified" or `cs::unspecified`. A shape comes from a connection, an
+  initializer, a producer's `pre_forward()` (`set_shape`), or a System's `shape_hook`.
+- **Forward.** `Model::forward()` enqueues one run and returns. Kernels are ordered by events, never by queue order, so
+  independent work overlaps. Run policy (`run_n`, `do_once`, `transient`) belongs to the parent, which deletes finished
+  children and can `rearm` them.
+- **Host access.** `Model::update_input` is the only write; `view_output` gives a host view of a result after a run, and
+  `sync()` makes it current.
+- **Memory.** One [SlabKit](https://github.com/NAGAGroup/SlabKit) pool per device, sized by you, with a counted OS fallback.
 
-- **Component / System composition.** Components declare inputs, outputs,
-  and state; systems compose components, promote shared inputs, and wire
-  connections. Everything resolves to fully-qualified names in one registry.
-- **Connection = shared variable.** A connection joins ports into one
-  variable; they share its storage, which lives while some port uses it.
-  Composition costs nothing at runtime.
-- **Cycles are expressed by registration order.** A consumer registered
-  before its producer reads the producer's previous value; CospanMDAO warns
-  at setup until solvers exist.
-- **Equilibrium as an execution mode.** `EquilibriumExecutor` iterates the
-  forward model to a fixed point, then solves the adjoint fixed point
-  (implicit function theorem — memory cost independent of iteration count;
-  no tape, no BPTT).
-- **Hand-written adjoints.** Every component implements `backward()` as a
-  SYCL kernel; gradients accumulate atomically through the aliased graph.
-  Stop-gradient is simply not accumulating.
-- **Optimizers included.** Adam (with objective-reduction stopping and
-  step gating) and Langevin dynamics, driving any input marked as a design
-  variable.
-- **Memory via [SlabKit](https://github.com/NAGAGroup/SlabKit).** All device
-  memory flows through SlabKit's USM pools and views.
+## A small example
 
-## Example: the Sellar problem
+Two copies of a component that doubles its input, connected in a chain:
 
-[`examples/sellar`](examples/sellar/sellar.cpp) solves the canonical MDAO
-test problem — two mutually-coupled disciplines optimized through their
-fixed point:
+```cpp
+#include <naga/cospan/cospan.hpp>
 
+namespace cs = naga::cospan;
+using cs::DType;
+
+struct DoubleBody {
+    struct Inputs  { cs::Input<DType::f32, 1> x; };
+    struct Outputs { cs::Output<DType::f32, 1> y; };
+    void operator()(sycl::id<1> i, Inputs in, Outputs out) const { out.y[i] = 2.0f * in.x[i]; }
+};
+
+class Double : public cs::Component<DoubleBody> {
+    cs::Input<DType::f32, 1>  x_;
+    cs::Output<DType::f32, 1> y_;
+
+public:
+    void setup() override {                                  // declare I/O; allocates nothing
+        declare_input(x_, "x", cs::unspecified);
+        declare_output(y_, "y", cs::unspecified);
+    }
+    void pre_forward() override { set_shape(y_, shape_of(x_)); }   // the output follows the input
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+        return create_launch_config(x_.shape(), {x_}, {y_}, {});
+    }
+};
+
+class Chain : public cs::System {
+public:
+    void setup() override {
+        add_subsystem(cs::subsystem_desc<Double>("a"));
+        add_subsystem(cs::subsystem_desc<Double>("b"));
+        connect("a.y", "b.x");                               // b reads what a wrote
+    }
+};
+
+int main() {
+    cs::ModelConfig cfg;                                     // the default device
+    cfg.default_pool_bytes = 64u << 20;                      // a 64 MiB pool per device
+    cs::Model model = cs::create_model<Chain>(cfg);
+    model.setup();                                           // wiring and shape rules are checked here
+
+    model.update_input("a.x", cs::init::from_host(std::vector<float>{1, 2, 3, 4}));  // supplies a.x and its shape
+    model.forward();                                         // enqueues and returns; the update is applied here
+
+    auto y = model.view_output<DType::f32, 1>("b.y");        // a view needs a run first
+    y.sync();                                                // wait for the data before reading
+    // y.shape()[0] == 4, y[0] == 4.0f, y[3] == 16.0f
+}
 ```
-[sellar] finished: 1000 iterations, objective 3.178551
-[sellar]   x  = -0.0000   (expect ~0)
-[sellar]   z1 = +1.9773   (expect ~1.978)
-[sellar]   z2 = -0.0049   (expect ~0)
-[sellar]   y1 = +3.1551   (expect ~3.16, constraint-active)
-[sellar]   y2 = +3.7486   (expect ~3.755)
-[sellar]   f  = +3.1786   (known optimum ~3.183)
-```
 
-The coupling cycle is closed with a single `connect()` plus an entry-point
-mark; the optimizer differentiates through the settled system.
+A System can also size an input from another variable. This makes `c.x` as long as `p.y`:
+
+```cpp
+add_subsystem(cs::subsystem_desc<Producer>("p"));
+add_subsystem(cs::subsystem_desc<Double>("c"));
+shape_hook("c.x", cs::dim::from_shape("p.y", 0));
+```
 
 ## Using CospanMDAO
 
-CospanMDAO is a [pixi](https://pixi.sh) **source package** — dependency
-management lives in pixi, not in CMake. pixi is the one host dependency; it
-builds the entire dependency chain (SlabKit, cereal, the AdaptiveCpp
-toolchain) hermetically from pinned sources, the same way on every machine.
-If you haven't met pixi-build yet: your project declares this repo as a
-dependency, and `pixi install` does the rest — no submodules, no
-FetchContent, no system SYCL install.
+CospanMDAO is a [pixi](https://pixi.sh) **source package**: dependency management lives in pixi, not in CMake. pixi is the
+one host dependency; it builds the dependency chain (SlabKit, cereal, the AdaptiveCpp toolchain) from pinned sources, the
+same way on every machine.
 
 **From a pixi project (recommended):**
 
@@ -91,57 +110,38 @@ preview = ["pixi-build"]
 cospanmdao = { git = "https://github.com/NAGAGroup/CospanMDAO.git", tag = "v0.1.0" }
 ```
 
-then in CMake: `find_package(cospanmdao CONFIG REQUIRED)` and link
-`naga::cospan`.
+then in CMake: `find_package(cospanmdao CONFIG REQUIRED)` and link `naga::cospan`. Packaging note: depend on `cospanmdao` as a
+host and a run dependency, so SlabKit's shared library comes with it.
 
-**From a non-pixi project:** use pixi once to produce a fully-installed,
-relocatable environment, then consume it like any installed CMake package:
-
-```sh
-pixi exec pixi-pack --create-executable
-./environment.sh        # self-extracting: creates ./env, no pixi/conda needed
-```
-
-Add the unpacked env to `CMAKE_PREFIX_PATH` and use the same
-`find_package(cospanmdao CONFIG)` / `naga::cospan` — the packages ship proper CMake config
-files.
-
-**Support policy:** the pixi pipeline is the only officially supported way
-to build and consume CospanMDAO. Conda's hermetic builds are the point:
-what pixi produces is compatible with your project without you fighting
-toolchain flags. Traditional embeddings (FetchContent, CPM, add_subdirectory
-of a raw clone) may happen to work, but issues specific to them will be
-closed.
+**Support policy:** the pixi pipeline is the only officially supported way to build and consume CospanMDAO. Other embeddings
+may work, but issues specific to them will be closed.
 
 ## Developing CospanMDAO
 
-All development happens in the `dev` environments — the package's full
-dependency closure (toolchain included) without building the package:
-
 ```sh
-pixi run -e dev sellar        # configure → build → run the example
-pixi run -e dev test          # build + ctest
-pixi run -e dev-omp sellar    # CPU-only (built-in OpenMP host backend)
-pixi run -e dev "cmake --build build/dev -t sellar"   # ad-hoc, same env
+pixi run test                       # build and run the test suite (OpenMP host backend)
+pixi run -e cuda test               # the same on CUDA
+pixi run gemver-chain               # the GEMVER chain example (see examples/gemver-chain/README.md)
+pixi run -e cuda gemver-chain       # on CUDA
+pixi run -e dev <command>           # the dev environment: the full build closure, nothing built
 ```
 
-Hardware flavors: `dev` (CUDA, default), `dev-cuda`, `dev-l0`, `dev-amd`,
-`dev-omp`.
+The `dev` and `dev-cuda` environments carry the package's full dependency closure without building the package.
+`pixi run -e git setup-git` points git at the project hooks.
+
+## Documentation
+
+- **Specification:** [`docs/spec/revisions/r02-2026-10-03-the-design-as-built.md`](docs/spec/revisions/r02-2026-10-03-the-design-as-built.md)
+  (r01 is superseded and kept as history).
+- **Migrating from the API before the 2026-10-03 rework:** [`docs/rework-migration-2026-10-03.md`](docs/rework-migration-2026-10-03.md).
+- **Decisions:** [`docs/phase1-decisions.md`](docs/phase1-decisions.md) (D144 is the rework) and
+  [`docs/design-review-2026-10-03.md`](docs/design-review-2026-10-03.md).
+- **Roadmap:** [`docs/ROADMAP.md`](docs/ROADMAP.md).
 
 ## Status
 
-v0.1.0 — extracted from a private research monorepo where the framework has
-been developed and exercised since early 2026. The API is not yet stable.
-Applications built on it so far include Mycelium (a private neural-field
-architecture research project) and meshless discretization research.
-
-Roadmap, roughly in order:
-
-- Test suite rebuild (the research-era suite predates several core API
-  revisions and did not make the extraction cut)
-- Spatial/nonlocal compute toolboxes (LBVH, meshless operators) as
-  companion libraries
-- CI
+v0.1.0. The API is not yet stable. Chunked systems, slices and leading ranges are not supported at present: they are being
+redesigned (the old code is kept as dead code in `include/naga/cospan/chunked_system.hpp`).
 
 ## License
 

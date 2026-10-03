@@ -1,5 +1,7 @@
 # Design review, started 2026-10-03
 
+Status: implemented on branch rework-2026-10-03 (2e8e223); the spec is docs/spec/revisions/r02-2026-10-03-the-design-as-built.md.
+
 This is the working record of the design review that started 2026-10-03 (Jack and the research lead). The code at c8553f6 works, but it is being redesigned piece by piece for clarity. No new features (solvers, cycles, gradients, optimizers) come before this is done.
 
 ## 1. Vocabulary and data (settled)
