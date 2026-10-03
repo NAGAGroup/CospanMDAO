@@ -25,6 +25,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -99,6 +100,11 @@ public:
     IOKind                 kind;
     Role                   role;
     std::vector<DimRecord> dims;  ///< as declared HERE; the variable's own definition is on the metadata
+    /// A ragged port's declared per-index counts (cs::counts / cs::offsets), as declared HERE; the variable's own are
+    /// VarMeta::def_counts.
+    std::optional<std::vector<std::size_t>> def_counts;
+    /// A shape hook targets this input (section 10): it cannot be connected or tied (can_be_target is cleared with it).
+    bool hooked = false;
 
     sycl::device device       = default_device();  ///< section 2: set_device overrides it
     sk::kind     storage_kind = sk::kind::device;
@@ -142,6 +148,7 @@ inline bool                is_output_port(const Instance& i) { return i.kind == 
 inline std::string         path_of(const Instance& i) { return i.full_path(); }
 inline const sycl::device& device_of(const Instance& i) { return i.device; }
 inline std::shared_ptr<VarMeta> meta_of(const Instance& i) { return i.meta; }
+inline bool                is_tie_output(const Instance& i) { return i.kind == IOKind::output && i.role == Role::tie; }
 
 // -----------------------------------------------------------------------------
 // Typed leaves: the instances that hold a member wrapper
@@ -183,15 +190,9 @@ protected:
         std::array<std::size_t, 2>          ext{1, 1};
         std::array<const std::uint64_t*, 2> per{nullptr, nullptr};
         const std::uint64_t*                offs = nullptr;
-        if (s.ragged()) {
+        if (s.ragged()) {  // rank 2: dimension 1 is per-index
             const auto* rd = dynamic_cast<const RaggedDeviceData<value_type>*>(data.get());
-            for (int d = 1; d < Rank; ++d) {
-                const auto u = static_cast<std::size_t>(d);
-                if (!s.per[u])
-                    ext[u - 1] = s.extents[u];
-                else if (rd != nullptr && rd->per[u - 1])
-                    per[u - 1] = rd->per[u - 1]->data();
-            }
+            if (rd != nullptr && rd->per) per[0] = rd->per->data();
             if (rd != nullptr && rd->offs) offs = rd->offs->data();
         } else {
             for (int d = 1; d < Rank; ++d) ext[static_cast<std::size_t>(d - 1)] = s.extents[static_cast<std::size_t>(d)];
@@ -288,16 +289,11 @@ public:
 // Factories: each makes the instance and, unless told to join a variable, a variable of its own
 // -----------------------------------------------------------------------------
 
-inline bool any_per_index(const std::vector<DimRecord>& dims) {
-    for (const DimRecord& r : dims)
-        if (r.per) return true;
-    return false;
-}
-
-/// Gives a new instance its own shared metadata (ragged when the port is, or any dimension is per-index) and enters
-/// it in that metadata's instance list.
+/// Gives a new instance its own shared metadata (ragged when the port is) and enters it in that metadata's instance
+/// list. The definition is the instance's declared dims, and a ragged port's declared counts.
 inline void adopt_new_meta(const std::shared_ptr<Instance>& inst, DType dt, int rank, bool ragged) {
-    inst->meta = make_var_meta(dt, rank, inst->dims, ragged || any_per_index(inst->dims));
+    inst->meta             = make_var_meta(dt, rank, inst->dims, ragged);
+    inst->meta->def_counts = inst->def_counts;
     inst->meta->add_instance(inst);
 }
 
@@ -322,16 +318,20 @@ std::shared_ptr<Instance> make_output(std::string name, const Subsystem* declare
 template <DType DT, int Rank>
     requires(!is_atomic_v<DT>)
 std::shared_ptr<Instance> make_ragged_input(std::string name, const Subsystem* declarer,
-                                            const std::array<DimRecord, Rank>& dims, RaggedInput<DT, Rank>* member) {
+                                            const std::array<DimRecord, Rank>& dims, RaggedInput<DT, Rank>* member,
+                                            std::optional<std::vector<std::size_t>> counts = std::nullopt) {
     std::shared_ptr<Instance> inst = std::make_shared<RaggedInputInstance<DT, Rank>>(std::move(name), declarer, dims, member);
+    inst->def_counts               = std::move(counts);
     adopt_new_meta(inst, DT, Rank, true);
     return inst;
 }
 
 template <DType DT, int Rank>
 std::shared_ptr<Instance> make_ragged_output(std::string name, const Subsystem* declarer,
-                                             const std::array<DimRecord, Rank>& dims, RaggedOutput<DT, Rank>* member) {
+                                             const std::array<DimRecord, Rank>& dims, RaggedOutput<DT, Rank>* member,
+                                             std::optional<std::vector<std::size_t>> counts = std::nullopt) {
     std::shared_ptr<Instance> inst = std::make_shared<RaggedOutputInstance<DT, Rank>>(std::move(name), declarer, dims, member);
+    inst->def_counts               = std::move(counts);
     adopt_new_meta(inst, DT, Rank, true);
     return inst;
 }

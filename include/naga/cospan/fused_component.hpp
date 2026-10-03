@@ -108,29 +108,16 @@ inline sycl::AdaptiveCpp_jit::dynamic_function_config& call_sequence_config(int 
     return *slot;
 }
 
-/// The first OUTPUT instance of `m` declared by a stage other than `self`, else null.
-inline std::shared_ptr<Instance> output_of_other_stage(const VarMeta& m, const Subsystem* self,
-                                                       const std::vector<ComponentBase*>& stages) {
-    for (const std::shared_ptr<Instance>& i : live_of(m)) {
-        if (i->kind != IOKind::output || i->declarer == self) continue;
-        for (const ComponentBase* s : stages)
-            if (static_cast<const Subsystem*>(s) == i->declarer) return i;
-    }
-    return nullptr;
-}
-
 /// A fused component's machinery: not the user path (section 4), a base for FusedComponent.
 class FusedBase : public System {
 public:
     explicit FusedBase(fuse_strategy s) : strategy_{s} {}
     ~FusedBase() override = default;
 
-    /// Setup, then the setup-end checks: no ragged ports, and no value-driven size driven by another stage.
+    /// Setup, then the setup-end check: no ragged ports.
     void run_setup() override {
         System::run_setup();
-        const std::vector<ComponentBase*> st = stages();
-        check_no_ragged_ports(st);
-        check_value_driven_sizes(st);
+        check_no_ragged_ports(stages());
     }
 
     void run_precompute(Runtime& rt) override {
@@ -302,30 +289,6 @@ private:
             if (const std::shared_ptr<Instance> e = s->first_ragged_port())
                 throw std::invalid_argument("naga::cospan: " + describe() + ": '" + e->name + "' of '" + s->path() +
                                             "' is a ragged port: ragged ports are not supported in fused components yet");
-    }
-
-    /// An instance with a value-driven dimension (FromInput, FromInputValues) is followed to its driving input, and the
-    /// driver's variable must not hold an output of another stage: the value is read on the host before the launch.
-    void check_value_driven_sizes(const std::vector<ComponentBase*>& st) const {
-        for (const ComponentBase* s : st) {
-            std::vector<std::shared_ptr<Instance>> insts;
-            s->collect_instances(insts);
-            for (const std::shared_ptr<Instance>& e : insts) {
-                for (int d = 0; d < e->meta->rank; ++d) {
-                    const DimRecord& r = e->dims[static_cast<std::size_t>(d)];
-                    if (r.how != DimRecord::How::from_input && r.how != DimRecord::How::per_index_from_input) continue;
-                    const std::shared_ptr<Instance> driver = s->find_instance(r.input);
-                    if (!driver || driver->kind != IOKind::input) continue;
-                    if (const std::shared_ptr<Instance> o = output_of_other_stage(*driver->meta, s, st))
-                        throw std::invalid_argument(
-                            "naga::cospan: " + describe() + ": '" + e->name + "' of '" + s->path() + "' takes dimension " +
-                            std::to_string(d) + " of its shape from the VALUE of input '" + r.input + "', whose source '" + o->name +
-                            "' is an output of '" + o->declarer->path() +
-                            "' in the same fuse; the value is read on the host before the wave launches, so it cannot come from "
-                            "a stage of the same wave (feed it from outside the fuse)");
-                }
-            }
-        }
     }
 
     static std::uint32_t append(std::vector<std::byte>& v, std::span<const std::byte> s) {

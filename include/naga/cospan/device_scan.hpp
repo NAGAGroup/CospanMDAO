@@ -4,8 +4,8 @@
 // naga/cospan/device_scan.hpp — a parallel exclusive scan of u64 on the device
 // =============================================================================
 //
-// The scan behind a value-driven column (variable.hpp, do_column_work) runs in parallel on the device, ragged dimensions
-// included (docs/design-review-2026-10-03.md, section 9): no single serial task. REDUCE-THEN-SCAN over work-groups:
+// The scan behind a ragged shape hook (shape_hook.hpp, counts_from) runs in parallel on the device
+// (docs/design-review-2026-10-03.md, section 10): no single serial task. REDUCE-THEN-SCAN over work-groups:
 //
 //   (a) an nd_range kernel: each work-group scans its chunk of `wg` elements (sycl::exclusive_scan_over_group), writes the
 //       chunk-local exclusive results into `out`, and writes its chunk sum into a block-sums buffer;

@@ -56,6 +56,7 @@
 #include "naga/cospan/init.hpp"
 #include "naga/cospan/instance.hpp"
 #include "naga/cospan/metadata.hpp"
+#include "naga/cospan/shape_hook.hpp"
 #include "naga/cospan/subsystem.hpp"
 #include "naga/cospan/wiring.hpp"
 
@@ -216,36 +217,59 @@ public:
     }
 
     /// A NEW variable (target, not source); every member's variable merges into it and the alias wins. The members
-    /// are inputs of dtype DT and rank Rank; their unspecified dims come from the tie and their specified dims are
-    /// constraints on it. The alias OWNS the shape: its `shape`, or, when left unspecified, the output connected into
-    /// it, else the tie's initializer. `device`: where the tie's initialization runs and its data stays (section 2).
+    /// are inputs of dtype DT and rank Rank. The tie's shape is a DEFINITION like a port's (cs::shape: per dimension
+    /// specified or unspecified; a ragged tie: cs::shape(), (n), (cs::counts(v)) or (cs::offsets(v))): the definitions of
+    /// the members and of everything connected to it merge (unspecified absorbs specified, two specified values must
+    /// agree), and a dimension still unspecified comes from the connected output, the initializer, or a shape_hook on the
+    /// alias (design review, section 10). `device`: where the tie's initialization runs and its data stays (section 2).
     template <DType DT, int Rank>
-    void tie_inputs(std::initializer_list<std::string_view> members, std::string name,
-                    AliasShape shape = detail::unspecified_alias_shape(), std::optional<sycl::device> device = {}) {
+    void tie_inputs(std::initializer_list<std::string_view> members, std::string name, ShapeSpec shape = {},
+                    std::optional<sycl::device> device = {}) {
         static_assert(Rank >= 1 && Rank <= 3, "cospan: rank is 1..3");
         require_declaring("tie_inputs");
         check_new_name(name, "alias");
         const detail::TieMembers ms = resolve_members(members);
-        auto a = detail::tie_inputs<DT, Rank>(site(), ms, name, this, std::move(shape), device,
-                                              [this](std::string_view p) { return instance_at(p); });
+        auto a = detail::tie_inputs<DT, Rank>(site(), ms, name, this, shape, device);
         store_alias(a);
         record_tie(members, name, /*is_input=*/true, a);
     }
 
     /// A NEW variable (source, not target); atomic member dtypes unless allow_plain. The members are outputs of dtype
     /// DT and rank Rank, all on one device; the alias owns the shape (an output alias defines the shape of its
-    /// connections, so it cannot take its shape from one).
+    /// connections). Its definition is the members' declared dimensions merged with `shape` (cs::shape); any dimension
+    /// still unspecified must be set by a shape_hook on the alias, and a member cannot reshape its output (section 10).
     template <DType DT, int Rank>
-    void tie_outputs(std::initializer_list<std::string_view> members, std::string name, AliasShape shape,
+    void tie_outputs(std::initializer_list<std::string_view> members, std::string name, ShapeSpec shape = {},
                      TieOutputsPolicy policy = TieOutputsPolicy::require_atomic) {
         static_assert(Rank >= 1 && Rank <= 3, "cospan: rank is 1..3");
         require_declaring("tie_outputs");
         check_new_name(name, "alias");
         const detail::TieMembers ms = resolve_members(members);
-        auto a = detail::tie_outputs<DT, Rank>(site(), ms, name, this, std::move(shape), policy,
-                                               [this](std::string_view p) { return instance_at(p); });
+        auto a = detail::tie_outputs<DT, Rank>(site(), ms, name, this, shape, policy);
         store_alias(a);
         record_tie(members, name, /*is_input=*/false, a);
+    }
+
+    // ---- shape hooks (legal inside setup() only) -------------------------------------
+    /// A shape hook is this System's contract for the shape of an input, an input tie alias or an output tie alias
+    /// (docs/design-review-2026-10-03.md, section 10; shape_hook.hpp). One descriptor per dimension (cs::dim::as_is,
+    /// from_shape, from_value, custom, fixed_at_run), or for a ragged target ONE of cs::ragged::counts_from /
+    /// offsets_from. Each hooked dimension must be unspecified in the definition and is owned by this hook only. A hook
+    /// and a connection exclude each other: the target can no longer be connected or tied (and a connected or tied input
+    /// takes no hook), but its tie alias can take one. The hook runs on the main thread immediately before the first
+    /// child that has an instance of the target; every source must be produced by an EARLIER child (checked when this
+    /// System's setup ends).
+    template <HookDescriptor... D>
+    void shape_hook(std::string_view target, D... descriptors) {
+        require_declaring("shape_hook");
+        std::vector<detail::HookDim> dims;
+        (dims.push_back(detail::make_hook_dim(descriptors)), ...);
+        const std::size_t h = install_hook(std::string{target}, std::move(dims));
+        const std::size_t k = decls_.size();
+        std::vector<std::string> refs{first_seg(target)};
+        for (const detail::HookDim& d : hooks_[h].dims)
+            if (d.names_source()) refs.push_back(first_seg(d.path));
+        record(std::move(refs), [k, h](System& sys, std::size_t) { sys.replay_hook(k, h); }, hooks_[h].target.lock()->meta);
     }
 
     // ---- initial values (legal inside setup() only) -----------------------------
@@ -291,9 +315,9 @@ public:
         if (const auto fed = detail::first_of_kind(v, IOKind::output))
             fail("add_design_var", "connected inputs are computed, not designed ('" + std::string{path} + "' is fed by '" +
                                        fed->full_path() + "')");
-        if (!all_fixed(v.definition))
+        if (!all_fixed(v))
             fail("add_design_var", "'" + std::string{path} + "' is dynamically shaped; a dynamic design variable is ill-formed");
-        check_sizes(flat_size(v.definition), b, std::nullopt, s, "add_design_var", path);
+        check_sizes(flat_size(v), b, std::nullopt, s, "add_design_var", path);
         store_mark(MarkDecl::Kind::design_var, path, inst, MarkRecord{std::move(b), std::nullopt, std::move(s)});
     }
 
@@ -304,7 +328,7 @@ public:
         const detail::VarMeta& v = *inst->meta;
         if (inst->kind != IOKind::output) fail("add_constraint", "'" + std::string{path} + "' is not an output");
         if (equals && (b.lower || b.upper)) fail("add_constraint", "'equals' and bounds are exclusive");
-        if (all_fixed(v.definition)) check_sizes(flat_size(v.definition), b, equals, s, "add_constraint", path);
+        if (all_fixed(v)) check_sizes(flat_size(v), b, equals, s, "add_constraint", path);
         store_mark(MarkDecl::Kind::constraint, path, inst, MarkRecord{std::move(b), std::move(equals), std::move(s)});
     }
 
@@ -314,9 +338,9 @@ public:
         const auto inst = instance_at(path);
         const detail::VarMeta& v = *inst->meta;
         if (inst->kind != IOKind::output) fail("add_objective", "'" + std::string{path} + "' is not an output");
-        if (!all_fixed(v.definition))
+        if (!all_fixed(v))
             fail("add_objective", "'" + std::string{path} + "' is not fixed in shape; an objective is one value (flat size 1)");
-        const std::size_t n = flat_size(v.definition);
+        const std::size_t n = flat_size(v);
         if (n != 1)
             fail("add_objective", "'" + std::string{path} + "' has flat size " + std::to_string(n) + "; an objective is one value");
         check_sizes(n, Bounds{}, std::nullopt, s, "add_objective", path);
@@ -403,6 +427,7 @@ public:
     void run_setup() override {
         DeclScope scope{declaring_};
         setup();
+        compute_hook_slots();  // after setup() and its declarations: where each hook runs, and the order of its sources
     }
 
     /// Section 2: the device of each own alias, then of every live child, recursively. The OUTER call wins: a
@@ -454,6 +479,8 @@ public:
         for (std::size_t i = 0; i < slots_.size(); ++i) {
             Subsystem* child = child_ptrs_[i];
             if (child == nullptr || slots_[i].counter == 0) continue;
+            for (detail::HookStep& hs : hooks_)  // the hooks whose target first appears in this child (section 10)
+                if (hs.run_slot == i) hs.run(rt, forward_events_);
             std::vector<sycl::event> deps = dep_in[i];
             deps.insert(deps.end(), pending_deps_.begin(), pending_deps_.end());
             if (!deps.empty()) child->add_dependencies(deps);
@@ -477,7 +504,7 @@ public:
 
     /// The System that owns a tie alias pushes the tied outputs to the variable's other placements after ALL members
     /// have submitted, depending on all their writes (section 3). Then the user's post_forward().
-    void run_postcompute(detail::Runtime& rt) override {
+    void run_postcompute([[maybe_unused]] detail::Runtime& rt) override {
         for (const auto& alias : alias_order_) {
             if (alias->role != detail::Role::tie || alias->kind != IOKind::output) continue;
             const std::shared_ptr<detail::DeviceDataBase> src = alias->data;
@@ -494,10 +521,6 @@ public:
                 forward_events_.push_back(e);
             }
         }
-        // The shape work of a tied variable that drives sizes (section 6): done here, as the pushes are, once per variable.
-        for (const auto& alias : alias_order_)
-            if (alias->role == detail::Role::tie && alias->kind == IOKind::output && alias->meta->shape_driving_)
-                alias->meta->do_shape_work(rt);
         post_forward();
     }
 
@@ -534,7 +557,10 @@ protected:
         b.run_setup();
         if (si.device) b.set_device(*si.device);
         if (forced_device_) b.set_device(*forced_device_);
-        if (rebuild) replay_slot(i);
+        if (rebuild) {
+            replay_slot(i);
+            compute_hook_slots();
+        }
     }
 
     /// Re-runs a child by name: deletes it if it is live, builds it again (the factory, its setup, its device, and the
@@ -744,7 +770,7 @@ private:
                 return;
             }
             const detail::WiringSite st = site(order_of(src), order_of(dst));
-            detail::check_compatible(st, "connect", *s->meta, *d->meta, s.get(), d.get());
+            detail::merge_definitions(st, "connect", *s->meta, *d->meta, s.get(), d.get());
             decls_[k].var = detail::merge_into(st, s->meta, d->meta);  // a data-holding variable survives, per merge_into
             detail::warn_cycle(st, *s, *d);                            // a pair already reported is not repeated
             return;
@@ -756,7 +782,7 @@ private:
         const auto inst = instance_at(src_alive ? src : dst);
         if (inst->meta == var) return;
         const detail::WiringSite st = site(order_of(src), order_of(dst));
-        detail::check_compatible(st, "connect", *var, *inst->meta, nullptr, inst.get());
+        detail::merge_definitions(st, "connect", *var, *inst->meta, nullptr, inst.get());
         decls_[k].var = detail::merge_into(st, var, inst->meta);
     }
 
@@ -765,7 +791,7 @@ private:
         const auto member = instance_at(child_path);
         if (alias->meta != member->meta) {
             const detail::WiringSite st = site();
-            detail::check_compatible(st, "promote", *member->meta, *alias->meta, member.get(), alias.get());
+            detail::merge_definitions(st, "promote", *member->meta, *alias->meta, member.get(), alias.get());
             detail::merge_into(st, member->meta, alias->meta);  // the member's variable wins
         }
         decls_[k].var = alias->meta;
@@ -779,7 +805,7 @@ private:
             const auto inst = instance_at(m);
             if (inst->meta != alias->meta) {
                 const detail::WiringSite st = site();
-                detail::check_compatible(st, is_input ? "tie_inputs" : "tie_outputs", *alias->meta, *inst->meta, alias.get(), inst.get());
+                detail::merge_definitions(st, is_input ? "tie_inputs" : "tie_outputs", *alias->meta, *inst->meta, alias.get(), inst.get());
                 detail::merge_into(st, alias->meta, inst->meta);  // the alias wins; read again at each member
             }
             (is_input ? inst->can_be_target : inst->can_be_source) = false;
@@ -793,13 +819,161 @@ private:
         decls_[k].var = inst->meta;
     }
 
-    // ---- marks ---------------------------------------------------------------------------
-    static bool all_fixed(const std::vector<detail::DimRecord>& def) {
-        return std::all_of(def.begin(), def.end(), [](const detail::DimRecord& r) { return r.how == detail::DimRecord::How::fixed; });
+    // ---- shape hooks ---------------------------------------------------------------------
+    /// The slot of the child of THIS System that (transitively) declares `i`, if any (aliases of this System, host views
+    /// and instances elsewhere in the tree have none).
+    std::optional<std::size_t> slot_of(const detail::Instance& i) const {
+        const Subsystem* p = i.declarer;
+        while (p != nullptr && p->owner() != this) p = p->owner();
+        if (p == nullptr) return std::nullopt;
+        const auto it = child_index_.find(std::string{p->name()});
+        if (it == child_index_.end()) return std::nullopt;
+        return it->second;
     }
-    static std::size_t flat_size(const std::vector<detail::DimRecord>& def) {
+
+    /// Gives `inst`'s variable the hook's marks: the dimensions it owns become `hook` (an unspecified one; a dimension
+    /// already owned by this hook stays), fixed_at_run ones become fixed; an input target is no longer a target. Safe to
+    /// repeat (a rebuilt target replays it).
+    void mark_hooked(detail::Instance& inst, const detail::HookStep& hs) {
+        using How = detail::DimRecord::How;
+        detail::VarMeta& m   = *inst.meta;
+        const auto       own = [&](std::size_t u) {
+            detail::DimRecord& r = m.definition[u];
+            if (r.how == How::unspecified) {
+                r.how        = How::hook;
+                r.hook_owner = hs.owner;
+            }
+        };
+        if (hs.dims.size() == 1 && hs.dims[0].is_ragged()) {
+            own(0);
+            own(1);
+        } else {
+            for (std::size_t u = 0; u < hs.dims.size(); ++u) {
+                const detail::HookDim& d = hs.dims[u];
+                if (d.kind == detail::HookDim::Kind::as_is) continue;
+                if (d.kind == detail::HookDim::Kind::fixed_at_run) {
+                    detail::DimRecord& r = m.definition[u];
+                    if (r.how == How::unspecified) {
+                        r.how    = How::fixed;
+                        r.extent = d.index;
+                    }
+                } else {
+                    own(u);
+                }
+            }
+        }
+        if (inst.kind == IOKind::input) {
+            inst.can_be_target = false;  // a hook and a connection exclude each other
+            inst.hooked        = true;
+        }
+    }
+
+    /// Validates a hook declaration, marks the definition and stores the step. Returns its index in hooks_.
+    std::size_t install_hook(const std::string& path, std::vector<detail::HookDim> dims) {
+        using How = detail::DimRecord::How;
+        const auto inst = instance_at(path);
+        const auto bad  = [&](const std::string& why) { fail("shape_hook", "'" + path + "': " + why); };
+        if (inst->kind != IOKind::input && !detail::is_tie_output(*inst)) bad("a shape hook targets an input or a tie alias");
+        detail::VarMeta& m = *inst->meta;
+        if (inst->kind == IOKind::input && (!inst->can_be_target || detail::first_of_kind(m, IOKind::output)))
+            bad("it is connected or tied; a shape hook and a connection exclude each other");
+        const bool ragged_target = m.is_ragged() && m.rank == 2;
+        if (ragged_target) {
+            if (dims.size() != 1 || !dims[0].is_ragged())
+                bad("a ragged target takes ONE ragged descriptor (cs::ragged::counts_from or offsets_from) for both dimensions");
+        } else {
+            if (dims.size() != static_cast<std::size_t>(m.rank))
+                bad("it has rank " + std::to_string(m.rank) + " but " + std::to_string(dims.size()) + " descriptors were given");
+            for (const detail::HookDim& d : dims)
+                if (d.is_ragged()) bad("a ragged descriptor (counts_from, offsets_from) is for a ragged target");
+        }
+        const auto need_unspecified = [&](std::size_t u) {
+            if (m.definition[u].how != How::unspecified)
+                bad("dimension " + std::to_string(u) + " is " + m.declared_rule(static_cast<int>(u)) +
+                    "; a hook can only own an unspecified dimension (and only one hook owns it)");
+        };
+        bool any = false;
+        if (ragged_target) {
+            need_unspecified(1);
+            if (m.definition[0].how == How::hook) bad("dimension 0 is already set by a shape hook");
+            any = true;
+        } else {
+            for (std::size_t u = 0; u < dims.size(); ++u) {
+                if (dims[u].kind == detail::HookDim::Kind::as_is) continue;
+                need_unspecified(u);
+                any = true;
+            }
+        }
+        if (!any) bad("every descriptor is as_is: nothing to hook");
+        for (detail::HookDim& d : dims) {
+            if (!d.names_source()) continue;
+            d.src = instance_at(d.path);
+            const std::shared_ptr<detail::Instance> up = d.src.lock();
+            if (d.kind != detail::HookDim::Kind::from_shape && !detail::is_integer_value_dtype(up->meta->dtype))
+                bad("'" + d.path + "' drives a size by value and must have an integer dtype");
+            if (d.kind == detail::HookDim::Kind::from_shape && d.index >= static_cast<std::size_t>(up->meta->rank))
+                bad("'" + d.path + "' has rank " + std::to_string(up->meta->rank) + ", no dimension " + std::to_string(d.index));
+        }
+        detail::HookStep hs;
+        hs.target  = inst;
+        hs.dims    = std::move(dims);
+        hs.owner   = ++root_system().next_hook_owner_;
+        hs.path    = path;
+        hs.resolve = [this](std::string_view p) { return instance_at(p); };
+        mark_hooked(*inst, hs);
+        hooks_.push_back(std::move(hs));
+        return hooks_.size() - 1;
+    }
+
+    /// Where each hook runs: before the first child that has an instance of its target's variable. Every source's
+    /// producer must be in an EARLIER child, else a setup error naming the hook, the source and both children. Run at the
+    /// end of setup and after a rebuild.
+    void compute_hook_slots() {
+        for (detail::HookStep& hs : hooks_) {
+            const std::shared_ptr<detail::Instance> target = hs.target.lock();
+            if (!target) continue;
+            std::size_t first = slots_.size();  // none: the hook never runs
+            for (const auto& i : target->meta->live_instances())
+                if (const auto s = slot_of(*i)) first = std::min(first, *s);
+            hs.run_slot = first;
+            for (const detail::HookDim& d : hs.dims) {
+                if (!d.names_source()) continue;
+                const std::shared_ptr<detail::Instance> src = d.src.lock();
+                if (!src) continue;
+                for (const auto& i : src->meta->live_instances()) {
+                    if (!detail::is_output_port(*i)) continue;
+                    const auto j = slot_of(*i);
+                    if (j && *j >= first)
+                        fail("shape_hook", "'" + hs.path + "': its source '" + d.path + "' is produced by '" + slots_[*j].name +
+                                               "', which does not come before '" + slots_[first].name +
+                                               "', the first child that has the target: a hook's sources must be produced by an earlier child");
+                }
+            }
+        }
+    }
+
+    /// REPLAY (section 2) of a hook: a rebuilt target is re-marked and re-pointed, and the sources that live are resolved
+    /// again.
+    void replay_hook(std::size_t k, std::size_t h) {
+        detail::HookStep& hs = hooks_[h];
+        for (detail::HookDim& d : hs.dims)
+            if (d.names_source() && path_alive(d.path)) d.src = instance_at(d.path);
+        if (!path_alive(hs.path)) return;
+        const auto inst = instance_at(hs.path);
+        hs.target       = inst;
+        mark_hooked(*inst, hs);
+        decls_[k].var = inst->meta;
+    }
+
+    // ---- marks ---------------------------------------------------------------------------
+    /// Every dimension is specified (a ragged variable's counts are not a single extent: it is never all fixed).
+    static bool all_fixed(const detail::VarMeta& v) {
+        return !v.def_counts && std::all_of(v.definition.begin(), v.definition.end(),
+                                            [](const detail::DimRecord& r) { return r.how == detail::DimRecord::How::fixed; });
+    }
+    static std::size_t flat_size(const detail::VarMeta& v) {
         std::size_t n = 1;
-        for (const detail::DimRecord& r : def) n *= r.extent;
+        for (const detail::DimRecord& r : v.definition) n *= r.extent;
         return n;
     }
 
@@ -846,6 +1020,8 @@ private:
     std::unordered_map<std::string, std::shared_ptr<detail::Instance>> aliases_;  ///< this System owns its aliases (section 1)
     std::vector<std::shared_ptr<detail::Instance>>                     alias_order_;
     std::vector<Decl>                                                  decls_;
+    std::vector<detail::HookStep>                                      hooks_;  ///< the shape hooks this System declared
+    std::uint32_t                                                      next_hook_owner_ = 0;  ///< (the root's) hook owner ids
     std::vector<MarkDecl>                                              marks_;
     std::set<std::string> warned_cycles_;  ///< the cycle warnings already printed (the root's is the one used)
 };

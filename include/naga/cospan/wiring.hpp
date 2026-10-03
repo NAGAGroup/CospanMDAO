@@ -9,14 +9,16 @@
 // A call merges the shared variable metadata (VarMeta) of the instances it joins; there is no other record of the
 // wiring, and nothing is ever unregistered (an instance that goes away just expires from its variable).
 //
-// THE THREE MERGE DIRECTIONS (section 1: whose metadata survives, and so whose shape definition and alias rule)
+// THE THREE MERGE DIRECTIONS (section 1: whose metadata survives). The SHAPE DEFINITIONS of everything a call joins
+// are merged (section 10, merge_definitions): unspecified absorbs specified, two specified values must agree, a hooked
+// dimension meets only unspecified; promotions take no shape.
 //   connect: the SOURCE's metadata wins. The target side's initializer is dropped: an initializer on a connected
 //            input is accepted and ignored (the source supplies the values).
 //   tie:     the ALIAS's metadata wins (it owns the shape). The members' initializers are folded into it by the
 //            highest-level-wins rule (smaller depth wins; two at one depth from different declarers are an error).
 //   promote: the MEMBER's metadata wins: the promotion joins the member's variable directly.
 // One exception, in merge_into: when exactly one side already holds data (a rebuilt child rejoining live data),
-// that side's object survives, carrying the rule-winner's shape definition and alias rule, and keeping its own
+// that side's object survives, carrying the merged shape definition, and keeping its own
 // resolved shape, initializer, stale flag, events and data. A merge never touches stale flags, events or data.
 //
 // EVERY RULE IS CHECKED IN ITS OWN CALL, BEFORE ANYTHING IS CHANGED: a call that throws has changed nothing
@@ -72,7 +74,6 @@ struct WiringSite {
 }
 
 using TieMembers = std::vector<std::pair<std::string, std::shared_ptr<Instance>>>;
-using ResolveFn  = std::function<std::shared_ptr<Instance>(std::string_view)>;
 
 /// The live instances of a variable (const: expired entries are skipped, not pruned).
 inline std::vector<std::shared_ptr<Instance>> live_of(const VarMeta& m) {
@@ -91,17 +92,24 @@ inline std::shared_ptr<Instance> first_of_kind(const VarMeta& m, IOKind k) {
 }
 
 // -----------------------------------------------------------------------------
-// Compatibility
+// Merging shape definitions (design review, section 10)
 // -----------------------------------------------------------------------------
 
-/// Two variables may merge: the value dtype, the rank, and every extent declared FIXED anywhere in either (the
-/// definitions and every live instance's own dims) must agree, and a statically per-index dimension (PerIndex) meets
-/// no fixed dense extent. Dimensions derived at run time (FromInputDim, FromInput, FromInputValues, the alias value
-/// and dim specs) and unspecified ones are skipped: they are checked reactively, later. `ia` / `ib`: the instances
-/// that are being joined, for the messages (else the variable's first live instance).
-inline void check_compatible(const WiringSite& site, const char* verb, const VarMeta& a, const VarMeta& b,
-                             const Instance* ia = nullptr, const Instance* ib = nullptr) {
-    if (&a == &b) return;
+/// The result of merging two variables' shape definitions.
+struct MergedDefinition {
+    std::vector<DimRecord>                  dims;
+    std::optional<std::vector<std::size_t>> counts;  ///< a ragged variable's declared per-index counts
+};
+
+/// What merging the definitions of `a` and `b` gives, or the error of the call. Nothing is changed. The value dtype and the
+/// rank must match; per dimension, UNSPECIFIED absorbs SPECIFIED, and two specified values must be equal (a ragged
+/// per-index dimension is specified by its counts, which must be equal; counts and a single extent do not meet). A
+/// dimension owned by a shape hook accepts only an unspecified one (it keeps the hook); hook with anything else is an error
+/// (a hook and a connection or tie exclude each other). `ia` / `ib`: the instances that are being joined, for the messages
+/// (else the variable's first live instance).
+inline MergedDefinition merged_definition(const WiringSite& site, const char* verb, const VarMeta& a, const VarMeta& b,
+                                          const Instance* ia = nullptr, const Instance* ib = nullptr) {
+    if (&a == &b) return MergedDefinition{a.definition, a.def_counts};
     const std::string pa = ia != nullptr ? ia->full_path() : a.display_path();
     const std::string pb = ib != nullptr ? ib->full_path() : b.display_path();
     if (!dtype_compatible(a.dtype, b.dtype))
@@ -110,43 +118,57 @@ inline void check_compatible(const WiringSite& site, const char* verb, const Var
         wiring_fail(site, verb, "'" + pa + "' has rank " + std::to_string(a.rank) + " but '" + pb + "' has rank " +
                                     std::to_string(b.rank) + ": the rank must match");
 
-    // Every dimension record that speaks about dimension d, with who declared it.
-    struct Said {
-        const DimRecord* rec;
-        std::string      who;
-    };
+    using How = DimRecord::How;
+    MergedDefinition out;
     for (int d = 0; d < a.rank; ++d) {
-        const auto        u = static_cast<std::size_t>(d);
-        std::vector<Said> said;
-        auto              add_group = [&](const VarMeta& m, const std::string& name) {
-            if (u < m.definition.size()) said.push_back({&m.definition[u], "'" + name + "' (the variable's shape definition)"});
-        };
-        add_group(a, pa);
-        add_group(b, pb);
-        const auto la = live_of(a);
-        const auto lb = live_of(b);
-        for (const auto* group : {&la, &lb})
-            for (const auto& i : *group)
-                if (u < i->dims.size()) said.push_back({&i->dims[u], "'" + i->full_path() + "'"});
-
-        const Said* fixed = nullptr;
-        const Said* per   = nullptr;
-        for (const Said& s : said) {
-            if (s.rec->how == DimRecord::How::fixed) {
-                if (fixed != nullptr && fixed->rec->extent != s.rec->extent)
-                    wiring_fail(site, verb, "dimension " + std::to_string(d) + ": " + fixed->who + " declares " +
-                                                std::to_string(fixed->rec->extent) + " but " + s.who + " declares " +
-                                                std::to_string(s.rec->extent) + ": the extents must match");
-                if (fixed == nullptr) fixed = &s;
-            } else if (s.rec->how == DimRecord::How::per_index_host && per == nullptr) {
-                per = &s;
+        const auto        u   = static_cast<std::size_t>(d);
+        const DimRecord&  x   = a.definition[u];
+        const DimRecord&  y   = b.definition[u];
+        const bool        xc  = u == 1 && a.def_counts.has_value();
+        const bool        yc  = u == 1 && b.def_counts.has_value();
+        const std::string dim = "dimension " + std::to_string(d);
+        if (x.how == How::hook || y.how == How::hook) {
+            const bool       xh    = x.how == How::hook;
+            const DimRecord& other = xh ? y : x;
+            if (other.how != How::unspecified)
+                wiring_fail(site, verb, dim + " of '" + (xh ? pa : pb) + "' is set by a shape hook; it cannot be connected or tied");
+            out.dims.push_back(xh ? x : y);
+        } else if (x.how == How::unspecified) {
+            out.dims.push_back(y);
+            if (yc) out.counts = b.def_counts;
+        } else if (y.how == How::unspecified) {
+            out.dims.push_back(x);
+            if (xc) out.counts = a.def_counts;
+        } else {  // both specified
+            if (xc != yc)
+                wiring_fail(site, verb, dim + ": '" + (xc ? pa : pb) + "' gives per-index counts but '" + (xc ? pb : pa) +
+                                            "' declares one extent (" + std::to_string(xc ? y.extent : x.extent) + ") for it");
+            if (xc) {
+                if (*a.def_counts != *b.def_counts)
+                    wiring_fail(site, verb, dim + ": '" + pa + "' declares the counts " + extents_str(*a.def_counts) + " but '" + pb +
+                                                "' declares " + extents_str(*b.def_counts) + ": the counts must match");
+                out.counts = a.def_counts;
+            } else if (x.extent != y.extent) {
+                wiring_fail(site, verb, dim + ": '" + pa + "' declares " + std::to_string(x.extent) + " but '" + pb + "' declares " +
+                                            std::to_string(y.extent) + ": the extents must match");
             }
+            out.dims.push_back(x);
         }
-        if (fixed != nullptr && per != nullptr)
-            wiring_fail(site, verb, "dimension " + std::to_string(d) + ": " + per->who + " gives per-index extents but " +
-                                        fixed->who + " declares one extent (" + std::to_string(fixed->rec->extent) +
-                                        ") for it");
     }
+    if (out.counts && !out.dims.empty() && out.dims[0].how == How::fixed && out.dims[0].extent != out.counts->size())
+        wiring_fail(site, verb, "the per-index counts have " + std::to_string(out.counts->size()) + " entries but dimension 0 is " +
+                                    std::to_string(out.dims[0].extent));
+    return out;
+}
+
+/// merged_definition, written into `winner` (the survivor of the call, or the side whose rules the survivor takes: see
+/// merge_into). Throws before anything is changed.
+inline void merge_definitions(const WiringSite& site, const char* verb, VarMeta& winner, VarMeta& loser,
+                              const Instance* a = nullptr, const Instance* b = nullptr) {
+    if (&winner == &loser) return;
+    MergedDefinition m = merged_definition(site, verb, winner, loser, a, b);
+    winner.definition  = std::move(m.dims);
+    winner.def_counts  = std::move(m.counts);
 }
 
 // -----------------------------------------------------------------------------
@@ -170,8 +192,9 @@ inline void fold_init(VarMeta& into, const VarMeta& from) {
 // The merge walk
 // -----------------------------------------------------------------------------
 
-/// The generic merge, after the call's own checks. Returns the surviving object; every live instance of the other
-/// is rebound to it. See the header for who survives. Never touches stale flags, events or data.
+/// The generic merge, after the call's own checks (and merge_definitions, which put the merged definition in `winner`).
+/// Returns the surviving object; every live instance of the other is rebound to it. See the header for who survives.
+/// Never touches stale flags, events or data.
 inline std::shared_ptr<VarMeta> merge_into(const WiringSite& site, std::shared_ptr<VarMeta> winner,
                                            std::shared_ptr<VarMeta> loser) {
     if (winner == loser) return winner;
@@ -180,25 +203,11 @@ inline std::shared_ptr<VarMeta> merge_into(const WiringSite& site, std::shared_p
     if (wm && lm) throw std::logic_error("naga::cospan: " + site.where + ": both sides of a merge hold data");
     std::shared_ptr<VarMeta> survivor = winner;
     std::shared_ptr<VarMeta> other    = loser;
-    // A tie's shape rule that the survivor does not take is kept as a CONSTRAINT (design review, section 9): a tie does not
-    // override its members or its source, its rule must be consistent with them, and a mismatch is thrown at the forward.
-    // The rules the other side already carried as constraints come across too.
-    const auto is_rule = [](const std::optional<AliasShape>& a) { return a && a->kind != AliasShape::Kind::unspecified; };
-    std::vector<std::pair<std::string, AliasShape>> carried = loser->shape_constraints;
-    if (lm) {  // a rebuilt child rejoining live data: its object survives, with the rule-winner's rules
+    if (lm) {  // a rebuilt child rejoining live data: its object survives, with the merged shape definition
         survivor              = loser;
         other                 = winner;
-        carried               = winner->shape_constraints;
-        if (is_rule(survivor->alias_shape)) carried.emplace_back(survivor->display_path(), *survivor->alias_shape);  // not taken
         survivor->definition  = winner->definition;
-        survivor->alias_shape = winner->alias_shape;
-    } else if (is_rule(other->alias_shape)) {
-        carried.emplace_back(other->display_path(), *other->alias_shape);
-    }
-    for (auto& c : carried) {
-        const bool known = std::any_of(survivor->shape_constraints.begin(), survivor->shape_constraints.end(),
-                                       [&](const auto& e) { return e.first == c.first; });
-        if (!known) survivor->shape_constraints.push_back(std::move(c));
+        survivor->def_counts  = winner->def_counts;
     }
     for (const std::shared_ptr<Instance>& i : other->live_instances()) i->rebind(survivor);
     return survivor;
@@ -238,6 +247,9 @@ inline void connect(const WiringSite& site, const std::shared_ptr<Instance>& src
     if (!src->can_be_source)
         wiring_fail(site, what.c_str(),
                     "'" + src->full_path() + "' cannot be a source (an input, or a tied output: connect from its tie alias)");
+    if (!dst->can_be_target && dst->hooked)
+        wiring_fail(site, what.c_str(),
+                    "'" + dst->full_path() + "' is the target of a shape hook; a shape hook and a connection exclude each other");
     if (!dst->can_be_target)
         wiring_fail(site, what.c_str(),
                     "'" + dst->full_path() + "' cannot be a target (an output, or a tied input: connect through its tie alias)");
@@ -252,8 +264,9 @@ inline void connect(const WiringSite& site, const std::shared_ptr<Instance>& src
         wiring_fail(site, what.c_str(),
                     "'" + src->full_path() + "' is ragged; a dense Input cannot see per-index extents; declare '" +
                         dst->full_path() + "' RaggedInput");
-    check_compatible(site, what.c_str(), *src->meta, *dst->meta, src.get(), dst.get());
     check_one_live(site, {src->meta.get(), dst->meta.get()});
+    // the merged shape definition goes into the source's variable (it throws before anything is changed)
+    merge_definitions(site, what.c_str(), *src->meta, *dst->meta, src.get(), dst.get());
 
     merge_into(site, src->meta, dst->meta);
     warn_cycle(site, *src, *dst);
@@ -262,22 +275,6 @@ inline void connect(const WiringSite& site, const std::shared_ptr<Instance>& src
 // -----------------------------------------------------------------------------
 // promote
 // -----------------------------------------------------------------------------
-
-/// A promotion's dims. Its shape is read live from the variable, so the dims are only classification: fixed and
-/// unspecified are kept, derived ones become inert from_input markers.
-inline std::vector<DimRecord> promoted_dims(const std::vector<DimRecord>& member) {
-    std::vector<DimRecord> out;
-    for (DimRecord r : member) {
-        if (r.how != DimRecord::How::fixed && r.how != DimRecord::How::unspecified) {
-            r.how         = DimRecord::How::from_input;
-            r.input.clear();
-            r.dim         = 0;
-            r.value_index = 0;
-        }
-        out.push_back(std::move(r));
-    }
-    return out;
-}
 
 /// Every instance is of dtype DT and rank Rank.
 template <DType DT, int Rank>
@@ -298,7 +295,7 @@ std::shared_ptr<Instance> promote(const WiringSite& site, const std::shared_ptr<
     static_assert(Rank >= 1 && Rank <= 3, "cospan: rank is 1..3");
     check_typed_instance<DT, Rank>(site, "promote", *member);
     std::shared_ptr<Instance> a = make_alias_instance(DT, Rank, std::move(name), declarer, member->kind, Role::promotion,
-                                                      promoted_dims(member->dims), member->can_be_source,
+                                                      member->dims, member->can_be_source,
                                                       member->can_be_target, member->meta);
     a->device = member->device;
     return a;
@@ -308,36 +305,36 @@ std::shared_ptr<Instance> promote(const WiringSite& site, const std::shared_ptr<
 // Ties
 // -----------------------------------------------------------------------------
 
-/// A tie alias's dims: fixed extents for alias::fixed and fixed specs; unspecified when the shape is left to what
-/// supplies the tie; placeholders (resolved reactively) for the others.
+/// A tie alias's dims from its ShapeSpec (cs::shape): per-dimension specified or unspecified, like a port. A ragged tie
+/// (any member is ragged, or the spec holds counts / offsets) is rank 2 and takes cs::shape(), cs::shape(n),
+/// cs::shape(cs::counts(v)) or cs::shape(cs::offsets(v)); `counts` is set for the last two. Promotions take no shape.
 template <int Rank>
-std::vector<DimRecord> alias_dims(const AliasShape& s) {
+std::vector<DimRecord> tie_dims(const WiringSite& site, const char* verb, const ShapeSpec& spec, bool ragged,
+                                std::optional<std::vector<std::size_t>>& counts) {
+    using How = DimRecord::How;
     std::vector<DimRecord> out(static_cast<std::size_t>(Rank));
-    for (int d = 0; d < Rank; ++d) {
-        const auto u = static_cast<std::size_t>(d);
-        DimRecord& r = out[u];
-        if (s.kind == AliasShape::Kind::fixed) {
-            r.how    = DimRecord::How::fixed;
-            r.extent = s.extents[u];
-        } else if (s.kind == AliasShape::Kind::unspecified) {
-            r.how = DimRecord::How::unspecified;
-        } else if (s.kind == AliasShape::Kind::dims && s.dim_specs[u].how == AliasDim::How::fixed) {
-            r.how    = DimRecord::How::fixed;
-            r.extent = s.dim_specs[u].extent;
-        } else {
-            r.how = DimRecord::How::from_input;
-            if (s.kind == AliasShape::Kind::dims) {  // statically per-index dims (resolved reactively)
-                const AliasDim& sp = s.dim_specs[u];
-                if (sp.how == AliasDim::How::per_index_host) {
-                    r.how = DimRecord::How::per_index_host;
-                    r.per = true;
-                } else if (sp.how == AliasDim::How::output_values) {
-                    r.per = true;
-                }
-            }
-        }
+    for (DimRecord& r : out) r.how = How::unspecified;
+    if (spec.ragged_counts) {
+        if (Rank != 2) wiring_fail(site, verb, "cs::counts / cs::offsets declare a ragged shape, which is rank 2 (the tie is rank " + std::to_string(Rank) + ")");
+        out[0]        = detail::make_dim_record(spec.ragged_counts->size());
+        out[1].how    = How::fixed;
+        out[1].extent = 0;
+        counts        = spec.ragged_counts;
+        return out;
     }
-    return out;
+    if (spec.dims.empty()) return out;  // cs::shape(): every dimension unspecified
+    if (ragged) {
+        if (Rank != 2) wiring_fail(site, verb, "a ragged tie is rank 2 (the tie is rank " + std::to_string(Rank) + ")");
+        if (spec.dims.size() == 1) {
+            out[0] = spec.dims[0];
+            return out;
+        }
+        if (spec.dims.size() == 2 && spec.dims[0].how == How::unspecified && spec.dims[1].how == How::unspecified) return out;
+        wiring_fail(site, verb, "a ragged tie takes cs::shape(), cs::shape(n), cs::shape(cs::counts(v)) or cs::shape(cs::offsets(v))");
+    }
+    if (spec.dims.size() != static_cast<std::size_t>(Rank))
+        wiring_fail(site, verb, "cs::shape gives " + std::to_string(spec.dims.size()) + " dimensions but the tie is rank " + std::to_string(Rank));
+    return spec.dims;
 }
 
 /// At least two members, none null, none listed twice.
@@ -351,104 +348,24 @@ inline void check_tie_members(const WiringSite& site, const char* verb, const Ti
     }
 }
 
-/// Validates an AliasShape against the alias's Rank, and records on it the upstream instances it reads (AliasSrc).
-template <int Rank>
-void check_alias_shape(const WiringSite& site, AliasShape& s, const char* verb, bool is_input, const ResolveFn& resolve) {
-    auto fail = [&](const std::string& why) { wiring_fail(site, verb, why); };
-    auto up_of = [&](const std::string& path) {
-        std::shared_ptr<Instance> up = resolve(path);
-        if (!up) fail("the alias shape names '" + path + "', which is no instance of the declaring System");
-        return up;
-    };
-    auto is_source_output = [](const Instance& up) { return up.kind == IOKind::output && up.can_be_source; };
-    switch (s.kind) {
-        case AliasShape::Kind::dims: {
-            if (s.rank != Rank || static_cast<int>(s.dim_specs.size()) != Rank)
-                fail("alias::dims gives " + std::to_string(s.dim_specs.size()) + " specs but the alias is rank " +
-                     std::to_string(Rank));
-            for (int d = 0; d < Rank; ++d) {
-                AliasDim&         sp  = s.dim_specs[static_cast<std::size_t>(d)];
-                const std::string dim = "alias::dims, dimension " + std::to_string(d) + ": ";
-                if (sp.how == AliasDim::How::fixed) continue;
-                if (sp.how == AliasDim::How::per_index_host) {
-                    if (d == 0) fail(dim + "a per-index spec is for dimensions >= 1 (dimension 0 is the number of indices)");
-                    const AliasDim& d0 = s.dim_specs[0];
-                    if (d0.how == AliasDim::How::fixed && sp.values.size() != d0.extent)
-                        fail(dim + "per_index has " + std::to_string(sp.values.size()) + " extents but dimension 0 is " +
-                             std::to_string(d0.extent));
-                    continue;
-                }
-                if (sp.how == AliasDim::How::output_values && d == 0)
-                    fail(dim + "output_values gives per-index extents, which are for dimensions >= 1");
-                const std::shared_ptr<Instance> up = up_of(sp.path);
-                if (sp.input) {
-                    if (up->kind != IOKind::input)
-                        fail(dim + "'" + sp.path + "' is not an input (input_value / input_values / input_dim name an input of "
-                                   "the declaring system: a promoted input or a tie_inputs alias)");
-                } else if (!is_source_output(*up)) {
-                    fail(dim + "'" + sp.path + "' is not an output that can be a source");
-                }
-                if (sp.how != AliasDim::How::output_dim && !is_integer_value_dtype(up->meta->dtype))
-                    fail(dim + "'" + sp.path + "' is not of integer dtype");
-                if (sp.how == AliasDim::How::output_values && up->meta->rank > 2)
-                    fail(dim + "'" + sp.path + "' drives per-index extents by value and must be rank 1 [N] or rank 2 [N,k]");
-                if (sp.how == AliasDim::How::output_dim && static_cast<int>(sp.index) >= up->meta->rank)
-                    fail(dim + "'" + sp.path + "' has rank " + std::to_string(up->meta->rank) + ", no dimension " +
-                         std::to_string(sp.index));
-                sp.src = AliasSrc{sp.path, up, up->meta};
-            }
-            return;
-        }
-        case AliasShape::Kind::fixed:
-            if (s.rank != Rank)
-                fail("alias::fixed gives " + std::to_string(s.rank) + " extents but the alias is rank " + std::to_string(Rank));
-            return;
-        case AliasShape::Kind::unspecified:
-            if (!is_input)
-                fail("an output alias needs a shape (alias::fixed, dims, from_output_shape, from_output_values or "
-                     "from_input_shape): an output with unspecified dims is an error");
-            return;
-        case AliasShape::Kind::from_input_shape: {
-            const std::shared_ptr<Instance> up = up_of(s.path);
-            if (up->kind != IOKind::input) fail("alias::from_input_shape('" + s.path + "') names an entry that is not an input");
-            if (up->meta->rank != Rank)
-                fail("alias::from_input_shape('" + s.path + "') names an input of rank " + std::to_string(up->meta->rank) +
-                     " but the alias is rank " + std::to_string(Rank));
-            s.src = AliasSrc{s.path, up, up->meta};
-            return;
-        }
-        case AliasShape::Kind::from_output_shape:
-        case AliasShape::Kind::from_output_values: {
-            const std::shared_ptr<Instance> up = up_of(s.path);
-            if (!is_source_output(*up)) fail("the alias shape names '" + s.path + "', which is not an output that can be a source");
-            if (s.kind == AliasShape::Kind::from_output_shape && up->meta->rank != Rank)
-                fail("alias::from_output_shape('" + s.path + "') names an output of rank " + std::to_string(up->meta->rank) +
-                     " but the alias is rank " + std::to_string(Rank));
-            if (s.kind == AliasShape::Kind::from_output_values && !is_integer_value_dtype(up->meta->dtype))
-                fail("alias::from_output_values('" + s.path + "') names an output that is not of integer dtype");
-            s.src = AliasSrc{s.path, up, up->meta};
-            return;
-        }
-    }
-}
-
-/// A fresh variable and alias instance for a tie. The variable is ragged when any dimension is per-index or any
-/// member's variable is ragged (a ragged member's data must be of the ragged kind).
+/// A fresh variable and alias instance for a tie. The variable is ragged when the spec holds counts or any member's
+/// variable is ragged (a ragged member's data must be of the ragged kind). Its definition is the spec's.
 template <DType DT, int Rank>
-std::shared_ptr<Instance> build_tie_alias(const TieMembers& ms, std::string name, const Subsystem* declarer,
-                                          const AliasShape& shape, IOKind kind, std::optional<sycl::device> device) {
-    bool ragged = false;
+std::shared_ptr<Instance> build_tie_alias(const WiringSite& site, const char* verb, const TieMembers& ms, std::string name,
+                                          const Subsystem* declarer, const ShapeSpec& spec, IOKind kind,
+                                          std::optional<sycl::device> device) {
+    bool ragged = spec.ragged_counts.has_value();
     for (const auto& m : ms) ragged = ragged || m.second->meta->is_ragged();
-    std::vector<DimRecord> dims = alias_dims<Rank>(shape);
-    ragged                      = ragged || any_per_index(dims);
-    for (const DimRecord& r : dims) ragged = ragged || r.how == DimRecord::How::per_index_from_input;
+    std::optional<std::vector<std::size_t>> counts;
+    std::vector<DimRecord>                  dims = tie_dims<Rank>(site, verb, spec, ragged, counts);
     std::shared_ptr<VarMeta> meta = make_var_meta(DT, Rank, dims, ragged);
-    meta->alias_shape             = shape;
+    meta->def_counts              = counts;
     meta->init_device             = device;
     const bool input              = kind == IOKind::input;
     std::shared_ptr<Instance> alias = make_alias_instance(DT, Rank, std::move(name), declarer, kind,
                                                           Role::tie, std::move(dims), /*can_source=*/!input,
                                                           /*can_target=*/input, std::move(meta));
+    alias->def_counts = std::move(counts);
     if (device) alias->device = *device;
     return alias;
 }
@@ -459,24 +376,25 @@ inline void check_tie_merge(const WiringSite& site, const char* verb, const std:
                             const TieMembers& ms) {
     std::vector<const VarMeta*> metas;
     for (const auto& m : ms) {
-        check_compatible(site, verb, *alias->meta, *m.second->meta, alias.get(), m.second.get());
+        (void)merged_definition(site, verb, *alias->meta, *m.second->meta, alias.get(), m.second.get());
         metas.push_back(m.second->meta.get());
     }
     for (std::size_t i = 0; i < ms.size(); ++i)
         for (std::size_t j = 0; j < i; ++j)
-            check_compatible(site, verb, *ms[j].second->meta, *ms[i].second->meta, ms[j].second.get(), ms[i].second.get());
+            (void)merged_definition(site, verb, *ms[j].second->meta, *ms[i].second->meta, ms[j].second.get(), ms[i].second.get());
     check_one_live(site, metas);
 }
 
 /// The merge of a tie, after check_tie_merge: the alias's variable wins each time (`alias->meta` is read again at
 /// every step: it is the survivor of the one before).
-inline void apply_tie_merge(const WiringSite& site, [[maybe_unused]] const char* verb, const std::shared_ptr<Instance>& alias,
+inline void apply_tie_merge(const WiringSite& site, const char* verb, const std::shared_ptr<Instance>& alias,
                             const TieMembers& ms, bool inputs) {
     // The alias's own initializer, if it has one, is the later declaration and is kept over every member's; otherwise the
     // members' are folded in order, later members replacing earlier ones.
     const bool own_init = alias->meta->init.has_value();
     for (const auto& m : ms) {
         if (inputs && !own_init && !alias->meta->is_materialized()) fold_init(*alias->meta, *m.second->meta);
+        merge_definitions(site, verb, *alias->meta, *m.second->meta, alias.get(), m.second.get());
         merge_into(site, alias->meta, m.second->meta);
     }
 }
@@ -487,8 +405,7 @@ inline void apply_tie_merge(const WiringSite& site, [[maybe_unused]] const char*
 /// initialization runs. Members become non-targets: they connect through the alias.
 template <DType DT, int Rank>
 std::shared_ptr<Instance> tie_inputs(const WiringSite& site, const TieMembers& members, std::string name,
-                                     const Subsystem* declarer, AliasShape shape, std::optional<sycl::device> device,
-                                     const ResolveFn& resolve) {
+                                     const Subsystem* declarer, const ShapeSpec& shape, std::optional<sycl::device> device) {
     static_assert(Rank >= 1 && Rank <= 3, "cospan: rank is 1..3");
     const char* verb = "tie_inputs";
     check_tie_members(site, verb, members);
@@ -498,12 +415,14 @@ std::shared_ptr<Instance> tie_inputs(const WiringSite& site, const TieMembers& m
         if (const std::shared_ptr<Instance> fed = first_of_kind(*m->meta, IOKind::output))
             wiring_fail(site, verb, "'" + path + "' is not a free input: its variable is fed by '" + fed->full_path() +
                                         "' (tie before connecting, or connect from the alias)");
+        if (!m->can_be_target && m->hooked)
+            wiring_fail(site, verb, "'" + path + "' is the target of a shape hook; a shape hook and a tie exclude each other");
         if (!m->can_be_target) wiring_fail(site, verb, "'" + path + "' is already tied: connect through its tie alias");
         check_typed_instance<DT, Rank>(site, verb, *m);
     }
-    check_alias_shape<Rank>(site, shape, verb, /*is_input=*/true, resolve);
 
-    std::shared_ptr<Instance> alias = build_tie_alias<DT, Rank>(members, std::move(name), declarer, shape, IOKind::input, device);
+    std::shared_ptr<Instance> alias =
+        build_tie_alias<DT, Rank>(site, verb, members, std::move(name), declarer, shape, IOKind::input, device);
     check_tie_merge(site, verb, alias, members);
     apply_tie_merge(site, verb, alias, members, /*inputs=*/true);
     for (const auto& m : members) m.second->can_be_target = false;  // visible at every use site
@@ -515,8 +434,7 @@ std::shared_ptr<Instance> tie_inputs(const WiringSite& site, const TieMembers& m
 /// it cannot take its shape from one). Members become non-sources: they connect from the alias.
 template <DType DT, int Rank>
 std::shared_ptr<Instance> tie_outputs(const WiringSite& site, const TieMembers& members, std::string name,
-                                      const Subsystem* declarer, AliasShape shape, TieOutputsPolicy policy,
-                                      const ResolveFn& resolve) {
+                                      const Subsystem* declarer, const ShapeSpec& shape, TieOutputsPolicy policy) {
     static_assert(Rank >= 1 && Rank <= 3, "cospan: rank is 1..3");
     const char* verb = "tie_outputs";
     check_tie_members(site, verb, members);
@@ -536,10 +454,9 @@ std::shared_ptr<Instance> tie_outputs(const WiringSite& site, const TieMembers& 
             wiring_fail(site, verb, "tie_outputs needs every member on one device: '" + first.first + "' is on " +
                                         first.second->device.get_info<sycl::info::device::name>() + " and '" + m.first +
                                         "' on " + m.second->device.get_info<sycl::info::device::name>());
-    check_alias_shape<Rank>(site, shape, verb, /*is_input=*/false, resolve);
 
     std::shared_ptr<Instance> alias =
-        build_tie_alias<DT, Rank>(members, std::move(name), declarer, shape, IOKind::output, first.second->device);
+        build_tie_alias<DT, Rank>(site, verb, members, std::move(name), declarer, shape, IOKind::output, first.second->device);
     check_tie_merge(site, verb, alias, members);
     apply_tie_merge(site, verb, alias, members, /*inputs=*/false);
     for (const auto& m : members) m.second->can_be_source = false;

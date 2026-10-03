@@ -7,15 +7,13 @@
 // A component is the leaf that does work, and it SUBMITS ITSELF (docs/design-review-2026-10-03.md, sections 3 and
 // 4). Its forward is three framework-owned steps that call user hooks:
 //
-//   precompute   (1) the expected extents of each input's own dimensions are worked out (a derived dimension
-//                    reads its sibling input; a value-driven one asks the driving variable for its value);
-//                (2) every distinct input variable is materialized;
-//                (3) each output's shape is built from its dimensions and given to its variable (a tied output's
-//                    shape belongs to its tie's System);
-//                (4) the user's pre_forward() runs;
-//                (5) every distinct output variable is materialized;
-//                (6) the reactive checks: what each dimension declared against what its variable has;
-//                (7) every member wrapper is pointed at its data.
+//   precompute   (1) every distinct input variable is materialized (shape hooks of the enclosing System have run);
+//                (2) the user's pre_forward() runs: an output is reshaped there with set_shape, within its definition
+//                    (a tied output's shape belongs to its tie's System);
+//                (3) every distinct output variable is materialized (an unknown dimension is an error);
+//                (4) every member wrapper is pointed at its data.
+//                Shapes (design review, section 10): a declaration says only specified or unspecified per dimension; every
+//                run-time shape change is checked against the variable's definition (VarMeta::set_dims).
 //   compute      the user's compute_forward() returns the launch (describe); the component submits it on the
 //                unordered queue, depending on its variables' events and nothing else (submit), and records
 //                its own event on them.
@@ -32,6 +30,7 @@
 
 #include <algorithm>
 #include <array>
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -95,6 +94,54 @@ struct ComponentAccess;
 
 }  // namespace detail
 
+/// The shape of a ragged port (rank 2: N indices and one count per index), as a copyable handle: what a component's
+/// shape_of returns for a RaggedInput / RaggedOutput, and what its set_shape takes. The counts are on the host or, for a
+/// hooked ragged variable, on the device (`column`: they never come down to the host unless asked for).
+struct RaggedShape {
+    std::size_t                                 n = 0;      ///< the number of indices (dimension 0)
+    std::uint64_t                               total = 0;  ///< the number of elements (the sum of the counts)
+    std::vector<std::size_t>                    counts;     ///< the host counts (empty when `column` is set)
+    std::shared_ptr<const detail::DeviceColumn> column;     ///< the device counts and offsets
+    std::uint64_t                               column_version = 0;
+
+    bool on_device() const noexcept { return column != nullptr; }
+
+    /// The counts on the host: the host array, or the device column copied down (waiting on it).
+    std::vector<std::size_t> counts_on_host(detail::Runtime& rt) const {
+        detail::ResolvedShape s = to_resolved();
+        return s.per_index_on_host(rt);
+    }
+
+    /// From a variable's resolved shape (a dense shape reads as constant rows).
+    static RaggedShape from(const detail::ResolvedShape& s) {
+        RaggedShape r;
+        r.n = s.extents[0];
+        if (s.per) {
+            r.counts         = s.per_index;
+            r.column         = s.dev_per;
+            r.column_version = s.dev_version;
+            r.total          = s.total;
+        } else {
+            r.counts.assign(r.n, s.extents[1] * s.extents[2]);
+            r.total = static_cast<std::uint64_t>(r.n) * s.extents[1] * s.extents[2];
+        }
+        return r;
+    }
+
+    /// As a resolved shape (rank 2, ragged); the host total is the sum of the counts.
+    detail::ResolvedShape to_resolved() const {
+        detail::ResolvedShape s;
+        s.known       = true;
+        s.extents     = {n, 0, 1};
+        s.per         = true;
+        s.per_index   = counts;
+        s.dev_per     = column;
+        s.dev_version = column_version;
+        s.settle_total();
+        return s;
+    }
+};
+
 class ComponentBase : public Subsystem {
 public:
     ComponentBase(const ComponentBase&)            = delete;
@@ -106,12 +153,15 @@ public:
     virtual void setup() = 0;
     /// There is no init hook: a free input's initial value is declared in setup() with init_input, and outputs are
     /// never initialized.
-    /// Per-forward manual shape control, after automatic derivation (reshape is legal here only).
+    /// Per-forward shape control: shape_of / set_shape are legal here only.
     virtual void pre_forward() {}
     /// At the end of postcompute, after the pushes to the variables' other placements.
     virtual void post_forward() {}
 
     // ---- declaration API (legal inside setup() only) ------------------------
+    // A declaration says, per dimension, only SPECIFIED (an integer) or UNSPECIFIED (cs::unspecified); it is the
+    // component's contract (docs/design-review-2026-10-03.md, section 10). Specified forces that dimension on anything
+    // joined to it; unspecified places no constraint. There are no derived specs.
     template <DType DT, int Rank, DimSpec... Specs>
         requires(sizeof...(Specs) == Rank)
     void declare_input(Input<DT, Rank>& m, std::string name, Specs... specs) {
@@ -125,7 +175,7 @@ public:
                              std::array<detail::DimRecord, Rank>{detail::make_dim_record(specs)...});
     }
 
-    /// The array forms: unspecified_shape<R>() and from_input_shape<R>(name).
+    /// The array forms: cs::unspecified_shape<R>() (or any std::array of DimSpecs).
     template <DType DT, int Rank, DimSpec S>
     void declare_input(Input<DT, Rank>& m, std::string name,
                        const std::array<S, static_cast<std::size_t>(Rank)>& specs) {
@@ -137,55 +187,93 @@ public:
         add_output<DT, Rank>(m, std::move(name), records_of<Rank>(specs));
     }
 
-    /// The whole-shape value-driven marker.
+    /// Ragged ports are RANK 2 ONLY (a dense leading dimension N and one per-index dimension). A declaration is one of:
+    ///   (m, name)                    both unspecified
+    ///   (m, name, n)                 the leading dimension specified, the counts unspecified
+    ///   (m, name, cs::counts(v))     a host array of counts; it defines the leading dimension (v.size()) too
+    ///   (m, name, cs::offsets(v))    the same as N + 1 offsets
     template <DType DT, int Rank>
-    void declare_input(Input<DT, Rank>& m, std::string name, FromInputArray marker) {
-        add_input<DT, Rank>(m, std::move(name), detail::expand_from_input_array<Rank>(marker));
+    void declare_input(RaggedInput<DT, Rank>& m, std::string name) {
+        add_ragged_input<DT, Rank>(m, std::move(name), ragged_records(std::nullopt, false), std::nullopt);
+    }
+    template <DType DT, int Rank, std::integral N>
+    void declare_input(RaggedInput<DT, Rank>& m, std::string name, N n) {
+        add_ragged_input<DT, Rank>(m, std::move(name), ragged_records(leading_of(n), false), std::nullopt);
     }
     template <DType DT, int Rank>
-    void declare_output(Output<DT, Rank>& m, std::string name, FromInputArray marker) {
-        add_output<DT, Rank>(m, std::move(name), detail::expand_from_input_array<Rank>(marker));
+    void declare_input(RaggedInput<DT, Rank>& m, std::string name, Counts c) {
+        const std::size_t n = c.v.size();
+        add_ragged_input<DT, Rank>(m, std::move(name), ragged_records(n, true), std::move(c.v));
+    }
+    template <DType DT, int Rank>
+    void declare_input(RaggedInput<DT, Rank>& m, std::string name, const Offsets& o) {
+        declare_input<DT, Rank>(m, std::move(name), counts_of(o));
+    }
+    template <DType DT, int Rank>
+    void declare_output(RaggedOutput<DT, Rank>& m, std::string name) {
+        add_ragged_output<DT, Rank>(m, std::move(name), ragged_records(std::nullopt, false), std::nullopt);
+    }
+    template <DType DT, int Rank, std::integral N>
+    void declare_output(RaggedOutput<DT, Rank>& m, std::string name, N n) {
+        add_ragged_output<DT, Rank>(m, std::move(name), ragged_records(leading_of(n), false), std::nullopt);
+    }
+    template <DType DT, int Rank>
+    void declare_output(RaggedOutput<DT, Rank>& m, std::string name, Counts c) {
+        const std::size_t n = c.v.size();
+        add_ragged_output<DT, Rank>(m, std::move(name), ragged_records(n, true), std::move(c.v));
+    }
+    template <DType DT, int Rank>
+    void declare_output(RaggedOutput<DT, Rank>& m, std::string name, const Offsets& o) {
+        declare_output<DT, Rank>(m, std::move(name), counts_of(o));
     }
 
-    /// Ragged ports take the array form too: cs::unspecified_shape<R>() (every dimension supplied from outside).
-    template <DType DT, int Rank, DimSpec S>
-    void declare_input(RaggedInput<DT, Rank>& m, std::string name, const std::array<S, static_cast<std::size_t>(Rank)>& specs) {
-        add_ragged_input<DT, Rank>(m, std::move(name), records_of<Rank>(specs));
-    }
-    template <DType DT, int Rank, DimSpec S>
-    void declare_output(RaggedOutput<DT, Rank>& m, std::string name, const std::array<S, static_cast<std::size_t>(Rank)>& specs) {
-        add_ragged_output<DT, Rank>(m, std::move(name), records_of<Rank>(specs));
-    }
+    // ---- shapes in pre_forward (legal inside pre_forward() only) -------------
+    // Inputs are never reshaped: an input's shape comes from its definition, its initializer, its connection's source, or
+    // a hook. An OUTPUT is reshaped only here, by its producing component, within its definition. An output that is a
+    // member of a tie_outputs cannot be reshaped by a member: its tie's System sets it with a shape hook.
 
-    /// Ragged ports: RaggedInput / RaggedOutput members, Rank 2..3, with the same DimSpec
-    /// arguments (scalar and per-index mixed: PerIndex, FromInputValues on dims >= 1).
-    template <DType DT, int Rank, DimSpec... Specs>
-        requires(sizeof...(Specs) == Rank)
-    void declare_input(RaggedInput<DT, Rank>& m, std::string name, Specs... specs) {
-        add_ragged_input<DT, Rank>(m, std::move(name), std::array<detail::DimRecord, Rank>{detail::make_dim_record(specs)...});
-    }
-    template <DType DT, int Rank, DimSpec... Specs>
-        requires(sizeof...(Specs) == Rank)
-    void declare_output(RaggedOutput<DT, Rank>& m, std::string name, Specs... specs) {
-        add_ragged_output<DT, Rank>(m, std::move(name), std::array<detail::DimRecord, Rank>{detail::make_dim_record(specs)...});
-    }
-
-    /// The pre_forward-only resize of an OUTPUT (the same setter as the automatic shape): it gives the output's
-    /// variable this shape. An input's shape is its variable's: it cannot be reshaped here.
+    /// The shape of one of this component's own ports NOW (its variable's shape). An input's is known here; an output's
+    /// only after an earlier forward or when its definition fixes it.
     template <DType DT, int Rank>
-    void reshape(Output<DT, Rank>& m, sycl::range<Rank> shape) {
-        if (!in_pre_forward_)
-            throw std::logic_error("naga::cospan: reshape is legal inside pre_forward() only");
-        const auto it = by_member_.find(&m);
-        if (it == by_member_.end())
-            throw std::invalid_argument("naga::cospan: " + describe() + ": reshape of a member that was never declared");
-        if (rt_ == nullptr) throw std::logic_error("naga::cospan: " + describe() + ": reshape outside a forward");
+    sycl::range<Rank> shape_of(const Input<DT, Rank>& m) const {
+        return dense_shape_of<Rank>(&m);
+    }
+    template <DType DT, int Rank>
+    sycl::range<Rank> shape_of(const Output<DT, Rank>& m) const {
+        return dense_shape_of<Rank>(&m);
+    }
+    template <DType DT, int Rank>
+    RaggedShape shape_of(const RaggedInput<DT, Rank>& m) const {
+        return ragged_shape_of(&m);
+    }
+    template <DType DT, int Rank>
+    RaggedShape shape_of(const RaggedOutput<DT, Rank>& m) const {
+        return ragged_shape_of(&m);
+    }
+
+    /// Gives an output's variable this shape (checked against its definition: a fixed dimension must equal).
+    template <DType DT, int Rank>
+    void set_shape(Output<DT, Rank>& m, sycl::range<Rank> shape) {
+        detail::Instance& inst = settable_output(&m, "set_shape");
         detail::ResolvedShape s;
         s.known = true;
         for (int d = 0; d < Rank; ++d) s.extents[static_cast<std::size_t>(d)] = shape[d];
-        detail::VarMeta* meta = it->second->meta.get();
-        meta->set_shape(*rt_, s);
-        reshaped_.push_back(meta);
+        inst.meta->set_shape(*rt_, s, detail::SetterId{detail::SetterId::Kind::producer, 0, inst.full_path()});
+    }
+    /// A ragged output's shape from a RaggedShape (read from an input's shape_of, or built).
+    template <DType DT, int Rank>
+    void set_shape(RaggedOutput<DT, Rank>& m, const RaggedShape& shape) {
+        static_assert(Rank == 2, "cospan: a ragged port is rank 2");
+        detail::Instance& inst = settable_output(&m, "set_shape");
+        inst.meta->set_shape(*rt_, shape.to_resolved(), detail::SetterId{detail::SetterId::Kind::producer, 0, inst.full_path()});
+    }
+    /// A ragged output's shape from N and its host counts (counts.size() == n).
+    template <DType DT, int Rank>
+    void set_shape(RaggedOutput<DT, Rank>& m, std::size_t n, std::vector<std::size_t> counts) {
+        RaggedShape rs;
+        rs.n      = n;
+        rs.counts = std::move(counts);
+        set_shape(m, rs);
     }
 
     // ---- initial values (legal inside setup() only) -----------------------
@@ -229,88 +317,23 @@ public:
     // ---- the forward (section 3) ---------------------------------------------
     void run_precompute(detail::Runtime& rt) override {
         PtrScope rt_scope{rt_, &rt};
-        reshaped_.clear();
 
-        // The tie alias rules of the variables this component touches, once each (a no-op without a rule, and once per
-        // forward per variable): a tied variable's shape is reactive.
-        {
-            std::vector<detail::VarMeta*> refreshed;
-            for (const auto& inst : order_) {
-                detail::VarMeta* m = inst->meta.get();
-                if (std::find(refreshed.begin(), refreshed.end(), m) != refreshed.end()) continue;
-                refreshed.push_back(m);
-                m->refresh_alias_shape(rt);
-            }
-        }
-
-        // (1) What each input's own dimensions say, as numbers: constraints, checked in (6).
-        std::vector<std::pair<detail::Instance*, Expected>> expects;
-        for (const auto& inst : order_)
-            if (inst->kind == IOKind::input) expects.emplace_back(inst.get(), expected_of(*inst, rt));
-
-        // (2) Every distinct input variable is materialized (a free input takes its initializer here).
+        // (1) Every distinct input variable is materialized (a free input takes its initializer, and its initializer's
+        // shape, here). Shape hooks of the enclosing System have already run (docs/design-review-2026-10-03.md, section 10).
         for (detail::VarMeta* m : metas_of(IOKind::input)) m->materialize(rt);
 
-        // (3) Each output's shape, from its dimensions, unless it belongs to a tie (that System resolves it).
-        for (const auto& inst : order_) {
-            if (inst->kind != IOKind::output) continue;
-            Expected ex = expected_of(*inst, rt);
-            if (!inst->meta->alias_shape) {
-                detail::ResolvedShape s;
-                s.known = true;
-                for (int d = 0; d < inst->meta->rank; ++d) {
-                    const auto u = static_cast<std::size_t>(d);
-                    if (!ex.has[u])
-                        throw std::invalid_argument("naga::cospan: output '" + inst->full_path() +
-                                                    "' has an unspecified dimension but is not a member of a tie_outputs: "
-                                                    "nothing supplies its shape (declare the dimension, or tie it)");
-                    s.extents[u] = ex.extent[u];
-                    if (d >= 1 && ex.per[u]) {
-                        s.per[u]       = true;
-                        s.per_index[u]   = ex.per_index[u];
-                        s.dev_per[u]     = ex.dev_per[u];
-                        s.dev_version[u] = ex.dev_version[u];
-                    }
-                }
-                // per-index dimensions have no scalar extent; the total (a device column's times the scalar dimensions,
-                // else the host sum); two per-index dimensions are brought to the host
-                detail::finish_ragged_total(s, rt, inst->full_path());
-                check_dense(*inst, s);
-                inst->meta->set_shape(rt, s);
-            }
-            expects.emplace_back(inst.get(), std::move(ex));
-        }
-
-        // (4) Manual shape control.
+        // (2) The user's pre_forward(): where an output is reshaped (set_shape) within its definition.
         {
             detail::FlagScope scope{in_pre_forward_};
             pre_forward();
         }
 
-        // (5) Every distinct output variable is materialized.
+        // (3) Every distinct output variable is materialized: an unknown dimension is the not-known error, naming who
+        // should have set it.
         for (detail::VarMeta* m : metas_of(IOKind::output)) m->materialize(rt);
 
-        // (6) Reactive checks: what each dimension declared against what its variable has. An output that was reshaped
-        // in pre_forward is the user's decision and is not checked against its declaration.
-        for (const auto& [inst, ex] : expects) {
-            if (std::find(reshaped_.begin(), reshaped_.end(), inst->meta.get()) != reshaped_.end()) continue;
-            check_expected(*inst, ex, rt);
-        }
+        // (4) The member wrappers (a dense port on a ragged variable is an error).
         for (const auto& inst : order_) check_dense(*inst, inst->meta->shape);
-
-        // (6b) The tie rules kept as constraints of the variables this component touches (a tie that was connected to a
-        // source does not override it: its rule must agree with the shape the variable has, section 9), once each.
-        {
-            std::vector<detail::VarMeta*> checked;
-            for (const auto& inst : order_) {
-                detail::VarMeta* m = inst->meta.get();
-                if (std::find(checked.begin(), checked.end(), m) != checked.end()) continue;
-                checked.push_back(m);
-                m->check_shape_constraints(rt);
-            }
-        }
-
-        // (7) The member wrappers.
         for (const auto& inst : order_) inst->point_wrapper();
     }
 
@@ -334,7 +357,7 @@ public:
             detail::VarMeta* m = inst->meta.get();
             if (std::find(seen.begin(), seen.end(), m) != seen.end()) continue;
             seen.push_back(m);
-            if (m->alias_shape || !inst->data) continue;
+            if (m->is_tied_output() || !inst->data) continue;
             const std::shared_ptr<detail::DeviceDataBase> own = inst->data;
             for (const auto& entry : m->data) {
                 const std::shared_ptr<detail::DeviceDataBase> dst = entry.second.lock();
@@ -346,11 +369,6 @@ public:
                 own->register_event(e);  // a later writer of this copy waits for the read
             }
         }
-        // The shape work (section 6): the producer does it right after its own launch, once per variable, as ordinary
-        // queued work ordered by events: one small copy of the driving elements to the host, which a consumer's
-        // precompute waits on. A tied output's is done by the tie's System, as the pushes are.
-        for (detail::VarMeta* m : metas_of(IOKind::output))
-            if (!m->alias_shape && m->shape_driving_) m->do_shape_work(rt);
         post_forward();
     }
 
@@ -425,16 +443,6 @@ protected:
 private:
     friend struct detail::ComponentAccess;
 
-    /// The expected extents of one instance's own dimensions, as numbers.
-    struct Expected {
-        std::array<bool, 3>                     has{false, false, false};
-        std::array<std::size_t, 3>              extent{1, 1, 1};
-        std::array<bool, 3>                     per{false, false, false};
-        std::array<std::vector<std::size_t>, 3> per_index{};
-        std::array<std::shared_ptr<const detail::DeviceColumn>, 3> dev_per{};  ///< a per-index dimension sourced from a device column
-        std::array<std::uint64_t, 3>            dev_version{};
-    };
-
     /// Sets a pointer for a scope, clears it on every exit.
     struct PtrScope {
         PtrScope(detail::Runtime*& p, detail::Runtime* v) : p_{p} { p_ = v; }
@@ -453,34 +461,91 @@ private:
         return out;
     }
 
+    /// A ragged port's two records: the leading dimension (`lead`, else unspecified) and the per-index dimension (fixed when
+    /// its counts are declared, else unspecified).
+    static std::array<detail::DimRecord, 2> ragged_records(const std::optional<std::size_t>& lead, bool counts_declared) {
+        std::array<detail::DimRecord, 2> out{};
+        out[0].how    = lead ? detail::DimRecord::How::fixed : detail::DimRecord::How::unspecified;
+        out[0].extent = lead.value_or(0);
+        out[1].how    = counts_declared ? detail::DimRecord::How::fixed : detail::DimRecord::How::unspecified;
+        out[1].extent = 0;
+        return out;
+    }
+    template <std::integral N>
+    static std::size_t leading_of(N n) {
+        if constexpr (std::is_signed_v<N>) {
+            if (n < 0) throw std::invalid_argument("naga::cospan: a fixed extent is negative");
+        }
+        return static_cast<std::size_t>(n);
+    }
+    static Counts counts_of(const Offsets& o) {
+        Counts c;
+        c.v.resize(o.v.size() - 1);
+        for (std::size_t i = 0; i + 1 < o.v.size(); ++i) c.v[i] = o.v[i + 1] - o.v[i];
+        return c;
+    }
+
     template <DType DT, int Rank>
     void add_input(Input<DT, Rank>& m, std::string name,
                    const std::array<detail::DimRecord, Rank>& dims) {
-        reject_per_index(name, dims);
         register_instance(detail::make_input<DT, Rank>(std::move(name), this, dims, &m), &m, "declare_input", false);
     }
     template <DType DT, int Rank>
     void add_output(Output<DT, Rank>& m, std::string name,
                     const std::array<detail::DimRecord, Rank>& dims) {
-        reject_per_index(name, dims);
         register_instance(detail::make_output<DT, Rank>(std::move(name), this, dims, &m), &m, "declare_output", false);
     }
     template <DType DT, int Rank>
-    void add_ragged_input(RaggedInput<DT, Rank>& m, std::string name, const std::array<detail::DimRecord, Rank>& dims) {
-        register_instance(detail::make_ragged_input<DT, Rank>(std::move(name), this, dims, &m), &m, "declare_input", true);
+    void add_ragged_input(RaggedInput<DT, Rank>& m, std::string name, const std::array<detail::DimRecord, Rank>& dims,
+                          std::optional<std::vector<std::size_t>> counts) {
+        static_assert(Rank == 2, "cospan: a ragged port is rank 2");
+        register_instance(detail::make_ragged_input<DT, Rank>(std::move(name), this, dims, &m, std::move(counts)), &m,
+                          "declare_input", true);
     }
     template <DType DT, int Rank>
-    void add_ragged_output(RaggedOutput<DT, Rank>& m, std::string name, const std::array<detail::DimRecord, Rank>& dims) {
-        register_instance(detail::make_ragged_output<DT, Rank>(std::move(name), this, dims, &m), &m, "declare_output", true);
+    void add_ragged_output(RaggedOutput<DT, Rank>& m, std::string name, const std::array<detail::DimRecord, Rank>& dims,
+                           std::optional<std::vector<std::size_t>> counts) {
+        static_assert(Rank == 2, "cospan: a ragged port is rank 2");
+        register_instance(detail::make_ragged_output<DT, Rank>(std::move(name), this, dims, &m, std::move(counts)), &m,
+                          "declare_output", true);
     }
 
-    /// a DENSE wrapper cannot hold per-index dims (PerIndex, FromInputValues).
-    template <std::size_t N>
-    void reject_per_index(const std::string& name, const std::array<detail::DimRecord, N>& dims) const {
-        for (const detail::DimRecord& r : dims)
-            if (r.how == detail::DimRecord::How::per_index_host || r.how == detail::DimRecord::How::per_index_from_input)
-                throw std::invalid_argument("naga::cospan: " + describe() + ": '" + name +
-                                            "': per-index dims need RaggedInput/RaggedOutput");
+    // ---- shapes in pre_forward ---------------------------------------------
+    /// The declared instance of a member, inside pre_forward only.
+    detail::Instance& member_instance(const void* member, const char* what) const {
+        if (!in_pre_forward_)
+            throw std::logic_error(std::string{"naga::cospan: "} + what + " is legal inside pre_forward() only (" + describe() + ")");
+        const auto it = by_member_.find(member);
+        if (it == by_member_.end())
+            throw std::invalid_argument("naga::cospan: " + describe() + ": " + what + " of a member that was never declared");
+        if (rt_ == nullptr) throw std::logic_error("naga::cospan: " + describe() + ": " + what + " outside a forward");
+        return *it->second;
+    }
+
+    /// The output instance a set_shape is for: not a member of a tie_outputs (its tie's System owns the shape).
+    detail::Instance& settable_output(const void* member, const char* what) {
+        detail::Instance& inst = member_instance(member, what);
+        for (const auto& i : inst.meta->live_instances())
+            if (detail::is_tie_output(*i))
+                throw std::invalid_argument("naga::cospan: '" + inst.full_path() +
+                                            "' is tied; its shape is set by its tie's System (a shape hook), not by a member");
+        return inst;
+    }
+
+    template <int Rank>
+    sycl::range<Rank> dense_shape_of(const void* member) const {
+        const detail::Instance&      inst = member_instance(member, "shape_of");
+        const detail::ResolvedShape& s    = inst.meta->shape;
+        if (!s.known) throw inst.meta->shape_unknown();
+        if (s.ragged())
+            throw std::invalid_argument("naga::cospan: '" + inst.full_path() + "' is ragged; read it with a ragged port");
+        return detail::make_range<Rank>(s.extents);
+    }
+    RaggedShape ragged_shape_of(const void* member) const {
+        const detail::Instance&      inst = member_instance(member, "shape_of");
+        const detail::ResolvedShape& s    = inst.meta->shape;
+        if (!s.known) throw inst.meta->shape_unknown();
+        return RaggedShape::from(s);
     }
 
     /// The component owns its instances (section 1); their device is the default until set_device says otherwise.
@@ -530,136 +595,6 @@ private:
         return out;
     }
 
-    // ---- shape derivation ----------------------------------------------------
-    detail::Instance& sibling_input(const detail::Instance& of, const std::string& name) const {
-        const auto it = by_name_.find(name);
-        if (it == by_name_.end() || it->second->kind != IOKind::input)
-            throw std::invalid_argument("naga::cospan: " + describe() + ": '" + of.name + "' derives its shape from '" + name +
-                                        "', which is not an input of this component");
-        return *it->second;
-    }
-
-    /// A sibling's shape for dimension `d` of `of`. A free input that is not materialized yet is materialized first
-    /// (that is where its initializer's shape is applied); anything else whose shape is unknown is an error.
-    const detail::ResolvedShape& source_shape(const detail::Instance& of, const detail::Instance& src, int d,
-                                              detail::Runtime& rt) const {
-        detail::VarMeta& m = *src.meta;
-        if (!m.shape.known && !detail::first_of_kind(m, IOKind::output)) m.materialize(rt);
-        if (!m.shape.known)
-            throw std::logic_error("naga::cospan: '" + of.full_path() + "': dimension " + std::to_string(d) + " comes from '" +
-                                   src.full_path() + "', whose shape is not known yet");
-        return m.shape;
-    }
-
-    /// The numbers one instance's own dimensions stand for NOW. Derivation sources are inputs only.
-    Expected expected_of(const detail::Instance& inst, detail::Runtime& rt) const {
-        Expected ex;
-        for (int d = 0; d < inst.meta->rank; ++d) {
-            const auto               u = static_cast<std::size_t>(d);
-            const detail::DimRecord& r = inst.dims[u];
-            switch (r.how) {
-                case detail::DimRecord::How::fixed:
-                    ex.has[u]    = true;
-                    ex.extent[u] = r.extent;
-                    break;
-                case detail::DimRecord::How::unspecified: break;
-                case detail::DimRecord::How::from_input_dim: {
-                    const detail::Instance& src = sibling_input(inst, r.input);
-                    if (r.dim >= src.meta->rank)
-                        throw std::out_of_range("naga::cospan: '" + inst.name + "' derives from a dimension past the rank of '" +
-                                                r.input + "'");
-                    const detail::ResolvedShape& sh = source_shape(inst, src, d, rt);
-                    ex.has[u]    = true;
-                    ex.extent[u] = sh.extents[r.dim];
-                    // a per-index source dimension passes its array on (dimension 0 is never per-index)
-                    if (d >= 1 && sh.per[r.dim]) {
-                        ex.per[u]         = true;
-                        ex.per_index[u]   = sh.per_index[r.dim];
-                        ex.dev_per[u]     = sh.dev_per[r.dim];
-                        ex.dev_version[u] = sh.dev_version[r.dim];
-                        ex.extent[u]      = 0;
-                    }
-                    break;
-                }
-                case detail::DimRecord::How::from_input: {
-                    const detail::Instance& src = sibling_input(inst, r.input);
-                    ex.has[u]    = true;
-                    ex.extent[u] = src.meta->driving_value(rt, r.value_index);
-                    break;
-                }
-                case detail::DimRecord::How::per_index_from_input: {
-                    const detail::Instance& src = sibling_input(inst, r.input);
-                    // the per-index extents are computed ON THE DEVICE (section 6): the expectation is a column, not an array
-                    const detail::VarMeta::PerIndexSource col = src.meta->driving_values(rt, r.value_index);
-                    ex.has[u]         = true;
-                    ex.per[u]         = true;
-                    ex.dev_per[u]     = col.col;
-                    ex.dev_version[u] = col.version;
-                    ex.extent[u]      = 0;
-                    break;
-                }
-                case detail::DimRecord::How::per_index_host:
-                    ex.has[u]       = true;
-                    ex.per[u]       = true;
-                    ex.per_index[u] = r.per_index;
-                    ex.extent[u]    = 0;
-                    break;
-            }
-        }
-        return ex;
-    }
-
-    static std::string rule_text(const detail::DimRecord& r) {
-        switch (r.how) {
-            case detail::DimRecord::How::fixed: return "fixed";
-            case detail::DimRecord::How::unspecified: return "unspecified";
-            case detail::DimRecord::How::from_input_dim: return "FromInputDim{'" + r.input + "', " + std::to_string(r.dim) + "}";
-            case detail::DimRecord::How::from_input: return "FromInput{'" + r.input + "', " + std::to_string(r.value_index) + "}";
-            case detail::DimRecord::How::per_index_host: return "PerIndex";
-            case detail::DimRecord::How::per_index_from_input:
-                return "FromInputValues{'" + r.input + "', " + std::to_string(r.value_index) + "}";
-        }
-        return "?";
-    }
-
-    /// Every dimension an instance declared (or derived) against what its variable has.
-    void check_expected(const detail::Instance& inst, const Expected& ex, detail::Runtime& rt) const {
-        const detail::ResolvedShape& s = inst.meta->shape;
-        for (int d = 0; d < inst.meta->rank; ++d) {
-            const auto u = static_cast<std::size_t>(d);
-            if (!ex.has[u]) continue;
-            const bool        ep   = d >= 1 && ex.per[u];
-            const bool        vp   = d >= 1 && s.per[u];
-            const std::string head = "naga::cospan: shape mismatch: dimension " + std::to_string(d) + " of '" + inst.full_path() +
-                                     "' is " + rule_text(inst.dims[u]) + " = ";
-            if (ep != vp)
-                throw std::invalid_argument(head + (ep ? "per-index" : std::to_string(ex.extent[u])) + " but the variable's dimension " +
-                                            std::to_string(d) + " is " + (vp ? "per-index" : std::to_string(s.extents[u])));
-            if (ep) {
-                // The same device column (and version) on both sides is the same extents: nothing to read. Host arrays compare
-                // element-wise. Anything else (a column against an array, or two different columns) is brought to the host
-                // first, on this path only.
-                const bool same_column = ex.dev_per[u] && s.dev_per[u] && ex.dev_per[u] == s.dev_per[u] && ex.dev_version[u] == s.dev_version[u];
-                if (!same_column) {
-                    std::vector<std::size_t> want = ex.per_index[u], have = s.per_index[u];
-                    if (ex.dev_per[u] || s.dev_per[u]) {
-                        detail::ResolvedShape w;
-                        w.dev_per[u]   = ex.dev_per[u];
-                        w.per_index[u] = ex.per_index[u];
-                        want           = w.per_index_on_host(u, rt);
-                        have           = s.per_index_on_host(u, rt);
-                    }
-                    if (want != have)
-                        throw std::invalid_argument(head + detail::extents_str(want) + " but the variable's dimension " + std::to_string(d) +
-                                                    " is " + detail::extents_str(have));
-                }
-            } else if (ex.extent[u] != s.extents[u]) {
-                throw std::invalid_argument(head + std::to_string(ex.extent[u]) + " but the variable's dimension " + std::to_string(d) +
-                                            " is " + std::to_string(s.extents[u]));
-            }
-        }
-    }
-
     /// A dense port cannot see per-index extents: a variable with a per-index dimension needs RaggedInput/RaggedOutput.
     void check_dense(const detail::Instance& inst, const detail::ResolvedShape& s) const {
         if (s.known && s.ragged() && !ragged_ports_.contains(&inst))
@@ -671,7 +606,6 @@ private:
     std::unordered_map<const void*, detail::Instance*>                 by_member_;
     std::vector<std::shared_ptr<detail::Instance>>                     order_;  // declaration order
     std::unordered_set<const detail::Instance*>                        ragged_ports_;
-    std::vector<detail::VarMeta*>                                      reshaped_;  ///< reshaped in this forward's pre_forward
 
     bool                declaring_      = false;
     bool                in_pre_forward_ = false;

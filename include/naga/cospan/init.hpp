@@ -24,7 +24,7 @@
 //   cs::init::custom_host<DT,R>(fn)  fn(HostInit<DT,R>&): host-side; the buffer is copied to the device after it returns
 //
 // A shape (cs::init::Shape) is written as a list of extents, {n, m}, or as a ragged one:
-//   cs::init::ragged(n, d1[, d2])  each di is one extent for every index or a vector of n extents, one per index
+//   cs::init::ragged(n, d1)        d1 is one extent for every index or a vector of n counts, one per index (rank 2 only)
 // An initializer that carries a shape supplies a free input's unspecified dimensions, and EVERY dimension of it is
 // checked against the resolved variable when it is applied: a mismatch throws, naming both sides.
 
@@ -149,52 +149,27 @@ private:
     InitShape s_;
 };
 
-namespace impl {
-/// One dimension (>= 1) given to ragged(): one extent for every index, or one per index.
-struct RaggedDim {
-    bool                     per = false;
-    std::size_t              scalar = 0;
-    std::vector<std::size_t> values;
-    static RaggedDim one(std::size_t c) { return {false, c, {}}; }
-    static RaggedDim each(const std::vector<std::size_t>& v) { return {true, 0, v}; }
-};
-inline Shape ragged_shape(std::size_t n, const std::vector<RaggedDim>& dims) {
+/// A RAGGED shape is rank 2 (section 10): a dense leading dimension n and one per-index dimension.
+/// ragged(n, d1): n indices of d1 extents each (a rectangle); ragged(n, counts): one count per index, counts.size() == n
+/// (a vector of the wrong length throws here; n = 0 is legal). There is no rank-3 ragged shape.
+inline Shape ragged(std::size_t n, std::size_t d1) {
     InitShape s;
-    s.rank       = 1 + static_cast<int>(dims.size());
+    s.rank       = 2;
     s.extents[0] = n;
-    for (std::size_t i = 0; i < dims.size(); ++i) {
-        const std::size_t d = i + 1;
-        if (dims[i].per) {
-            if (dims[i].values.size() != n)
-                throw std::invalid_argument("naga::cospan: init::ragged: dimension " + std::to_string(d) + " has " +
-                                            std::to_string(dims[i].values.size()) + " extents but dimension 0 has " +
-                                            std::to_string(n) + " indices");
-            s.per[d]       = true;
-            s.per_index[d] = dims[i].values;
-            s.extents[d]   = 0;
-        } else {
-            s.extents[d] = dims[i].scalar;
-        }
-    }
+    s.extents[1] = d1;
     return Shape::of(std::move(s));
 }
-}  // namespace impl
-
-/// A ragged shape [n, d1] or [n, d1, d2]: dimension 0 is n; each di is one extent (a std::size_t) or a vector of n extents,
-/// one per index. A vector of the wrong length throws here; n = 0 is legal.
-inline Shape ragged(std::size_t n, std::size_t d1) { return impl::ragged_shape(n, {impl::RaggedDim::one(d1)}); }
-inline Shape ragged(std::size_t n, const std::vector<std::size_t>& d1) { return impl::ragged_shape(n, {impl::RaggedDim::each(d1)}); }
-inline Shape ragged(std::size_t n, std::size_t d1, std::size_t d2) {
-    return impl::ragged_shape(n, {impl::RaggedDim::one(d1), impl::RaggedDim::one(d2)});
-}
-inline Shape ragged(std::size_t n, std::size_t d1, const std::vector<std::size_t>& d2) {
-    return impl::ragged_shape(n, {impl::RaggedDim::one(d1), impl::RaggedDim::each(d2)});
-}
-inline Shape ragged(std::size_t n, const std::vector<std::size_t>& d1, std::size_t d2) {
-    return impl::ragged_shape(n, {impl::RaggedDim::each(d1), impl::RaggedDim::one(d2)});
-}
-inline Shape ragged(std::size_t n, const std::vector<std::size_t>& d1, const std::vector<std::size_t>& d2) {
-    return impl::ragged_shape(n, {impl::RaggedDim::each(d1), impl::RaggedDim::each(d2)});
+inline Shape ragged(std::size_t n, const std::vector<std::size_t>& counts) {
+    if (counts.size() != n)
+        throw std::invalid_argument("naga::cospan: init::ragged: the counts have " + std::to_string(counts.size()) +
+                                    " entries but dimension 0 has " + std::to_string(n) + " indices");
+    InitShape s;
+    s.rank       = 2;
+    s.extents[0] = n;
+    s.extents[1] = 0;
+    s.per        = true;
+    s.per_index  = counts;
+    return Shape::of(std::move(s));
 }
 
 /// Every element = value (converted to the variable's element type). The one-argument form carries no shape: it is

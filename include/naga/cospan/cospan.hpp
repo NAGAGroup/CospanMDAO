@@ -16,6 +16,7 @@
 #include "naga/cospan/subsystem.hpp"
 #include "naga/cospan/kernel.hpp"
 #include "naga/cospan/component.hpp"
+#include "naga/cospan/shape_hook.hpp"
 #include "naga/cospan/system.hpp"
 #include "naga/cospan/fused_component.hpp"
 #include "naga/cospan/model.hpp"
