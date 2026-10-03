@@ -7,9 +7,17 @@
 // A System never does work: it orders the work its children do. It has no I/O of its own beyond ALIAS instances:
 // promotions and tie aliases, which it owns by shared_ptr (docs/design-review-2026-10-03.md, section 1).
 //
-// THIS HEADER IS STRUCTURE ONLY. Phase 6 adds the forward: the precompute / compute / postcompute overrides, rearm,
-// depends_on and the event getter (section 3). They are not declared here, so System is still abstract (it does not
-// yet implement Subsystem's forward contract) until then.
+// THE FORWARD (docs/design-review-2026-10-03.md, section 3). A System's forward is three framework-owned steps:
+//   precompute   rebuilds transient children (this allocates nothing), then the user's pre_forward(), where rearm()
+//                may re-run children by name;
+//   compute      calls each live child's forward in declaration order, and nothing else: no materializing and no
+//                submitting. A child whose run policy has ended is deleted right away, waiting on THAT child's events
+//                only, so its memory is free before later children allocate while independent work keeps running.
+//                (Users: add subsystems that can go out of scope as late as possible in setup(), since deleting one
+//                makes its parent wait on that subsystem's events before continuing.) depends_on hands one child's
+//                events to another for one forward;
+//   postcompute  the pushes of the tie_outputs aliases this System owns to the variable's other placements, then the
+//                user's post_forward().
 //
 // Everything structural (add_subsystem, connect, promote, tie_*, init_input, marks) is legal inside setup() only,
 // and every rule is checked in its own call (section 2): the wiring rules live in wiring.hpp, which these verbs
@@ -150,6 +158,10 @@ public:
     // ---- HOOK ------------------------------------------------------------------
     /// Structure and wiring (legal here only). There is no init hook: initial values are declared with init_input.
     virtual void setup() {}
+    /// Runs at the end of precompute: where rearm() may re-run children on a trigger only the author knows.
+    virtual void pre_forward() {}
+    /// Runs at the end of postcompute.
+    virtual void post_forward() {}
 
     // ---- adding children (legal inside setup() only) ---------------------------
     /// The child is built, named, placed, and its run_setup has run BEFORE this returns; then the device (if any)
@@ -252,6 +264,23 @@ public:
                    sys.replay_init(k, t, init, depth, by);
                },
                inst->meta);
+    }
+
+    // ---- ordering (legal inside setup() only) -------------------------------------
+    /// Child `b` depends on child `a`: for one forward at a time, B's submissions wait on A's events (A's forward runs
+    /// first; its events are collected and handed to B). If B is a System, every component inside it adds them to its
+    /// submissions. `a` must have been added before `b`. A duplicate edge is ignored.
+    void depends_on(std::string_view b, std::string_view a) {
+        require_declaring("depends_on");
+        const auto ib = child_index_.find(std::string{b});
+        const auto ia = child_index_.find(std::string{a});
+        if (ib == child_index_.end()) fail("depends_on", "'" + std::string{b} + "' is not a subsystem of " + describe());
+        if (ia == child_index_.end()) fail("depends_on", "'" + std::string{a} + "' is not a subsystem of " + describe());
+        if (ia->second >= ib->second)
+            fail("depends_on", "'" + std::string{b} + "' can depend only on a subsystem added before it ('" + std::string{a} + "' was not)");
+        for (const DepEdge& e : dep_edges_)
+            if (e.from == ia->second && e.to == ib->second) return;
+        dep_edges_.push_back(DepEdge{ia->second, ib->second});
     }
 
     // ---- optimization marks: the last of a kind on a variable wins ---------------
@@ -388,6 +417,78 @@ public:
         for (const auto& a : alias_order_) out.push_back(a);
     }
 
+    // ---- the forward (section 3) ---------------------------------------------------
+    /// depends_on: these events are handed on to every child's submissions for ONE forward.
+    void add_dependencies(std::span<const sycl::event> deps) override {
+        pending_deps_.insert(pending_deps_.end(), deps.begin(), deps.end());
+    }
+
+    /// The events of this forward: the children's, plus this System's own push events.
+    std::vector<sycl::event> events() const override { return forward_events_; }
+
+    /// Rebuilds the transient children that are gone (the build allocates nothing), then the user's pre_forward().
+    void run_precompute(detail::Runtime& rt) override {
+        (void)rt;
+        for (std::size_t i = 0; i < slots_.size(); ++i)
+            if (slots_[i].requested == -2 && child_ptrs_[i] == nullptr) build_child(i, /*rebuild=*/true);
+        DeclScope scope{in_pre_forward_};
+        pre_forward();
+    }
+
+    /// Calls each live child's forward in declaration order, and nothing else. A child that has run its last turn
+    /// (run_n reached 0, or a transient's one forward) is deleted right away: this waits on ITS events only, not the
+    /// queue, so memory is freed before later children allocate while independent work already submitted keeps
+    /// running. Add subsystems that can go out of scope as late as possible in setup().
+    void run_compute(detail::Runtime& rt) override {
+        forward_events_.clear();
+        std::vector<std::vector<sycl::event>> dep_in(slots_.size());
+        for (std::size_t i = 0; i < slots_.size(); ++i) {
+            Subsystem* child = child_ptrs_[i];
+            if (child == nullptr || slots_[i].counter == 0) continue;
+            std::vector<sycl::event> deps = dep_in[i];
+            deps.insert(deps.end(), pending_deps_.begin(), pending_deps_.end());
+            if (!deps.empty()) child->add_dependencies(deps);
+            child->run_precompute(rt);
+            child->run_compute(rt);
+            child->run_postcompute(rt);
+            const std::vector<sycl::event> ev = child->events();
+            forward_events_.insert(forward_events_.end(), ev.begin(), ev.end());
+            for (const DepEdge& e : dep_edges_)
+                if (e.from == i) dep_in[e.to].insert(dep_in[e.to].end(), ev.begin(), ev.end());
+            SlotInfo& si = slots_[i];
+            si.ran       = true;
+            if (si.requested > 0) {
+                if (--si.counter == 0) delete_child(i);
+            } else if (si.requested == -2) {
+                delete_child(i);
+            }
+        }
+        pending_deps_.clear();
+    }
+
+    /// The System that owns a tie alias pushes the tied outputs to the variable's other placements after ALL members
+    /// have submitted, depending on all their writes (section 3). Then the user's post_forward().
+    void run_postcompute(detail::Runtime& rt) override {
+        (void)rt;
+        for (const auto& alias : alias_order_) {
+            if (alias->role != detail::Role::tie || alias->kind != IOKind::output) continue;
+            const std::shared_ptr<detail::DeviceDataBase> src = alias->data;
+            if (!src) continue;  // nothing was written this forward, or the variable is not materialized
+            const std::shared_ptr<detail::VarMeta> m = alias->meta;
+            for (const auto& entry : m->data) {
+                const std::shared_ptr<detail::DeviceDataBase> dst = entry.second.lock();
+                if (!dst || dst == src || entry.first == src->key) continue;
+                std::vector<sycl::event> deps = m->events.read_deps();  // every member's write of this forward
+                const std::vector<sycl::event> own = src->events();
+                deps.insert(deps.end(), own.begin(), own.end());
+                const sycl::event e = dst->copy_from(*src, deps);
+                src->register_event(e);  // a later writer of the source waits for the read
+                forward_events_.push_back(e);
+            }
+        }
+        post_forward();
+    }
+
 protected:
     /// "the root System" or "System 'path'": the prefix of every System error.
     std::string describe() const {
@@ -422,6 +523,21 @@ protected:
         if (si.device) b.set_device(*si.device);
         if (forced_device_) b.set_device(*forced_device_);
         if (rebuild) replay_slot(i);
+    }
+
+    /// Re-runs a child by name: deletes it if it is live, builds it again (the factory, its setup, its device, and the
+    /// replay of the wiring that names it), and gives it its full run policy again. For triggers only the author
+    /// knows, e.g. re-running a do_once child from the previous run's results. Legal inside pre_forward() only.
+    void rearm(std::string_view name) {
+        if (!in_pre_forward_) throw std::logic_error("naga::cospan: rearm is legal inside pre_forward() only (" + describe() + ")");
+        const auto it = child_index_.find(std::string{name});
+        if (it == child_index_.end())
+            throw std::invalid_argument("naga::cospan: " + describe() + ": rearm('" + std::string{name} + "'): no such subsystem");
+        const std::size_t i = it->second;
+        if (child_ptrs_[i] != nullptr) delete_child(i);
+        build_child(i, /*rebuild=*/true);
+        slots_[i].counter = slots_[i].requested;
+        slots_[i].ran     = false;
     }
 
     /// Deletes slot i's child. It waits on THAT child's events only, never the queue (section 3); the child's
@@ -705,7 +821,15 @@ private:
     }
 
     // ---- state ---------------------------------------------------------------------------
-    bool declaring_ = false;
+    struct DepEdge {
+        std::size_t from, to;  ///< slot indices: `to` waits on `from`'s events
+    };
+
+    bool declaring_      = false;
+    bool in_pre_forward_ = false;
+    std::vector<DepEdge>     dep_edges_;
+    std::vector<sycl::event> pending_deps_;   ///< depends_on events for this System, for one forward
+    std::vector<sycl::event> forward_events_; ///< this forward's: the children's and the pushes
 
     std::unordered_map<std::string, std::shared_ptr<detail::Instance>> aliases_;  ///< this System owns its aliases (section 1)
     std::vector<std::shared_ptr<detail::Instance>>                     alias_order_;

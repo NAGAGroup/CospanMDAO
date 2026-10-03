@@ -14,8 +14,8 @@
 // Setup never allocates, never submits and never compiles. There is no default device (section 2): every instance
 // takes AdaptiveCpp's default when it is declared, and a device given to add_subsystem overrides a subtree.
 //
-// Coming later (section 8): the forward in phase 6; host views, update_input and the memory report's OS counters in
-// phase 8.
+// The forward is here (section 3). Coming later (section 8): host views, update_input and the memory report's OS
+// counters, in phase 8.
 //
 // STATE LIVES ON THE HEAP. The Model is one pointer to an Impl; moving a Model moves the pointer. Inside Impl the
 // members are declared so that destruction (the reverse of declaration) runs the root System first: its instances go,
@@ -118,6 +118,17 @@ public:
         root.run_setup();       // pass 1: declare, recursively
         collect_marks(root, s);  // pass 2: finalize
         s.ready = true;
+    }
+
+    /// ENQUEUES one forward and returns: precompute, compute and postcompute of the root, in that order. It does not
+    /// wait: forwards stream with no artificial synchronization, so call wait() or sync a host view when you need the
+    /// results (section 5).
+    void forward() {
+        Impl& s = ready("forward");
+        ++s.rt.forward;
+        s.root->run_precompute(s.rt);
+        s.root->run_compute(s.rt);
+        s.root->run_postcompute(s.rt);
     }
 
     /// queue.wait_and_throw() on both queues. OPTIONAL: for "everything I submitted is done" and to surface

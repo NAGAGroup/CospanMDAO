@@ -231,6 +231,18 @@ public:
         PtrScope rt_scope{rt_, &rt};
         reshaped_.clear();
 
+        // The tie alias rules of the variables this component touches, once each (a no-op without a rule, and once per
+        // forward per variable): a tied variable's shape is reactive.
+        {
+            std::vector<detail::VarMeta*> refreshed;
+            for (const auto& inst : order_) {
+                detail::VarMeta* m = inst->meta.get();
+                if (std::find(refreshed.begin(), refreshed.end(), m) != refreshed.end()) continue;
+                refreshed.push_back(m);
+                m->refresh_alias_shape(rt);
+            }
+        }
+
         // (1) What each input's own dimensions say, as numbers: constraints, checked in (6).
         std::vector<std::pair<detail::Instance*, Expected>> expects;
         for (const auto& inst : order_)

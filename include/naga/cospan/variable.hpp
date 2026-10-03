@@ -266,6 +266,7 @@ inline std::string         path_of(const Instance& i);
 inline const sycl::device& device_of(const Instance& i);
 
 class VarMeta;
+inline std::shared_ptr<VarMeta> meta_of(const Instance& i);  // the instance's variable
 inline void check_init_shape(const VarMeta& v, const ResolvedShape& r, const InitShape& s);
 
 class VarMeta : public std::enable_shared_from_this<VarMeta> {
@@ -295,6 +296,9 @@ public:
 
     /// See is_stale(): this flag alone says nothing for a variable that is not materialized.
     bool stale_ = true;
+
+    /// The forward in which refresh_alias_shape last ran (once per forward); ~0 = never.
+    std::uint64_t alias_forward_ = ~0ull;
 
     /// The instances that share this metadata (weak; used by merges and to answer where the variable lives).
     std::vector<std::weak_ptr<Instance>> instances;
@@ -463,6 +467,85 @@ public:
         throw std::logic_error("naga::cospan: driving_values: not implemented until Phase 8");
     }
 
+    /// "2x(per-index)x4": a shape as text, for messages.
+    static std::string alias_shape_str(const std::array<std::size_t, 3>& ext, const std::array<bool, 3>& per, int rank) {
+        std::string out;
+        for (int d = 0; d < rank; ++d) {
+            if (d > 0) out += "x";
+            out += per[static_cast<std::size_t>(d)] ? std::string{"(per-index)"} : std::to_string(ext[static_cast<std::size_t>(d)]);
+        }
+        return out;
+    }
+
+    /// A tie alias's shape, evaluated by its rule NOW and given to the variable (section 2 and section 6): a no-op for a
+    /// variable without an alias rule, and once per forward. The rules read other variables, so the shape is reactive:
+    /// it can change between forwards. `unspecified` is not evaluated here: the connection or the initializer supplies
+    /// it (resolve_free_shape). A source that does not exist any more, or whose shape is not known, is an error.
+    void refresh_alias_shape(Runtime& rt) {
+        if (!alias_shape || alias_forward_ == rt.forward) return;
+        const AliasShape& rule = *alias_shape;
+        if (rule.kind == AliasShape::Kind::unspecified) return;
+        ResolvedShape s;
+        s.known = true;
+        switch (rule.kind) {
+            case AliasShape::Kind::fixed:
+                for (int d = 0; d < rank; ++d) s.extents[static_cast<std::size_t>(d)] = rule.extents[static_cast<std::size_t>(d)];
+                break;
+            case AliasShape::Kind::unspecified: return;
+            case AliasShape::Kind::from_output_shape:
+            case AliasShape::Kind::from_input_shape: {
+                const std::shared_ptr<VarMeta> up = alias_source(rt, rule.src, /*need_shape=*/true);
+                for (int d = 0; d < rank; ++d) copy_alias_dim(s, static_cast<std::size_t>(d), up->shape, static_cast<std::size_t>(d), rule.src);
+                break;
+            }
+            case AliasShape::Kind::from_output_values: {
+                const std::shared_ptr<VarMeta> up = alias_source(rt, rule.src, /*need_shape=*/false);
+                for (int d = 0; d < rank; ++d)
+                    s.extents[static_cast<std::size_t>(d)] = up->driving_value(rt, static_cast<std::size_t>(d));
+                break;
+            }
+            case AliasShape::Kind::dims:
+                for (int d = 0; d < rank; ++d) {
+                    const auto      u  = static_cast<std::size_t>(d);
+                    const AliasDim& sp = rule.dim_specs[u];
+                    switch (sp.how) {
+                        case AliasDim::How::fixed: s.extents[u] = sp.extent; break;
+                        case AliasDim::How::per_index_host:
+                            s.per[u]       = true;
+                            s.per_index[u] = sp.values;
+                            break;
+                        // an input source is read through its variable, as an output is
+                        case AliasDim::How::output_value:
+                            s.extents[u] = alias_source(rt, sp.src, false)->driving_value(rt, sp.index);
+                            break;
+                        case AliasDim::How::output_values:
+                            s.per[u]       = true;
+                            s.per_index[u] = alias_source(rt, sp.src, false)->driving_values(rt, sp.index);
+                            break;
+                        case AliasDim::How::output_dim: {
+                            const std::shared_ptr<VarMeta> up = alias_source(rt, sp.src, true);
+                            copy_alias_dim(s, u, up->shape, sp.index, sp.src);
+                            break;
+                        }
+                    }
+                }
+                break;
+        }
+        // A per-index dim has no scalar extent, whichever spec made it.
+        for (std::size_t u = 0; u < 3; ++u)
+            if (s.per[u]) s.extents[u] = 0;
+        // every per-index array has one entry per index of dimension 0
+        for (int d = 1; d < rank; ++d) {
+            const auto u = static_cast<std::size_t>(d);
+            if (s.per[u] && s.per_index[u].size() != s.extents[0])
+                throw std::invalid_argument("naga::cospan: tie alias '" + display_path() + "': per-index dimension " + std::to_string(d) +
+                                            " has " + std::to_string(s.per_index[u].size()) + " extents but dimension 0 has " +
+                                            std::to_string(s.extents[0]) + " (the shape is " + alias_shape_str(s.extents, s.per, rank) + ")");
+        }
+        set_shape(rt, s);
+        alias_forward_ = rt.forward;
+    }
+
     /// Brings the variable's data into being on every device that has an instance, then initializes it or
     /// copies it, as section 3 says. A no-op when everything is live and not stale.
     virtual void materialize(Runtime& rt) = 0;
@@ -470,6 +553,39 @@ public:
     /// Gives the variable a new resolved shape: resizes every live data in place (contents are kept, and the
     /// variable never becomes stale). A no-op when the shape is unchanged.
     virtual void set_shape(Runtime& rt, const ResolvedShape& s) = 0;
+
+private:
+    /// The variable an alias rule reads, through the instance it names (weak: a deleted child's expires). With
+    /// `need_shape` its shape must be known: a free source that is not materialized yet is materialized first (that is
+    /// where its initializer's shape is applied).
+    std::shared_ptr<VarMeta> alias_source(Runtime& rt, const AliasSrc& src, bool need_shape) {
+        const std::shared_ptr<Instance> up = src.inst.lock();
+        if (!up)
+            throw std::logic_error("naga::cospan: '" + display_path() + "': its shape comes from '" + src.path +
+                                   "', which does not exist right now");
+        std::shared_ptr<VarMeta> m = meta_of(*up);
+        if (need_shape) {
+            if (!m->shape.known && !m->has_producer()) m->materialize(rt);
+            if (!m->shape.known)
+                throw std::logic_error("naga::cospan: '" + display_path() + "': its shape comes from '" + src.path +
+                                       "', whose shape is not known yet");
+        }
+        return m;
+    }
+
+    /// Slot `to` of `out` takes dimension `d` of an upstream shape (per-index too, if that dim is).
+    void copy_alias_dim(ResolvedShape& out, std::size_t to, const ResolvedShape& up, std::size_t d, const AliasSrc& src) const {
+        if (up.per[d]) {
+            if (to == 0)
+                throw std::invalid_argument("naga::cospan: a per-index dimension of '" + src.path +
+                                            "' cannot become dimension 0 of the tie alias '" + display_path() + "'");
+            out.per[to]       = true;
+            out.per_index[to] = up.per_index[d];
+            out.extents[to]   = 0;
+        } else {
+            out.extents[to] = up.extents[d];
+        }
+    }
 };
 
 inline std::string extents_str(const std::vector<std::size_t>& v) {

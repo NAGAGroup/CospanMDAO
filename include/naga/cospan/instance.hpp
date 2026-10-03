@@ -141,6 +141,7 @@ inline void                give_data(Instance& i, std::shared_ptr<DeviceDataBase
 inline bool                is_output_port(const Instance& i) { return i.kind == IOKind::output && i.role == Role::port; }
 inline std::string         path_of(const Instance& i) { return i.full_path(); }
 inline const sycl::device& device_of(const Instance& i) { return i.device; }
+inline std::shared_ptr<VarMeta> meta_of(const Instance& i) { return i.meta; }
 
 // -----------------------------------------------------------------------------
 // Typed leaves: the instances that hold a member wrapper
