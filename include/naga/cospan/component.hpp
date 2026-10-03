@@ -1,15 +1,36 @@
 #pragma once
 
 // =============================================================================
-// naga/cospan/component.hpp — ComponentBase and Component<KB> (r01 §6)
+// naga/cospan/component.hpp — ComponentBase and Component<KB>
 // =============================================================================
 //
-// ComponentBase is the user surface: hooks, declarations, retrieval,
-// initializers, and every runner body that touches no KB-typed state. It is
-// the friend of detail::IOEntry (friendship is not inherited), so those bodies
-// live here. Component<KB> adds the typed layer: launch-config staging,
-// compile() and the compute-forward runner.
+// A component is the leaf that does work, and it SUBMITS ITSELF (docs/design-review-2026-10-03.md, sections 3 and
+// 4). Its forward is three framework-owned steps that call user hooks:
+//
+//   precompute   (1) the expected extents of each input's own dimensions are worked out (a derived dimension
+//                    reads its sibling input; a value-driven one asks the driving variable for its value);
+//                (2) every distinct input variable is materialized;
+//                (3) each output's shape is built from its dimensions and given to its variable (a tied output's
+//                    shape belongs to its tie's System);
+//                (4) the user's pre_forward() runs;
+//                (5) every distinct output variable is materialized;
+//                (6) the reactive checks: what each dimension declared against what its variable has;
+//                (7) every member wrapper is pointed at its data.
+//   compute      the user's compute_forward() returns the launch (describe); the component submits it on the
+//                unordered queue, depending on its variables' events and nothing else (submit), and records
+//                its own event on them.
+//   postcompute  the pushes to the variable's other placements, then the user's post_forward().
+//
+// A component OWNS its instances by shared_ptr (section 1) and holds no pointer to its owner's data. It holds no
+// queue and no device of its own: the device of each instance is a field of the instance (section 2), and a
+// Runtime is given for the duration of a forward step.
+//
+// Component<KB> adds the typed layer. ONE KERNEL BODY PER COMPONENT: the body's signature fixes the kind (plain:
+// sycl::id<R>; group: GroupItem<R>; custom-op: CustomOp&; host: Host) and the kernel rank at COMPILE TIME, so there
+// is no run-time branching on rank. Custom-op and host bodies cannot be fused (section 4): the fuse helper enforces
+// it on the traits below.
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -28,17 +49,36 @@
 
 #include <sycl/sycl.hpp>
 
-#include "naga/cospan/alias_eval.hpp"
+#include "naga/slabkit/slabkit.hpp"
+
+#include "naga/cospan/diagnostics.hpp"
 #include "naga/cospan/dtype.hpp"
-#include "naga/cospan/host_view.hpp"
 #include "naga/cospan/init.hpp"
+#include "naga/cospan/instance.hpp"
 #include "naga/cospan/kernel.hpp"
 #include "naga/cospan/metadata.hpp"
-#include "naga/cospan/reactive_shape.hpp"
+#include "naga/cospan/runtime.hpp"
 #include "naga/cospan/subsystem.hpp"
+#include "naga/cospan/variable.hpp"
+#include "naga/cospan/wiring.hpp"
 #include "naga/cospan/wrappers.hpp"
 
 namespace naga::cospan {
+
+/// What a Component's compute turn yields (describe): the complete launch, configuration plus the user's setup. The
+/// component submits it itself; a fused owner (phase 7) collects the descriptions of its stages instead.
+class LaunchDescription {
+public:
+    virtual ~LaunchDescription() = default;
+    virtual bool is_custom_op() const = 0;
+    virtual bool is_host() const      = 0;
+    /// Submits on `q` for `dev`, ordered ONLY by `deps` (section 3). Returns the events of what it submitted: one for a
+    /// kernel, custom-op or host launch, none when nothing was submitted (an empty range).
+    virtual std::vector<sycl::event> submit(sk::unordered_queue& q, const sycl::device& dev,
+                                            const std::vector<sycl::event>& deps) const = 0;
+    /// Null for custom-op and host descriptions.
+    virtual const KernelParts* kernel() const { return nullptr; }
+};
 
 namespace detail {
 
@@ -51,6 +91,8 @@ struct FlagScope {
     bool& f_;
 };
 
+struct ComponentAccess;
+
 }  // namespace detail
 
 class ComponentBase : public Subsystem {
@@ -60,12 +102,14 @@ public:
     ~ComponentBase() override = default;
 
     // ---- HOOKS (user-implemented) ------------------------------------------
-    /// Declare I/O. Runs once, during the declare pass. Zero allocation.
+    /// Declare I/O. Runs once, during setup. Zero allocation.
     virtual void setup() = 0;
-    /// There is no init hook: a free input's initial value is declared in setup() with
-    /// init_input, and outputs are never initialized (r01 §6.0, §4.4).
-    /// Per-forward manual shape control, after automatic derivation.
+    /// There is no init hook: a free input's initial value is declared in setup() with init_input, and outputs are
+    /// never initialized.
+    /// Per-forward manual shape control, after automatic derivation (reshape is legal here only).
     virtual void pre_forward() {}
+    /// At the end of postcompute, after the pushes to the variables' other placements.
+    virtual void post_forward() {}
 
     // ---- declaration API (legal inside setup() only) ------------------------
     template <DType DT, int Rank, DimSpec... Specs>
@@ -106,11 +150,11 @@ public:
     /// Ragged ports take the array form too: cs::unspecified_shape<R>() (every dimension supplied from outside).
     template <DType DT, int Rank, DimSpec S>
     void declare_input(RaggedInput<DT, Rank>& m, std::string name, const std::array<S, static_cast<std::size_t>(Rank)>& specs) {
-        register_entry(std::make_unique<detail::RaggedInputEntry<DT, Rank>>(name, records_of<Rank>(specs), &m), &m, "declare_input");
+        add_ragged_input<DT, Rank>(m, std::move(name), records_of<Rank>(specs));
     }
     template <DType DT, int Rank, DimSpec S>
     void declare_output(RaggedOutput<DT, Rank>& m, std::string name, const std::array<S, static_cast<std::size_t>(Rank)>& specs) {
-        register_entry(std::make_unique<detail::RaggedOutputEntry<DT, Rank>>(name, records_of<Rank>(specs), &m), &m, "declare_output");
+        add_ragged_output<DT, Rank>(m, std::move(name), records_of<Rank>(specs));
     }
 
     /// Ragged ports: RaggedInput / RaggedOutput members, Rank 2..3, with the same DimSpec
@@ -118,218 +162,185 @@ public:
     template <DType DT, int Rank, DimSpec... Specs>
         requires(sizeof...(Specs) == Rank)
     void declare_input(RaggedInput<DT, Rank>& m, std::string name, Specs... specs) {
-        register_entry(std::make_unique<detail::RaggedInputEntry<DT, Rank>>(
-                           name, std::array<detail::DimRecord, Rank>{detail::make_dim_record(specs)...}, &m),
-                       &m, "declare_input");
+        add_ragged_input<DT, Rank>(m, std::move(name), std::array<detail::DimRecord, Rank>{detail::make_dim_record(specs)...});
     }
     template <DType DT, int Rank, DimSpec... Specs>
         requires(sizeof...(Specs) == Rank)
     void declare_output(RaggedOutput<DT, Rank>& m, std::string name, Specs... specs) {
-        register_entry(std::make_unique<detail::RaggedOutputEntry<DT, Rank>>(
-                           name, std::array<detail::DimRecord, Rank>{detail::make_dim_record(specs)...}, &m),
-                       &m, "declare_output");
+        add_ragged_output<DT, Rank>(m, std::move(name), std::array<detail::DimRecord, Rank>{detail::make_dim_record(specs)...});
     }
 
-    /// The pre_forward-only resize (same setter as automatic derivation).
-    template <DType DT, int Rank>
-    void reshape(Input<DT, Rank>& m, sycl::range<Rank> shape) {
-        reshape_member(&m, shape);
-    }
+    /// The pre_forward-only resize of an OUTPUT (the same setter as the automatic shape): it gives the output's
+    /// variable this shape. An input's shape is its variable's: it cannot be reshaped here.
     template <DType DT, int Rank>
     void reshape(Output<DT, Rank>& m, sycl::range<Rank> shape) {
-        reshape_member(&m, shape);
+        if (!in_pre_forward_)
+            throw std::logic_error("naga::cospan: reshape is legal inside pre_forward() only");
+        const auto it = by_member_.find(&m);
+        if (it == by_member_.end())
+            throw std::invalid_argument("naga::cospan: " + describe() + ": reshape of a member that was never declared");
+        if (rt_ == nullptr) throw std::logic_error("naga::cospan: " + describe() + ": reshape outside a forward");
+        detail::ResolvedShape s;
+        s.known = true;
+        for (int d = 0; d < Rank; ++d) s.extents[static_cast<std::size_t>(d)] = shape[d];
+        detail::VarMeta* meta = it->second->meta.get();
+        meta->set_shape(*rt_, s);
+        reshaped_.push_back(meta);
     }
 
-    // ---- retrieval & enumeration ---------------------------------------------
-    template <DType DT, int Rank>
-    Input<DT, Rank>& get_input(std::string_view name) {
-        auto* e = dynamic_cast<detail::InputEntry<DT, Rank>*>(&find_kind(name, IOKind::input));
-        if (e == nullptr) throw wrong_type(name);
-        return e->member();
-    }
-    template <DType DT, int Rank>
-    Output<DT, Rank>& get_output(std::string_view name) {
-        auto* e = dynamic_cast<detail::OutputEntry<DT, Rank>*>(&find_kind(name, IOKind::output));
-        if (e == nullptr) throw wrong_type(name);
-        return e->member();
-    }
-
-    using EntryRefs = std::vector<std::reference_wrapper<const detail::IOEntry>>;
-    EntryRefs get_inputs() const { return entries_of(IOKind::input); }
-    EntryRefs get_outputs() const { return entries_of(IOKind::output); }
-
-    // ---- initial values (legal inside setup() only; r01 §4.4) -----------
-    /// Declare the initial value of one of this Component's OWN inputs, by name. Metadata on the
-    /// input's root, applied by the framework when the root is allocated from nothing; the
-    /// declaration of the highest level wins, it is ignored when the input ends up with a source,
-    /// and it is an error to name an output.
+    // ---- initial values (legal inside setup() only) -----------------------
+    /// Declare the initial value of one of this Component's OWN inputs, by name. Metadata on the input's variable
+    /// (section 1); the declaration of the highest level wins (decided in this call), it is ignored when the input
+    /// ends up with a source, and it is an error to name an output.
     void init_input(std::string_view name, InitSpec init) {
         if (!declaring_)
             throw std::logic_error("naga::cospan: init_input is legal inside setup() only (" + describe() + ")");
-        detail::IOEntry& e = find_kind(name, IOKind::input);  // an output throws
-        e.init_decls_.push_back(detail::IOEntry::InitDecl{std::move(init), detail::depth_of(*this), path()});
+        const std::shared_ptr<detail::Instance> inst = find_kind(name, IOKind::input);  // an output throws
+        detail::declare_init(detail::WiringSite{describe()}, inst, std::move(init), detail::depth_of(*this), path());
     }
 
-    // ---- Subsystem verbs whose bodies touch no KB-typed state -----------------
+    // ---- Subsystem verbs ---------------------------------------------------
     void run_setup() override {
         detail::FlagScope scope{declaring_};
         setup();
     }
 
-    std::unordered_map<sycl::device, std::size_t> get_exec_info(
-        const sycl::device& parent_device) override {
-        device_ = parent_device;
-        std::size_t bytes = 0;
-        for (detail::IOEntry* e : order_) {
-            e->device_       = parent_device;
-            e->storage_kind_ = default_storage_kind();
-            const Placement own = e->placement();
-            detail::IOEntry&        root = *e->root();
-            if (e->local_shape()) {
-                root.set_primary_placement(own);
-                bytes += root.static_bytes();
-            } else if (e->kind() == IOKind::input) {
-                // Host-kind placements cost no arena bytes; a device-kind one
-                // costs the root's arena bytes once per device.
-                if (!has_registered(root, own)) {
-                    root.register_placement(own);
-                    if (own.kind == sk::kind::device) bytes += root.static_bytes();
+    /// Section 2: each of this component's instances goes to `d`. The outer call wins.
+    void set_device(const sycl::device& d) override {
+        for (const auto& inst : order_) inst->device = d;
+    }
+
+    std::shared_ptr<detail::Instance> find_instance(std::string_view name) const override {
+        const auto it = by_name_.find(std::string{name});
+        return it == by_name_.end() ? nullptr : it->second;
+    }
+    void collect_instances(std::vector<std::shared_ptr<detail::Instance>>& out) const override {
+        for (const auto& i : order_) out.push_back(i);
+    }
+
+    /// The last launch's event(s): what deleting this component waits on, and what depends_on hands on.
+    std::vector<sycl::event> events() const override { return last_events_; }
+
+    /// depends_on: these events are added to this component's submission for ONE forward.
+    void add_dependencies(std::span<const sycl::event> deps) override {
+        pending_deps_.insert(pending_deps_.end(), deps.begin(), deps.end());
+    }
+
+    // ---- the forward (section 3) ---------------------------------------------
+    void run_precompute(detail::Runtime& rt) override {
+        PtrScope rt_scope{rt_, &rt};
+        reshaped_.clear();
+
+        // (1) What each input's own dimensions say, as numbers: constraints, checked in (6).
+        std::vector<std::pair<detail::Instance*, Expected>> expects;
+        for (const auto& inst : order_)
+            if (inst->kind == IOKind::input) expects.emplace_back(inst.get(), expected_of(*inst, rt));
+
+        // (2) Every distinct input variable is materialized (a free input takes its initializer here).
+        for (detail::VarMeta* m : metas_of(IOKind::input)) m->materialize(rt);
+
+        // (3) Each output's shape, from its dimensions, unless it belongs to a tie (that System resolves it).
+        for (const auto& inst : order_) {
+            if (inst->kind != IOKind::output) continue;
+            Expected ex = expected_of(*inst, rt);
+            if (!inst->meta->alias_shape) {
+                detail::ResolvedShape s;
+                s.known = true;
+                for (int d = 0; d < inst->meta->rank; ++d) {
+                    const auto u = static_cast<std::size_t>(d);
+                    if (!ex.has[u])
+                        throw std::invalid_argument("naga::cospan: output '" + inst->full_path() +
+                                                    "' has an unspecified dimension but is not a member of a tie_outputs: "
+                                                    "nothing supplies its shape (declare the dimension, or tie it)");
+                    s.extents[u] = ex.extent[u];
+                    if (d >= 1 && ex.per[u]) {
+                        s.per[u]       = true;
+                        s.per_index[u] = ex.per_index[u];
+                    }
                 }
-            } else if (root.device_ && root.placement() != own) {
-                throw std::logic_error("naga::cospan: " + describe() + ": output '" +
-                                       std::string{e->name()} + "' is tied to '" +
-                                       std::string{root.name()} +
-                                       "', which sits on another placement (device, storage "
-                                       "kind); producers cannot write one storage from two "
-                                       "placements");
+                check_dense(*inst, s);
+                inst->meta->set_shape(rt, s);
             }
+            expects.emplace_back(inst.get(), std::move(ex));
         }
-        return {{parent_device, bytes}};
-    }
 
-    void prepare_exec(sk::queue& queue, Substrates& substrates) override {
-        queue_ = &queue;
-        subs_  = &substrates;
-        ev_.queue_  = &queue;
-        // a shape-driving read may need a variable's storage: materialize it on need (r01 §4.5)
-        ev_.ensure_ = [this](detail::IOEntry& r) { r.variable().materialize(queue_ref(), nullptr, !replay_); };
-        for (detail::IOEntry* e : order_)
-            if (e->kind() == IOKind::input && !e->local_shape() && e->tie_alias_ == nullptr && e->has_unspecified())
-                e->update_shape();  // takes the connected source's unspecified dims
-        // No allocation at setup: a variable is materialized on need, in run_pre_compute (r01 §4.5).
-        // Roots only learn what to allocate from.
-        for (detail::IOEntry* e : order_)
-            if (e->local_shape()) e->bind_substrates(substrates);
-        for (detail::IOEntry* e : order_) {
-            if (!e->local_shape() && !e->root()->is_dynamic()) e->check_constraints(true);  // fixed dims, at setup
-            if (e->kind() == IOKind::input && !e->local_shape() && !e->is_dynamic() &&
-                !e->root()->is_dynamic())
-                e->validate_connection();
-            point_if_stored(*e);
-        }
-    }
-
-    /// Shape resolution only (a ChunkedSystem's full-range pass, host only, no allocation of
-    /// what it owns beyond what a FromInput read needs, and no pre_forward): the tie aliases this
-    /// Component owns, then every input, then every output.
-    void resolve_shapes() {
-        diag::count_resolve_shapes();
-        ev_.resolving_ = nullptr;
-        // Tie aliases first: the root's owner resolves an alias root's shape BEFORE
-        // the entries below read it (and before allocation); a connected alias is checked once.
-        resolve_alias_shapes();
-        std::unordered_set<const detail::IOEntry*> done, active;
-        // Inputs first: derivation sources are inputs only.
-        for (detail::IOEntry* e : order_)
-            if (e->kind() == IOKind::input) resolve(*e, done, active);
-        for (detail::IOEntry* e : order_)
-            if (e->kind() == IOKind::output) resolve(*e, done, active);
-        ev_.resolving_ = nullptr;
-    }
-
-    void run_pre_compute(ExecCtx& owner_ctx) override {
-        (void)owner_ctx;
-        // REPLAY (a ChunkedSystem with a cached topology, inside its chunk loop): the shapes were applied from the
-        // cache, the internal roots' index arrays were uploaded once and shifted per chunk (meta_shift_), and the
-        // connections were validated when the topology was built. So no shape resolution, no per-root ragged
-        // upload and no validate_connection here. pre_forward still runs (a manual reshape inside a chunked system
-        // is not supported), roots are allocated (held roots are present), pending inits are applied and the
-        // wrappers are re-pointed.
-        if (!replay_) resolve_shapes();
+        // (4) Manual shape control.
         {
             detail::FlagScope scope{in_pre_forward_};
             pre_forward();
         }
-        // MATERIALIZE every variable this Component touches that is not live (r01 §4.5): a free input takes
-        // its init at the allocation; a variable live nowhere else is only pointed at. A pending Model::init_input
-        // is applied here too. Then a ragged variable's device index arrays follow its (possibly changed)
-        // description (version-gated, so unchanged metadata is not sent again).
-        {
-            std::vector<detail::Variable*> seen;
-            for (detail::IOEntry* e : order_) {
-                detail::Variable* v = &e->variable();
-                if (std::find(seen.begin(), seen.end(), v) != seen.end()) continue;
-                seen.push_back(v);
-                v->materialize(queue_ref(), nullptr, !replay_);
-                if (!replay_) e->root()->upload_ragged(queue_ref());
-            }
+
+        // (5) Every distinct output variable is materialized.
+        for (detail::VarMeta* m : metas_of(IOKind::output)) m->materialize(rt);
+
+        // (6) Reactive checks: what each dimension declared against what its variable has. An output that was reshaped
+        // in pre_forward is the user's decision and is not checked against its declaration.
+        for (const auto& [inst, ex] : expects) {
+            if (std::find(reshaped_.begin(), reshaped_.end(), inst->meta.get()) != reshaped_.end()) continue;
+            check_expected(*inst, ex);
         }
-        for (detail::IOEntry* e : order_) {
-            if (!replay_ && !e->local_shape()) e->check_constraints(false);  // specified dims against their supplier
-            if (!replay_ && e->kind() == IOKind::input && !e->local_shape() &&
-                (e->is_dynamic() || e->root()->is_dynamic()))
-                e->validate_connection();
-            point_if_stored(*e);
-        }
+        for (const auto& inst : order_) check_dense(*inst, inst->meta->shape);
+
+        // (7) The member wrappers.
+        for (const auto& inst : order_) inst->point_wrapper();
     }
 
-    /// The launch's events go on the storage of every port this Component touched, inputs and
-    /// outputs, at this Component's placement (the one the launch ran on): later memory
-    /// operations on that storage (the other-placement push below, a resize) are then ordered
-    /// after the kernel by SlabKit, and a free waits on them (r01 §4.4). Tied members share a
-    /// root, so each (root, placement) is registered once.
-    void register_launch_events(std::span<const sycl::event> events) override {
-        if (events.empty()) return;
-        std::vector<detail::IOEntry*> seen;
-        for (detail::IOEntry* e : order_) {
-            detail::IOEntry* r = e->root();
-            if (std::find(seen.begin(), seen.end(), r) != seen.end()) continue;
-            seen.push_back(r);  // one placement per Component, so the root alone identifies the pair
-            e->register_launch_events(events);
+    /// Submits the launch and records its event. Writers in one forward never wait on each other (write_deps returns the
+    /// PREVIOUS generation), so tied outputs run concurrently; there is no queue-wide wait anywhere (section 3). The
+    /// submission depends on its inputs' write events, its outputs' read events, the events of the data it touches,
+    /// and any depends_on events.
+    void run_compute(detail::Runtime& rt) override {
+        const std::unique_ptr<LaunchDescription> desc = compute_forward_impl();
+        if (!desc) throw std::logic_error("naga::cospan: " + describe() + ": compute_forward returned no launch");
+        // the component's device: its first instance's (set_device moves them all together), else the default
+        const sycl::device device = order_.empty() ? detail::default_device() : order_.front()->device;
+
+        const std::vector<detail::VarMeta*> ins  = metas_of(IOKind::input);
+        const std::vector<detail::VarMeta*> outs = metas_of(IOKind::output);
+        std::vector<sycl::event>            deps;
+        const auto                          add = [&](const std::vector<sycl::event>& v) { deps.insert(deps.end(), v.begin(), v.end()); };
+        for (detail::VarMeta* m : ins) add(m->events.read_deps());
+        for (detail::VarMeta* m : outs) add(m->events.write_deps(rt.forward));
+        std::vector<detail::DeviceDataBase*> datas;
+        for (const auto& inst : order_)
+            if (inst->data && std::find(datas.begin(), datas.end(), inst->data.get()) == datas.end()) datas.push_back(inst->data.get());
+        for (detail::DeviceDataBase* d : datas) add(d->events());
+        add(pending_deps_);
+
+        const std::vector<sycl::event> ev = desc->submit(rt.uq, device, deps);
+        for (const sycl::event& e : ev) {
+            for (detail::VarMeta* m : outs) m->events.record_write(e);
+            for (detail::VarMeta* m : ins) m->events.record_read(e);
+            for (detail::DeviceDataBase* d : datas) d->register_event(e);
         }
-        last_events_.assign(events.begin(), events.end());
+        last_events_ = ev;
+        pending_deps_.clear();
     }
-    std::vector<sycl::event> last_events_;  ///< the last launch's events (what collect_inflight reports)
 
-    /// Refresh the other-placement copies of every output root this Component
-    /// produces (routed copies: device<->host, cross-device), ordered after the
-    /// launch by the stream. Nothing is freed here: a variable lives while a port holds its bundle.
-    void run_post_compute(ExecCtx& owner_ctx) override {
-        // Write epochs: every launch path ends here, with this Component's kernels submitted. Each OUTPUT's
-        // root advances once per call (tied members of one root are separate Components, so N writers give +N).
-        {
-            std::vector<detail::IOEntry*> bumped;
-            for (detail::IOEntry* e : order_) {
-                if (e->kind() != IOKind::output) continue;
-                detail::IOEntry* r = e->root();
-                if (std::find(bumped.begin(), bumped.end(), r) != bumped.end()) continue;
-                bumped.push_back(r);
-                r->bump_write();
+    /// Pushes each output variable this component wrote to the variable's OTHER placements, ordered after the launch
+    /// and the data's own events. A tied output is pushed by the tie's System (phase 6). Then the user's hook.
+    void run_postcompute(detail::Runtime& rt) override {
+        (void)rt;
+        std::vector<detail::VarMeta*> seen;
+        for (const auto& inst : order_) {
+            if (inst->kind != IOKind::output) continue;
+            detail::VarMeta* m = inst->meta.get();
+            if (std::find(seen.begin(), seen.end(), m) != seen.end()) continue;
+            seen.push_back(m);
+            if (m->alias_shape || !inst->data) continue;
+            const std::shared_ptr<detail::DeviceDataBase> own = inst->data;
+            for (const auto& entry : m->data) {
+                const std::shared_ptr<detail::DeviceDataBase> dst = entry.second.lock();
+                if (!dst || dst == own || entry.first == own->key) continue;
+                std::vector<sycl::event> deps = last_events_;
+                const std::vector<sycl::event> own_ev = own->events();
+                deps.insert(deps.end(), own_ev.begin(), own_ev.end());
+                const sycl::event e = dst->copy_from(*own, deps);
+                own->register_event(e);  // a later writer of this copy waits for the read
             }
         }
-        // The other placements of every output variable this Component wrote follow the primary (once per variable;
-        // the push is done on the variable's shadow, which holds the typed storage).
-        {
-            std::vector<detail::IOEntry*> synced;
-            for (detail::IOEntry* e : order_) {
-                if (e->kind() != IOKind::output) continue;
-                detail::IOEntry* r = e->root();
-                if (std::find(synced.begin(), synced.end(), r) != synced.end()) continue;
-                synced.push_back(r);
-                if (r->storage_placements().size() > 1 && r->has_storage()) r->sync_other_placements(*owner_ctx.queue);
-            }
-        }
-
+        // Phase 8: producer-side shape work for shape-driving variables goes here.
+        post_forward();
     }
 
     // ---- what a fused owner needs to know, without knowing the KernelBody type --
@@ -352,32 +363,33 @@ protected:
     /// The storage kind of this Component's I/O: device, or host for a host body.
     virtual sk::kind default_storage_kind() const { return sk::kind::device; }
 
-    const sycl::device& device_ref() const {
-        if (!device_) throw std::logic_error("naga::cospan: " + describe() + " has no device yet");
-        return *device_;
-    }
-    sk::queue& queue_ref() const {
-        if (queue_ == nullptr)
-            throw std::logic_error("naga::cospan: " + describe() + " has no queue yet (prepare_exec)");
-        return *queue_;
-    }
+    /// The launch of this forward (describe): implemented by Component<KB> from the user's compute_forward().
+    virtual std::unique_ptr<LaunchDescription> compute_forward_impl() = 0;
 
     std::string describe() const { return path().empty() ? std::string{"component"} : "'" + path() + "'"; }
 
-    std::optional<sycl::device> device_;
-    sk::queue*                  queue_ = nullptr;
-    Substrates*                 subs_  = nullptr;
+    std::vector<sycl::event> last_events_;  ///< the last launch's events
+    std::vector<sycl::event> pending_deps_; ///< depends_on events, for the next submission only
 
 private:
-    /// System resolves paths into a Component's namespace and walks its
-    /// entries (transient marking); nothing else reaches these.
-    friend class System;
-    friend class ChunkedSystem;
+    friend struct detail::ComponentAccess;
 
-    detail::IOEntry* lookup_entry(std::string_view name) const {
-        const auto it = by_name_.find(std::string{name});
-        return it == by_name_.end() ? nullptr : it->second.get();
-    }
+    /// The expected extents of one instance's own dimensions, as numbers.
+    struct Expected {
+        std::array<bool, 3>                     has{false, false, false};
+        std::array<std::size_t, 3>              extent{1, 1, 1};
+        std::array<bool, 3>                     per{false, false, false};
+        std::array<std::vector<std::size_t>, 3> per_index{};
+    };
+
+    /// Sets a pointer for a scope, clears it on every exit.
+    struct PtrScope {
+        PtrScope(detail::Runtime*& p, detail::Runtime* v) : p_{p} { p_ = v; }
+        ~PtrScope() { p_ = nullptr; }
+        PtrScope(const PtrScope&)            = delete;
+        PtrScope& operator=(const PtrScope&) = delete;
+        detail::Runtime*& p_;
+    };
 
     // ---- declaration -------------------------------------------------------
     template <int Rank, class S>
@@ -392,13 +404,21 @@ private:
     void add_input(Input<DT, Rank>& m, std::string name,
                    const std::array<detail::DimRecord, Rank>& dims) {
         reject_per_index(name, dims);
-        register_entry(std::make_unique<detail::InputEntry<DT, Rank>>(name, dims, &m), &m, "declare_input");
+        register_instance(detail::make_input<DT, Rank>(std::move(name), this, dims, &m), &m, "declare_input", false);
     }
     template <DType DT, int Rank>
     void add_output(Output<DT, Rank>& m, std::string name,
                     const std::array<detail::DimRecord, Rank>& dims) {
         reject_per_index(name, dims);
-        register_entry(std::make_unique<detail::OutputEntry<DT, Rank>>(name, dims, &m), &m, "declare_output");
+        register_instance(detail::make_output<DT, Rank>(std::move(name), this, dims, &m), &m, "declare_output", false);
+    }
+    template <DType DT, int Rank>
+    void add_ragged_input(RaggedInput<DT, Rank>& m, std::string name, const std::array<detail::DimRecord, Rank>& dims) {
+        register_instance(detail::make_ragged_input<DT, Rank>(std::move(name), this, dims, &m), &m, "declare_input", true);
+    }
+    template <DType DT, int Rank>
+    void add_ragged_output(RaggedOutput<DT, Rank>& m, std::string name, const std::array<detail::DimRecord, Rank>& dims) {
+        register_instance(detail::make_ragged_output<DT, Rank>(std::move(name), this, dims, &m), &m, "declare_output", true);
     }
 
     /// a DENSE wrapper cannot hold per-index dims (PerIndex, FromInputValues).
@@ -410,214 +430,182 @@ private:
                                             "': per-index dims need RaggedInput/RaggedOutput");
     }
 
-    void register_entry(std::unique_ptr<detail::IOEntry> e, const void* member, const char* what) {
+    /// The component owns its instances (section 1); their device is the default until set_device says otherwise.
+    void register_instance(std::shared_ptr<detail::Instance> inst, const void* member, const char* what, bool ragged) {
         if (!declaring_)
             throw std::logic_error(std::string{"naga::cospan: "} + what + " is legal inside setup() only");
-        const std::string key{e->name()};
+        const std::string key = inst->name;
         if (by_name_.contains(key))
             throw std::invalid_argument("naga::cospan: " + describe() + ": '" + key + "' is declared twice");
         if (by_member_.contains(member))
             throw std::invalid_argument("naga::cospan: " + describe() + ": member wrapper of '" + key +
                                         "' is already declared");
-        e->declarer_ = this;  // System's transient marking walks declarer -> owner (§4.4)
-        order_.push_back(e.get());
-        by_member_.emplace(member, e.get());
-        by_name_.emplace(key, std::move(e));
+        inst->storage_kind = default_storage_kind();
+        if (ragged) ragged_ports_.insert(inst.get());
+        order_.push_back(inst);
+        by_member_.emplace(member, inst.get());
+        by_name_.emplace(key, std::move(inst));
     }
 
     // ---- lookup -----------------------------------------------------------
-    detail::IOEntry& find_kind(std::string_view name, IOKind k) {
+    std::shared_ptr<detail::Instance> find_kind(std::string_view name, IOKind k) const {
         const auto it = by_name_.find(std::string{name});
         if (it == by_name_.end())
             throw std::out_of_range("naga::cospan: " + describe() + " declares no '" + std::string{name} + "'");
-        if (it->second->kind() != k)
+        if (it->second->kind != k)
             throw std::invalid_argument("naga::cospan: " + describe() + ": '" + std::string{name} +
                                         "' is an " + (k == IOKind::input ? "output" : "input"));
-        return *it->second;
+        return it->second;
     }
 
-    std::invalid_argument wrong_type(std::string_view name) const {
-        return std::invalid_argument("naga::cospan: " + describe() + ": '" + std::string{name} +
-                                     "' was asked for with the wrong dtype or rank");
-    }
-
-    EntryRefs entries_of(IOKind k) const {
-        EntryRefs out;
-        for (const detail::IOEntry* e : order_)
-            if (e->kind() == k) out.emplace_back(*e);
+    /// The distinct variables of this component's instances of kind `k`, in declaration order.
+    std::vector<detail::VarMeta*> metas_of(IOKind k) const {
+        std::vector<detail::VarMeta*> out;
+        for (const auto& inst : order_) {
+            if (inst->kind != k) continue;
+            detail::VarMeta* m = inst->meta.get();
+            if (std::find(out.begin(), out.end(), m) == out.end()) out.push_back(m);
+        }
         return out;
     }
 
-    // ---- phase guards ------------------------------------------------------
-    template <class W>
-    void reshape_member(const W* member, sycl::range<W::rank> shape) {
-        if (!in_pre_forward_)
-            throw std::logic_error("naga::cospan: reshape is legal inside pre_forward() only");
-        const auto it = by_member_.find(member);
-        if (it == by_member_.end())
-            throw std::invalid_argument("naga::cospan: " + describe() + ": reshape of a member that was never declared");
-        std::array<std::size_t, 3> ext{1, 1, 1};
-        for (int d = 0; d < W::rank; ++d) ext[static_cast<std::size_t>(d)] = shape[d];
-        it->second->reshape(sycl::range<3>{ext[0], ext[1], ext[2]});
-    }
-
-    // ---- storage helpers ---------------------------------------------------
-    static bool has_registered(const detail::IOEntry& root, const Placement& p) {
-        for (const Placement& e : root.storage_placements())
-            if (e == p) return true;
-        return false;
-    }
-
-    void point_if_stored(detail::IOEntry& e) {
-        // only when the variable is live at THIS port's placement (a rebuilt port may sit on a placement that is not live yet)
-        if (e.root()->has_storage() && e.variable().live_bundle(e.placement())) e.point_wrapper();
-    }
-
-    // ---- shape derivation (r01 §6.5 step 1) ----------------------------------
-    detail::IOEntry& sibling_input(const detail::IOEntry& of, const std::string& name) {
+    // ---- shape derivation ----------------------------------------------------
+    detail::Instance& sibling_input(const detail::Instance& of, const std::string& name) const {
         const auto it = by_name_.find(name);
-        if (it == by_name_.end() || it->second->kind() != IOKind::input)
-            throw std::invalid_argument("naga::cospan: " + describe() + ": '" + std::string{of.name()} +
-                                        "' derives its shape from '" + name + "', which is not an input of this component");
+        if (it == by_name_.end() || it->second->kind != IOKind::input)
+            throw std::invalid_argument("naga::cospan: " + describe() + ": '" + of.name + "' derives its shape from '" + name +
+                                        "', which is not an input of this component");
         return *it->second;
     }
 
-    /// Resolve `e`'s dimensions: its sources first (recursively), then apply.
-    void resolve(detail::IOEntry& e, std::unordered_set<const detail::IOEntry*>& done,
-                 std::unordered_set<const detail::IOEntry*>& active) {
-        if (done.contains(&e)) return;
-        ev_.resolving_ = &e;
-        if (!active.insert(&e).second)
-            throw std::logic_error("naga::cospan: " + describe() + ": shape derivation cycle through '" +
-                                   std::string{e.name()} + "'");
-        for (int d = 0; d < e.rank(); ++d) {
-            detail::DimRecord& r = e.dims_[static_cast<std::size_t>(d)];
-            // Inside a ChunkedSystem dim 0 is the chunk length: its declared rule is not evaluated.
-            if (d == 0 && e.dim0_override_) continue;
-            if (r.how == detail::DimRecord::How::from_input_dim) {
-                detail::IOEntry& src = sibling_input(e, r.input);
-                resolve(src, done, active);
-                if (r.dim >= src.rank())
-                    throw std::out_of_range("naga::cospan: '" + std::string{e.name()} +
-                                            "' derives from a dimension past the rank of '" + r.input + "'");
-                if (detail::dim_pending(src, r.dim)) throw detail::shape_needed(e.full_path(), "dimension " + std::to_string(d), src);
-                r.extent = src.extents()[r.dim];
-                // a per-index source dimension passes its array on (dim 0 is never per-index).
-                if (d >= 1) {
-                    r.per_index = src.per_index_raw(r.dim);
-                    r.per       = src.dim(r.dim).per;
-                }
-            } else if (r.how == detail::DimRecord::How::per_index_from_input) {
-                detail::IOEntry& src = sibling_input(e, r.input);
-                resolve(src, done, active);
-                ev_.resolving_  = &e;
-                r.per_index = ev_.read_values(src, r.value_index);
-                r.per       = true;
-                r.extent    = 0;
-            } else if (r.how == detail::DimRecord::How::from_input) {
-                detail::IOEntry& src = sibling_input(e, r.input);
-                resolve(src, done, active);
-                ev_.resolving_ = &e;
-                r.extent   = ev_.read_value(src, r.value_index);
-            }
-        }
-        e.update_shape();
-        if (e.is_ragged() && !e.is_ragged_port())
-            throw std::invalid_argument("naga::cospan: " + describe() + ": '" + std::string{e.name()} +
-                                        "' is ragged; declare it with RaggedInput/RaggedOutput");
-        active.erase(&e);
-        done.insert(&e);
+    /// A sibling's shape for dimension `d` of `of`. A free input that is not materialized yet is materialized first
+    /// (that is where its initializer's shape is applied); anything else whose shape is unknown is an error.
+    const detail::ResolvedShape& source_shape(const detail::Instance& of, const detail::Instance& src, int d,
+                                              detail::Runtime& rt) const {
+        detail::VarMeta& m = *src.meta;
+        if (!m.shape.known && !detail::first_of_kind(m, IOKind::output)) m.materialize(rt);
+        if (!m.shape.known)
+            throw std::logic_error("naga::cospan: '" + of.full_path() + "': dimension " + std::to_string(d) + " comes from '" +
+                                   src.full_path() + "', whose shape is not known yet");
+        return m.shape;
     }
 
-    // ---- tie aliases ------------------------------------------------
-    /// For each tie alias one of this Component's entries belongs to: a connected tie_inputs alias
-    /// is checked once against the output it joined. (A tie alias that is a ROOT is resolved by its
-    /// owner, the System that declared it: System::materialize.)
-    void resolve_alias_shapes() {
-        std::vector<detail::IOEntry*> seen;
-        for (detail::IOEntry* e : order_) {
-            detail::IOEntry* a = e->tie_alias_;
-            if (a == nullptr || !a->alias_shape_ || std::find(seen.begin(), seen.end(), a) != seen.end()) continue;
-            seen.push_back(a);
-            const AliasShape& s = *a->alias_shape_;
-            if (a->local_shape()) continue;  // a tie root is resolved and allocated by its owner, the declaring System
-            if (!a->alias_checked_) {
-                if (s.kind != AliasShape::Kind::unspecified) {
-                    const detail::AliasEvaluator::AliasEval want = ev_.alias_eval(*a);
-                    const detail::IOEntry& root = *a->root();
-                    bool                   same = true;
-                    std::string            got_str, why;
-                    if (root.is_ragged() || want.per[1] || want.per[2]) {
-                        // Scalar dims compare by extent; per-index dims by their ARRAYS (length = dim 0, then element
-                        // by element), never by extent.
-                        std::array<std::size_t, 3> got{1, 1, 1};
-                        std::array<bool, 3>        got_per{false, false, false};
-                        for (int d = 0; d < a->rank(); ++d) {
-                            const auto u = static_cast<std::size_t>(d);
-                            got[u]       = root.extents()[u];
-                            got_per[u]   = root.dim_is_per(d);
-                            if (got_per[u]) got[u] = 0;
-                            if (!same) continue;  // report the first difference only
-                            if (want.per[u] != got_per[u]) {
-                                same = false;
-                                why  = "dimension " + std::to_string(d) + " is per-index on the " +
-                                       (want.per[u] ? "alias" : "connection") + " only";
-                            } else if (!want.per[u]) {
-                                if (want.ext[u] != got[u]) {
-                                    same = false;
-                                    why  = "dimension " + std::to_string(d) + ": the alias declares " + std::to_string(want.ext[u]) +
-                                          ", the connection has " + std::to_string(got[u]);
-                                }
-                            } else {
-                                const std::vector<std::size_t> have = root.per_index_extents(d);
-                                const std::vector<std::size_t>& mine = want.per_index[u];
-                                if (mine.size() != have.size()) {
-                                    same = false;
-                                    why  = "per-index dimension " + std::to_string(d) + ": the alias has " + std::to_string(mine.size()) +
-                                          " entries, the connection " + std::to_string(have.size());
-                                } else {
-                                    for (std::size_t k = 0; k < mine.size(); ++k)
-                                        if (mine[k] != have[k]) {
-                                            same = false;
-                                            why  = "per-index dimension " + std::to_string(d) + " differs at index " +
-                                                  std::to_string(k) + ": the alias declares " + std::to_string(mine[k]) +
-                                                  ", the connection has " + std::to_string(have[k]);
-                                            break;
-                                        }
-                                }
-                            }
-                        }
-                        got_str = detail::AliasEvaluator::alias_shape_str(got, got_per, a->rank());
-                    } else {
-                        const auto v   = a->view();
-                        const auto got = v ? v->extents : root.geometry().shape;
-                        same           = want.ext == got;
-                        got_str        = detail::AliasEvaluator::alias_shape_str(got, {false, false, false}, 3);
+    /// The numbers one instance's own dimensions stand for NOW. Derivation sources are inputs only.
+    Expected expected_of(const detail::Instance& inst, detail::Runtime& rt) const {
+        Expected ex;
+        for (int d = 0; d < inst.meta->rank; ++d) {
+            const auto               u = static_cast<std::size_t>(d);
+            const detail::DimRecord& r = inst.dims[u];
+            switch (r.how) {
+                case detail::DimRecord::How::fixed:
+                    ex.has[u]    = true;
+                    ex.extent[u] = r.extent;
+                    break;
+                case detail::DimRecord::How::unspecified: break;
+                case detail::DimRecord::How::from_input_dim: {
+                    const detail::Instance& src = sibling_input(inst, r.input);
+                    if (r.dim >= src.meta->rank)
+                        throw std::out_of_range("naga::cospan: '" + inst.name + "' derives from a dimension past the rank of '" +
+                                                r.input + "'");
+                    const detail::ResolvedShape& sh = source_shape(inst, src, d, rt);
+                    ex.has[u]    = true;
+                    ex.extent[u] = sh.extents[r.dim];
+                    // a per-index source dimension passes its array on (dimension 0 is never per-index)
+                    if (d >= 1 && sh.per[r.dim]) {
+                        ex.per[u]       = true;
+                        ex.per_index[u] = sh.per_index[r.dim];
+                        ex.extent[u]    = 0;
                     }
-                    if (!same)
-                        throw std::invalid_argument(
-                            "naga::cospan: tie alias '" + a->full_path() + "' declares the shape " +
-                            detail::AliasEvaluator::alias_shape_str(want.ext, want.per, root.is_ragged() || want.per[1] || want.per[2] ? a->rank() : 3) +
-                            " but is connected to '" + std::string{root.name()} + "', whose shape is " + got_str +
-                            (why.empty() ? std::string{} : " (" + why + ")"));
+                    break;
                 }
-                // A shape that reads other entries (values or dims) can change between forwards: check it again
-                // every forward. A static one (fixed, per_index host arrays) is checked once.
-                if (a->alias_sources().empty()) a->alias_checked_ = true;
+                case detail::DimRecord::How::from_input: {
+                    const detail::Instance& src = sibling_input(inst, r.input);
+                    ex.has[u]    = true;
+                    ex.extent[u] = src.meta->driving_value(rt, r.value_index);
+                    break;
+                }
+                case detail::DimRecord::How::per_index_from_input: {
+                    const detail::Instance& src = sibling_input(inst, r.input);
+                    ex.has[u]       = true;
+                    ex.per[u]       = true;
+                    ex.per_index[u] = src.meta->driving_values(rt, r.value_index);
+                    ex.extent[u]    = 0;
+                    break;
+                }
+                case detail::DimRecord::How::per_index_host:
+                    ex.has[u]       = true;
+                    ex.per[u]       = true;
+                    ex.per_index[u] = r.per_index;
+                    ex.extent[u]    = 0;
+                    break;
+            }
+        }
+        return ex;
+    }
+
+    static std::string rule_text(const detail::DimRecord& r) {
+        switch (r.how) {
+            case detail::DimRecord::How::fixed: return "fixed";
+            case detail::DimRecord::How::unspecified: return "unspecified";
+            case detail::DimRecord::How::from_input_dim: return "FromInputDim{'" + r.input + "', " + std::to_string(r.dim) + "}";
+            case detail::DimRecord::How::from_input: return "FromInput{'" + r.input + "', " + std::to_string(r.value_index) + "}";
+            case detail::DimRecord::How::per_index_host: return "PerIndex";
+            case detail::DimRecord::How::per_index_from_input:
+                return "FromInputValues{'" + r.input + "', " + std::to_string(r.value_index) + "}";
+        }
+        return "?";
+    }
+
+    /// Every dimension an instance declared (or derived) against what its variable has.
+    void check_expected(const detail::Instance& inst, const Expected& ex) const {
+        const detail::ResolvedShape& s = inst.meta->shape;
+        for (int d = 0; d < inst.meta->rank; ++d) {
+            const auto u = static_cast<std::size_t>(d);
+            if (!ex.has[u]) continue;
+            const bool        ep   = d >= 1 && ex.per[u];
+            const bool        vp   = d >= 1 && s.per[u];
+            const std::string head = "naga::cospan: shape mismatch: dimension " + std::to_string(d) + " of '" + inst.full_path() +
+                                     "' is " + rule_text(inst.dims[u]) + " = ";
+            if (ep != vp)
+                throw std::invalid_argument(head + (ep ? "per-index" : std::to_string(ex.extent[u])) + " but the variable's dimension " +
+                                            std::to_string(d) + " is " + (vp ? "per-index" : std::to_string(s.extents[u])));
+            if (ep) {
+                if (ex.per_index[u] != s.per_index[u])
+                    throw std::invalid_argument(head + detail::extents_str(ex.per_index[u]) + " but the variable's dimension " +
+                                                std::to_string(d) + " is " + detail::extents_str(s.per_index[u]));
+            } else if (ex.extent[u] != s.extents[u]) {
+                throw std::invalid_argument(head + std::to_string(ex.extent[u]) + " but the variable's dimension " + std::to_string(d) +
+                                            " is " + std::to_string(s.extents[u]));
             }
         }
     }
 
-    std::unordered_map<std::string, std::unique_ptr<detail::IOEntry>> by_name_;
-    std::unordered_map<const void*, detail::IOEntry*>                 by_member_;
-    std::vector<detail::IOEntry*>                                     order_;  // declaration order
+    /// A dense port cannot see per-index extents: a variable with a per-index dimension needs RaggedInput/RaggedOutput.
+    void check_dense(const detail::Instance& inst, const detail::ResolvedShape& s) const {
+        if (s.known && s.ragged() && !ragged_ports_.contains(&inst))
+            throw std::invalid_argument("naga::cospan: " + describe() + ": '" + inst.name +
+                                        "' is ragged; declare it with RaggedInput/RaggedOutput");
+    }
 
-    bool declaring_       = false;
-    bool in_pre_forward_  = false;
-    bool chunk_inside_    = false;                       ///< this Component is inside a ChunkedSystem (set at its classification)
-    detail::AliasEvaluator ev_;                          ///< alias-shape evaluation, value/shape reads, the chunk-pass recorders
-    bool replay_          = false;                       ///< a ChunkedSystem replays its cached topology: run_pre_compute applies, never resolves
+    std::unordered_map<std::string, std::shared_ptr<detail::Instance>> by_name_;
+    std::unordered_map<const void*, detail::Instance*>                 by_member_;
+    std::vector<std::shared_ptr<detail::Instance>>                     order_;  // declaration order
+    std::unordered_set<const detail::Instance*>                        ragged_ports_;
+    std::vector<detail::VarMeta*>                                      reshaped_;  ///< reshaped in this forward's pre_forward
+
+    bool                declaring_      = false;
+    bool                in_pre_forward_ = false;
+    detail::Runtime*    rt_             = nullptr;  ///< set during run_precompute only
 };
+
+namespace detail {
+
+/// INTERNAL: what a fused owner (phase 7) calls to get a stage's complete launch without submitting it.
+struct ComponentAccess {
+    static std::unique_ptr<LaunchDescription> describe(ComponentBase& c) { return c.compute_forward_impl(); }
+};
+
+}  // namespace detail
 
 // -----------------------------------------------------------------------------
 // detail::KernelLaunch<KB> — the individual description of a kernel body
@@ -654,17 +642,17 @@ sycl::range<3> pad3(const sycl::range<R>& r) {
 
 /// A kernel-body launch submitted on its own: the record and the typed
 /// Inputs/Outputs/body/Scratch are captured BY VALUE in the outer kernel; there
-/// is no staging allocation (fused waves stage through device buffers instead).
+/// is no staging allocation (fused waves stage through device buffers instead). The JIT
+/// configuration is the body type's static one (jit_config<KB>()), read at submit.
 template <class KB>
 class KernelLaunch final : public LaunchDescription {
 public:
     static constexpr int R = kernel_rank_v<KB>;
     using Scratch          = scratch_t<KB>;
-    using Config           = sycl::AdaptiveCpp_jit::dynamic_function_config;
 
-    KernelLaunch(Config* cfg, sycl::range<R> range, std::optional<sycl::range<R>> wg,
+    KernelLaunch(sycl::range<R> range, std::optional<sycl::range<R>> wg,
                  typename KB::Inputs in, typename KB::Outputs out, KB body, Scratch scratch)
-        : cfg_{cfg}, payload_{StageRecord{}, in, out, BodyPack{body, scratch}} {
+        : payload_{StageRecord{}, in, out, BodyPack{body, scratch}} {
         wg3_ = wg ? pad3<R>(*wg) : default_wg<R>();
         StageRecord& r = payload_.rec;
         r.range        = pad3<R>(range);
@@ -707,10 +695,11 @@ public:
     bool is_host() const override { return false; }
     const KernelParts* kernel() const override { return &parts_; }
 
-    std::vector<sycl::event> submit(SubmitTarget& t) const override {
+    std::vector<sycl::event> submit(sk::unordered_queue& q, const sycl::device& dev,
+                                    const std::vector<sycl::event>& deps) const override {
         if (payload_.rec.flat_extent == 0) return {};  // nothing to run for an empty range
-        return {launch_individual<R>(t, *cfg_, wave_nd_range<R>(payload_.rec.group_count, wg3_), payload_,
-                                     scratch_bytes_)};
+        return {launch_individual<R>(q, dev, deps, jit_config<KB>(), wave_nd_range<R>(payload_.rec.group_count, wg3_),
+                                     payload_, scratch_bytes_)};
     }
 
 private:
@@ -726,7 +715,6 @@ private:
     };
     static_assert(std::is_trivially_copyable_v<Payload>);
 
-    Config*        cfg_;
     Payload        payload_;
     sycl::range<3> wg3_{1, 1, 1};
     uint32_t       scratch_bytes_ = 0;
@@ -746,7 +734,8 @@ public:
     bool is_custom_op() const override { return true; }
     bool is_host() const override { return false; }
 
-    std::vector<sycl::event> submit(SubmitTarget& t) const override {
+    std::vector<sycl::event> submit(sk::unordered_queue& q, const sycl::device& dev,
+                                    const std::vector<sycl::event>& deps) const override {
         const typename KB::Inputs  in   = in_;
         const typename KB::Outputs out  = out_;
         const KB                   body = body_;
@@ -756,8 +745,7 @@ public:
                 body(op, in, out);
             });
         };
-        if (t.group != nullptr) return {t.group->submit(t.device, cgf)};
-        return {t.queue->submit(t.device, cgf)};
+        return {q.submit(dev, deps, cgf)};
     }
 
 private:
@@ -766,11 +754,8 @@ private:
     KB                   body_;
 };
 
-/// A host launch (D3): the body runs on the host as an ordered host task.
+/// A host launch (D3): the body runs on the host as a host task, ordered only by `deps`.
 /// Its Inputs/Outputs point at host-kind USM on the component's device.
-/// Without a group the task joins the stream's kernel order
-/// (async_host_in_order); under a group, group.async_host (a group has no
-/// in-order variant; ordering against kernel tasks is the group's).
 template <class KB>
 class HostLaunch final : public LaunchDescription {
 public:
@@ -780,14 +765,14 @@ public:
     bool is_custom_op() const override { return false; }
     bool is_host() const override { return true; }
 
-    std::vector<sycl::event> submit(SubmitTarget& t) const override {
+    std::vector<sycl::event> submit(sk::unordered_queue& q, const sycl::device& dev,
+                                    const std::vector<sycl::event>& deps) const override {
         const typename KB::Inputs  in   = in_;
         const typename KB::Outputs out  = out_;
         const KB                   body = body_;
         auto f = [=]() { body(Host{}, in, out); };
         diag::count_host_tasks();
-        if (t.group != nullptr) return {t.group->async_host(t.device, f)};
-        return {t.queue->async_host_in_order(t.device, f)};
+        return {q.async_host(dev, deps, f)};
     }
 
 private:
@@ -808,27 +793,8 @@ class Component : public ComponentBase {
 public:
     /// USER, every forward: assemble Inputs/Outputs (and body config, and
     /// Scratch shapes) from the already-synced members; state the launch
-    /// parameters. Returns the description the owner will submit.
+    /// parameters. Returns the description the component submits (section 3).
     virtual std::unique_ptr<LaunchDescription> compute_forward() = 0;
-
-    /// The individual dynamic_function_config: built once, here. A custom-op
-    /// or host body has nothing to compile.
-    void compile() override {
-        if constexpr (CustomOpBody<KB> || HostBody<KB>) {
-            // nothing: no kernel is JIT-specialised for these bodies
-        } else {
-            constexpr int R = kernel_rank_v<KB>;
-            cfg_            = std::make_shared<Config>();
-            if constexpr (R == 1)
-                cfg_->define(&kb_entry_r1, &kb_fn<KB>);
-            else if constexpr (R == 2)
-                cfg_->define(&kb_entry_r2, &kb_fn<KB>);
-            else
-                cfg_->define(&kb_entry_r3, &kb_fn<KB>);
-        }
-    }
-
-    std::unique_ptr<LaunchDescription> run_compute_forward() override { return compute_forward(); }
 
     // ---- read off the body's signature, for a fused owner --------------------
     int  kernel_rank() const override { return kernel_rank_v<KB>; }
@@ -846,6 +812,8 @@ public:
 
 protected:
     static constexpr int LR = launch_rank_v<KB>;
+
+    std::unique_ptr<LaunchDescription> compute_forward_impl() override { return compute_forward(); }
 
     /// Kernel bodies: range, Inputs, Outputs, body (default work-group).
     std::unique_ptr<LaunchDescription> create_launch_config(sycl::range<LR> range,
@@ -897,24 +865,11 @@ protected:
     }
 
 private:
-    using Config = sycl::AdaptiveCpp_jit::dynamic_function_config;
-
     std::unique_ptr<LaunchDescription> make_launch(sycl::range<LR> range,
                                                    std::optional<sycl::range<LR>> wg,
                                                    typename KB::Inputs in, typename KB::Outputs out,
                                                    KB body, detail::scratch_t<KB> scratch) {
-        if (!cfg_)
-            throw std::logic_error("naga::cospan: " + describe() +
-                                   ": create_launch_config before compile()");
-        return std::make_unique<detail::KernelLaunch<KB>>(cfg_.get(), range, wg, in, out, body,
-                                                          scratch);
-    }
-
-    std::shared_ptr<Config> cfg_;
-
-public:
-    void collect_inflight(std::vector<Subsystem::InflightKeep>& out) const override {
-        if (cfg_ && !this->last_events_.empty()) out.emplace_back(this->last_events_, cfg_);
+        return std::make_unique<detail::KernelLaunch<KB>>(range, wg, in, out, body, scratch);
     }
 };
 

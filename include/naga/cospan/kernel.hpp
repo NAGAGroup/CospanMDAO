@@ -18,14 +18,18 @@
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 #include <sycl/sycl.hpp>
 
+#include "naga/slabkit/slabkit.hpp"
+
 #include "naga/cospan/dtype.hpp"
-#include "naga/cospan/subsystem.hpp"
 #include "naga/cospan/wrappers.hpp"
 
 namespace naga::cospan {
+
+namespace sk = ::naga::slabkit;
 
 // -----------------------------------------------------------------------------
 // CustomOp, Host: the first-parameter tags of the non-kernel bodies
@@ -466,6 +470,32 @@ SYCL_EXTERNAL void kb_fn(sycl::nd_item<kernel_rank_v<KB>> it, FnOffsetInfo& info
     }
 }
 
+namespace detail {
+
+/// The dynamic_function_config of a kernel-body type: ONE per KB, built once, with static lifetime. The runtime
+/// reads a config on a worker thread AFTER the kernel is submitted, so it must outlive every component and every
+/// launch in flight; a function-local static does, which is why no retire list is needed
+/// (docs/design-review-2026-10-03.md, section 3). Only plain and group bodies have one (custom-op and host
+/// bodies compile no kernel).
+template <class KB>
+sycl::AdaptiveCpp_jit::dynamic_function_config& jit_config() {
+    constexpr int R = kernel_rank_v<KB>;
+    static sycl::AdaptiveCpp_jit::dynamic_function_config cfg;
+    static const bool defined = [] {
+        if constexpr (R == 1)
+            cfg.define(&kb_entry_r1, &kb_fn<KB>);
+        else if constexpr (R == 2)
+            cfg.define(&kb_entry_r2, &kb_fn<KB>);
+        else
+            cfg.define(&kb_entry_r3, &kb_fn<KB>);
+        return true;
+    }();
+    (void)defined;
+    return cfg;
+}
+
+}  // namespace detail
+
 // -----------------------------------------------------------------------------
 // The outer launch (individual: one-stage wave)
 // -----------------------------------------------------------------------------
@@ -497,13 +527,14 @@ const std::byte* bytes_of(const T* p) {
     return reinterpret_cast<const std::byte*>(p);
 }
 
-/// Submit the ONE outer kernel of rank R. `payload` (a trivially copyable
-/// struct with members rec, in, out, body) is captured by value; the stage
-/// function reads the private copies through FnOffsetInfo and byte pointers. Returns its event.
+/// Submit the ONE outer kernel of rank R on the unordered queue `q`, for device `dev`. It is ordered ONLY by `deps`
+/// (docs/design-review-2026-10-03.md, section 3): nothing else in the queue orders it. `payload` (a trivially
+/// copyable struct with members rec, in, out, body) is captured by value; the stage function reads the private copies
+/// through FnOffsetInfo and byte pointers. Returns its event.
 template <int R, class Payload>
-sycl::event launch_individual(const SubmitTarget& t, sycl::AdaptiveCpp_jit::dynamic_function_config& cfg,
-                              const sycl::nd_range<R>& nd, const Payload& payload,
-                              std::size_t scratch_bytes) {
+sycl::event launch_individual(sk::unordered_queue& q, const sycl::device& dev, const std::vector<sycl::event>& deps,
+                              sycl::AdaptiveCpp_jit::dynamic_function_config& cfg, const sycl::nd_range<R>& nd,
+                              const Payload& payload, std::size_t scratch_bytes) {
     auto cgf = [&](sycl::handler& h) {
         sycl::local_accessor<std::byte, 1> local{sycl::range<1>{scratch_bytes ? scratch_bytes : 1}, h};
         h.parallel_for(nd, cfg.apply([=](sycl::nd_item<R> it) {
@@ -520,8 +551,7 @@ sycl::event launch_individual(const SubmitTarget& t, sycl::AdaptiveCpp_jit::dyna
                 kb_entry_r3(it, info, in_b, out_b, body_b, lb);
         }));
     };
-    if (t.group != nullptr) return t.group->submit(t.device, cgf);
-    return t.queue->submit(t.device, cgf);
+    return q.submit(dev, deps, cgf);
 }
 
 // -----------------------------------------------------------------------------
@@ -563,10 +593,11 @@ inline JitId wave_entry_id(int rank) {
 /// Submit the ONE outer kernel of a fused wave: like launch_individual, but the
 /// records and the three byte streams are USM the owner staged, captured as
 /// raw pointers. Every work-item starts with a fresh cursor at record 0; the
-/// call sequence in `cfg` walks the records in position order. Returns its event.
+/// call sequence in `cfg` walks the records in position order. Submitted on the unordered queue `q` for `dev`, ordered
+/// ONLY by `deps` (section 3). Returns its event.
 template <int R>
-sycl::event launch_wave(const SubmitTarget& t, sycl::AdaptiveCpp_jit::dynamic_function_config& cfg,
-                        const sycl::nd_range<R>& nd, const StageRecord* records, const std::byte* in_bytes,
+sycl::event launch_wave(sk::unordered_queue& q, const sycl::device& dev, const std::vector<sycl::event>& deps,
+                        sycl::AdaptiveCpp_jit::dynamic_function_config& cfg, const sycl::nd_range<R>& nd, const StageRecord* records, const std::byte* in_bytes,
                         std::byte* out_bytes, const std::byte* body_bytes, std::size_t local_bytes) {
     auto cgf = [&](sycl::handler& h) {
         sycl::local_accessor<std::byte, 1> local{sycl::range<1>{local_bytes ? local_bytes : 1}, h};
@@ -581,8 +612,7 @@ sycl::event launch_wave(const SubmitTarget& t, sycl::AdaptiveCpp_jit::dynamic_fu
                 kb_entry_r3(it, info, in_bytes, out_bytes, body_bytes, lb);
         }));
     };
-    if (t.group != nullptr) return t.group->submit(t.device, cgf);
-    return t.queue->submit(t.device, cgf);
+    return q.submit(dev, deps, cgf);
 }
 
 }  // namespace detail

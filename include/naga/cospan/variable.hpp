@@ -77,6 +77,9 @@ struct DeviceDataBase {
     virtual void register_event(const sycl::event& e) = 0;
     virtual void*       raw()        = 0;
     virtual std::size_t size() const = 0;
+    /// Makes this data a copy of `src` (the same element type, another placement), after `deps`: the container's
+    /// assign, so it resizes to the source. Returns the event of the copy. A ragged variable's index arrays follow.
+    virtual sycl::event copy_from(DeviceDataBase& src, const std::vector<sycl::event>& deps) = 0;
 };
 
 template <class T>
@@ -89,6 +92,9 @@ struct DeviceData : DeviceDataBase {
     void                     register_event(const sycl::event& e) override { vec.register_event(e); }
     void*                    raw() override { return vec.data(); }
     std::size_t              size() const override { return vec.size(); }
+    sycl::event              copy_from(DeviceDataBase& src, const std::vector<sycl::event>& deps) override {
+        return vec.assign(static_cast<DeviceData<T>&>(src).vec, std::span<const sycl::event>{deps});
+    }
 };
 
 /// A ragged variable's device data: the elements, the N + 1 block offsets and, for each per-index dimension
@@ -117,6 +123,21 @@ struct RaggedDeviceData : DeviceData<T> {
         if (offs) offs->register_event(e);  // the kernel reads the index arrays too
         for (auto& p : per)
             if (p) p->register_event(e);
+    }
+    /// The elements, then the index arrays that both sides have (each after the source array's own events). The
+    /// returned event is the elements' copy; the index copies are tracked by their containers, which `events()` reports.
+    sycl::event copy_from(DeviceDataBase& src, const std::vector<sycl::event>& deps) override {
+        const sycl::event e = DeviceData<T>::copy_from(src, deps);
+        auto&             s = static_cast<RaggedDeviceData<T>&>(src);
+        const auto        assign = [](std::optional<sk::usm_vector<std::uint64_t>>& to,
+                               const std::optional<sk::usm_vector<std::uint64_t>>& from) {
+            if (!to || !from) return;
+            const std::vector<sycl::event> ev = from->events();
+            to->assign(*from, std::span<const sycl::event>{ev});
+        };
+        assign(offs, s.offs);
+        for (std::size_t k = 0; k < per.size(); ++k) assign(per[k], s.per[k]);
+        return e;
     }
 };
 
@@ -428,6 +449,19 @@ public:
     }
 
     virtual bool is_ragged() const noexcept { return false; }
+
+    /// The driving-value accessor (section 6): the VALUE of element `index` (flat) of this variable, which sizes a
+    /// consumer's dimension, materializing the variable if need be. Implemented in Phase 8.
+    virtual std::size_t driving_value(Runtime&, std::size_t index) {
+        (void)index;
+        throw std::logic_error("naga::cospan: driving_value: not implemented until Phase 8");
+    }
+    /// The same for per-index extents: the values of column `column` (rank 1 [N]: column 0; rank 2 [N, k]) as an
+    /// array of N extents. Implemented in Phase 8.
+    virtual std::vector<std::size_t> driving_values(Runtime&, std::size_t column) {
+        (void)column;
+        throw std::logic_error("naga::cospan: driving_values: not implemented until Phase 8");
+    }
 
     /// Brings the variable's data into being on every device that has an instance, then initializes it or
     /// copies it, as section 3 says. A no-op when everything is live and not stale.
