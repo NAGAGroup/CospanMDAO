@@ -5,7 +5,11 @@
 // =============================================================================
 //
 // Every test goes through a cospan::Model (create_model / setup / forward /
-// wait / view_* / set_*). Nothing here reaches past the Model's public API.
+// wait / view_* / update_input). Nothing here reaches past the Model's public API.
+//
+// Reading results (docs/design-review-2026-10-03.md, section 5): forward() only enqueues. A host view can be
+// obtained only after the first forward, and it must be sync()ed before it is read. The helpers below do the
+// forward + view + sync sequence so the cases do not repeat it.
 
 #include <algorithm>
 #include <cmath>
@@ -25,7 +29,7 @@ namespace cs = naga::cospan;
 namespace sk = naga::slabkit;
 using cs::DType;
 
-/// The configuration every test uses: the runtime's default device, one context.
+/// The configuration every test uses: the runtime's default device, one context, no pool.
 inline cs::ModelConfig default_config() { return cs::ModelConfig{}; }
 
 /// default_config() plus a 1 MiB pool on every device: transient roots draw from it, so
@@ -65,7 +69,7 @@ inline bool all_close(const std::vector<T>& got, const std::vector<T>& want) {
     return all_close<T>(std::span<const T>{got}, std::span<const T>{want});
 }
 
-/// The elements of a host view as a vector (for comparing with ==, or with all_close).
+/// The elements of a host view as a vector (for comparing with ==, or with all_close). The view must be synced.
 template <class View>
 inline auto to_vector(const View& v) {
     const auto s = v.span();
@@ -73,12 +77,33 @@ inline auto to_vector(const View& v) {
 }
 
 // ---- running a Model -----------------------------------------------------------
-/// One forward, wait, then a read-only host copy of an output.
+/// One forward, then wait for everything submitted ("run it and let it finish").
+inline void forward_and_wait(cs::Model& m) {
+    m.forward();
+    m.wait();
+}
+
+/// A synced read-only host view of an output. The model must have run at least once.
+template <DType DT, int Rank>
+inline cs::HostView<DT, Rank> synced_output(cs::Model& m, std::string_view path) {
+    auto v = m.view_output<DT, Rank>(path);
+    v.sync();
+    return v;
+}
+
+/// A synced read-only host view of an input. The model must have run at least once.
+template <DType DT, int Rank>
+inline cs::HostView<DT, Rank> synced_input(cs::Model& m, std::string_view path) {
+    auto v = m.view_input<DT, Rank>(path);
+    v.sync();
+    return v;
+}
+
+/// One forward, then a synced host view of an output (forward + view + sync).
 template <DType DT, int Rank>
 inline cs::HostView<DT, Rank> wait_and_view(cs::Model& m, std::string_view path) {
     m.forward();
-    m.wait();
-    return m.view_output<DT, Rank>(path);
+    return synced_output<DT, Rank>(m, path);
 }
 
 }  // namespace cst
