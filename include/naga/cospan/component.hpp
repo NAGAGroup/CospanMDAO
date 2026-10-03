@@ -297,36 +297,15 @@ public:
         for (const auto& inst : order_) inst->point_wrapper();
     }
 
-    /// Submits the launch and records its event. Writers in one forward never wait on each other (write_deps returns the
-    /// PREVIOUS generation), so tied outputs run concurrently; there is no queue-wide wait anywhere (section 3). The
-    /// submission depends on its inputs' write events, its outputs' read events, the events of the data it touches,
-    /// and any depends_on events.
+    /// Submits the launch and records its event: describe, submit, record. Writers in one forward never wait on each
+    /// other (write_deps returns the PREVIOUS generation), so tied outputs run concurrently; there is no queue-wide wait
+    /// anywhere (section 3). The pieces are protected so a fused component (section 4) can submit ONE launch for its
+    /// stages and still give each stage the event as if it had submitted alone.
     void run_compute(detail::Runtime& rt) override {
         const std::unique_ptr<LaunchDescription> desc = compute_forward_impl();
         if (!desc) throw std::logic_error("naga::cospan: " + describe() + ": compute_forward returned no launch");
-        // the component's device: its first instance's (set_device moves them all together), else the default
-        const sycl::device device = order_.empty() ? detail::default_device() : order_.front()->device;
-
-        const std::vector<detail::VarMeta*> ins  = metas_of(IOKind::input);
-        const std::vector<detail::VarMeta*> outs = metas_of(IOKind::output);
-        std::vector<sycl::event>            deps;
-        const auto                          add = [&](const std::vector<sycl::event>& v) { deps.insert(deps.end(), v.begin(), v.end()); };
-        for (detail::VarMeta* m : ins) add(m->events.read_deps());
-        for (detail::VarMeta* m : outs) add(m->events.write_deps(rt.forward));
-        std::vector<detail::DeviceDataBase*> datas;
-        for (const auto& inst : order_)
-            if (inst->data && std::find(datas.begin(), datas.end(), inst->data.get()) == datas.end()) datas.push_back(inst->data.get());
-        for (detail::DeviceDataBase* d : datas) add(d->events());
-        add(pending_deps_);
-
-        const std::vector<sycl::event> ev = desc->submit(rt.uq, device, deps);
-        for (const sycl::event& e : ev) {
-            for (detail::VarMeta* m : outs) m->events.record_write(e);
-            for (detail::VarMeta* m : ins) m->events.record_read(e);
-            for (detail::DeviceDataBase* d : datas) d->register_event(e);
-        }
-        last_events_ = ev;
-        pending_deps_.clear();
+        const std::vector<sycl::event> ev = desc->submit(rt.uq, device_of(), gather_deps(rt));
+        record_launch(ev);
     }
 
     /// Pushes each output variable this component wrote to the variable's OTHER placements, ordered after the launch
@@ -355,6 +334,14 @@ public:
         post_forward();
     }
 
+    /// The first instance that is a ragged port (declared RaggedInput / RaggedOutput) or whose variable is ragged, else
+    /// null. A fused component refuses such ports (section 4).
+    std::shared_ptr<detail::Instance> first_ragged_port() const {
+        for (const auto& inst : order_)
+            if (ragged_ports_.contains(inst.get()) || inst->meta->is_ragged()) return inst;
+        return nullptr;
+    }
+
     // ---- what a fused owner needs to know, without knowing the KernelBody type --
     // Answered by Component<KB> from its body's signature. An owner reads
     // these; nothing here knows what fusing is.
@@ -379,6 +366,38 @@ protected:
     virtual std::unique_ptr<LaunchDescription> compute_forward_impl() = 0;
 
     std::string describe() const { return path().empty() ? std::string{"component"} : "'" + path() + "'"; }
+
+    /// What a submission of this component must come after: its inputs' write events, its outputs' read events, the
+    /// events of the data it touches, and any depends_on events (which last one forward: they are cleared here).
+    std::vector<sycl::event> gather_deps(detail::Runtime& rt) {
+        const std::vector<detail::VarMeta*> ins  = metas_of(IOKind::input);
+        const std::vector<detail::VarMeta*> outs = metas_of(IOKind::output);
+        std::vector<sycl::event>            deps;
+        const auto                          add = [&](const std::vector<sycl::event>& v) { deps.insert(deps.end(), v.begin(), v.end()); };
+        for (detail::VarMeta* m : ins) add(m->events.read_deps());
+        for (detail::VarMeta* m : outs) add(m->events.write_deps(rt.forward));
+        for (detail::DeviceDataBase* d : distinct_data()) add(d->events());
+        add(pending_deps_);
+        pending_deps_.clear();
+        return deps;
+    }
+
+    /// Records the event(s) of this component's launch: a write on each output's variable, a read on each input's,
+    /// and an event of outside work over every data it touches (so a later mutation or free waits for it).
+    void record_launch(const std::vector<sycl::event>& ev) {
+        const std::vector<detail::VarMeta*> ins  = metas_of(IOKind::input);
+        const std::vector<detail::VarMeta*> outs = metas_of(IOKind::output);
+        const std::vector<detail::DeviceDataBase*> datas = distinct_data();
+        for (const sycl::event& e : ev) {
+            for (detail::VarMeta* m : outs) m->events.record_write(e);
+            for (detail::VarMeta* m : ins) m->events.record_read(e);
+            for (detail::DeviceDataBase* d : datas) d->register_event(e);
+        }
+        last_events_ = ev;
+    }
+
+    /// The component's device: its first instance's (set_device moves them all together), else the default.
+    sycl::device device_of() const { return order_.empty() ? detail::default_device() : order_.front()->device; }
 
     std::vector<sycl::event> last_events_;  ///< the last launch's events
     std::vector<sycl::event> pending_deps_; ///< depends_on events, for the next submission only
@@ -478,6 +497,14 @@ private:
             detail::VarMeta* m = inst->meta.get();
             if (std::find(out.begin(), out.end(), m) == out.end()) out.push_back(m);
         }
+        return out;
+    }
+
+    /// The distinct data this component's instances hold (null ones skipped).
+    std::vector<detail::DeviceDataBase*> distinct_data() const {
+        std::vector<detail::DeviceDataBase*> out;
+        for (const auto& inst : order_)
+            if (inst->data && std::find(out.begin(), out.end(), inst->data.get()) == out.end()) out.push_back(inst->data.get());
         return out;
     }
 
@@ -615,6 +642,9 @@ namespace detail {
 /// INTERNAL: what a fused owner (phase 7) calls to get a stage's complete launch without submitting it.
 struct ComponentAccess {
     static std::unique_ptr<LaunchDescription> describe(ComponentBase& c) { return c.compute_forward_impl(); }
+    static std::vector<sycl::event>            gather_deps(ComponentBase& c, Runtime& rt) { return c.gather_deps(rt); }
+    static void                                record_launch(ComponentBase& c, const std::vector<sycl::event>& ev) { c.record_launch(ev); }
+    static sycl::device                        device_of(const ComponentBase& c) { return c.device_of(); }
 };
 
 }  // namespace detail
@@ -803,6 +833,8 @@ private:
 template <KernelBodyC KB>
 class Component : public ComponentBase {
 public:
+    using body_type = KB;
+
     /// USER, every forward: assemble Inputs/Outputs (and body config, and
     /// Scratch shapes) from the already-synced members; state the launch
     /// parameters. Returns the description the component submits (section 3).

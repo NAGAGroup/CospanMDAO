@@ -297,6 +297,9 @@ public:
     /// See is_stale(): this flag alone says nothing for a variable that is not materialized.
     bool stale_ = true;
 
+    /// Connected inside one fused component; a later phase may keep such an intermediate in local memory (section 4).
+    bool internal = false;
+
     /// The forward in which refresh_alias_shape last ran (once per forward); ~0 = never.
     std::uint64_t alias_forward_ = ~0ull;
 
