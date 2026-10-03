@@ -36,7 +36,7 @@ std::vector<std::uint64_t> device_scan(const std::vector<std::uint64_t>& values)
     std::vector<sycl::event> deps = in.events();
     for (const sycl::event& e : out.events()) deps.push_back(e);
 
-    const sycl::event ev = cs::detail::exclusive_scan_u64(rt, dev, deps, in.data(), out.data(), n);
+    sycl::event ev = cs::detail::exclusive_scan_u64(rt, dev, deps, in.data(), out.data(), n);
     ev.wait();
     q.wait_and_throw();
     uq.wait_and_throw();

@@ -2772,7 +2772,7 @@ TEST_CASE("lifetime: a tie alias keeps the last shape of a do_once value source 
     // never change again, so the tie keeps its last shape; "which does not exist right now" is for a shape that was never
     // known. Nothing needs to hold nb.n for the SHAPE to survive. Promoting nb.n (hold) additionally keeps its VALUE readable.
     for (const bool hold : {false, true}) {
-        DYNAMIC_SECTION(hold ? "nb.n is promoted: its value stays readable too" : "nothing holds nb.n") {
+        DYNAMIC_SECTION((hold ? "nb.n is promoted: its value stays readable too" : "nothing holds nb.n")) {
             auto model = tsys2::make(
                 [hold](cs::System& s) { s.add_subsystem(cs::subsystem_desc<tsys2::ValueSourceSys>("s", hold)); },
                 cst::pooled_config());
