@@ -32,6 +32,10 @@ set(COSPAN_TEST_SOURCES
     test_diagnostics.cpp
     test_epochs.cpp
     test_system.cpp
+    # The dynamic-function probe: the kernels in one translation unit, the
+    # SYCL_EXTERNAL definitions in the other.
+    test_acpp_dynfn.cpp
+    acpp_dynfn_defs.cpp
 )
 
 add_executable(cospan-tests ${COSPAN_TEST_SOURCES})
