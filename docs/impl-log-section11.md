@@ -63,3 +63,13 @@ Running log, newest entries at the bottom. Each entry: date/time (UTC), phase, w
 - **Open questions for Jack:**
   - An outside writer given `write_deps()` does not wait on the container's own earlier writes (writes never wait on writes), so a kernel that writes data() right after `fill()` may run before the fill unless the caller also passes `read_deps()`.
   - The collapse task runs on the container's slabkit queue, so it is ordered like any kernel task there, behind earlier kernel tasks of that stream.
+
+### 2026-10-06 UTC, P1c: toolchain adopted, dynamic-function probe
+- **Done:** SlabKit and CoSpan both pin naga-acpp 2026.10.06 (`naga-acpp-tools`, `c_compiler_version`, `cxx_compiler_version`) and are relocked; the channel index had no lag. CoSpan's slabkit `rev` is unchanged (dc51516; P3 moves it). The probe is `tests/test_acpp_dynfn.cpp` plus `tests/acpp_dynfn_defs.cpp` (the `SYCL_EXTERNAL` definitions live only there).
+- **Commits:** SlabKit `67f0b715036cbbf3872fff78e5800b76fcb83692` ("build: naga-acpp 2026.10.06"); CoSpan `cdec366fe0b222631141de2b82168934138e0735` ("build: naga-acpp 2026.10.06; dynamic-function probe").
+- **Probe cases, all green on default and cuda:** (a) define across TUs; (b) call sequence across TUs; (c) indexed sequence of three across TUs (`{1,12,23,0}`); (d) indexed sequence of one across TUs (`{7,0,0,0}`); (e) same-TU indexed control (`{1,12,23,0}`).
+- **Tests:** SlabKit default `169 | 165 passed | 4 skipped`, cuda `All tests passed (1053886 assertions in 169 test cases)`. CoSpan default `182 | 178 passed | 4 skipped` (2008 assertions), cuda `All tests passed (2031 assertions in 182 test cases)`.
+- **Toolchain run 37441431821:** published linux-64 and the others; `test-linux-aarch64` and `test-osx-arm64` passed. `test-linux-64` was still running when this was written.
+- **Decisions taken / findings:**
+  - **A `dynamic_function_config` must outlive every kernel that uses it, until the queue has been waited on.** The first probe versions kept the config as a local inside the launch lambda. It was destroyed on return, before the wait, and AdaptiveCpp's JIT thread read it afterwards: every case aborted (`std::bad_alloc`, once `std::length_error`) right after `kernel_cache: Cache MISS`, before any `jit: Specializing function call` line. That was a bug in the probe, not in the fork. With the config declared in the test scope all five cases pass. The fused-group design has to keep the config alive in the same way.
+- **Open questions for Jack:** none.
