@@ -25,10 +25,17 @@ Running log, newest entries at the bottom. Each entry: date/time (UTC), phase, w
 
 ## Open questions for Jack
 
-- The join task (collapse) breaks ordering in CoSpan on the OpenMP backend; we ship without collapse (SlabKit `7655b84`). Lists drop completed events past 64 entries. Root cause in AdaptiveCpp still to find.
-- Section 11: outside writes never wait on writes. Added (SlabKit `e86ae9f`): an outside writer still waits on the container's own write operations (resize fill, reallocation copy, copy-in), which are not outside writes.
-- add_subsystem is still setup-only; should it follow the anywhere principle?
-- (P8) `onepass` on OpenMP is still expected to give a wrong q (your item); `--variant all` skips it there with its message. On cuda it runs and passes.
+(Consolidated at the close of P9; newest wording. The spec's "Departures from the design review" has the reasons.)
+
+- **Own-writes.** An outside writer also waits on the container's own write operations (resize fill, reallocation copy, copy-in), beyond "writes never wait on writes" (SlabKit `e86ae9f`). Keep it?
+- **No collapse.** The empty-`single_task` join of an event list breaks ordering on the OpenMP backend (stale reads, zero shapes, heap corruption); SlabKit `7655b84` returns lists whole and drops completed events past 64 entries. The root cause is not found (AdaptiveCpp or our use of it). Should the collapse come back once it is?
+- **add_subsystem anywhere.** It and the marks are still setup-only. Should `add_subsystem` follow the "anywhere" principle?
+- **gemver onepass on OpenMP.** q is wrong there (yours); `--variant all` skips it with its message. On cuda it runs and passes.
+- **gemver fused and parallel on cuda.** In the P8 and P9 runs (n = 16384) they are slower than unfused (14.9 and 15.5 ms vs 11.8 ms; the pre-P7 README measured fused faster). Not profiled; the README timings are pre-P7.
+- **Toolchain `test-linux-64` (run 37441431821) failed.** AdaptiveCpp's own `sycl_tests: generic on OpenCL (Intel CPU)` timed out after 10 minutes, after 16 fatal errors in `atomic_tests` (11), `group_functions_tests` (4) and `math_tests` (1): "JIT session error: Symbols not found: [ _Z10atomic_addPU3AS4Vii, _Z11atomic_xchgPU3AS4Vii ]" and "ocl_code_object: Building CL program failed". The sanitizer smoke on that job passed. `test-win-64` and `test-win-arm64` failed too (not looked at); `test-linux-aarch64` and `test-osx-arm64` passed. CoSpan and SlabKit pass on the published linux-64 build on OpenMP and CUDA.
+- **Deferred, by design:** merging two materialized variables (throws at the call), co-residency / persistent threads / vendor grid barriers, and the look-back prefix test for `wait_group` (the case built is a neighbor-group read).
+- **A big-shape ticket case** relies on the device's largest work-group; whether it exceeds co-residency depends on the GPU (not measured).
+- SlabKit default suite: `test_host_work.cpp:295` ("a group mixes kernel and memory subtasks") failed once in four runs at P3 (no `usm_vector` in it; 20 of 20 alone); it did not show in the final run.
 
 ## Entries
 
@@ -230,3 +237,18 @@ Commits 03007cd (gemver, smoke), c2bc450 (REVIEW markers), 0e2762b (stale text),
   - OpenMP (default env): unfused, parallel and fused all `1.93e-07 4.11e-08 4.11e-08 2.38e-07 1.78e-07 4.14e-08`, bitwise equal to each other; onepass skipped with its message ("onepass: skipped on omp: q incorrect on this backend, under investigation"); ALL OK. Times 971 / 929 / 884 ms per chain (unfused / parallel / fused).
   - cuda: unfused, parallel and fused all `1.93e-07 4.23e-08 4.23e-08 2.38e-07 1.78e-07 4.03e-08`, bitwise equal to each other; onepass `1.93e-07 4.23e-08 1.19e-07 2.38e-07 1.78e-07 4.04e-08` (not bitwise equal to unfused, worst rel L2 1.26e-07, as designed); ALL OK. Times 11.76 (unfused), 9.04 (onepass), 15.34 (parallel), 14.80 (fused) ms per chain, single run, not a benchmark.
 - Suites: default 237 cases (227 passed, 10 skipped, 2303 assertions); cuda `All tests passed (2364 assertions in 237 test cases)`.
+
+## P9: spec and close-out
+
+Commits 0e47c69 (the last REVIEW marker) and "P9: spec r03; final gate" (spec, pointers, this entry).
+
+- **Last marker.** test_epochs.cpp, "Views: a value-driven ragged output follows its driver": settled by design review 11.1 (a shape change resizes every container of the variable, the host one included). The case now keeps the FIRST view alive across the driver change and asserts that after the next forward and a `sync()` the same view shows the new size and values (and that a view made afterwards agrees). The marker and its open question are gone; no REVIEW marker is left in tests, examples or include.
+- **Spec.** docs/spec/revisions/r03-2026-10-06-section-11-as-built.md (about 480 lines): 1 Vocabulary and data, 2 Setup and wiring, 3 Execution and events, 4 Host access, 5 Shapes, 6 Fused groups, 7 Memory and pool accounting, 8 Not supported now, and "Departures from the design review" (17 items). docs/spec/README.md points at r03 (r02 and r01 superseded); the design review status line reads "Section 11 implemented on main (0e47c69); spec r03"; the top-level README links r03.
+- **Spelling table.** Kept as it is at the top of this log.
+- **Toolchain run 37441431821** (the P1b release). `test-linux-64` **failed**: AdaptiveCpp's own `sycl_tests: generic on OpenCL (Intel CPU)` timed out after 10 minutes after 16 fatal errors (atomic_tests 11, group_functions_tests 4, math_tests 1: "JIT session error: Symbols not found: [ _Z10atomic_addPU3AS4Vii, _Z11atomic_xchgPU3AS4Vii ]", "ocl_code_object: Building CL program failed"); its sanitizer smoke passed. `test-win-64` and `test-win-arm64` failed too (not looked at); `test-linux-aarch64`, `test-osx-arm64` passed; every build and publish job succeeded. Listed under the open questions.
+- **Final gate.**
+  - cospan default: `test cases: 237 | 227 passed | 10 skipped`, `assertions: 2320 | 2320 passed | 0 skipped`.
+  - cospan cuda, five runs, each `All tests passed (2381 assertions in 237 test cases)`.
+  - SlabKit (`7655b84`) default: `test cases: 172 | 168 passed | 4 skipped`, `assertions: 1052532 | 1052532 passed`; cuda: `All tests passed (1053976 assertions in 172 test cases)`.
+  - gemver `--variant all --check`, n = 16384, R = 64. OpenMP: unfused, parallel, fused all `x1 1.93e-07 w1 4.11e-08 q 4.11e-08 s 2.38e-07 x2 1.78e-07 w2 4.14e-08`, bitwise equal, onepass skipped with its message, ALL OK. cuda: unfused, parallel, fused all `1.93e-07 4.23e-08 4.23e-08 2.38e-07 1.78e-07 4.03e-08`, bitwise equal; onepass `1.93e-07 4.23e-08 1.19e-07 2.38e-07 1.78e-07 4.04e-08`; ALL OK.
+- **What is next.** The chunked-systems redesign (slices and leading ranges; the old code stays dead in `chunked_system.hpp` and in git history at `c8553f6`), then the open questions above.
