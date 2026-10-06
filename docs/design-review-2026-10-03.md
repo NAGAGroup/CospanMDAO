@@ -1,6 +1,7 @@
 # Design review, started 2026-10-03
 
 Status: implemented on branch rework-2026-10-03 (2e8e223); the spec is docs/spec/revisions/r02-2026-10-03-the-design-as-built.md.
+Section 11 (second-round review, 2026-10-04 to 10-06) supersedes sections 1-10 and spec r02 wherever they conflict. It is settled design, not yet implemented.
 
 This is the working record of the design review that started 2026-10-03 (Jack and the research lead). The code at c8553f6 works, but it is being redesigned piece by piece for clarity. No new features (solvers, cycles, gradients, optimizers) come before this is done.
 
@@ -228,3 +229,261 @@ This is the working record of the design review that started 2026-10-03 (Jack an
   - from_value reads are batched (one wait). counts_from and offsets_from use the parallel device scan, and only the total comes back to the host.
 - **A rebuilt consumer whose producer is gone with nothing holding its data is a user error** (section 9).
 - **Removed by this section:** the value-driven dimension specs, the driving-value accessor, producer-side shape work and the shape-driving flag, device-sourced shapes in ResolvedShape, AliasShape's value and shape kinds (ties become per-dimension specified/unspecified), refresh_alias_shape's rule evaluation and the tie shape constraints (both replaced by the definition merge), and rank-3 ragged.
+
+## 11. Second-round review (2026-10-04 to 2026-10-06)
+
+This section restates the design from the discussion only, not from the code. The code on main may differ from it. Auditing the code against this section is a separate, later step.
+
+### 11.0 Principles
+
+- **Nothing looks up.** No code needs to know anything above it.
+  - A holder doesn't know its owner.
+  - A component doesn't know its System.
+  - A System doesn't know whether it is the root.
+  - An alias doesn't know whether it came from a tie or a promotion.
+  - The variable doesn't know its holders.
+  - Everything above reaches down. The calls (declare, connect, tie, promote, shape_hook) do the cross-cutting work.
+- **Check early only what can't be checked simply at run time.** Everything else fails when it happens, on demand. Each item's timing is decided case by case. Watch for a possible third category: checks that are easy neither at setup nor at run time.
+- **Don't restrict a call to a phase without a real reason.** A call either works or fails when it is made. The user is trusted to understand the semantics (as in OpenMDAO).
+- **Ordering comes only from data.** Any ordering beyond that is the user's, through depends_on.
+
+### 11.1 Vocabulary and data
+
+- **Variable.** The shared metadata object *is* the variable. Holders share it; subsystems never do.
+- **Holders and owners.**
+  - A holder is an input, output, alias or host view.
+  - An owner is the component or System that owns a holder, or the user's scope for a host view.
+  - A holder holds a shared_ptr to its variable and a shared_ptr to the container (usm_vector) for its own device, and it knows that device.
+  - It does not know its owner.
+- **What the variable holds:**
+  - dtype and rank;
+  - the shape definition (per dimension: specified, unspecified or hook-owned) and the actual shape;
+  - the initializer (the last declaration wins);
+  - the cycle entry;
+  - the stale flag;
+  - the materialized flag;
+  - the push-suppressed flag (tied outputs);
+  - the tie marks (input and output, kept separate);
+  - weak pointers to the per-device containers.
+- **Containers exist from declaration.**
+  - Declaring a holder takes a shared_ptr to its device's container, creating an empty usm_vector if that device has none yet. The variable keeps a weak pointer to it.
+  - Entries are never removed.
+  - An empty usm_vector allocates nothing, so every container has owners from setup onward.
+  - When a call merges two variables, the winner absorbs any device entries the loser had and it lacked.
+- **Materialization** is a holder API, called by the owner in its precompute.
+  - **Variable not yet materialized: global materialization.** Storage is allocated in every device container at once, and the flag is set. That puts all allocation cost up front and leaves later submissions cleanly queue-ordered. The materializing holder initializes unless it is an output; an output's data is about to be written.
+  - **Variable already materialized.** The holder checks only its own device's container. If it is empty, the holder allocates it and queues a copy from the first live device. A live device always exists. Choosing the best source device comes later.
+- **Lifetime is just these pointers.**
+  - When the last holder on a device goes, that device's memory is freed. The free waits on the container's events.
+  - When the last holder anywhere goes, the variable goes.
+  - A rearmed subsystem runs its setup again and creates fresh variables. A fresh variable owns its own initialization, naturally.
+- **Shape changes.** A shape change resizes every container of the variable, the host one included.
+- **Promotions.** A promote alias is a real holder. The promote call sets the alias's device from the member's device.
+
+### 11.2 Setup
+
+- **Setup runs in two passes.**
+  - Setup is recursive through add_subsystem.
+  - Finalize collects the marks. Marks have no scope rule: whatever is collected at setup stays until marks actually do something.
+  - Setup never allocates and never submits.
+- **add_subsystem(descriptor, run policy, optional device).**
+  - The device is applied by update_device after the child's setup. The outermost call wins, and update_device covers aliases too.
+  - The descriptor is kept for rearm.
+- **Tie devices.** Both tie calls take a device and use the default device when none is given. They are kept symmetric on purpose, so there is one rule and errors stay direct.
+  - **tie_outputs.** Every member must be on the tie's device, because the members write the same memory in ways the framework can't know (atomics, disjoint slices, interleaved indices).
+    - This is checked at the tie call.
+    - Because update_device can later move a single member, the System that owns the alias also checks the members against the alias device at run time.
+  - **tie_inputs.** The device decides where the alias lives and where the initializer runs. Members can be elsewhere; a device no member uses just costs one more allocation.
+- **Merges.**
+  - Connect: source wins. Tie: alias wins. Promote: member wins (a merge into an empty side).
+  - Definitions merge: unspecified absorbs specified. Two different specified values are an error at the call.
+  - Device entries merge.
+- **Cycles.**
+  - Connect detects a cycle and records it on the variable.
+  - Connect keeps the target's initializer; it does not drop it.
+  - At materialization in the first forward, a cycle variable runs its initializer even though it is connected. No initializer is an error at that moment.
+  - This is checked at the first forward, not at setup, because a user may set an initializer after setup.
+- **Initializers.**
+  - Initializers go on inputs and aliases, and the last declaration wins.
+  - Model get_input can set one; get_output never can.
+- **Replay log.**
+  - Each System logs its own connect, tie, promote and init calls per child.
+  - Rearming a child runs the child's setup, then the parent replays that child's logged calls.
+  - A logged call whose other side no longer exists is skipped.
+  - Wiring calls stay callable outside setup and are not gated.
+  - A merge of two already-materialized variables is not defined; it is deferred until a real use appears.
+- **Nested rearm (A holds B, B rearms C, A wires into C).**
+  - This is user error and is not handled. A user replaying the connection in their pre_forward can't fix it either, because C runs inside A's compute loop after A's pre_forward.
+  - The one escape hatch is overriding a subsystem's run policy by path, for example making "b.c" eternal. It is legal anywhere. If A rearms B, A re-applies the override.
+  - The author of B documents how B should be used.
+- **Ties of ties.**
+  - Tying a tie is not allowed for now, on either the input or the output side. Promoting a tie is allowed.
+  - A tie call refuses a member whose variable already carries the tie mark of that kind. Input and output marks are separate.
+
+### 11.3 Execution and events
+
+- **Forward.** The forward runs the root System's precompute, then its compute, then its postcompute.
+- **System precompute.**
+  - It rebuilds transient children, then calls the user's pre_forward, which may rearm children or override run policies.
+  - It does NOT run the children's precomputes.
+- **System compute is the loop.**
+  - For each child: the child's precompute, compute and postcompute.
+  - A child whose run policy has ended is deleted right after its postcompute. Deleting it just stalls naturally on container frees.
+  - A tied-output alias takes a turn in the loop right after the last child that holds a member. That turn is the push.
+- **Component.**
+  - Precompute: materialize inputs, then the user's pre_forward (set_shape), then materialize outputs.
+  - Compute: build the launch, submit it on the unordered queue, and keep the event (used for depends_on and in postcompute).
+  - Postcompute:
+    - register that event as a write on every output container;
+    - push to the output's other devices by copy assignment, unless the variable is push-suppressed;
+    - call the user's post_forward.
+- **Tied outputs.**
+  - The tie call sets push-suppressed on the variable.
+  - Each member's default path only registers its write; it pushes nothing.
+  - The System pushes through an explicit alias method that does the copy assignments.
+- **Containers are the only source of event truth.** Each container has a read list and a write list. Variables keep no event lists.
+- **Event rules.**
+  - A reader waits on the write list. A writer waits on the read list. Writes never wait on writes.
+  - A kernel registers a read on its input containers and a write on its output containers.
+- **Container operations go into the same two lists.**
+  - A copy out is a read on the source. A copy in, a fill or a resize is a write on the destination.
+  - A container's own write operations wait on both of its lists.
+  - A copy between containers involves both: it waits on the source's writes and on both of the destination's lists, then registers a read on the source and a write on the destination.
+- **Collapse on access.**
+  - Any access to a list holding more than one event collapses it into one event, using an empty single_task that depends on them all, and stores that event back.
+  - Lists accumulate between accesses. Nothing ever needs clearing.
+- **depends_on.** Any ordering beyond data is the user's, through depends_on. A depends_on on a System covers every component inside it.
+
+### 11.4 Host access
+
+- **Model access.**
+  - get_input and get_output reach a holder by path.
+  - Both can read, meaning both can make a view.
+  - get_input can also set initializers (update_input).
+- **Component views.**
+  - A component has a protected method to make a host view of its own inputs, never its outputs.
+  - It uses the queue its precompute already receives.
+  - This is how a component can size its outputs from values.
+- **Views.**
+  - A view is a read-only holder on the host, owned by the user, and it can outlive the model.
+  - It can be made at any time. It materializes like any holder and fails if the shape can't be resolved yet.
+  - Reading a view before anything is computed shows whatever is in memory, and that's the user's concern.
+- **Push to the host.**
+  - The host is just another device: the producer pushes to it every forward.
+  - An unwanted view should simply go out of scope.
+  - sync waits on the host container's write list.
+  - Spans taken before a shape change are invalid after it.
+- **update_input.**
+  - It sets the initializer (the last call wins) and sets one stale flag on the variable.
+  - In the next forward, the first holder to materialize runs the initializer on its own device and copies to the other devices.
+  - On a connected input it warns and has no effect, unless the variable is part of a cycle.
+- **wait.**
+  - wait is optional.
+  - An exception thrown in a host component comes out of wait as the original exception.
+  - Destroying the model stalls naturally on the frees.
+- **Zero elements** behave like any other size.
+
+### 11.5 Shapes
+
+- **Defining versus setting.**
+  - Defining a shape: declaring a port, merging through the wiring calls, registering a hook, fixed_at_run.
+  - Setting a shape: an output's producer in pre_forward, a hook when it runs, a free input from its initializer.
+- **Declarations** are specified or unspecified per dimension, nothing else.
+- **Ragged is rank 2 only.** It is declared in one of three ways:
+  - a host counts or offsets array, which also fixes the leading dimension;
+  - both dimensions unspecified;
+  - the leading dimension specified and the counts unspecified.
+- **Inputs are never set by a component.** The data's producer is the authority on its shape.
+- **set_shape(output, one entry per dimension).** Each entry is a number or as_is.
+  - A number is allowed only on an unspecified dimension. A number on a specified or hook-owned dimension is an error at the call, naming the dimension and its owner.
+  - as_is leaves a dimension alone. A dimension still unknown at materialize fails with the shape-not-known error.
+- **Tied outputs.**
+  - The tie call marks each member's output holder as unable to set its shape.
+  - The members' declared definitions merge at the tie.
+  - Any dimension still unspecified must come from a hook on the alias; otherwise it fails at materialize.
+- **shape_hook(target, one descriptor per dimension).**
+  - Descriptors:
+    - as_is;
+    - from_shape(path, d);
+    - from_value(path, index);
+    - custom(fn);
+    - fixed_at_run(v), which makes the dimension specified at the call and is therefore the same as as_is inside the hook.
+  - Ragged descriptors: counts_from (a rank-1 counts source) and offsets_from. These use the parallel device scan, and only the total goes back to the host.
+  - Targets: an input, an input tie alias, an output tie alias, or an ordinary untied output. For an untied output, the hook runs before the producer, and the producer sets only the dimensions it owns.
+  - A hooked dimension must be unspecified at the call and has exactly one owning hook.
+  - On an input, a hook and a connection exclude each other.
+  - Each shape_hook call creates one templated pseudo-component that has only a forward and covers all of its dimensions.
+  - The hook runs every forward in the System loop, right before the first child that holds its target.
+  - There is no source-ordering check at setup: a hook works or fails when it runs. If its source is gone, the last shape stands.
+- **The "two sets of one dimension in one forward must agree" rule is dropped.** Every dimension has exactly one setter.
+- **Inside a fused group,** stage precomputes run in order before the launch. So from_shape on an earlier stage's output can work, and from_value cannot.
+
+### 11.6 Fused groups
+
+- **Name.** "Fused group" replaces "fused component". From outside it behaves like a component, and external wiring follows the normal rules.
+- **Philosophy.**
+  - Stages are free functions joined into one kernel.
+  - Their author usually designs them knowing they will be fused: work-group shape, barriers, local memory, ordering.
+  - Library authors (including our future standard library) design for unknown neighbours.
+  - The framework provides tools and execution guarantees and inserts no barriers.
+- **Segments.**
+  - The descriptor lists stages and says which consecutive stages share groups. Each such run is a segment with its own block of groups.
+  - Inside a segment there are two range modes, and both launch the largest range any stage asked for: each stage sees only its requested groups, or each stage sees the whole range.
+  - With no boundary primitive, segments use plain hardware group ids, with no atomics. That is the former "parallel" case.
+- **Connects inside a fused group** are allowed anywhere, as long as they go forward in stage order (that is, no cycles). What a connect means is the user's responsibility: work-group-local ownership of the data, or a wait.
+- **Boundary primitives** are descriptor entries between segments, not components.
+  - **Ticket ordering.**
+    - It switches the whole launch to tickets taken from an atomic counter.
+    - Every group of a later segment starts only after every group of the earlier segments has started.
+    - It records per-group completion.
+  - **Global barrier.** Ticket ordering, plus every group of the later segment waits until all earlier groups have finished.
+  - **Per-tile ordering** is the user's own logic inside their components, built on the handle.
+  - **Counters.** The fused group owns a small global buffer for its counters. It is reset each forward, either by a fill or by comparing against the forward number times the group count.
+- **Item wrapper and handle.**
+  - Every group-based component, fused or not, sees our item wrapper, never raw SYCL group objects. The handle lives inside the wrapper, so the user never sees it.
+  - The wrapper exposes:
+    - the current segment index and the number of segments;
+    - each segment's group count;
+    - the group's index within its own segment, starting from 0;
+    - waiting on a specific earlier group (by segment and index);
+    - waiting on all earlier groups;
+    - group barriers, reductions and local memory.
+  - Waits are collective: one work-item spins, then a group barrier releases the rest.
+  - If there is no primitive, the ticket metadata is null and using it is UB, with no branches on the fast path. Waiting on your own segment or a later one deadlocks; that's for the user to debug.
+  - There are two flavours, one for work-group stages and one for plain stages.
+- **Local memory.**
+  - It is per work-group.
+  - The block size is the largest segment's total.
+  - Each component requests its own. The segment's strategy either sums its stages' requests or overlaps them (shared).
+  - A typed allocator hands out slices, and stages in one segment may share an allocation.
+- **Work-group shape.** Each stage declares its shape in its launch config. Every forward, the fuser checks that they match before the launch.
+- **Dynamic functions.**
+  - **One per component type.** Each fusible component type owns one dynamic-function definition: our wrapper, held as a function-local static. It is reused by every fused group that contains that type.
+  - **Bare components.** A bare component added with add_subsystem launches as a fused group of one stage, so there is one launch path.
+  - **Launch config** = the cached definition plus this forward's launch parameters.
+  - **Fork change.** A call sequence that also passes an incrementing stage index.
+    - Each call gets the native item, the handle array, the argument-pointer array and its stage index.
+    - The wrapper uses the index to pick its own handle and argument pointer, builds the item wrapper, and calls the user's body.
+- **Stage data.**
+  - Each component keeps a one-element USM vector holding its typed argument struct. Every forward it copies the struct in from a host member, with normal event ordering, and hands the fuser a type-erased pointer.
+  - The fuser's pointer array is allocated, filled and waited on once, at its first precompute (not at setup, because devices aren't final then). It is redone only after a rearm rebuilds the group.
+  - The per-stage geometry array (segment, group base, local offset, ticket data) is the fuser's. It is filled from a host member every forward, with event ordering.
+- **Events.**
+  - The single launch's event is registered as a read on every stage's input containers, the argument containers and the geometry array.
+  - It is registered as a write on every stage's output containers.
+  - There are no connection checks; internal connections work out naturally.
+  - The launch depends on the union of every stage's dependencies plus every stage's depends_on.
+- **Deferred.** Co-residency, persistent threads, vendor grid barriers.
+- **gemver-chain.** The example's "barrier" variant was never agreed and is to be removed.
+
+### 11.7 Open items
+
+1. **Fork: stage-index counter.** Read the fork's dynamic-function code (the config API and the call-sequence rewrite pass) and add the stage-index counter.
+2. **Fork: translation-unit report.** Investigate the old report that JIT compilation aborts when stage definitions live in a different translation unit from the outer kernel. It is not trusted.
+3. **Fork: empty single_task.** Confirm that an empty single_task with dependencies is never dropped by AdaptiveCpp, for collapsing event lists.
+4. **Code audit.** Audit the code on main against this section, by reading the code.
+5. **Tests.**
+   - Pool in-use numbers asserted exactly.
+   - A gate test showing that destruction waits on in-flight work.
+   - Remove the REVIEW markers this section settles.
+6. **gemver onepass.** The q bug on OpenMP is pre-existing and comes after the above.
