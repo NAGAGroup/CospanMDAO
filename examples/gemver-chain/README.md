@@ -29,6 +29,7 @@ indexed only by `sycl::id<2>{i, j}`.
 | `ColReduce<Z>` | `n` items | `x[j] = (Z ? z[j] : 0) + scale * sum_c P[c][j]`; `Z = false` has no `z` input |
 | `Gemv` | a group per row, grid-stride over rows | `reduce_over_group`; works under the generic JIT |
 | `BicgkOnePass`, `RowReduce` | a group per (strip, 256-column block); `n` items | q and s from one pass over `B`, and the row reducer of its q |
+| `Rank2UpdateLocal`, `GemvTPartialLocal`, `BicgkTileLocal`, `Rank2UpdateFromLocal` | one group per 32 x 256 tile of `B` | the `crafted` components: the tile lives in local memory between stages (below) |
 
 ## Variants (`systems.hpp`)
 
@@ -45,6 +46,41 @@ variant promotes the same names, so the driver is variant-agnostic.
   instead of twice, but sums in a different order, so it is not bitwise equal to the others
   (relative L2 about 3e-6 against unfused). **Skipped by `--variant all` on omp**, where its `q` is
   wrong (see the open questions); an explicit `--variant onepass` still runs it there.
+* **naive**: the SAME components, fused with global barriers into **three launches for the whole chain** (the
+  barrier items make every group of the next segment wait for every group of the earlier ones, in ticket order, so no
+  co-residency is needed):
+  `G1 = fuse_components(segment<whole>(r2u, gtp), global_barrier(), cred, global_barrier(), gemv)`,
+  `BiCGK = fuse_components(onepass, global_barrier(), segment(rowred, cred_s))`, `G2` as `G1`. It contains `BicgkOnePass`, so on
+  omp its `q` is wrong too (and **`--variant all` skips it there**; an explicit `--variant naive` runs it).
+* **crafted**: components written to be fused, three launches (see below). Passes `--check` on omp as well.
+
+### What `crafted` does differently
+
+The plain components each read `B` from global memory: the rank-2 update writes it, the partial column sums read it back,
+and BiCGK reads it again (and G2's rank-2 update reads B1 a third time). `crafted` gives every work-group a **tile of
+32 rows by 256 columns of `B` (32 KB of local memory)** and keeps it there between the stages of one segment
+(`local_mem::shared`: every stage of the segment sees the same block):
+
+* **G1 launch**: `Rank2UpdateLocal` computes its tile of `B1`, writes it to global `B1` (an output) and leaves it in local
+  memory; `GemvTPartialLocal` (after a group barrier) reads the tile from local memory for the partial column sums, so
+  `B1` is not read back. Then `global_barrier`, `cred`, `global_barrier`, `gemv` (the existing components).
+* **Middle launch** (BiCGK and G2's rank-2 update share ONE read of `B1`): `BicgkTileLocal` loads the `B1` tile into local
+  memory and produces the `q` and `s` partials from it, as `BicgkOnePass` does; `Rank2UpdateFromLocal` (after a group
+  barrier) writes `B2 = tile + u1b v1b^T + u2b v2b^T` from local memory. G2's update does not depend on `q` or `s`, which is
+  why it can share the read. Then `global_barrier`, then `rowred` and `cred_s`.
+* **G2 launch**: `gtp` reads `B2` from global memory (it needs `y = q`, which is not known when `B2` is made, so it cannot
+  come from local memory), then `global_barrier`, `cred`, `global_barrier`, `gemv`.
+
+The tile stages process exactly one tile per work-group (one group per tile, no grid-stride loop): stages run one after
+the other inside a work-group, so a stage that looped over several tiles would leave only the last one in local memory.
+The reducers use `n / 32` strips (not `--R`). All new components expose the same promoted outputs, so the driver and
+`--check` are unchanged. Every launch of a fused group reserves the largest local block of its segments, so `gemv` and
+`cred` groups of the same launch also hold 32 KB each.
+
+**The limit.** `B` stays in local memory only within a segment, between two stages of the same work-group. Keeping it there
+across the `x -> w` dependency of GEMVER (`gemv` needs the whole `x`, which needs every strip's partials) would need all the
+work-groups to be resident at once (co-resident groups, persistent threads); that is deferred, so `gemv` and `gtp` in G2
+read `B` from global memory again.
 
 ### A fused group with segments
 
@@ -76,7 +112,7 @@ nothing else in GEMVER:
 
 A global dependency like these can be put inside one fused group with a boundary item
 (`cs::global_barrier()` between two segments, or `cs::ticket_order()` plus `GroupItem::wait_group`).
-This example does not use them: the chain keeps its global dependencies at kernel boundaries.
+The `naive` and `crafted` variants use them: the global dependencies of the whole chain become barriers inside three launches.
 
 ## cuBLAS reference (`cublas/`)
 
@@ -91,34 +127,69 @@ update in one pass. Also each BLAS call and copy is a separate launch.
 
 ## Results
 
-**These numbers were measured before the fused-group rework (P7) and were NOT re-measured for P8**: the fused launch path
-has changed since. RTX 4090 (128 SMs), n = 16384, R = 64, 20 iterations after 3 warm-up, one wait after the batch
-(CoSpan) / CUDA events (cuBLAS). Second run of each program (the JIT cache is warm).
-GB/s uses a **nominal** 8 * n^2 * 4 B = 8.59 GB per chain, not measured traffic
-(the unfused chain really moves about 11 matrix passes).
+Measured on 2026-10-06 on an NVIDIA GeForce RTX 4090 (128 SMs, 24 GiB; driver 610.74, CUDA 13.3 as reported by nvidia-smi;
+cuBLAS from conda-forge CUDA 13.3, libcublas 13.6), AdaptiveCpp with its default `ACPP_ADAPTIVITY_LEVEL` and the same
+compile flags for every CoSpan variant. Protocol (`examples/run_benchmarks.nu`, `pixi run benchmarks`): **each variant in its
+own process**, JIT warm-up runs until AdaptiveCpp stops printing its "new binaries being JIT-compiled" warning (one run was
+enough everywhere, the kernel cache being warm), then **5 timed runs: the median, with the min-max spread**; each run times 20
+chains after 3 warm-up chains, `--R 64`. GB/s uses the **nominal** traffic of 8 n^2 * 4 B per chain (not measured). The
+relative L2 error is the worst of x1 w1 q s x2 w2 (and B2 for n <= 4096) against the host double-precision reference, from
+`--check`. `naive` and `crafted` are not bitwise equal to the others (other summation orders).
 
-| variant | ms / chain | speedup vs unfused | GB/s (nominal) |
-|---|---:|---:|---:|
-| unfused | 15.99 | 1.00x | 537 |
-| parallel | 16.19 | 0.99x | 531 |
-| fused | 11.66 | 1.37x | 737 |
-| onepass (provisional) | 11.12 / 10.95 | 1.44x / 1.47x | 772 / 784 |
-| cuBLAS | 21.07 | 0.76x | 408 |
+| n | variant | ms / chain | min-max | GB/s (nominal) | worst rel L2 |
+|---:|---|---:|---|---:|---:|
+| 2048 | naive | 1.224 | 1.196-1.270 | 109.6 | 1.12e-7 |
+| 2048 | crafted | 1.223 | 1.172-1.299 | 109.7 | 1.24e-7 |
+| 2048 | cuBLAS | 0.172 | 0.170-0.205 | 782.8 | 1.26e-7 |
+| 4096 | naive | 1.433 | 1.346-1.447 | 374.7 | 1.38e-7 |
+| 4096 | crafted | 1.259 | 1.237-1.308 | 426.5 | 1.7e-7 |
+| 4096 | cuBLAS | 0.813 | 0.793-0.817 | 660.5 | 1.24e-7 |
+| 8192 | naive | 2.386 | 2.383-2.408 | 900.0 | 1.69e-7 |
+| 8192 | crafted | 2.384 | 2.376-2.417 | 900.9 | 2.4e-7 |
+| 8192 | cuBLAS | 5.185 | 5.173-5.193 | 414.2 | 1.85e-7 |
+| 16384 | naive | 8.997 | 8.964-9.121 | 954.8 | 2.38e-7 |
+| 16384 | crafted | 8.901 | 8.866-8.949 | 965.1 | 3.4e-7 |
+| 16384 | cuBLAS | 21.01 | 21.01-21.02 | 408.8 | 2.33e-7 |
+
+The other variants, the same way (one process each):
+
+| n | variant | ms / chain | min-max | GB/s (nominal) |
+|---:|---|---:|---|---:|
+| 2048 | unfused | 1.982 | 1.921-2.066 | 67.7 |
+| 2048 | parallel | 1.963 | 1.933-1.982 | 68.4 |
+| 2048 | fused | 1.675 | 1.613-1.702 | 80.1 |
+| 2048 | onepass | 1.755 | 1.743-1.905 | 76.5 |
+| 4096 | unfused | 1.950 | 1.919-1.951 | 275.3 |
+| 4096 | parallel | 1.946 | 1.924-1.983 | 275.9 |
+| 4096 | fused | 1.735 | 1.648-1.850 | 309.4 |
+| 4096 | onepass | 1.899 | 1.870-1.950 | 282.7 |
+| 8192 | unfused | 3.183 | 3.163-3.834 | 674.7 |
+| 8192 | parallel | 3.790 | 3.153-3.830 | 566.6 |
+| 8192 | fused | 2.621 | 2.607-2.644 | 819.3 |
+| 8192 | onepass | 2.550 | 2.544-2.563 | 842.0 |
+| 16384 | unfused | 12.11 | 12.07-12.15 | 709.1 |
+| 16384 | parallel | 12.12 | 12.06-12.19 | 708.6 |
+| 16384 | fused | 9.858 | 9.834-9.935 | 871.4 |
+| 16384 | onepass | 9.309 | 9.244-9.367 | 922.8 |
 
 Notes, honestly:
 
-* **Noise in `fused`.** Across five full-size runs it measured 15.05, 15.08, 14.91, 11.82 and 11.66 ms
-  (1.06x to 1.37x); the other variants moved by under 2%. I did not find why. Read fused as
-  "1.06x to 1.37x", not 1.37x.
-* `parallel` is a wash: the two kernels are already large enough to fill the GPU.
-* **Small n is different.** At n = 2048 (`--check` runs, 5 iterations) unfused took about 0.25 ms,
-  parallel 0.32 to 0.56 ms and fused about 1.7 ms: fusion lost badly when the work was tiny. The suspect was
-  the per-forward host-side overhead of the old fused wave (packing and uploading its stage records, now
-  gone); not re-measured.
-* cuBLAS is the slowest, largely because of the copies and the in-place `sger` passes above.
-* The unfused, parallel and fused variants are bitwise equal at n = 2048 and n = 16384, and agree with
-  cuBLAS to a relative L2 of 3e-7 (x1, s, x2) to 2.7e-6 (w1, q, w2). Against the host double
-  reference the errors are the same size (see `--check`).
+* **At n = 16384 (a 1 GiB matrix) the three-launch variants and onepass are all near 9 ms (about 950 GB/s of nominal
+  traffic, against a 1008 GB/s card); `crafted` is 1% ahead of `naive` and 4%
+  ahead of `onepass`.** The local-memory tiles save `B` traffic that the nominal figure does not count, so they show up
+  only as a small difference here; I did not profile why they do not show up as more.
+* **cuBLAS at n = 2048 runs out of the L2 cache**: the matrix is 16 MB (2048 * 2048 * 4 B) and the 4090 has
+  72 MB of L2, so its 0.17 ms is not a memory-bound figure, and at n = 4096 (64 MB) it is still mostly cached. At n = 16384
+  the data comes from DRAM and cuBLAS takes 21 ms (it copies `A` into `B` before each in-place `sger`, see above). The CoSpan
+  variants at n <= 4096 take about 1.2 ms whatever n is, which is not bandwidth; launch and barrier costs are the suspect, not profiled.
+* **Running all the variants in one process (`--variant all`) slows the fused ones down and makes them bimodal; the cause
+  was not investigated.** At n = 16384 `crafted` and `naive` measured 13-14 ms (min-max 12.97-16.19 ms) as the last variants
+  of an `all` run against 8.9-9.0 ms alone, and `fused` and `parallel` spread 10.1-14.5 ms and 16.2-20.4 ms. That is why the
+  tables above use one process per variant. `--variant all` is kept for `--check` and for a quick look.
+* A `--check` run is the correctness record: every variant, one process, relative L2 against the host reference below 1e-4
+  at n = 2048, 4096, 8192 and 16384 (the table above lists the worst value per variant).
+* On omp, `crafted` passes `--check` at n = 2048 and 4096 (worst relative L2 about 1.7e-7); `naive` fails there (`q`, `x2`
+  and `w2` are wrong, as `onepass`'s are: it contains `BicgkOnePass`, the known omp bug).
 
 ## Running
 
@@ -132,9 +203,9 @@ pixi run -e cublas gemver-chain-cublas --check --n 2048
 pixi run -e cublas gemver-chain-cublas --n 16384 --compare /tmp/gc   # rel L2 against the CoSpan dumps
 ```
 
-Flags: `--n --R --iters --warmup --variant all|unfused|parallel|fused|onepass --check --dump`.
+Flags: `--n --R --iters --warmup --variant all|unfused|parallel|fused|onepass|naive|crafted --check --dump`.
 `--check` compares every output with the host double reference (relative L2 <= 1e-4; B2 too
-when n <= 4096) and the variants with each other (bitwise). To pick the GPU on a machine that also
+when n <= 4096) and the variants with each other (bitwise for unfused, parallel and fused; within the tolerance for onepass, naive and crafted). To pick the GPU on a machine that also
 has the omp device, set `ACPP_VISIBILITY_MASK=cuda` (the default selector already picks it here).
 
 ## Open questions — to explore further

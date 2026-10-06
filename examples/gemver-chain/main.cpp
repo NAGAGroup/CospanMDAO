@@ -1,7 +1,7 @@
 // examples/gemver-chain/main.cpp — the GEMVER -> BiCGK -> GEMVER chain on CoSpan, in several fusion styles.
 //
 //   gemver-chain [--n 16384] [--R 64] [--iters 20] [--warmup 3]
-//                [--variant all|unfused|parallel|fused|onepass] [--check] [--dump <dir>]
+//                [--variant all|unfused|parallel|fused|onepass|naive|crafted] [--check] [--dump <dir>]
 //
 // Per variant: create the model, set the inputs from the shared generator (Model::update_input: applied by the first
 // forward), warm up (forward + wait), then time `iters` forwards followed by ONE wait. --check compares
@@ -110,15 +110,23 @@ Outputs read_outputs(cs::Model& m, bool with_B2) {
 }
 
 // ---- variants -------------------------------------------------------------------------------------------
-enum class Variant { unfused, parallel, fused, onepass };
+enum class Variant { unfused, parallel, fused, onepass, naive, crafted };
 constexpr const char* name_of(Variant v) {
     switch (v) {
         case Variant::unfused: return "unfused";
         case Variant::parallel: return "parallel";
         case Variant::fused: return "fused";
         case Variant::onepass: return "onepass";
+        case Variant::naive: return "naive";
+        case Variant::crafted: return "crafted";
     }
     return "?";
+}
+
+/// Whether a variant sums in the same order as `unfused`, so that the two are bit-identical. onepass and naive (which
+/// contains BicgkOnePass) sum BiCGK in another order; crafted uses other strips (kRt rows) and another order.
+constexpr bool same_order_as_unfused(Variant v) {
+    return v == Variant::unfused || v == Variant::parallel || v == Variant::fused;
 }
 
 cs::Model make_model(Variant v, const Options& o) {
@@ -127,6 +135,8 @@ cs::Model make_model(Variant v, const Options& o) {
         case Variant::parallel: return cs::create_model<gc::Chain>(cs::ModelConfig{}, gc::Style::parallel, o.n, o.R);
         case Variant::fused: return cs::create_model<gc::Chain>(cs::ModelConfig{}, gc::Style::fused, o.n, o.R);
         case Variant::onepass: return cs::create_model<gc::Chain>(cs::ModelConfig{}, gc::Style::onepass, o.n, o.R);
+        case Variant::naive: return cs::create_model<gc::Chain>(cs::ModelConfig{}, gc::Style::naive, o.n, o.R);
+        case Variant::crafted: return cs::create_model<gc::Chain>(cs::ModelConfig{}, gc::Style::crafted, o.n, o.R);
     }
     throw std::logic_error("unknown variant");
 }
@@ -229,8 +239,8 @@ int main(int argc, char** argv) {
         const Options o = parse(argc, argv);
         gd::check_problem(static_cast<std::size_t>(o.n), static_cast<std::size_t>(o.R));
         if (o.variant != "all" && o.variant != "unfused" && o.variant != "parallel" && o.variant != "fused" &&
-            o.variant != "onepass")
-            throw std::invalid_argument("--variant must be all|unfused|parallel|fused|onepass");
+            o.variant != "onepass" && o.variant != "naive" && o.variant != "crafted")
+            throw std::invalid_argument("--variant must be all|unfused|parallel|fused|onepass|naive|crafted");
 
         // ModelConfig has no default device (design review, section 2): the systems add no device, so every instance runs on
         // AdaptiveCpp's default device. This default_selector_v device is the same one; it is used only to print its name
@@ -255,6 +265,15 @@ int main(int argc, char** argv) {
         }
         if (want("parallel")) todo.push_back(Variant::parallel);
         if (want("fused")) todo.push_back(Variant::fused);
+        if (want("naive")) {
+            // naive contains BicgkOnePass, so under `all` on omp it is skipped for the same reason as onepass; an explicit
+            // --variant naive still runs it.
+            if (is_omp && o.variant == "all")
+                std::printf("naive: skipped on omp: it contains onepass, whose q is incorrect on this backend\n");
+            else
+                todo.push_back(Variant::naive);
+        }
+        if (want("crafted")) todo.push_back(Variant::crafted);
         if (todo.empty()) throw std::invalid_argument("--variant: nothing to run for '" + o.variant + "'");
 
         Data data;
@@ -313,7 +332,7 @@ int main(int argc, char** argv) {
                 if (!check_against_reference(r, ref, o, with_B2)) all_ok = false;
                 if (first == nullptr)
                     first = &r;
-                else if (!check_agree(*first, r, /*bitwise=*/r.variant != Variant::onepass, with_B2, o))  // one-pass sums in another order
+                else if (!check_agree(*first, r, /*bitwise=*/same_order_as_unfused(r.variant), with_B2, o))  // the others sum in another order
                     all_ok = false;
             }
         }
