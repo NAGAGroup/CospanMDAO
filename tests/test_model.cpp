@@ -718,33 +718,37 @@ public:
 };
 }  // namespace tmod
 
-TEST_CASE("Marks: only on subsystems that never go out of scope", "[model][marks][errors]") {
-    // Design review, section 9 (Jack, 2026-10-03): Model::setup's finalize walks the slots from the root to the mark's
-    // declaring subsystem and refuses a run policy (transient, do_once, run_n) on the way.
-    SECTION("an eternal subsystem: fine") {
+TEST_CASE("Marks: no scope rule; whatever is collected at setup stays", "[model][marks]") {
+    // Design review, 11.2 (P4): marks have no scope rule. The old finalize walk that refused a run policy on the way
+    // (transient, do_once, run_n) is gone; every mark is collected, by absolute path.
+    SECTION("an eternal subsystem") {
         auto model = cs::create_model<tmod::MarkScopeTop>(default_config(), 0, 'd');
         CHECK_NOTHROW(model.setup());
-        CHECK(model.design_vars().size() == 1);
+        REQUIRE(model.design_vars().size() == 1);
+        CHECK(model.design_vars()[0].path == "a.x");
     }
     SECTION("a transient subsystem") {
         auto model = cs::create_model<tmod::MarkScopeTop>(default_config(), 1, 'd');
-        tmod::expect_throws([&] { model.setup(); },
-                            {"'a.x' is a design variable on a subsystem that can go out of scope", "('a' has a run policy)",
-                             "marks must live on subsystems that never go out of scope"});
+        CHECK_NOTHROW(model.setup());
+        REQUIRE(model.design_vars().size() == 1);
+        CHECK(model.design_vars()[0].path == "a.x");
     }
     SECTION("a do_once subsystem, a constraint") {
         auto model = cs::create_model<tmod::MarkScopeTop>(default_config(), 2, 'c');
-        tmod::expect_throws([&] { model.setup(); },
-                            {"'a.y' is a constraint on a subsystem that can go out of scope", "('a' has a run policy)"});
+        CHECK_NOTHROW(model.setup());
+        REQUIRE(model.constraints().size() == 1);
+        CHECK(model.constraints()[0].path == "a.y");
     }
     SECTION("a run_n subsystem") {
         auto model = cs::create_model<tmod::MarkScopeTop>(default_config(), 3, 'd');
-        tmod::expect_throws([&] { model.setup(); }, {"design variable", "('a' has a run policy)"});
+        CHECK_NOTHROW(model.setup());
+        REQUIRE(model.design_vars().size() == 1);
     }
-    SECTION("an eternal System under a transient one: the walk starts at the root") {
+    SECTION("an eternal System under a transient one") {
         auto model = cs::create_model<tmod::MarkScopeTop>(default_config(), 4, 'd');
-        tmod::expect_throws([&] { model.setup(); },
-                            {"'outer.in.a.x' is a design variable", "('outer' has a run policy)"});
+        CHECK_NOTHROW(model.setup());
+        REQUIRE(model.design_vars().size() == 1);
+        CHECK(model.design_vars()[0].path == "outer.in.a.x");
     }
 }
 

@@ -396,8 +396,20 @@ public:
     /// The first materialization has sized every live container (variable.hpp, Var::materialize). Never cleared.
     bool materialized = false;
 
-    /// Set (by a later phase) to stop the post-compute pushes of this variable's output to its other placements.
+    /// Set by tie_outputs: the members' own postcompute pushes to the variable's other placements are off, and the System
+    /// that owns the tie alias pushes through the alias instead (System::run_compute).
     bool push_suppressed = false;
+
+    /// The variable closes a cycle (connect found a consumer registered before its producer). Its initializer is kept and
+    /// runs at the first materialization even though the variable is connected; with none, that is an error naming
+    /// `cycle_note`. Sticky: merges carry it.
+    bool        cycle = false;
+    std::string cycle_note;
+
+    /// Tie marks, one per kind (design review, 11.2): a tie call refuses a member whose variable already has the mark of
+    /// its kind. Set by the tie call on the alias's variable; merges carry them (a promotion of a tie shares the variable).
+    bool tied_input  = false;
+    bool tied_output = false;
 
     /// Connected inside one fused component; a later phase may keep such an intermediate in local memory (section 4).
     bool internal = false;
@@ -869,8 +881,8 @@ public:
             return;
         }
         // Materialized: a stale variable (update_input) is initialized again in place; then the holder that asked checks
-        // only its own container.
-        if (stale_ && !has_producer()) reinitialize(rt, trigger);
+        // only its own container. (A cycle variable has a producer and is initialized by its initializer all the same.)
+        if (stale_ && (!has_producer() || cycle)) reinitialize(rt, trigger);
         if (trigger != nullptr) populate(rt, std::static_pointer_cast<Data>(data_of(*trigger)));
     }
 
@@ -897,11 +909,18 @@ private:
     void first_materialization(Runtime& rt, const Instance* trigger) {
         // The shape: the dimensions the definition fixes, and for a variable nothing produces, its initializer's shape
         // (section 10). Anything still unknown is an error naming the dimension and who should set it.
+        // A cycle variable is read before its producer has run: it has no initializer only by mistake, and the error
+        // names the cycle (design review 11.2: checked here, not at setup, because update_input may supply it).
+        if (cycle && !init)
+            throw std::logic_error("naga::cospan: '" + display_path() + "' closes a cycle (" + cycle_note +
+                                   ") and has no initializer: its first read needs one (init_input, or update_input before the "
+                                   "first forward)");
+        const bool from_init = !has_producer() || cycle;  // an initializer supplies the values, and the shape it carries
         if (!shape.known) {
             fill_fixed_dims(rt);
-            if (!has_producer()) resolve_free_shape(rt);
+            if (from_init) resolve_free_shape(rt);
             if (!shape.known) throw shape_unknown();
-        } else if (!has_producer()) {
+        } else if (from_init) {
             resolve_free_shape(rt);  // an initializer's shape, or update_input's
         }
 
@@ -911,8 +930,9 @@ private:
 
         // Unless the holder that asked is an output (its producer writes the data), initialize and copy to the others.
         // A variable with no initializer is all zeros already (a container is sized by value-initialization).
+        // A cycle variable always initializes: whichever holder asks first, the consumer reads it before the producer writes.
         const bool output_asked = trigger != nullptr && kind_of(*trigger) == IOKind::output;
-        if (!output_asked && init) initialize(rt, live, trigger);
+        if ((!output_asked || cycle) && init) initialize(rt, live, trigger);
         materialized = true;
         stale_       = false;
     }

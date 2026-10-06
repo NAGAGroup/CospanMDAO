@@ -179,7 +179,7 @@ public:
             throw std::invalid_argument("naga::cospan: Model::update_input: '" + std::string{path} +
                                         "' is an output; outputs are never initialized");
         detail::VarMeta& v = *inst->meta;
-        if (detail::first_of_kind(v, IOKind::output)) {
+        if (detail::first_of_kind(v, IOKind::output) && !v.cycle) {  // a cycle variable keeps an initializer: update_input counts
             std::cerr << "naga::cospan: warning: input '" << path << "' is connected to an output; update_input is never applied\n";
             return;
         }
@@ -304,37 +304,13 @@ private:
         s_.reset();
     }
 
-    /// Marks live only on subsystems that never go out of scope (design review, section 9): walks the slots from the
-    /// root along the mark's absolute path to the instance's declaring subsystem (every segment but the last), and
-    /// throws at the first slot that has a run policy (run_n, do_once or transient).
-    static void check_mark_scope(const System& root, const Mark& m, const char* kind) {
-        const System* cur  = &root;
-        std::string   slot;
-        std::size_t   from = 0;
-        while (cur != nullptr) {
-            const std::size_t dot = m.path.find('.', from);
-            if (dot == std::string::npos) return;  // the last segment is the port or alias itself, not a slot
-            const std::string seg = m.path.substr(from, dot - from);
-            slot += (slot.empty() ? "" : ".") + seg;
-            if (cur->run_policy_of(seg) != -1)
-                throw std::invalid_argument("naga::cospan: '" + m.path + "' is a " + kind +
-                                            " on a subsystem that can go out of scope ('" + slot +
-                                            "' has a run policy); marks must live on subsystems that never go out of scope");
-            cur  = dynamic_cast<const System*>(cur->child_of(seg));
-            from = dot + 1;
-        }
-    }
-
     /// FINALIZE: depth-first in declaration order, a System's own marks and then its live children. Each declared
     /// mark becomes a Mark by absolute path (the declaring System's path, a dot, the declared path; at the root, the
-    /// declared path).
+    /// declared path). There is no scope rule (design review, 11.2): whatever is collected at setup stays, even under a
+    /// subsystem that later goes out of scope (the mark's instance pointer is weak and just expires with it).
     static void collect_marks(const System& sys, Impl& s) {
         for (const System::MarkDecl& m : sys.marks()) {
             Mark out{sys.path().empty() ? m.path : sys.path() + "." + m.path, m.inst, m.rec};
-            check_mark_scope(*s.root, out,
-                             m.kind == System::MarkDecl::Kind::design_var   ? "design variable"
-                             : m.kind == System::MarkDecl::Kind::constraint ? "constraint"
-                                                                            : "objective");
             switch (m.kind) {
                 case System::MarkDecl::Kind::design_var: s.design_vars.push_back(std::move(out)); break;
                 case System::MarkDecl::Kind::constraint: s.constraints.push_back(std::move(out)); break;

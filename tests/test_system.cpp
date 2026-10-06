@@ -1907,13 +1907,14 @@ TEST_CASE("structural errors", "[system][errors]") {
         tsys::expect_setup_throws<tsys::ConnectUnknownEntry>("a.nope");
         tsys::expect_setup_throws<tsys::ConnectUnknownSub>("zz");
     }
-    SECTION("a structural call outside setup()") {
+    SECTION("a call outside setup(): wiring is legal anywhere (tests/test_p4.cpp), marks and depends_on are not") {
         cs::Model model = cs::create_model<tsys::ThreeAxpb>(default_config());
         model.setup();
         auto& sys = model.root();
-        tsys::expect_throws([&] { sys.connect("a.y", "b.x"); }, "setup() only");
-        tsys::expect_throws([&] { sys.promote<DType::f32, 1>("a.y", "y"); }, "setup() only");
-        tsys::expect_throws([&] { sys.tie_inputs<DType::f32, 1>({"a.x", "b.x"}, "t", cs::shape(1)); }, "setup() only");
+        // P4: connect, promote, tie_* and init_input have no phase guard; their own rules still apply. The connect works
+        // (nothing has run), and the tie that follows it meets the ordinary rule: b.x is no longer a free input.
+        CHECK_NOTHROW(sys.connect("a.y", "b.x"));
+        tsys::expect_throws([&] { sys.tie_inputs<DType::f32, 1>({"a.x", "b.x"}, "t", cs::shape(1)); }, "not a free input");
         tsys::expect_throws([&] { sys.add_design_var("a.x"); }, "setup() only");
         tsys::expect_throws([&] { sys.depends_on("b", "a"); }, "setup() only");
     }
@@ -2228,10 +2229,9 @@ TEST_CASE("cycle warning: a consumer registered before its producer warns once, 
         "the producer's previous value (or its initial state on the first forward)\n";
     CHECK(text.find(line) != std::string::npos);
     CHECK(text.find(line) == text.rfind(line));  // one line for the one connection
-    // REVIEW: the old case then ran two forwards and checked that "the consumer sees the producer's previous value" (a.y =
-    // 6, one forward late) and that the first forward did not throw. With the rework a is called before b, and a.x's
-    // variable has a producer that has not run, so its first materialization may hit "its shape is not known yet"
-    // (variable.hpp, Var::materialize); the headers do not settle what a cycle does at run time, so no forward is asserted.
+    // P4 settles what a cycle does at run time (tests/test_p4.cpp): a.x has no initializer here, so the first forward of
+    // this model throws, naming the variable and the cycle; with an initializer the consumer reads it on the first forward
+    // and the produced value on the second.
 }
 
 TEST_CASE("cycle warning: a correctly ordered model prints nothing", "[system][cycle]") {
@@ -2693,12 +2693,18 @@ TEST_CASE("lifetime: a model-level promotion is eternal", "[system][lifetime]") 
     }
 }
 
-TEST_CASE("lifetime: a mark under a transient System is refused at setup", "[system][lifetime]") {
-    // Changed (design review, section 9, Jack 2026-10-03): marks live only on subsystems that never go out of scope, so this
-    // used to be accepted ("marks keep nothing alive") and now throws in Model::setup's finalize.
+TEST_CASE("lifetime: a mark under a transient System is collected at setup and stays", "[system][lifetime]") {
+    // Changed (design review, 11.2, P4): marks have no scope rule. They are collected at setup and stay; the transient
+    // System's variable lives only while it does, and a forward does not touch the collected mark.
     cs::Model model = cs::create_model<tsys::MarkedInTransient>(cst::pooled_config());
-    tsys::expect_throws([&] { model.setup(); },
-                        "'tr.a.x' is a design variable on a subsystem that can go out of scope ('tr' has a run policy)");
+    REQUIRE_NOTHROW(model.setup());
+    REQUIRE(model.design_vars().size() == 1);
+    CHECK(model.design_vars()[0].path == "tr.a.x");
+    model.forward();
+    model.wait();
+    CHECK(model.get_subsystem("tr") == nullptr);  // deleted after its turn
+    REQUIRE(model.design_vars().size() == 1);
+    CHECK(model.design_vars()[0].path == "tr.a.x");
 }
 
 TEST_CASE("lifetime: rearm sends a do_once's variables back out of scope and they are initialized again", "[system][lifetime][rearm]") {

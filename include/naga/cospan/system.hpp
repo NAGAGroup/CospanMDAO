@@ -9,19 +9,21 @@
 //
 // THE FORWARD (docs/design-review-2026-10-03.md, section 3). A System's forward is three framework-owned steps:
 //   precompute   rebuilds transient children (this allocates nothing), then the user's pre_forward(), where rearm()
-//                may re-run children by name;
-//   compute      calls each live child's forward in declaration order, and nothing else: no materializing and no
-//                submitting. A child whose run policy has ended is deleted right away, waiting on THAT child's events
-//                only, so its memory is free before later children allocate while independent work keeps running.
-//                (Users: add subsystems that can go out of scope as late as possible in setup(), since deleting one
-//                makes its parent wait on that subsystem's events before continuing.) depends_on hands one child's
-//                events to another for one forward;
-//   postcompute  the pushes of the tie_outputs aliases this System owns to the variable's other placements, then the
-//                user's post_forward().
+//                and override_run_policy() may re-run children or change their run policy. It never runs a child's
+//                precompute;
+//   compute      the loop: for each live child in declaration order, the child's precompute, compute and postcompute.
+//                A tie_outputs alias this System owns takes its turn right after the last child that holds a member: the
+//                push of the tied variable to its other placements. A child whose run policy has ended is deleted right
+//                after its postcompute (and that push); there is no explicit wait, the container frees wait on their own
+//                events. (Users: add subsystems that can go out of scope as late as possible in setup(), since a free
+//                stalls until the child's kernels are done.) depends_on hands one child's events to another for one
+//                forward;
+//   postcompute  the user's post_forward().
 //
-// Everything structural (add_subsystem, connect, promote, tie_*, init_input, marks) is legal inside setup() only,
-// and every rule is checked in its own call (section 2): the wiring rules live in wiring.hpp, which these verbs
-// call after resolving paths to instances. Setup allocates nothing, submits nothing and compiles nothing.
+// add_subsystem, depends_on, shape_hook and the marks are legal inside setup() only; connect, promote, tie_*, init_input,
+// override_run_policy and rearm are legal at any time (design review, 11.0: no phase restrictions without a real reason).
+// Every rule is checked in its own call (section 2): the wiring rules live in wiring.hpp, which these verbs call after
+// resolving paths to instances. Setup allocates nothing, submits nothing and compiles nothing.
 //
 // ADDING A CHILD. add_subsystem is the factory (sections 2 and 4): it builds the child from a descriptor, runs the
 // child's setup, then calls set_device on it, first with the device it was given and then, if this System itself has
@@ -184,10 +186,10 @@ public:
         declare_child(std::move(desc.name), props, dev, detail::make_factory<T>(std::move(desc.args)));
     }
 
-    // ---- structure: connect / promote / tie (legal inside setup() only) --------
-    /// Feeds `dst` from `src`; the source's variable wins (wiring.hpp, connect).
+    // ---- structure: connect / promote / tie (legal at any time) -----------------
+    /// Feeds `dst` from `src`; the source's variable wins (wiring.hpp, connect). Merging two variables that are both
+    /// materialized is an error here ("merging two materialized variables is not defined (yet)").
     void connect(std::string_view src, std::string_view dst) {
-        require_declaring("connect");
         const auto s = instance_at(src);
         const auto d = instance_at(dst);
         detail::connect(site(order_of(src), order_of(dst)), s, d);
@@ -203,7 +205,6 @@ public:
     template <DType DT, int Rank>
     void promote(std::string_view child_path, std::string promoted_name) {
         static_assert(Rank >= 1 && Rank <= 3, "cospan: rank is 1..3");
-        require_declaring("promote");
         check_new_name(promoted_name, "alias");
         const auto member = instance_at(child_path);
         auto       a      = detail::promote<DT, Rank>(site(), member, promoted_name, this);
@@ -221,15 +222,16 @@ public:
     /// specified or unspecified; a ragged tie: cs::shape(), (n), (cs::counts(v)) or (cs::offsets(v))): the definitions of
     /// the members and of everything connected to it merge (unspecified absorbs specified, two specified values must
     /// agree), and a dimension still unspecified comes from the connected output, the initializer, or a shape_hook on the
-    /// alias (design review, section 10). `device`: where the tie's initialization runs and its data stays (section 2).
+    /// alias (design review, section 10). `device` (the default device when none is given): where the alias lives and
+    /// where the tie's initialization runs; the members can be elsewhere (section 2). A member that is already a tie, or a
+    /// promotion of one, is refused: no ties of ties.
     template <DType DT, int Rank>
     void tie_inputs(std::initializer_list<std::string_view> members, std::string name, ShapeSpec shape = {},
                     std::optional<sycl::device> device = {}) {
         static_assert(Rank >= 1 && Rank <= 3, "cospan: rank is 1..3");
-        require_declaring("tie_inputs");
         check_new_name(name, "alias");
         const detail::TieMembers ms = resolve_members(members);
-        auto a = detail::tie_inputs<DT, Rank>(site(), ms, name, this, shape, device);
+        auto a = detail::tie_inputs<DT, Rank>(site(), ms, name, this, shape, std::optional<sycl::device>{device.value_or(detail::default_device())});
         store_alias(a);
         record_tie(members, name, /*is_input=*/true, a);
     }
@@ -238,15 +240,20 @@ public:
     /// DT and rank Rank, all on one device; the alias owns the shape (an output alias defines the shape of its
     /// connections). Its definition is the members' declared dimensions merged with `shape` (cs::shape); any dimension
     /// still unspecified must be set by a shape_hook on the alias, and a member cannot reshape its output (section 10).
+    /// `device` (the default device when none is given): every member must be on it at the call, and this System checks
+    /// again at each forward (a member can be moved later by set_device). The variable is push-suppressed: the members
+    /// only register their writes, and this System pushes through the alias right after the last child holding a member.
     template <DType DT, int Rank>
     void tie_outputs(std::initializer_list<std::string_view> members, std::string name, ShapeSpec shape = {},
-                     TieOutputsPolicy policy = TieOutputsPolicy::require_atomic) {
+                     TieOutputsPolicy policy = TieOutputsPolicy::require_atomic, std::optional<sycl::device> device = {}) {
         static_assert(Rank >= 1 && Rank <= 3, "cospan: rank is 1..3");
-        require_declaring("tie_outputs");
         check_new_name(name, "alias");
         const detail::TieMembers ms = resolve_members(members);
-        auto a = detail::tie_outputs<DT, Rank>(site(), ms, name, this, shape, policy);
+        auto a = detail::tie_outputs<DT, Rank>(site(), ms, name, this, shape, policy, device.value_or(detail::default_device()));
         store_alias(a);
+        TieOut t{a, {}};
+        for (const std::string_view m : members) t.members.emplace_back(m);
+        tie_outs_.push_back(std::move(t));
         record_tie(members, name, /*is_input=*/false, a);
     }
 
@@ -272,13 +279,12 @@ public:
         record(std::move(refs), [k, h](System& sys, std::size_t) { sys.replay_hook(k, h); }, hooks_[h].target.lock()->meta);
     }
 
-    // ---- initial values (legal inside setup() only) -----------------------------
+    // ---- initial values (legal at any time) ----------------------------------------
     /// Declares the initial value of a free input's variable: `path` is a child input path or one of this System's
     /// promoted or tied input aliases. The last declaration wins: this System's setup runs after its children's, so it
     /// replaces theirs (and a tie's or promotion's own). It is ignored when the input ends up with a source, and
     /// naming an output throws.
     void init_input(std::string_view target, InitSpec init) {
-        require_declaring("init_input");
         const auto        inst = instance_at(target);
         detail::declare_init(site(), inst, init);
         const std::size_t k = decls_.size();
@@ -302,6 +308,34 @@ public:
         for (const DepEdge& e : dep_edges_)
             if (e.from == ia->second && e.to == ib->second) return;
         dep_edges_.push_back(DepEdge{ia->second, ib->second});
+    }
+
+    // ---- run policy override (legal at any time) -----------------------------------
+    /// Sets the run policy of the subsystem at `path` (relative to this System; it may go through children: "b.c") on
+    /// that subsystem's registration record in ITS parent: no property is eternal, {transient}, {run_n{n}} and {do_once}
+    /// are the others, and the counter starts over. This is the escape hatch for a grandchild a parent decides the
+    /// lifetime of (e.g. making "b.c" eternal). It is NOT logged for replay: when this System rearms an ancestor of the
+    /// target, the slot is built again with its declared policy, and the caller applies the override again. A child that
+    /// is gone and is not made transient comes back now (built and wired as a rebuild is); a transient is rebuilt at the
+    /// next precompute.
+    void override_run_policy(std::string_view path, const property_list& policy = {}) {
+        const auto seg = split_path(path);
+        System*    s   = this;
+        for (std::size_t i = 0; i + 1 < seg.size(); ++i) {
+            const auto it = s->child_index_.find(std::string{seg[i]});
+            if (it == s->child_index_.end())
+                throw std::invalid_argument("naga::cospan: " + s->describe() + " has no subsystem '" + std::string{seg[i]} +
+                                            "' (override_run_policy('" + std::string{path} + "'))");
+            Subsystem* c = s->child_ptrs_[it->second];
+            if (c == nullptr)
+                throw std::logic_error("naga::cospan: override_run_policy('" + std::string{path} + "'): subsystem '" +
+                                       std::string{seg[i]} + "' does not exist right now (it was deleted)");
+            s = dynamic_cast<System*>(c);
+            if (s == nullptr)
+                throw std::invalid_argument("naga::cospan: override_run_policy('" + std::string{path} + "'): '" + std::string{seg[i]} +
+                                            "' is a Component; the path descends into it");
+        }
+        s->apply_run_policy(seg.back(), policy, path);
     }
 
     // ---- optimization marks: the last of a kind on a variable wins ---------------
@@ -462,20 +496,24 @@ public:
     std::vector<sycl::event> events() const override { return forward_events_; }
 
     /// Rebuilds the transient children that are gone (the build allocates nothing), then the user's pre_forward().
+    /// It does NOT run any child's precompute: that is the loop's, in run_compute.
     void run_precompute(detail::Runtime& rt) override {
         (void)rt;
         for (std::size_t i = 0; i < slots_.size(); ++i)
             if (slots_[i].requested == -2 && child_ptrs_[i] == nullptr) build_child(i, /*rebuild=*/true);
-        DeclScope scope{in_pre_forward_};
         pre_forward();
     }
 
-    /// Calls each live child's forward in declaration order, and nothing else. A child that has run its last turn
-    /// (run_n reached 0, or a transient's one forward) is deleted right away: its containers' frees wait on their own
-    /// events only, not the queue, so memory is freed before later children allocate while independent work already
-    /// submitted keeps running. Add subsystems that can go out of scope as late as possible in setup().
+    /// THE LOOP: for each live child in declaration order, its precompute, compute and postcompute. The turn of a
+    /// tie_outputs alias comes right after the last child that holds one of its members (and will run this forward): the
+    /// push of the tied variable to its other placements. A child that has run its last turn (run_n reached 0, or a
+    /// transient's one forward) is deleted right after that, with no explicit wait: its containers' frees wait on their own
+    /// events, so memory is freed before later children allocate while independent work already submitted keeps running.
+    /// Add subsystems that can go out of scope as late as possible in setup().
     void run_compute(detail::Runtime& rt) override {
         forward_events_.clear();
+        check_tied_output_devices();
+        const std::vector<std::optional<std::size_t>> push_after = last_member_slots();
         std::vector<std::vector<sycl::event>> dep_in(slots_.size());
         for (std::size_t i = 0; i < slots_.size(); ++i) {
             Subsystem* child = child_ptrs_[i];
@@ -492,6 +530,8 @@ public:
             forward_events_.insert(forward_events_.end(), ev.begin(), ev.end());
             for (const DepEdge& e : dep_edges_)
                 if (e.from == i) dep_in[e.to].insert(dep_in[e.to].end(), ev.begin(), ev.end());
+            for (std::size_t t = 0; t < tie_outs_.size(); ++t)
+                if (push_after[t] == i) push_tied_output(tie_outs_[t]);
             SlotInfo& si = slots_[i];
             si.ran       = true;
             if (si.requested > 0) {
@@ -503,24 +543,8 @@ public:
         pending_deps_.clear();
     }
 
-    /// The System that owns a tie alias pushes the tied outputs to the variable's other placements after ALL members
-    /// have submitted (section 3): the container assignment waits on the source's write list, which holds every member's
-    /// write of this forward, and registers the read. Then the user's post_forward(). (A later phase moves these pushes.)
-    void run_postcompute([[maybe_unused]] detail::Runtime& rt) override {
-        for (const auto& alias : alias_order_) {
-            if (alias->role != detail::Role::tie || alias->kind != IOKind::output) continue;
-            const std::shared_ptr<detail::DeviceDataBase> src = alias->data;
-            if (!src || !src->bound()) continue;  // the variable is not materialized
-            const std::shared_ptr<detail::VarMeta> m = alias->meta;
-            if (m->push_suppressed) continue;
-            for (const auto& entry : m->data) {
-                const std::shared_ptr<detail::DeviceDataBase> dst = entry.second.lock();
-                if (!dst || dst == src || !dst->bound()) continue;
-                forward_events_.push_back(dst->copy_from(*src, std::span<const sycl::event>{}));
-            }
-        }
-        post_forward();
-    }
+    /// The user's post_forward(). (The pushes of tied outputs are the loop's: run_compute.)
+    void run_postcompute([[maybe_unused]] detail::Runtime& rt) override { post_forward(); }
 
 protected:
     /// "the root System" or "System 'path'": the prefix of every System error.
@@ -563,9 +587,9 @@ protected:
 
     /// Re-runs a child by name: deletes it if it is live, builds it again (the factory, its setup, its device, and the
     /// replay of the wiring that names it), and gives it its full run policy again. For triggers only the author
-    /// knows, e.g. re-running a do_once child from the previous run's results. Legal inside pre_forward() only.
+    /// knows, e.g. re-running a do_once child from the previous run's results. Legal at any time (design review, 11.0:
+    /// no phase restrictions without a real reason); pre_forward() is where it is usually called.
     void rearm(std::string_view name) {
-        if (!in_pre_forward_) throw std::logic_error("naga::cospan: rearm is legal inside pre_forward() only (" + describe() + ")");
         const auto it = child_index_.find(std::string{name});
         if (it == child_index_.end())
             throw std::invalid_argument("naga::cospan: " + describe() + ": rearm('" + std::string{name} + "'): no such subsystem");
@@ -596,6 +620,77 @@ protected:
     std::unordered_map<std::string, std::size_t> child_index_;
 
     std::optional<sycl::device> forced_device_;  ///< set by set_device: applied to every child built later
+
+    /// One tie_outputs alias this System owns and the member paths it was declared with (relative to this System): what
+    /// the loop needs to push it and to check its members' devices at each forward.
+    struct TieOut {
+        std::shared_ptr<detail::Instance> alias;
+        std::vector<std::string>          members;
+    };
+
+    /// Every live member of every tied output is still on its alias's device (set_device may have moved one). An error
+    /// names the member and both devices. Runs at the start of the loop, before any push.
+    void check_tied_output_devices() {
+        for (const TieOut& t : tie_outs_)
+            for (const std::string& p : t.members) {
+                if (!path_alive(p)) continue;  // a deleted child holds no member right now
+                const auto m = instance_at(p);
+                if (m->device == t.alias->device) continue;
+                throw std::invalid_argument(
+                    "naga::cospan: " + describe() + ": tie_outputs '" + t.alias->name + "': member '" + m->full_path() + "' is on " +
+                    m->device.get_info<sycl::info::device::name>() + " but the tie is on " +
+                    t.alias->device.get_info<sycl::info::device::name>() + "; every member must be on the tie's device");
+            }
+    }
+
+    /// For each tied output, the slot of the last child that holds a member and will run this forward (none: no push).
+    std::vector<std::optional<std::size_t>> last_member_slots() const {
+        std::vector<std::optional<std::size_t>> out;
+        for (const TieOut& t : tie_outs_) {
+            std::optional<std::size_t> last;
+            for (const std::string& p : t.members) {
+                const auto j = order_of(p);
+                if (!j || child_ptrs_[*j] == nullptr || slots_[*j].counter == 0) continue;
+                if (!last || *j > *last) last = *j;
+            }
+            out.push_back(last);
+        }
+        return out;
+    }
+
+    /// The push of a tied output: copy assignment from the alias's container to each other live, bound container of the
+    /// variable (a holder that is not materialized fills itself later). Each assignment waits on the source's write list,
+    /// which holds every member's write of this forward, and registers the read.
+    void push_tied_output(const TieOut& t) {
+        const std::shared_ptr<detail::DeviceDataBase> src = t.alias->data;
+        if (!src || !src->bound()) return;  // the variable is not materialized
+        for (const auto& entry : t.alias->meta->data) {
+            const std::shared_ptr<detail::DeviceDataBase> dst = entry.second.lock();
+            if (!dst || dst == src || !dst->bound()) continue;
+            forward_events_.push_back(dst->copy_from(*src, std::span<const sycl::event>{}));
+        }
+    }
+
+    /// override_run_policy, at the System that owns the slot: sets the policy asked for and resets the counter.
+    void apply_run_policy(std::string_view name, const property_list& props, std::string_view full) {
+        const auto it = child_index_.find(std::string{name});
+        if (it == child_index_.end())
+            throw std::invalid_argument("naga::cospan: " + describe() + ": override_run_policy('" + std::string{full} +
+                                        "'): no such subsystem");
+        const bool tr    = props.has_property<property::transient>();
+        const bool has_n = props.has_property<property::run_n>();
+        const bool once  = props.has_property<property::do_once>();
+        if (tr && (has_n || once))
+            throw std::invalid_argument("naga::cospan: " + describe() + ": override_run_policy('" + std::string{full} +
+                                        "'): transient cannot be combined with run_n or do_once");
+        const std::size_t i = it->second;
+        SlotInfo&         si = slots_[i];
+        si.requested         = has_n ? static_cast<long>(props.get_property<property::run_n>().n) : once ? 1 : tr ? -2 : -1;
+        si.counter           = si.requested;
+        // A child that is gone and is not transient (it ran its last turn, or was a transient between forwards) comes back
+        // now; a transient is rebuilt by the next precompute.
+        if (child_ptrs_[i] == nullptr && si.requested != -2) build_child(i, /*rebuild=*/true);
+    }
 
 private:
     /// Raises the declaring flag for the duration of setup().
@@ -767,8 +862,8 @@ private:
             }
             const detail::WiringSite st = site(order_of(src), order_of(dst));
             detail::merge_definitions(st, "connect", *s->meta, *d->meta, s.get(), d.get());
-            decls_[k].var = detail::merge_into(st, s->meta, d->meta);  // a data-holding variable survives, per merge_into
-            detail::warn_cycle(st, *s, *d);                            // a pair already reported is not repeated
+            decls_[k].var = detail::merge_connected(st, *s, *d, s->meta, d->meta);  // a data-holding variable survives, per merge_into
+            detail::warn_cycle(st, *s, *d);                                          // a pair already reported is not repeated
             return;
         }
         // The other end is a deleted child: the rebuilt end rejoins the variable that still lives, if any. Otherwise
@@ -779,7 +874,11 @@ private:
         if (inst->meta == var) return;
         const detail::WiringSite st = site(order_of(src), order_of(dst));
         detail::merge_definitions(st, "connect", *var, *inst->meta, nullptr, inst.get());
-        decls_[k].var = detail::merge_into(st, var, inst->meta);
+        const std::optional<InitSpec> own_init = inst->meta->init;  // the rebuilt end's declared initializer
+        const auto                    survivor = detail::merge_into(st, var, inst->meta);
+        // On a cycle the target's initializer is kept: when the rebuilt end is the target, its declaration replaces.
+        if (survivor->cycle && !src_alive && own_init && !survivor->is_materialized()) survivor->init = own_init;
+        decls_[k].var = survivor;
     }
 
     void replay_promote(std::size_t k, const std::string& child_path, const std::string& name) {
@@ -1010,7 +1109,7 @@ private:
     };
 
     bool declaring_      = false;
-    bool in_pre_forward_ = false;
+    std::vector<TieOut>      tie_outs_;       ///< the tie_outputs aliases this System owns
     std::vector<DepEdge>     dep_edges_;
     std::vector<sycl::event> pending_deps_;   ///< depends_on events for this System, for one forward
     std::vector<sycl::event> forward_events_; ///< this forward's: the children's and the pushes

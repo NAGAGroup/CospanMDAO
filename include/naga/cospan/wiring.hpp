@@ -13,7 +13,11 @@
 // are merged (section 10, merge_definitions): unspecified absorbs specified, two specified values must agree, a hooked
 // dimension meets only unspecified; promotions take no shape.
 //   connect: the SOURCE's metadata wins. The target side's initializer is dropped: an initializer on a connected
-//            input is accepted and ignored (the source supplies the values).
+//            input is accepted and ignored (the source supplies the values) -- except on a CYCLE (a consumer registered
+//            before its producer): the variable is marked `cycle`, keeps the target's initializer, and runs it at its
+//            first materialization (variable.hpp).
+// Wiring calls are legal at any time (design review, 11.0: no phase restrictions without a real reason). A merge of two
+// variables that are BOTH materialized is an error at the call: "merging two materialized variables is not defined (yet)".
 //   tie:     the ALIAS's metadata wins (it owns the shape). The members' initializers are folded into it by the
 //            last-declaration-wins rule (design review, section 9; a tie's own initializer replaces its members').
 //            A member's initializer is carried only when the alias has none.
@@ -197,6 +201,9 @@ inline void fold_init(VarMeta& into, const VarMeta& from) {
 // The merge walk
 // -----------------------------------------------------------------------------
 
+/// The error of a merge whose two variables both hold data (deferred until a real use appears).
+inline constexpr const char* kBothMaterialized = "merging two materialized variables is not defined (yet)";
+
 /// The generic merge, after the call's own checks (and merge_definitions, which put the merged definition in `winner`).
 /// Returns the surviving object; every live instance of the other is rebound to it. See the header for who survives.
 /// Never touches stale flags, events or data.
@@ -205,7 +212,7 @@ inline std::shared_ptr<VarMeta> merge_into(const WiringSite& site, std::shared_p
     if (winner == loser) return winner;
     const bool wm = winner->is_materialized();
     const bool lm = loser->is_materialized();
-    if (wm && lm) throw std::logic_error("naga::cospan: " + site.where + ": both sides of a merge hold data");
+    if (wm && lm) wiring_fail(site, "merge", kBothMaterialized);
     std::shared_ptr<VarMeta> survivor = winner;
     std::shared_ptr<VarMeta> other    = loser;
     if (lm) {  // a rebuilt child rejoining live data: its object survives, with the merged shape definition
@@ -216,11 +223,20 @@ inline std::shared_ptr<VarMeta> merge_into(const WiringSite& site, std::shared_p
     }
     survivor->adopt_containers(*other);  // a key the survivor has no container for takes the loser's (identity kept)
     for (const std::shared_ptr<Instance>& i : other->live_instances()) i->rebind(survivor);
+    // The sticky marks of the loser stay true of the variable: a tie alias's variable that loses to a source is still a
+    // tie (no tie of a tie), a tied output still pushes through its alias, a cycle is still a cycle.
+    survivor->push_suppressed = survivor->push_suppressed || other->push_suppressed;
+    survivor->tied_input      = survivor->tied_input || other->tied_input;
+    survivor->tied_output     = survivor->tied_output || other->tied_output;
+    if (other->cycle && !survivor->cycle) {
+        survivor->cycle      = true;
+        survivor->cycle_note = other->cycle_note;
+    }
     return survivor;
 }
 
 /// Both-sides-hold-data, checked before a multi-step merge begins (merge_into checks it again, per step).
-inline void check_one_live(const WiringSite& site, const std::vector<const VarMeta*>& metas) {
+inline void check_one_live(const WiringSite& site, const char* verb, const std::vector<const VarMeta*>& metas) {
     std::vector<const VarMeta*> live;
     for (const VarMeta* m : metas) {
         if (!m->is_materialized()) continue;
@@ -228,17 +244,42 @@ inline void check_one_live(const WiringSite& site, const std::vector<const VarMe
         for (const VarMeta* l : live) seen = seen || l == m;
         if (!seen) live.push_back(m);
     }
-    if (live.size() > 1) throw std::logic_error("naga::cospan: " + site.where + ": both sides of a merge hold data");
+    if (live.size() > 1) wiring_fail(site, verb, kBothMaterialized);
 }
 
 // -----------------------------------------------------------------------------
 // connect
 // -----------------------------------------------------------------------------
 
+/// The consumer reads a producer that runs after it (both are children of the calling System).
+inline bool is_cycle(const WiringSite& site) {
+    return site.src_order && site.dst_order && *site.src_order > *site.dst_order;
+}
+
+/// The merge of a connect (and of its replay): the source's variable wins. On a cycle the survivor is marked `cycle` and
+/// keeps the TARGET's initializer (and the device it runs on), which a plain connect drops; a survivor that already holds
+/// data keeps its own. Returns the survivor.
+inline std::shared_ptr<VarMeta> merge_connected(const WiringSite& site, const Instance& src, const Instance& dst,
+                                                std::shared_ptr<VarMeta> src_meta, std::shared_ptr<VarMeta> dst_meta) {
+    const bool                         cyc      = is_cycle(site);
+    const std::optional<InitSpec>      dst_init = dst_meta->init;
+    const std::optional<sycl::device>  dst_dev  = dst_meta->init_device;
+    const std::shared_ptr<VarMeta>     survivor = merge_into(site, std::move(src_meta), std::move(dst_meta));
+    if (cyc) {
+        survivor->cycle      = true;
+        survivor->cycle_note = "'" + dst.full_path() + "' reads '" + src.full_path() + "', which runs after it";
+        if (dst_init && !survivor->is_materialized()) {
+            survivor->init = dst_init;
+            if (dst_dev) survivor->init_device = dst_dev;
+        }
+    }
+    return survivor;
+}
+
 /// The consumer reads a producer that runs after it: one line on std::cerr per (consumer, producer) pair, never an
 /// error. Without a solver the consumer sees the producer's previous value (its initial state on the first forward).
 inline void warn_cycle(const WiringSite& site, const Instance& src, const Instance& dst) {
-    if (!site.src_order || !site.dst_order || *site.src_order <= *site.dst_order) return;
+    if (!is_cycle(site)) return;
     const std::string line = "'" + dst.full_path() + "' reads '" + src.full_path() + "'";
     if (site.warned != nullptr && !site.warned->insert(line).second) return;
     std::cerr << "naga::cospan: warning: " << line
@@ -270,11 +311,11 @@ inline void connect(const WiringSite& site, const std::shared_ptr<Instance>& src
         wiring_fail(site, what.c_str(),
                     "'" + src->full_path() + "' is ragged; a dense Input cannot see per-index extents; declare '" +
                         dst->full_path() + "' RaggedInput");
-    check_one_live(site, {src->meta.get(), dst->meta.get()});
+    check_one_live(site, what.c_str(), {src->meta.get(), dst->meta.get()});
     // the merged shape definition goes into the source's variable (it throws before anything is changed)
     merge_definitions(site, what.c_str(), *src->meta, *dst->meta, src.get(), dst.get());
 
-    merge_into(site, src->meta, dst->meta);
+    merge_connected(site, *src, *dst, src->meta, dst->meta);
     warn_cycle(site, *src, *dst);
 }
 
@@ -392,7 +433,7 @@ inline void check_tie_merge(const WiringSite& site, const char* verb, const std:
     for (std::size_t i = 0; i < ms.size(); ++i)
         for (std::size_t j = 0; j < i; ++j)
             (void)merged_definition(site, verb, *ms[j].second->meta, *ms[i].second->meta, ms[j].second.get(), ms[i].second.get());
-    check_one_live(site, metas);
+    check_one_live(site, verb, metas);
 }
 
 /// The merge of a tie, after check_tie_merge: the alias's variable wins each time (`alias->meta` is read again at
@@ -428,6 +469,8 @@ std::shared_ptr<Instance> tie_inputs(const WiringSite& site, const TieMembers& m
         if (!m->can_be_target && m->hooked)
             wiring_fail(site, verb, "'" + path + "' is the target of a shape hook; a shape hook and a tie exclude each other");
         if (!m->can_be_target) wiring_fail(site, verb, "'" + path + "' is already tied: connect through its tie alias");
+        if (m->meta->tied_input)
+            wiring_fail(site, verb, "'" + path + "' is a tie (or a promotion of one); tying a tie is not allowed (yet): tie its members instead");
         check_typed_instance<DT, Rank>(site, verb, *m);
     }
 
@@ -435,6 +478,7 @@ std::shared_ptr<Instance> tie_inputs(const WiringSite& site, const TieMembers& m
         build_tie_alias<DT, Rank>(site, verb, members, std::move(name), declarer, shape, IOKind::input, device);
     check_tie_merge(site, verb, alias, members);
     apply_tie_merge(site, verb, alias, members, /*inputs=*/true);
+    alias->meta->tied_input = true;  // after the merge: the survivor is the alias's variable
     for (const auto& m : members) m.second->can_be_target = false;  // visible at every use site
     return alias;
 }
@@ -444,13 +488,16 @@ std::shared_ptr<Instance> tie_inputs(const WiringSite& site, const TieMembers& m
 /// it cannot take its shape from one). Members become non-sources: they connect from the alias.
 template <DType DT, int Rank>
 std::shared_ptr<Instance> tie_outputs(const WiringSite& site, const TieMembers& members, std::string name,
-                                      const Subsystem* declarer, const ShapeSpec& shape, TieOutputsPolicy policy) {
+                                      const Subsystem* declarer, const ShapeSpec& shape, TieOutputsPolicy policy,
+                                      const sycl::device& device) {
     static_assert(Rank >= 1 && Rank <= 3, "cospan: rank is 1..3");
     const char* verb = "tie_outputs";
     check_tie_members(site, verb, members);
     for (const auto& [path, m] : members) {
         if (m->kind != IOKind::output) wiring_fail(site, verb, "'" + path + "' is not an output");
         if (!m->can_be_source) wiring_fail(site, verb, "'" + path + "' is already tied: connect from its tie alias");
+        if (m->meta->tied_output)
+            wiring_fail(site, verb, "'" + path + "' is a tie (or a promotion of one); tying a tie is not allowed (yet): tie its members instead");
         if (const std::shared_ptr<Instance> down = first_of_kind(*m->meta, IOKind::input))
             wiring_fail(site, verb, "'" + path + "' is already connected downstream to '" + down->full_path() +
                                         "': tie before connecting, or connect from the alias");
@@ -458,17 +505,20 @@ std::shared_ptr<Instance> tie_outputs(const WiringSite& site, const TieMembers& 
             wiring_fail(site, verb, "'" + path + "' is not atomic (require_atomic; pass allow_plain to assert the producers do not race)");
         check_typed_instance<DT, Rank>(site, verb, *m);
     }
-    const auto& first = members.front();
+    // Every member writes the same memory in ways the framework cannot know (atomics, disjoint slices), so they all live
+    // on the tie's device. Checked here, and again by the owning System at each forward (a member can be moved later).
     for (const auto& m : members)
-        if (m.second->device != first.second->device)
-            wiring_fail(site, verb, "tie_outputs needs every member on one device: '" + first.first + "' is on " +
-                                        first.second->device.get_info<sycl::info::device::name>() + " and '" + m.first +
-                                        "' on " + m.second->device.get_info<sycl::info::device::name>());
+        if (m.second->device != device)
+            wiring_fail(site, verb, "tie_outputs needs every member on the tie's device (" +
+                                        device.get_info<sycl::info::device::name>() + "): '" + m.first + "' is on " +
+                                        m.second->device.get_info<sycl::info::device::name>());
 
     std::shared_ptr<Instance> alias =
-        build_tie_alias<DT, Rank>(site, verb, members, std::move(name), declarer, shape, IOKind::output, first.second->device);
+        build_tie_alias<DT, Rank>(site, verb, members, std::move(name), declarer, shape, IOKind::output, device);
     check_tie_merge(site, verb, alias, members);
     apply_tie_merge(site, verb, alias, members, /*inputs=*/false);
+    alias->meta->tied_output     = true;
+    alias->meta->push_suppressed = true;  // the members only register their writes; the owning System pushes through the alias
     for (const auto& m : members) m.second->can_be_source = false;
     return alias;
 }
@@ -484,7 +534,7 @@ inline void declare_init(const WiringSite& site, const std::shared_ptr<Instance>
     if (inst->kind != IOKind::input)
         wiring_fail(site, "init_input", "'" + inst->full_path() + "' is an output; outputs are never initialized");
     VarMeta& v = *inst->meta;
-    if (first_of_kind(v, IOKind::output)) return;
+    if (first_of_kind(v, IOKind::output) && !v.cycle) return;  // a cycle variable is connected and still has an initializer
     v.init = std::move(spec);
 }
 
