@@ -7,7 +7,7 @@ supersedes sections 1 to 10 where they conflict). r02 is superseded and kept as 
 `include/naga/cospan/`.
 
 Notation: `cs::` is `naga::cospan`, `sk::` is `naga::slabkit`. SlabKit owns the contracts of `sk::context`, `sk::queue`,
-`sk::unordered_queue`, `sk::usm_vector` and the pool. SlabKit is pinned at `7655b84` (no collapse of event lists).
+`sk::unordered_queue`, `sk::usm_vector` and the pool. SlabKit is pinned at `4f57086` (no collapse of event lists; pruning at assignment at 8 events; uninitialized allocations; no own-writes list).
 
 ---
 
@@ -231,16 +231,24 @@ container and a write on every output container.
 
 Every container (`sk::usm_vector`) keeps a **read list** and a **write list**. Variables keep none.
 
-- A reader waits on the write list (`read_deps()`). A writer waits on the read list **and the container's own writes**
-  (`write_deps()`). Writes never wait on other outside writes.
+- A reader waits on the write list (`read_deps()`). A writer waits on the read list (`write_deps()`). Writes never wait on
+  other outside writes. There is one read list and one write list, nothing else.
 - A kernel registers a read on each input container and a write on each output container.
-- The container's own operations go into the same lists: a copy out is a read of the source; a copy in, a fill or a resize is
-  a write of the destination; they wait on both of the container's lists. A copy between containers (`copy_from`) waits on
+- The container's own operations go into the same lists: a copy out is a read of the source; a copy in, a fill or the copy
+  of a reallocation is a write of the destination; they wait on both of the container's lists. A copy between containers (`copy_from`) waits on
   the source's writes and on both of the destination's lists, then registers a read on the source and a write on the
   destination. A free waits on every event in both lists.
-- **No collapse.** The lists are handed out whole. A registration that makes a list longer than 64 events drops the events
-  that have already completed, so a list that is registered on again and again but never accessed stays bounded. Nothing is
-  ever cleared otherwise.
+- **No collapse; pruning at assignment.** The lists are handed out whole. A registration (by us or the container) that makes a
+  list longer than 8 events drops the events whose `command_execution_status` is complete. Reading a list never prunes it.
+- **Allocations are uninitialized.** `resize(n)` and `reserve(n)` never fill and a size-only constructor does not fill; a call
+  given a value does. A reallocation with elements to keep copies them over (a write, in the write list) and returns the
+  copy's event as `std::optional<sycl::event>`; every other case returns an empty optional. Nothing in CoSpan may rely on
+  zeroed memory: a variable with no initializer holds undefined values until a producer writes it.
+- **The resize-event slot.** `VarMeta` keeps a list of pending resize events. Every container resize made for the variable
+  (materialization sizing, `set_shape`, hooks, initializer shapes, the ragged index arrays) appends the event it returned.
+  Reading the slot drops the completed events and returns the rest. Every launch adds the slot events of each variable it
+  writes to its dependencies, together with the containers' `write_deps()`: bare components, every stage of a fused group,
+  and both members of a tied output (they share the variable).
 - **depends_on** `depends_on("b", "a")` (legal at any time; `a` added before `b`; a duplicate edge is ignored): `a`'s forward
   runs first, its events are collected and handed to `b`'s submissions for ONE forward; if `b` is a System every component
   inside adds them. Execution order is data dependencies and `depends_on` only: children are called in declaration order but
@@ -550,7 +558,7 @@ body gets `sycl::id<R>`.
 
 The single launch waits on, and registers a read on: every stage's input containers, the argument arrays, the geometry array
 and the pointer array. It registers a write on every stage's output containers and on the ticket state. Its dependencies are
-those of one component (per stage: inputs' writes, outputs' reads and own writes, `depends_on` events) collected over every
+those of one component (per stage: inputs' writes, outputs' reads and their variables' resize events, `depends_on` events) collected over every
 stage, plus the geometry, pointer and ticket-state arrays. Internal connections work out naturally. The group's event is
 recorded on every stage.
 
@@ -599,13 +607,14 @@ events registered on the container.
 
 Section 11 is the design; where the code differs, this is where and why.
 
-1. **Own-writes (11.3).** The design says writes never wait on writes and the container's own operations wait on both lists.
-   As built, an *outside* writer (`write_deps()`) also waits on the container's own write operations (resize fill,
-   reallocation copy, copy-in), which are not outside writes (SlabKit `e86ae9f`). Reason: a fresh allocation's fill must come
-   before a kernel that writes the data; without it the kernel could run before the fill.
-2. **No collapse (11.3, "collapse on access").** The design collapses a list with more than one event into one event with an
-   empty `single_task`. As built, lists are returned whole and a registration that makes a list longer than 64 drops completed
-   events (SlabKit `7655b84`). Reason: with the collapse, the histogram test (a hook reading a value an earlier kernel wrote)
+1. **Own-writes (11.3): tried, then removed.** SlabKit `e86ae9f` made an outside writer also wait on the container's own
+   writes, because a resize filled new elements asynchronously and a kernel could run before the fill. The own-writes list is
+   gone (SlabKit `4f57086`): allocations are uninitialized, nothing fills, and the copy of a reallocation goes through the
+   variable's resize-event slot (a kernel that writes the variable waits on it). Reason: one read list and one write list is
+   the design; the fill was the only thing that needed more.
+2. **No collapse (11.3, "collapse on access"): retired in favor of status pruning at assignment at 8.** The design collapses a
+   list with more than one event into one event with an empty `single_task`. As built, lists are returned whole and a
+   registration that makes a list longer than 8 drops the completed events (SlabKit `4f57086`; `7655b84` used 64). Reason: with the collapse, the histogram test (a hook reading a value an earlier kernel wrote)
    read stale values in about half the runs on the OpenMP backend and the full suite showed zero shapes and heap corruption;
    a join task that was not empty failed the same way. Waiting on the kernel's event directly made it pass, so the symptom is a
    dependency that was not honored. **The cause is not known.**

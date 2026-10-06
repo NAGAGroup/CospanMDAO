@@ -62,8 +62,8 @@ inline sycl::event exclusive_scan_u64(Runtime& rt, const sycl::device& dev, cons
     std::uint64_t*                s = sums.data();
     std::uint64_t*                b = block_offs.data();
 
-    // These two are private to this call and kernels write them right after the container's own zero-fill, so a kernel
-    // here waits on BOTH of a container's lists (writes never wait on writes, and the fill is a write).
+    // These two are private to this call, uninitialized (every element is written before it is read), and a kernel here
+    // waits on BOTH of a container's lists (an earlier kernel of this scan is a write the next one must follow).
     const auto both = [](const sk::usm_vector<std::uint64_t>& c, std::vector<sycl::event>& into) {
         for (const sycl::event& e : c.read_deps()) into.push_back(e);
         for (const sycl::event& e : c.write_deps()) into.push_back(e);

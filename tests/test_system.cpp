@@ -562,7 +562,7 @@ const cs::property_list kTransient{cs::property::transient{}};
 
 class OneAxpb : public cs::System {
 public:
-    void setup() override { add_subsystem(cs::subsystem_desc<Axpb>("a", 2.0f, 1.0f)); }  // free x, no init: zeros
+    void setup() override { add_subsystem(cs::subsystem_desc<Axpb>("a", 2.0f, 1.0f)); }  // free x, no init: uninitialized
 };
 
 /// An eternal free input with a logged init (x = 5): the init is applied by the owner on its first run.
@@ -1458,7 +1458,8 @@ TEST_CASE("init: the last declaration wins (System init_input beats the Componen
 TEST_CASE("init: init_input on an eternal free input between forwards", "[system][init]") {
     cs::Model model = cs::create_model<tsys::OneAxpb>(default_config());
     model.setup();
-    // No init declared: zeros, so y = 2 * 0 + 1.
+    // No init declared, and an unset input is uninitialized: give it an explicit zero, so y = 2 * 0 + 1.
+    tsys::set_x(model, "a.x", 0.0f);
     model.forward();
     model.wait();
     CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "a.y")) == tsys::filled(1.0f));
@@ -2404,6 +2405,7 @@ TEST_CASE("alias: tie_inputs shapes: fixed, from_output_shape, from_output_value
         for (const std::uint32_t n : {3u, 6u, 4u}) {
             INFO("n = " << n);
             model.update_input("v.n", cs::init::from_host(tsys2::one_u32(n)));
+            model.update_input("x", cs::init::zero());  // a resized variable is uninitialized: zero it explicitly
             model.forward();
             model.wait();
             CHECK(cst::synced_input<DType::f32, 1>(model, "x").shape()[0] == n);
@@ -3359,6 +3361,7 @@ TEST_CASE("placement: a rebuilt child keeps the outer device", "[system][placeme
     REQUIRE(model.get_subsystem("in") != nullptr);
     CHECK(model.root().instance_at("in.k.x")->device == host);
     CHECK(model.root().instance_at("in.k.y")->device == host);
-    // the rebuilt child's free input is a fresh variable (zeros), and it runs on the outer device
-    CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "in.k.y")) == tsys::filled(0.0f));
+    // the rebuilt child's free input is a fresh variable with no initializer (undefined values): it runs on the outer
+    // device, and only the shape of its output is defined
+    CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "in.k.y")).size() == tsys::filled(0.0f).size());
 }

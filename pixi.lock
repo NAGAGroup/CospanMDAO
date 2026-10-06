@@ -105,10 +105,10 @@ environments:
       - conda: https://prefix.dev/jackm97/naga-labs-staging/linux-64/naga-acpp-runtime-2026.10.06-llvm21_1_8_he1ec34c_0.conda
       - conda: https://prefix.dev/jackm97/naga-labs-staging/linux-64/naga-acpp-runtime-cuda-2026.10.06-llvm21_1_8_h7deb504_0.conda
       - conda: https://prefix.dev/jackm97/naga-labs-staging/noarch/naga-acpp-llvm-21-h6ee9b8c_0.conda
-      - conda_source: cospanmdao-examples[6c58052f] @ examples
-      - conda_source: cospanmdao-tests[1f394db1] @ tests
-      - conda_source: cospanmdao[0bdf0f30] @ .
-      - conda_source: slabkit[1f77beaf] @ git+https://github.com/nagagroup/slabkit?rev=7655b8474296775b7302bca8ad4f19a09a30409c#7655b8474296775b7302bca8ad4f19a09a30409c
+      - conda_source: cospanmdao-examples[f493db46] @ examples
+      - conda_source: cospanmdao-tests[3bd67d13] @ tests
+      - conda_source: cospanmdao[1404fa2f] @ .
+      - conda_source: slabkit[08a273e0] @ git+https://github.com/nagagroup/slabkit?rev=4f570864349a598f598da7487aa892ffda67f66a#4f570864349a598f598da7487aa892ffda67f66a
   default:
     channels:
     - url: https://prefix.dev/jackm97/naga-labs-staging/
@@ -131,10 +131,10 @@ environments:
       - conda: https://prefix.dev/conda-forge/noarch/cereal-1.3.2-hd8ed1ab_1.conda
       - conda: https://prefix.dev/jackm97/naga-labs-staging/linux-64/naga-acpp-runtime-2026.10.06-llvm21_1_8_he1ec34c_0.conda
       - conda: https://prefix.dev/jackm97/naga-labs-staging/noarch/naga-acpp-llvm-21-h6ee9b8c_0.conda
-      - conda_source: cospanmdao-examples[6c58052f] @ examples
-      - conda_source: cospanmdao-tests[1f394db1] @ tests
-      - conda_source: cospanmdao[0bdf0f30] @ .
-      - conda_source: slabkit[1f77beaf] @ git+https://github.com/nagagroup/slabkit?rev=7655b8474296775b7302bca8ad4f19a09a30409c#7655b8474296775b7302bca8ad4f19a09a30409c
+      - conda_source: cospanmdao-examples[f493db46] @ examples
+      - conda_source: cospanmdao-tests[3bd67d13] @ tests
+      - conda_source: cospanmdao[1404fa2f] @ .
+      - conda_source: slabkit[08a273e0] @ git+https://github.com/nagagroup/slabkit?rev=4f570864349a598f598da7487aa892ffda67f66a#4f570864349a598f598da7487aa892ffda67f66a
   dev:
     channels:
     - url: https://prefix.dev/jackm97/naga-labs-staging/
@@ -196,7 +196,7 @@ environments:
       - conda: https://prefix.dev/jackm97/naga-labs-staging/linux-64/naga-acpp-runtime-2026.10.06-llvm21_1_8_he1ec34c_0.conda
       - conda: https://prefix.dev/jackm97/naga-labs-staging/linux-64/naga-acpp-tools-2026.10.06-llvm21_1_8_h56e7f05_0.conda
       - conda: https://prefix.dev/jackm97/naga-labs-staging/noarch/naga-acpp-llvm-21-h6ee9b8c_0.conda
-      - conda_source: slabkit[1f77beaf] @ git+https://github.com/nagagroup/slabkit?rev=7655b8474296775b7302bca8ad4f19a09a30409c#7655b8474296775b7302bca8ad4f19a09a30409c
+      - conda_source: slabkit[08a273e0] @ git+https://github.com/nagagroup/slabkit?rev=4f570864349a598f598da7487aa892ffda67f66a#4f570864349a598f598da7487aa892ffda67f66a
   dev-cuda:
     channels:
     - url: https://prefix.dev/jackm97/naga-labs-staging/
@@ -263,7 +263,7 @@ environments:
       - conda: https://prefix.dev/jackm97/naga-labs-staging/linux-64/naga-acpp-runtime-cuda-2026.10.06-llvm21_1_8_h7deb504_0.conda
       - conda: https://prefix.dev/jackm97/naga-labs-staging/linux-64/naga-acpp-tools-2026.10.06-llvm21_1_8_h56e7f05_0.conda
       - conda: https://prefix.dev/jackm97/naga-labs-staging/noarch/naga-acpp-llvm-21-h6ee9b8c_0.conda
-      - conda_source: slabkit[1f77beaf] @ git+https://github.com/nagagroup/slabkit?rev=7655b8474296775b7302bca8ad4f19a09a30409c#7655b8474296775b7302bca8ad4f19a09a30409c
+      - conda_source: slabkit[08a273e0] @ git+https://github.com/nagagroup/slabkit?rev=4f570864349a598f598da7487aa892ffda67f66a#4f570864349a598f598da7487aa892ffda67f66a
   git:
     channels:
     - url: https://prefix.dev/jackm97/naga-labs-staging/
@@ -1562,6 +1562,18 @@ packages:
   run_exports: {}
   size: 10520530
   timestamp: 1788383918299
+- conda: https://prefix.dev/conda-forge/linux-64/libpython-3.14.8-hdc7f604_100_cp314.conda
+  build_number: 100
+  sha256: 1bb70b5d17d013d339861aa267fa4eaeb5fd77c2ec0f957bdcedb182191a5bab
+  md5: c8f02b0aae074eb15838d82b1e296fdb
+  depends:
+  - __glibc >=2.17,<3.0.a0
+  - libgcc >=15
+  - libstdcxx >=15
+  license: Python-2.0
+  run_exports: {}
+  size: 10533011
+  timestamp: 1791294749926
 - conda: https://prefix.dev/conda-forge/linux-64/libsqlite-3.53.4-h0737f62_1.conda
   sha256: 35c05bd0adfaf6fcac01fc3a42214e4e2a44e32f7ce2c77ddae419522c3c328d
   md5: 17b328272d5caa0994678529be5b86ab
@@ -1918,6 +1930,39 @@ packages:
   size: 26484459
   timestamp: 1788383955577
   python_site_packages_path: lib/python3.14/site-packages
+- conda: https://prefix.dev/conda-forge/linux-64/python-3.14.8-hcd007b5_100_cp314.conda
+  build_number: 100
+  sha256: c47b0695966c0f5c61dbad05b4d8964fdfbe91943be5c1a7e97d728e921f5f8e
+  md5: e1996ea70f368bc7a82c2826da54cf0a
+  depends:
+  - __glibc >=2.17,<3.0.a0
+  - bzip2 >=1.0.8,<2.0a0
+  - ld_impl_linux-64 >=2.36.1
+  - libexpat >=2.8.5,<3.0a0
+  - libffi >=3.7.0,<3.8.0a0
+  - libgcc >=15
+  - liblzma >=5.8.3,<6.0a0
+  - libmpdec >=4.0.0,<5.0a0
+  - libpython 3.14.8 hdc7f604_100_cp314
+  - libsqlite >=3.53.4,<4.0a0
+  - libuuid >=2.42.4,<3.0a0
+  - libzlib >=1.3.2,<2.0a0
+  - ncurses >=6.6,<7.0a0
+  - openssl >=3.5.9,<4.0a0
+  - python_abi 3.14.* *_cp314
+  - readline >=8.3,<9.0a0
+  - tk >=8.6.13,<8.7.0a0
+  - tzdata
+  - zstd >=1.5.7,<1.6.0a0
+  license: Python-2.0
+  run_exports:
+    weak:
+    - python_abi 3.14.* *_cp314
+    noarch:
+    - python
+  size: 26492080
+  timestamp: 1791294793508
+  python_site_packages_path: lib/python3.14/site-packages
 - conda: https://prefix.dev/conda-forge/linux-64/readline-8.3-hd6e31c0_1.conda
   sha256: 01b3fe073a66e321970d09e04b388708f8cbdca5cdfbfcb7c9eeb470ad10383d
   md5: 69c01c781e7c8190bbdaf79e3848c5ca
@@ -2221,7 +2266,7 @@ packages:
     - naga-acpp-llvm >=21,<22.0a0
   size: 3556
   timestamp: 1790580982524
-- conda_source: cospanmdao-examples[6c58052f] @ examples
+- conda_source: cospanmdao-examples[f493db46] @ examples
   variants:
     c_stdlib: sysroot
     c_stdlib_version: '2.28'
@@ -2305,9 +2350,9 @@ packages:
   - conda: https://prefix.dev/conda-forge/noarch/cereal-1.3.2-hd8ed1ab_1.conda
   - conda: https://prefix.dev/jackm97/naga-labs-staging/linux-64/naga-acpp-runtime-2026.10.06-llvm21_1_8_he1ec34c_0.conda
   - conda: https://prefix.dev/jackm97/naga-labs-staging/noarch/naga-acpp-llvm-21-h6ee9b8c_0.conda
-  - conda_source: 'cospanmdao[18523e5a] @ '
-  - conda_source: slabkit[1f77beaf] @ git+https://github.com/nagagroup/slabkit?rev=7655b8474296775b7302bca8ad4f19a09a30409c#7655b8474296775b7302bca8ad4f19a09a30409c
-- conda_source: cospanmdao-tests[1f394db1] @ tests
+  - conda_source: 'cospanmdao[b3be6dee] @ '
+  - conda_source: slabkit[08a273e0] @ git+https://github.com/nagagroup/slabkit?rev=4f570864349a598f598da7487aa892ffda67f66a#4f570864349a598f598da7487aa892ffda67f66a
+- conda_source: cospanmdao-tests[3bd67d13] @ tests
   variants:
     c_stdlib: sysroot
     c_stdlib_version: '2.28'
@@ -2393,9 +2438,9 @@ packages:
   - conda: https://prefix.dev/conda-forge/noarch/cereal-1.3.2-hd8ed1ab_1.conda
   - conda: https://prefix.dev/jackm97/naga-labs-staging/linux-64/naga-acpp-runtime-2026.10.06-llvm21_1_8_he1ec34c_0.conda
   - conda: https://prefix.dev/jackm97/naga-labs-staging/noarch/naga-acpp-llvm-21-h6ee9b8c_0.conda
-  - conda_source: 'cospanmdao[18523e5a] @ '
-  - conda_source: slabkit[1f77beaf] @ git+https://github.com/nagagroup/slabkit?rev=7655b8474296775b7302bca8ad4f19a09a30409c#7655b8474296775b7302bca8ad4f19a09a30409c
-- conda_source: cospanmdao[0bdf0f30] @ .
+  - conda_source: 'cospanmdao[b3be6dee] @ '
+  - conda_source: slabkit[08a273e0] @ git+https://github.com/nagagroup/slabkit?rev=4f570864349a598f598da7487aa892ffda67f66a#4f570864349a598f598da7487aa892ffda67f66a
+- conda_source: cospanmdao[1404fa2f] @ .
   variants:
     c_stdlib: sysroot
     c_stdlib_version: '2.28'
@@ -2412,7 +2457,7 @@ packages:
   source_depends:
     slabkit:
       git: https://github.com/NAGAGroup/SlabKit.git
-      rev: 7655b8474296775b7302bca8ad4f19a09a30409c
+      rev: 4f570864349a598f598da7487aa892ffda67f66a
   build_packages:
   - conda: https://prefix.dev/conda-forge/linux-64/_openmp_mutex-4.5-20_gnu.conda
   - conda: https://prefix.dev/conda-forge/linux-64/binutils_impl_linux-64-2.46.1-default_hfdba357_102.conda
@@ -2485,8 +2530,8 @@ packages:
   - conda: https://prefix.dev/conda-forge/noarch/cereal-1.3.2-hd8ed1ab_1.conda
   - conda: https://prefix.dev/jackm97/naga-labs-staging/linux-64/naga-acpp-runtime-2026.10.06-llvm21_1_8_he1ec34c_0.conda
   - conda: https://prefix.dev/jackm97/naga-labs-staging/noarch/naga-acpp-llvm-21-h6ee9b8c_0.conda
-  - conda_source: slabkit[1f77beaf] @ git+https://github.com/nagagroup/slabkit?rev=7655b8474296775b7302bca8ad4f19a09a30409c#7655b8474296775b7302bca8ad4f19a09a30409c
-- conda_source: 'cospanmdao[18523e5a] @ '
+  - conda_source: slabkit[08a273e0] @ git+https://github.com/nagagroup/slabkit?rev=4f570864349a598f598da7487aa892ffda67f66a#4f570864349a598f598da7487aa892ffda67f66a
+- conda_source: 'cospanmdao[b3be6dee] @ '
   variants:
     c_stdlib: sysroot
     c_stdlib_version: '2.28'
@@ -2503,7 +2548,7 @@ packages:
   source_depends:
     slabkit:
       git: https://github.com/NAGAGroup/SlabKit.git
-      rev: 7655b8474296775b7302bca8ad4f19a09a30409c
+      rev: 4f570864349a598f598da7487aa892ffda67f66a
   build_packages:
   - conda: https://prefix.dev/conda-forge/linux-64/_openmp_mutex-4.5-20_gnu.conda
   - conda: https://prefix.dev/conda-forge/linux-64/binutils_impl_linux-64-2.46.1-default_hfdba357_102.conda
@@ -2576,8 +2621,8 @@ packages:
   - conda: https://prefix.dev/conda-forge/noarch/cereal-1.3.2-hd8ed1ab_1.conda
   - conda: https://prefix.dev/jackm97/naga-labs-staging/linux-64/naga-acpp-runtime-2026.10.06-llvm21_1_8_he1ec34c_0.conda
   - conda: https://prefix.dev/jackm97/naga-labs-staging/noarch/naga-acpp-llvm-21-h6ee9b8c_0.conda
-  - conda_source: slabkit[1f77beaf] @ git+https://github.com/nagagroup/slabkit?rev=7655b8474296775b7302bca8ad4f19a09a30409c#7655b8474296775b7302bca8ad4f19a09a30409c
-- conda_source: slabkit[1f77beaf] @ git+https://github.com/nagagroup/slabkit?rev=7655b8474296775b7302bca8ad4f19a09a30409c#7655b8474296775b7302bca8ad4f19a09a30409c
+  - conda_source: slabkit[08a273e0] @ git+https://github.com/nagagroup/slabkit?rev=4f570864349a598f598da7487aa892ffda67f66a#4f570864349a598f598da7487aa892ffda67f66a
+- conda_source: slabkit[08a273e0] @ git+https://github.com/nagagroup/slabkit?rev=4f570864349a598f598da7487aa892ffda67f66a#4f570864349a598f598da7487aa892ffda67f66a
   version: 0.1.0
   build: hef0c406_0
   subdir: linux-64
@@ -2616,7 +2661,7 @@ packages:
   - conda: https://prefix.dev/conda-forge/linux-64/libnghttp2-1.68.1-h74cf4be_1.conda
   - conda: https://prefix.dev/conda-forge/linux-64/libnuma-2.0.18-hb03c661_4.conda
   - conda: https://prefix.dev/conda-forge/linux-64/libpsl-0.23.1-hd9e3e90_1.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/libpython-3.14.7-hdc7f604_106_cp314.conda
+  - conda: https://prefix.dev/conda-forge/linux-64/libpython-3.14.8-hdc7f604_100_cp314.conda
   - conda: https://prefix.dev/conda-forge/linux-64/libsqlite-3.53.4-h0737f62_102.conda
   - conda: https://prefix.dev/conda-forge/linux-64/libssh2-1.11.1-h6154650_1.conda
   - conda: https://prefix.dev/conda-forge/linux-64/libstdcxx-16.2.0-h934c35e_7.conda
@@ -2630,7 +2675,7 @@ packages:
   - conda: https://prefix.dev/conda-forge/linux-64/ninja-1.13.2-h171cf75_1.conda
   - conda: https://prefix.dev/conda-forge/linux-64/numactl-2.0.18-hb03c661_4.conda
   - conda: https://prefix.dev/conda-forge/linux-64/openssl-3.6.5-h781a0a9_0.conda
-  - conda: https://prefix.dev/conda-forge/linux-64/python-3.14.7-hcd007b5_106_cp314.conda
+  - conda: https://prefix.dev/conda-forge/linux-64/python-3.14.8-hcd007b5_100_cp314.conda
   - conda: https://prefix.dev/conda-forge/linux-64/readline-8.3-hd6e31c0_1.conda
   - conda: https://prefix.dev/conda-forge/linux-64/rhash-1.4.6-hb03c661_2.conda
   - conda: https://prefix.dev/conda-forge/linux-64/tk-8.6.13-noxft_h1df4ec4_4.conda

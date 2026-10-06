@@ -403,6 +403,7 @@ TEST_CASE("wiring: merging two materialized variables is an error at the call", 
         s.add_subsystem(cs::subsystem_desc<tp4::Axpb>("c", 2.0f, 1.0f));
     });
     model.setup();
+    model.update_input("c.x", cs::init::zero());  // an input with no initializer is uninitialized
     tp4::run(model);  // p.y and c.x are both materialized now
     tp4::expect_throws_all([&] { model.root().connect("p.y", "c.x"); },
                            {"connect", "merging two materialized variables is not defined (yet)"});
@@ -764,7 +765,8 @@ TEST_CASE("replay skips a logged connection whose other side was deleted: the re
     CHECK(tp4::out(model, "c.y") == tp4::filled(11.0f));
     CHECK(model.get_subsystem("p") == nullptr);
     CHECK_NOTHROW(tp4::run(model));  // pre_forward rearms c: the connect to the deleted p is skipped
-    CHECK(tp4::out(model, "c.y") == tp4::filled(1.0f));  // c.x is a fresh variable (zeros): 2 * 0 + 1
+    // c.x is a fresh variable with no initializer: its values are undefined, so only the shape of c.y is checked.
+    CHECK(tp4::out(model, "c.y").size() == tp4::filled(1.0f).size());
 }
 
 // =============================================================================================

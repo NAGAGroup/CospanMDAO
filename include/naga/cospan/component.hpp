@@ -515,15 +515,22 @@ protected:
     std::string describe() const { return path().empty() ? std::string{"component"} : "'" + path() + "'"; }
 
     /// What a submission of this component must come after: each input container's read_deps (its writes), each output
-    /// container's write_deps (its reads, and the container's own writes such as a resize fill), and any depends_on events
-    /// (which last one forward: they are cleared here). Outside writes never wait on each other.
+    /// container's write_deps (its reads) together with its variable's pending resize events (VarMeta::resize_events: a
+    /// resize allocates uninitialized, and its copy of the old elements must land before a kernel writes), and any
+    /// depends_on events (which last one forward: they are cleared here). Outside writes never wait on each other.
+    /// Bare components and every stage of a fused group come through here; a tied output's members share the variable.
     std::vector<sycl::event> gather_deps(detail::Runtime& rt) {
         (void)rt;
         std::vector<sycl::event> deps;
         const auto               add = [&](const std::vector<sycl::event>& v) { deps.insert(deps.end(), v.begin(), v.end()); };
         for (const auto& inst : order_) {
             if (!inst->data) continue;
-            add(inst->kind == IOKind::input ? inst->data->read_deps() : inst->data->write_deps());
+            if (inst->kind == IOKind::input) {
+                add(inst->data->read_deps());
+            } else {
+                add(inst->data->write_deps());
+                add(inst->meta->resize_events());
+            }
         }
         add(pending_deps_);
         pending_deps_.clear();

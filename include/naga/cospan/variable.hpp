@@ -85,7 +85,8 @@ struct DataKey {
 ///
 /// EVENTS (SlabKit's rules): a READER of the data (a kernel that reads it, a copy out of it) waits on read_deps() (the
 /// writes) and registers a read; a WRITER (a kernel that writes it) waits on write_deps() (the reads) and registers a
-/// write. Writes never wait on writes. The container's own operations (resize, a copy in, a free) wait on both lists.
+/// write. Writes never wait on writes. The container's own operations (a copy in, a free) wait on both lists. A resize
+/// does not initialize; its event (a copy of the old elements) is kept in the variable's resize-event slot (VarMeta).
 struct DeviceDataBase {
     DataKey key;
 
@@ -420,6 +421,26 @@ public:
     /// Each placement's data, weak: it lives while a holder on that placement holds it. Entries are never removed; one
     /// whose data is gone is given a new empty data when a holder asks for it (container_for).
     std::vector<std::pair<DataKey, std::weak_ptr<DeviceDataBase>>> data;
+
+    // ---- the resize-event slot ---------------------------------------------------------------------
+    // Allocations are uninitialized and a resize that reallocates returns the event of the copy of the old elements.
+    // Every resize made for this variable (materialization sizing, set_shape, hooks, initializer shapes, the ragged index
+    // arrays) hands its event here. A launch that WRITES the variable (its outputs, in a bare component or in any stage of a
+    // fused group, both members of a tie) comes after what is in the slot, on top of the containers' write_deps.
+    mutable std::vector<sycl::event> resize_events_;
+
+    void note_resize(const std::optional<sycl::event>& e) {
+        if (e) resize_events_.push_back(*e);
+    }
+    void note_resize(const sycl::event& e) { resize_events_.push_back(e); }
+
+    /// The pending resize events: reading drops the ones that have completed (a status query) and returns the rest.
+    std::vector<sycl::event> resize_events() const {
+        std::erase_if(resize_events_, [](const sycl::event& e) {
+            return e.get_info<sycl::info::event::command_execution_status>() == sycl::info::event_command_status::complete;
+        });
+        return resize_events_;
+    }
 
     // ---- instances ---------------------------------------------------------------------------------
     void add_instance(std::weak_ptr<Instance> w) { instances.push_back(std::move(w)); }
@@ -940,7 +961,8 @@ private:
         for (const auto& d : live) size_container(rt, *d);
 
         // Unless the holder that asked is an output (its producer writes the data), initialize and copy to the others.
-        // A variable with no initializer is all zeros already (a container is sized by value-initialization).
+        // A variable with no initializer is UNINITIALIZED (nothing fills a new container): a producer writes it, or the
+        // user gave it an initializer.
         // A cycle variable always initializes: whichever holder asks first, the consumer reads it before the producer writes.
         const bool output_asked = trigger != nullptr && kind_of(*trigger) == IOKind::output;
         if ((!output_asked || cycle) && init) initialize(rt, live, trigger);
@@ -1008,7 +1030,7 @@ private:
     }
 
     /// `own` is the holder's container. An empty one is bound, sized and copied from the first live container that
-    /// holds data (or, with none, just sized: a variable nothing wrote yet is zeros).
+    /// holds data (or, with none, just sized: a variable nothing wrote yet is uninitialized).
     void populate(Runtime& rt, const std::shared_ptr<Data>& own) {
         if (!own) return;
         own->bind(rt);
@@ -1024,13 +1046,13 @@ private:
         size_container(rt, *own);
     }
 
-    /// Binds `d` and sizes it to the shape (the prefix is kept; new elements are zero), then its index arrays. The
-    /// resize is the container's own write; it is also registered as a read, so that a kernel that writes the container
-    /// (a writer waits on the read list) comes after it.
+    /// Binds `d` and sizes it to the shape (the prefix is kept; new elements are UNINITIALIZED), then its index arrays.
+    /// The event of the resize's copy, if any, goes into the variable's resize-event slot: a kernel that writes the
+    /// variable comes after it.
     void size_container(Runtime& rt, Data& d) {
         d.bind(rt);
         const std::size_t n = shape.elements();
-        if (d.size() != n) d.register_read(d.v().resize(n));
+        if (d.size() != n) this->note_resize(d.v().resize(n));
         fill_index(rt, d, d.key);
     }
 
@@ -1075,14 +1097,14 @@ protected:
             // later rebuild of the column waits for it.
             const DeviceColumn&              col = *s.dev_per;
             const std::array<sycl::event, 1> dep{col.ev};
-            d.per->assign(*col.extents, std::span<const sycl::event>{dep});
-            d.offs->assign(*col.offs, std::span<const sycl::event>{dep});  // resizes to n + 1
+            this->note_resize(d.per->assign(*col.extents, std::span<const sycl::event>{dep}));
+            this->note_resize(d.offs->assign(*col.offs, std::span<const sycl::event>{dep}));  // resizes to n + 1
             return;
         }
         const std::vector<std::uint64_t> conv(s.per_index.begin(), s.per_index.end());
-        d.per->from_host(std::span<const std::uint64_t>{conv});
+        this->note_resize(d.per->from_host(std::span<const std::uint64_t>{conv}));
         const std::vector<std::uint64_t> offs = s.block_offsets();
-        d.offs->from_host(std::span<const std::uint64_t>{offs});
+        this->note_resize(d.offs->from_host(std::span<const std::uint64_t>{offs}));
     }
 };
 

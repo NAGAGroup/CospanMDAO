@@ -32,12 +32,10 @@ std::vector<std::uint64_t> device_scan(const std::vector<std::uint64_t>& values)
     // host-kind USM: readable by the kernels and by this thread
     sk::usm_vector<std::uint64_t> in(n, rt.allocator_for<std::uint64_t>(dev, sk::kind::host));
     sk::usm_vector<std::uint64_t> out(n + 1, rt.allocator_for<std::uint64_t>(dev, sk::kind::host));
-    // The container initializes its elements asynchronously (its construction event): wait for that before writing from the
-    // host, or the late initialization zeroes what was written and the scan reads zeros.
+    // Size-only containers are uninitialized and submit nothing; sync() is kept so the host writes below follow any event.
     in.sync();
     for (std::size_t i = 0; i < n; ++i) in.data()[i] = values[i];
-    // The scan reads `in` (it waits on its writes) and writes `out` right after the container's own fill (it waits on
-    // both of its lists).
+    // The scan reads `in` (it waits on its writes) and writes `out` (it waits on both of its lists).
     std::vector<sycl::event> deps = in.read_deps();
     for (const sycl::event& e : out.read_deps()) deps.push_back(e);
     for (const sycl::event& e : out.write_deps()) deps.push_back(e);
