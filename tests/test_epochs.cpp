@@ -139,7 +139,7 @@ public:
 /// RGen: a free u32 input `counts` [n] drives the ragged output r [n, counts[i]]; r block i = 1000 i + q.
 /// Section 10: ragged is rank 2 (was [n, counts[i], 3]); a component cannot read values, so RGenTop hooks the free ragged input
 /// `layout` with counts_from(g.counts) and r copies its shape in pre_forward.
-/// REVIEW: this is the same device as Fill in test_ragged.cpp; a hook cannot target an output.
+/// The same device as Fill in test_ragged.cpp: it tests a hook (counts_from) on a ragged INPUT.
 struct RGenBody {
     struct Inputs {
         cs::Input<DType::u32, 1>       counts;
@@ -287,9 +287,8 @@ TEST_CASE("Views: a value-driven ragged output follows its driver", "[epoch][vie
     cs::Model                        m = cs::create_model<tep::RGenTop>(default_config(), counts);
     m.setup();
     for (int r = 0; r < 4; ++r) forward_and_wait(m);
-    // REVIEW: the old case kept this first view alive across the shape change below. Whether a live view follows a
-    // shape change of its variable is not settled by host_view.hpp (it says each forward pushes a copy, not what a
-    // resize does to the host copy), so the view is released before the driver changes.
+    // REVIEW (question for Jack): does a live view follow a shape change of its variable (a resize of the host copy)? host_view.hpp
+    // only says each forward pushes a copy. This case releases the view before the driver changes.
     {
         const auto v = m.view_ragged_output<DType::f32, 2>("g.r");
         v.sync();

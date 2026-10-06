@@ -372,8 +372,8 @@ public:
 };
 
 // ---- NSrc / Bins: a value-driven size. NSrc writes the value n; Bins' output has n elements -----
-// REVIEW: a component cannot read a value and a hook cannot target an output (section 10), so Bins takes a free input `ref`
-// that its System hooks with from_value(n) (hook_bins), and copies its shape in pre_forward.
+// Bins tests a hook on an INPUT: it takes a free input `ref` that its System hooks with from_value(n) (hook_bins), and
+// copies its shape in pre_forward. (Hooks on outputs are tested in test_shapes.cpp.)
 struct NSrcBody {
     struct Inputs {};
     struct Outputs {

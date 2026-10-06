@@ -933,9 +933,8 @@ TEST_CASE("Ragged ties: errors", "[ragged][tie]") {
 
 TEST_CASE("Ragged ties: an outside tie_outputs over a promotion of an inside output plus an outside writer", "[ragged][tie]") {
     // The plain half of the old "Chunked vs plain: an outside tie_outputs over a promotion ..." case, with a host reference.
-    // REVIEW: the accumulating System `inner` is ordered after the zeroing writer `w` by depends_on("inner", "w") on a System
-    // child (not a component). system.hpp's depends_on and Subsystem::add_dependencies are assumed to forward to the System's
-    // children; no header here states it.
+    // The accumulating System `inner` is ordered after the zeroing writer `w` by depends_on("inner", "w") on a System child:
+    // depends_on hands the events on to every child's submissions for one forward (system.hpp).
     const trt::Counts counts{3, 1, 4, 0, 2, 5, 1, 3, 2, 4};
     cs::Model         m = cs::create_model<trt::OtTop>(default_config(), counts);
     m.setup();

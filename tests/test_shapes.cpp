@@ -429,9 +429,9 @@ TEST_CASE("shape definitions: a conflicting tie spec throws at tie_inputs", "[sh
 }
 
 TEST_CASE("shape definitions: promote carries no shape", "[shapes][definition][promote]") {
-    // REVIEW: promote<DT, R>(path, name) takes no ShapeSpec, so "carries no shape" is read as: the promoted name is the same
-    // variable with the member's own definition. An unspecified output promoted and then connected to a fixed-5 input stays
-    // unspecified until it meets it; the connect gives it 5.
+    // promote<DT, R>(path, name) takes no ShapeSpec: the promoted name is the same variable with the member's own definition.
+    // An unspecified output promoted and then connected to a fixed-5 input stays unspecified until it meets it; the connect
+    // gives it 5.
     class Inner : public cs::System {
     public:
         void setup() override {
@@ -495,7 +495,7 @@ TEST_CASE("hook from_shape: an input takes a dimension of an upstream output's s
 }
 
 TEST_CASE("hook from_value: two dimensions from two different sources", "[shapes][hook]") {
-    // REVIEW: the reads are batched into one host wait (shape_hook.hpp); that is not observable here, so only the result is checked.
+    // (shape_hook.hpp batches the reads into one host wait; that is not observable here, so only the result is checked.)
     auto m = tshape::sh_make([](cs::System& s) {
         s.add_subsystem(cs::subsystem_desc<tshape::ShN>("na", 3.0f));
         s.add_subsystem(cs::subsystem_desc<tshape::ShN>("nb", 5.0f));
@@ -564,8 +564,8 @@ TEST_CASE("hook on an input tie alias", "[shapes][hook][tie]") {
 }
 
 TEST_CASE("hook on an output tie alias whose members are atomic Adders", "[shapes][hook][tie][atomic]") {
-    // REVIEW: fill(v) with no shape on the tie is not used; the output alias is sized only by the hook. The Adders carry no
-    // set_shape (a tied output cannot) and are ordered after the zeroing writer by depends_on (design review, section 3).
+    // The output alias is sized only by the hook (no shape on the tie). The Adders carry no set_shape (a tied output cannot)
+    // and are ordered after the zeroing writer by depends_on (design review, section 3).
     auto m = tshape::sh_make([](cs::System& s) {
         s.add_subsystem(cs::subsystem_desc<tshape::ShN>("nn", 6.0f));
         s.add_subsystem(cs::subsystem_desc<tshape::ShZero>("z"));

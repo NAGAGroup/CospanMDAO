@@ -426,8 +426,8 @@ public:
 
 // ---- Value-driven size on a pool (case 6) -----------------------------------------------------------
 // Bins: a free u32 input n and an output of n floats (bins[i] = i + 1).
-// REVIEW: a component cannot read a value and a hook cannot target an output (section 10), so Bins takes a free input `ref`
-// that its System hooks with from_value(n) (hook_bins) and copies its shape in pre_forward.
+// Bins tests a hook on an INPUT: it takes a free input `ref` that its System hooks with from_value(n) (hook_bins) and
+// copies its shape in pre_forward. (Hooks on outputs are tested in test_shapes.cpp.)
 struct BinsBody {
     struct Inputs {
         cs::Input<DType::u32, 1> n;
@@ -925,10 +925,9 @@ TEST_CASE("Two devices: a producer on one, its consumer on the other", "[model][
     sycl::device first, host;
     if (!tmod::pick_two(first, host)) SKIP("a non-OpenMP device and the OpenMP host device are not both visible");
 
-    // REVIEW: ModelConfig has no default_device (design review, section 2): every instance takes AdaptiveCpp's default
-    // and a device given to add_subsystem overrides a subtree. The old case made `first` the default and put `mid` on
-    // `host`. Here the default-selector device must be one of the two, and `mid` goes to the other one; the case skips
-    // otherwise. Whether that is the intended replacement is not settled.
+    // ModelConfig has no default_device (design review, section 2): every instance takes AdaptiveCpp's default and a device
+    // given to add_subsystem overrides a subtree. So the default-selector device must be one of the two, and `mid` goes to
+    // the other one; the case skips otherwise.
     const sycl::device dflt = cs::detail::default_device();
     if (dflt != first && dflt != host) SKIP("the default device is neither of the two devices picked");
     const sycl::device other = (dflt == first) ? host : first;
@@ -957,8 +956,8 @@ TEST_CASE("Two devices: a producer on one, its consumer on the other", "[model][
         CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "out.y")) == want_out);
     }
 
-    // REVIEW: replaces "arena_bytes > 0 on both devices". Assumes a device-kind allocation on each device is served by
-    // that device's pool (so in use > 0 on both after a forward); the headers do not settle which allocations the pool serves.
+    // Every context device has a pool (ModelConfig::default_pool_bytes) and a device-kind container draws from its device's
+    // pool, so bytes are in use on both after a forward.
     const auto rep = model.memory_report();
     CHECK(rep.devices.size() == 2);
     CHECK(rep.devices.at(first).pool_bytes_in_use > 0);
@@ -978,9 +977,7 @@ TEST_CASE("empty: a size-0 root is present and empty; its consumer runs as a no-
     model.update_input("bins.n", cs::init::from_host(std::vector<std::uint32_t>{0}));
     cst::forward_and_wait(model);
     {
-        // REVIEW: "present, size 0" is the old expectation. A host view needs the host copy to have data
-        // (host_view.hpp's host_store throws when it has none); whether a zero-element variable has a host copy is
-        // not settled from the headers.
+        // A zero-element variable is present with a host copy of size 0.
         auto bins = cst::synced_output<DType::f32, 1>(model, "bins.bins");  // present, size 0
         CHECK(bins.size() == 0);
         CHECK(bins.shape()[0] == 0);

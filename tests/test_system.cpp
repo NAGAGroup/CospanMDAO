@@ -2031,8 +2031,8 @@ class VBins : public cs::Component<VBinsBody> {
 
 public:
     explicit VBins(bool as_is = false) : as_is_{as_is} {}
-    // REVIEW: a component cannot read a value and a hook cannot target an output (section 10), so the size by value goes
-    // through the free input `ref`: the System hooks it (add_bins: from_value of `n`) and b copies its shape in pre_forward.
+    // This fixture tests a hook on an INPUT: the size by value goes through the free input `ref`, which the System hooks
+    // (add_bins: from_value of `n`), and b copies its shape in pre_forward. Hooks on outputs are tested in test_shapes.cpp.
     void setup() override {
         declare_input(n_, "n", 1);
         declare_input(ref_, "ref", cs::unspecified);
@@ -2330,7 +2330,15 @@ TEST_CASE("alias: tie errors", "[system][alias][errors]") {
     }
     // DELETED: "an output alias cannot have an unspecified shape". tie_outputs now takes cs::shape() (unspecified) by default
     // and a shape_hook on the alias supplies the size (section 10); it is no longer a setup error.
-    // REVIEW: an unspecified output tie that no hook supplies has no test here; the headers do not say where it fails.
+    SECTION("an unspecified tie_outputs alias nothing supplies: thrown at the first forward") {
+        forward_throws(
+            [&](cs::System& s) {
+                s.add_subsystem(cs::subsystem_desc<tsys2::TIota>("w1"));
+                s.add_subsystem(cs::subsystem_desc<tsys2::TIota>("w2"));
+                s.tie_outputs<DType::f32, 1>({"w1.o", "w2.o"}, "t", cs::shape(), cs::TieOutputsPolicy::allow_plain);
+            },
+            {"its shape is not known yet"});
+    }
     SECTION("an unspecified tie_inputs alias nothing supplies: thrown at the first forward") {
         forward_throws(
             [&](cs::System& s) {
@@ -2623,11 +2631,10 @@ TEST_CASE("lifetime: a do_once producer with an eternal reader is eternal; its v
 
 TEST_CASE("lifetime: a do_once producer with a transient reader: the rebuilt reader's input has no source and its shape is not known",
           "[system][lifetime]") {
-    // REVIEW: the old case fed an Axpb (fixed x) and expected run 2 to throw, naming the root, the producer and the
-    // reader. Under the rework a rebuilt transient reader whose producer is gone and whose variable lives nowhere keeps a
-    // FRESH variable (system.hpp, replay_connect), and a fresh variable with only fixed dims resolves as a free input
-    // (variable.hpp, resolve_free_shape), so no error is raised. The reader is now a Copy1, whose x is unspecified:
-    // run 2 throws variable.hpp's shape_unknown ("its shape is not known yet"). The old message's names are gone.
+    // A rebuilt transient reader whose producer is gone and whose variable lives nowhere keeps a FRESH variable
+    // (system.hpp, replay_connect), and a fresh variable with only fixed dims resolves as a free input (variable.hpp,
+    // resolve_free_shape), so a reader with a fixed x raises no error. The reader here is a Copy1, whose x is unspecified:
+    // run 2 throws variable.hpp's shape_unknown ("its shape is not known yet").
     cs::Model model = cs::create_model<tsys::DoOnceProducer>(default_config(), true);
     model.setup();
     model.forward();  // run 1: both run, the variable is freed after them
@@ -3154,8 +3161,7 @@ TEST_CASE("shape: an unspecified dim nothing supplies is thrown at the first for
     SECTION("an untied output with an unspecified dim that its producer never sets") {
         auto model = tsys2::make([](cs::System& s) { s.add_subsystem(cs::subsystem_desc<tshape::OutUnspec>("o")); });
         CHECK_NOTHROW(model.setup());
-        // REVIEW: variable.hpp shape_unknown names "its producer, in pre_forward (set_shape)" for an unset output dim; whether
-        // the throw comes from the launch (y_.shape()) or from the materialization is not settled by the headers.
+        // variable.hpp shape_unknown names "its producer, in pre_forward (set_shape)" for an unset output dimension.
         tshape::forward_throws(model, std::vector<const char*>{"its shape is not known yet", "its producer, in pre_forward (set_shape)"});
     }
     SECTION("a free input with an unspecified dim and no shape-giving initializer") {

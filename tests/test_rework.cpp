@@ -143,9 +143,8 @@ TEST_CASE("a host view outlives the Model and still holds its values", "[rework]
 }
 
 TEST_CASE("Model::wait after forward surfaces an exception thrown inside a host-body component", "[rework][wait]") {
-    // REVIEW: model.hpp says forward() only enqueues and wait() is wait_and_throw on both queues; whether the runtime reports a
-    // host task's exception through the queue's async handler (so wait() throws), and what text the exception carries, is not
-    // stated in the headers. Only that wait() throws is asserted; forward() is expected not to.
+    // forward() only enqueues and wait() is wait_and_throw on both queues (model.hpp), so a host task's exception surfaces
+    // from wait(), not from forward(). Only that wait() throws is asserted, not the text.
     cs::Model m = cs::create_model<trework::TrTop<trework::TrThrow>>(default_config());
     m.setup();
     CHECK_NOTHROW(m.forward());

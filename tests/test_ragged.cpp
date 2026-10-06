@@ -101,9 +101,9 @@ struct FillBody {
         for (std::size_t j = 0; j < b.shape()[0]; ++j) b[j] = static_cast<float>(i * 1000 + j);
     }
 };
-// REVIEW: the old Fill sized its output by the VALUES of its `counts` input (FromInputValues). A component has no value-read
-// helper in the new headers (host views are made by the Model only) and a hook cannot target an output, so the size comes in
-// through a free ragged input `layout` that the System hooks with counts_from, and Fill copies its shape.
+// Fill tests a hook on a ragged INPUT: a component reads no values, so the size comes in through a free ragged input
+// `layout` that the System hooks with counts_from, and Fill copies its shape. (Hooks on ragged outputs are tested in
+// test_shapes.cpp.)
 class Fill : public cs::Component<FillBody> {
     cs::RaggedInput<DType::f32, 2>  layout_;
     cs::RaggedOutput<DType::f32, 2> pts_;
@@ -458,8 +458,7 @@ TEST_CASE("Ragged: fill / scale / sum over forwards with changing counts", "[rag
 }
 
 TEST_CASE("Ragged: N = 0 stays ragged-capable", "[ragged]") {
-    // REVIEW: n = 0 makes zero-size variables (raw, counts, layout, pts); the headers do not say how a zero-element allocation
-    // is handled now that the old arena (and its "no arena for a size-0 root" comment) is gone. The old assertions are kept.
+    // n = 0 makes zero-size variables (raw, counts, layout, pts): each is present, with size 0 and a host copy of size 0.
     cs::Model model = cs::create_model<trag::RaggedTop>(default_config(), std::size_t{0});
     model.setup();
     trag::run_counts(model, {});
@@ -471,8 +470,7 @@ TEST_CASE("Ragged: N = 0 stays ragged-capable", "[ragged]") {
 }
 
 TEST_CASE("Ragged: counts_from on a rank-2 [N,k] input reads column 0", "[ragged]") {
-    // was: FromInputValues on column 1. counts_from takes no column argument: it reads column 0 (the data below is the old
-    // one with its columns swapped), see the REVIEW in test_shapes.cpp.
+    // counts_from takes no column argument: it reads column 0 of a rank-2 [N, k] input (shape_hook.hpp).
     cs::Model model = cs::create_model<trag::HookedTop<trag::Col0>>(default_config());
     model.setup();
     model.update_input("c.cnt", cs::init::from_host(std::vector<std::uint32_t>{2, 9, 0, 9, 3, 9, 1, 9}));
