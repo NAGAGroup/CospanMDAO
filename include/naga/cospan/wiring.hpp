@@ -519,7 +519,10 @@ std::shared_ptr<Instance> tie_outputs(const WiringSite& site, const TieMembers& 
     apply_tie_merge(site, verb, alias, members, /*inputs=*/false);
     alias->meta->tied_output     = true;
     alias->meta->push_suppressed = true;  // the members only register their writes; the owning System pushes through the alias
-    for (const auto& m : members) m.second->can_be_source = false;
+    for (const auto& m : members) {
+        m.second->can_be_source = false;
+        m.second->tied_member   = true;  // its tie's System owns the shape
+    }
     return alias;
 }
 
@@ -530,12 +533,15 @@ std::shared_ptr<Instance> tie_outputs(const WiringSite& site, const TieMembers& 
 /// Declares the initial value of a free input's variable: the last declaration wins, so it replaces any held (a parent's
 /// setup runs after its children's). An output throws. Declaring one on a connected input is accepted and has no
 /// effect (the variable's source wins), as before: nothing is stored when the variable has a producer.
-inline void declare_init(const WiringSite& site, const std::shared_ptr<Instance>& inst, InitSpec spec) {
+inline void declare_init(const WiringSite& site, const std::shared_ptr<Instance>& inst, InitSpec spec, bool restale = false) {
     if (inst->kind != IOKind::input)
         wiring_fail(site, "init_input", "'" + inst->full_path() + "' is an output; outputs are never initialized");
     VarMeta& v = *inst->meta;
     if (first_of_kind(v, IOKind::output) && !v.cycle) return;  // a cycle variable is connected and still has an initializer
     v.init = std::move(spec);
+    // A declaration made after the variable holds data (System::init_input, legal anywhere) is stale-making, like
+    // Model::update_input: the variable initializes again at the next forward. (A replay does not re-initialize.)
+    if (restale) v.mark_stale();
 }
 
 }  // namespace detail

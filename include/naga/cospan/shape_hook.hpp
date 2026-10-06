@@ -4,11 +4,14 @@
 // naga/cospan/shape_hook.hpp — shape hooks: a System's contract for the shape of an input or a tie alias
 // =============================================================================
 //
-// docs/design-review-2026-10-03.md, section 10. A hook is a lightweight type-erased STEP (not a component) that a System
-// declares with System::shape_hook(target, <one descriptor per dimension>). It sets the dimensions of its target that
-// are not as_is; those dimensions are unspecified in the definition and owned by this hook alone. It runs on the main
-// thread immediately before the first child that has an instance of the target, so every source's producer must be in an
-// earlier slot (System checks this at setup).
+// docs/design-review-2026-10-03.md, sections 10 and 11.5. Each System::shape_hook(target, <one descriptor per dimension>)
+// call creates ONE templated pseudo-component (ShapeHookStep<descriptor types...>) that has only a forward. It sets the
+// dimensions of its target that are not as_is; those dimensions are unspecified in the definition and owned by this hook
+// alone. The target is an input, an input or output tie alias, or an ordinary untied output (for which the hook runs before
+// the producer, which then sets only the dimensions it owns: it passes cs::as_is for the hooked ones). It runs on the main
+// thread every forward, immediately before the first child that has an instance of the target, found when the System's loop
+// reaches it. There is no source-ordering check: a source that is not produced yet gives whatever is there, and a gone
+// source keeps the last shape.
 //
 // DESCRIPTORS
 //   cs::dim::as_is()                    leave this dimension alone
@@ -24,6 +27,7 @@
 // counts_from / offsets_from build a DeviceColumn on the SOURCE's device with a parallel exclusive scan (device_scan.hpp;
 // offsets_from copies and validates the offsets instead): only [total, negative / invalid flag] comes back to the host.
 
+#include <array>
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
@@ -33,6 +37,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -80,65 +85,39 @@ inline OffsetsFrom offsets_from(std::string path) { return OffsetsFrom{std::move
 }  // namespace ragged
 
 namespace detail {
+template <class D, class... Ts>
+inline constexpr bool is_one_of_v = (std::is_same_v<D, Ts> || ...);
+}  // namespace detail
 
-/// One descriptor, type-erased. `src` is the source's instance, resolved by the System at setup.
-struct HookDim {
+/// What a descriptor type is: one of the above.
+template <class D>
+concept HookDescriptor =
+    detail::is_one_of_v<D, dim::AsIs, dim::FromShape, dim::FromValue, dim::Custom, dim::FixedAtRun, ragged::CountsFrom, ragged::OffsetsFrom>;
+
+namespace detail {
+
+/// What a descriptor type is, as plain data: the facts the System needs when the hook is DECLARED (validating it, marking
+/// the target's definition, resolving the sources it names, replaying it). The hook itself never interprets this list: the
+/// step (ShapeHookStep below) evaluates each dimension by the descriptor's TYPE.
+struct HookInfo {
     enum class Kind : uint8_t { as_is, from_shape, from_value, custom, fixed_at_run, counts_from, offsets_from };
-    Kind                                      kind = Kind::as_is;
-    std::string                               path;    ///< from_shape / from_value / counts_from / offsets_from
-    std::size_t                               index = 0;  ///< from_shape: the dimension; from_value: the element; fixed_at_run: the value
-    std::function<std::size_t(ShapeHookCtx&)> fn;      ///< custom
-    std::weak_ptr<Instance>                   src;     ///< the named source, resolved at setup (not for custom)
+    Kind        kind = Kind::as_is;
+    std::string path;       ///< from_shape / from_value / counts_from / offsets_from
+    std::size_t index = 0;  ///< from_shape: the dimension; from_value: the element; fixed_at_run: the value
 
     bool is_ragged() const noexcept { return kind == Kind::counts_from || kind == Kind::offsets_from; }
     bool names_source() const noexcept { return kind == Kind::from_shape || kind == Kind::from_value || is_ragged(); }
 };
 
-inline HookDim make_hook_dim(const dim::AsIs&) { return HookDim{}; }
-inline HookDim make_hook_dim(const dim::FromShape& s) {
-    HookDim h;
-    h.kind  = HookDim::Kind::from_shape;
-    h.path  = s.path;
-    h.index = s.d;
-    return h;
-}
-inline HookDim make_hook_dim(const dim::FromValue& s) {
-    HookDim h;
-    h.kind  = HookDim::Kind::from_value;
-    h.path  = s.path;
-    h.index = s.index;
-    return h;
-}
-inline HookDim make_hook_dim(const dim::Custom& s) {
-    HookDim h;
-    h.kind = HookDim::Kind::custom;
-    h.fn   = s.fn;
-    return h;
-}
-inline HookDim make_hook_dim(const dim::FixedAtRun& s) {
-    HookDim h;
-    h.kind  = HookDim::Kind::fixed_at_run;
-    h.index = s.v;
-    return h;
-}
-inline HookDim make_hook_dim(const ragged::CountsFrom& s) {
-    HookDim h;
-    h.kind = HookDim::Kind::counts_from;
-    h.path = s.path;
-    return h;
-}
-inline HookDim make_hook_dim(const ragged::OffsetsFrom& s) {
-    HookDim h;
-    h.kind = HookDim::Kind::offsets_from;
-    h.path = s.path;
-    return h;
-}
+inline HookInfo hook_info(const dim::AsIs&) { return HookInfo{}; }
+inline HookInfo hook_info(const dim::FromShape& s) { return HookInfo{HookInfo::Kind::from_shape, s.path, s.d}; }
+inline HookInfo hook_info(const dim::FromValue& s) { return HookInfo{HookInfo::Kind::from_value, s.path, s.index}; }
+inline HookInfo hook_info(const dim::Custom&) { return HookInfo{HookInfo::Kind::custom, {}, 0}; }
+inline HookInfo hook_info(const dim::FixedAtRun& s) { return HookInfo{HookInfo::Kind::fixed_at_run, {}, s.v}; }
+inline HookInfo hook_info(const ragged::CountsFrom& s) { return HookInfo{HookInfo::Kind::counts_from, s.path, 0}; }
+inline HookInfo hook_info(const ragged::OffsetsFrom& s) { return HookInfo{HookInfo::Kind::offsets_from, s.path, 0}; }
 
 }  // namespace detail
-
-/// What a descriptor type is: one of the above.
-template <class D>
-concept HookDescriptor = requires(const D& d) { { detail::make_hook_dim(d) } -> std::same_as<detail::HookDim>; };
 
 // -----------------------------------------------------------------------------
 // The data a hook reads
@@ -385,105 +364,138 @@ private:
 
 namespace detail {
 
-/// A declared hook: the target, what to do per dimension, who owns the dimensions, and where it runs.
-struct HookStep {
-    std::weak_ptr<Instance>   target;
-    std::vector<HookDim>      dims;     ///< one per dimension of the target, or ONE ragged descriptor for a ragged target
-    std::uint32_t             owner = 0;
-    std::string               path;     ///< the target's path in the declaring System's namespace, for messages
-    std::size_t               run_slot = 0;  ///< the child the hook runs before: the first with an instance of the target's variable
-    std::shared_ptr<DeviceColumn> column;    ///< a ragged hook's device counts and offsets, reused across forwards
-    InstanceResolver          resolve;       ///< for the context of custom descriptors
+/// What a System stores of a hook: only a forward. (The concrete step is the template below.)
+class HookBase {
+public:
+    virtual ~HookBase()                  = default;
+    virtual void forward(Runtime& rt) = 0;
+};
 
-    /// Computes the dimensions this hook owns and sets them on the target's variable (checked against its definition). All
-    /// from_value copies are batched and waited for once; events of device work are appended to `events_out`.
-    void run(Runtime& rt, std::vector<sycl::event>& events_out) {
-        const std::shared_ptr<Instance> inst = target.lock();
+template <class D>
+inline constexpr bool names_source_v = is_one_of_v<D, dim::FromShape, dim::FromValue, ragged::CountsFrom, ragged::OffsetsFrom>;
+
+/// The pseudo-component of ONE shape_hook call: its template parameters are the descriptor types, one per dimension (or one
+/// ragged descriptor), and forward() evaluates every dimension by compile-time dispatch on them. It computes the dimensions
+/// its target's variable gives it, from the named sources, and sets them (checked against the definition: it owns them).
+/// from_value copies are batched and waited for once; counts_from / offsets_from build a device column with the parallel scan
+/// and only the total comes back to the host. The System runs it every forward right before the first child that holds its
+/// target (System::run_compute).
+template <HookDescriptor... D>
+class ShapeHookStep final : public HookBase {
+    static_assert(sizeof...(D) >= 1, "cospan: a shape hook takes one descriptor per dimension");
+
+public:
+    static constexpr std::size_t N       = sizeof...(D);
+    static constexpr bool        kRagged = N == 1 && (is_one_of_v<D, ragged::CountsFrom, ragged::OffsetsFrom> && ...);
+
+    ShapeHookStep(std::tuple<D...> descriptors, std::string path, std::uint32_t owner, InstanceResolver resolve)
+        : ds_{std::move(descriptors)}, path_{std::move(path)}, owner_{owner}, resolve_{std::move(resolve)} {}
+
+    /// The System points the step at its target and at the sources the descriptors name (declaration and replay).
+    void set_target(std::shared_ptr<Instance> t) { target_ = std::move(t); }
+    void set_source(std::size_t i, std::shared_ptr<Instance> s) { src_[i] = std::move(s); }
+
+    void forward(Runtime& rt) override {
+        const std::shared_ptr<Instance> inst = target_.lock();
         if (!inst) return;  // the target's child is gone: nothing to set
-        VarMeta&      tm  = *inst->meta;
-        const std::string who = "the shape hook on '" + path + "'";
+        VarMeta&          tm  = *inst->meta;
+        const std::string who = "the shape hook on '" + path_ + "'";
         // A named source whose instance is gone (its child was deleted, e.g. a producer that ran its last turn) can never change
-        // again: while the target's shape is known the hook does nothing and the last shape stands (design review, sections 9
-        // and 10). "... does not exist right now" is thrown only when the shape was never known (source() below).
-        if (tm.shape.known)
-            for (const HookDim& h : dims)
-                if (h.names_source() && h.src.expired()) return;
-        const auto source = [&](const HookDim& h) -> std::shared_ptr<VarMeta> {
-            const std::shared_ptr<Instance> up = h.src.lock();
-            if (!up) throw std::logic_error("naga::cospan: " + who + ": its source '" + h.path + "' does not exist right now");
-            return up->meta;
-        };
+        // again: while the target's shape is known the hook does nothing and the last shape stands. "... does not exist right
+        // now" is thrown only when the shape was never known (source() below).
+        if (tm.shape.known && any_source_gone()) return;
 
-        ResolvedShape s = tm.shape;  // dimensions not owned by the hook are not touched (set_dims takes the mask)
-        DimMask       mask{};
+        ResolvedShape            s = tm.shape;  // dimensions the hook does not own are not touched (set_dims takes the mask)
+        DimMask                  mask{};
         std::vector<sycl::event> evs;
         std::vector<std::pair<std::size_t, std::function<std::size_t()>>> reads;  // from_value: dimension, its getter
 
-        if (dims.size() == 1 && dims[0].is_ragged()) {
-            const std::shared_ptr<VarMeta> m = source(dims[0]);
-            if (!column) column = std::make_shared<DeviceColumn>();
-            evs.push_back(build_column(rt, *m, *column, dims[0].kind == HookDim::Kind::offsets_from));
+        if constexpr (kRagged) {
+            using R = std::tuple_element_t<0, std::tuple<D...>>;
+            const std::shared_ptr<VarMeta> m = source(0, who, std::get<0>(ds_).path);
+            if (!column_) column_ = std::make_shared<DeviceColumn>();
+            evs.push_back(build_column(rt, *m, *column_, std::is_same_v<R, ragged::OffsetsFrom>));
+            // dimension 0 is the hook's, or specified (set_dims then checks the source's count against the declared N)
             mask[0] = mask[1] = true;
         } else {
-            for (std::size_t d = 0; d < dims.size(); ++d) {
-                const HookDim& h = dims[d];
-                switch (h.kind) {
-                    case HookDim::Kind::as_is:
-                    case HookDim::Kind::fixed_at_run: break;  // fixed_at_run made the dimension specified at setup
-                    case HookDim::Kind::from_shape: {
-                        const std::shared_ptr<VarMeta> m = source(h);
-                        if (!m->shape.known && !m->has_producer()) m->materialize(rt);
-                        if (!m->shape.known)
-                            throw std::logic_error("naga::cospan: " + who + ": the shape of '" + h.path + "' is not known yet");
-                        if (h.index >= static_cast<std::size_t>(m->rank))
-                            throw std::out_of_range("naga::cospan: " + who + ": '" + h.path + "' has rank " + std::to_string(m->rank) +
-                                                    ", no dimension " + std::to_string(h.index));
-                        if (h.index == 1 && m->rank == 2 && m->shape.per)
-                            throw std::invalid_argument("naga::cospan: " + who + ": dimension 1 of '" + h.path +
-                                                        "' is per-index and cannot become a dense dimension (use cs::ragged::counts_from)");
-                        s.extents[d] = m->shape.extents[h.index];
-                        mask[d]      = true;
-                        break;
-                    }
-                    case HookDim::Kind::from_value: {
-                        const std::shared_ptr<VarMeta> m = source(h);
-                        reads.emplace_back(d, queue_value_read(rt, *m, h.index, evs));
-                        mask[d] = true;
-                        break;
-                    }
-                    case HookDim::Kind::custom: {
-                        ShapeHookCtx ctx{rt, resolve, path};
-                        s.extents[d] = h.fn(ctx);
-                        mask[d]      = true;
-                        break;
-                    }
-                    case HookDim::Kind::counts_from:
-                    case HookDim::Kind::offsets_from:
-                        throw std::invalid_argument("naga::cospan: " + who + ": a ragged descriptor is for a ragged target, as its only descriptor");
-                }
-            }
+            [&]<std::size_t... I>(std::index_sequence<I...>) { (eval_dim<I>(rt, who, tm, s, mask, evs, reads), ...); }(std::index_sequence_for<D...>{});
         }
         sycl::event::wait(evs);  // ONE wait for every read this hook queued
         for (const auto& [d, get] : reads) s.extents[d] = get();
-        if (column && dims.size() == 1 && dims[0].is_ragged()) {
-            column->total = column->host_total->data()[0];
-            if (column->host_total->data()[1] != 0)
-                throw std::invalid_argument("naga::cospan: " + who + ": '" + dims[0].path + "' holds " +
-                                            (dims[0].kind == HookDim::Kind::offsets_from
+        if constexpr (kRagged) {
+            const auto& desc = std::get<0>(ds_);
+            column_->total   = column_->host_total->data()[0];
+            if (column_->host_total->data()[1] != 0)
+                throw std::invalid_argument("naga::cospan: " + who + ": '" + desc.path + "' holds " +
+                                            (std::is_same_v<std::tuple_element_t<0, std::tuple<D...>>, ragged::OffsetsFrom>
                                                  ? std::string{"offsets that are negative, do not start at 0, or decrease"}
                                                  : std::string{"a negative value"}) +
                                             "; a size cannot be negative");
             s.per         = true;
             s.per_index.clear();
-            s.dev_per     = column;
-            s.dev_version = column->version;
-            s.extents[0]  = column->n;
+            s.dev_per     = column_;
+            s.dev_version = column_->version;
+            s.extents[0]  = column_->n;
             s.extents[1]  = 0;
-            s.total       = column->total;
+            s.total       = column_->total;
         }
-        events_out.insert(events_out.end(), evs.begin(), evs.end());
-        tm.set_dims(rt, s, mask, SetterId{SetterId::Kind::hook, owner, who});
+        tm.set_dims(rt, s, mask, SetterId{SetterId::Kind::hook, owner_, who});
     }
+
+private:
+    bool any_source_gone() const {
+        return [&]<std::size_t... I>(std::index_sequence<I...>) {
+            return ((names_source_v<std::tuple_element_t<I, std::tuple<D...>>> && src_[I].expired()) || ...);
+        }(std::index_sequence_for<D...>{});
+    }
+
+    std::shared_ptr<VarMeta> source(std::size_t i, const std::string& who, const std::string& path) const {
+        const std::shared_ptr<Instance> up = src_[i].lock();
+        if (!up) throw std::logic_error("naga::cospan: " + who + ": its source '" + path + "' does not exist right now");
+        return up->meta;
+    }
+
+    /// Dimension I, by the descriptor's type.
+    template <std::size_t I>
+    void eval_dim(Runtime& rt, const std::string& who, VarMeta& tm, ResolvedShape& s, DimMask& mask, std::vector<sycl::event>& evs,
+                  std::vector<std::pair<std::size_t, std::function<std::size_t()>>>& reads) {
+        using Dsc         = std::tuple_element_t<I, std::tuple<D...>>;
+        const Dsc& d = std::get<I>(ds_);
+        (void)tm, (void)d;
+        if constexpr (std::is_same_v<Dsc, dim::AsIs> || std::is_same_v<Dsc, dim::FixedAtRun>) {
+            (void)rt, (void)who, (void)s, (void)mask, (void)evs, (void)reads;  // fixed_at_run made the dimension specified at the call
+        } else if constexpr (std::is_same_v<Dsc, dim::FromShape>) {
+            const std::shared_ptr<VarMeta> m = source(I, who, d.path);
+            if (!m->shape.known && !m->has_producer()) m->materialize(rt);
+            if (!m->shape.known) throw std::logic_error("naga::cospan: " + who + ": the shape of '" + d.path + "' is not known yet");
+            if (d.d >= static_cast<std::size_t>(m->rank))
+                throw std::out_of_range("naga::cospan: " + who + ": '" + d.path + "' has rank " + std::to_string(m->rank) + ", no dimension " +
+                                        std::to_string(d.d));
+            if (d.d == 1 && m->rank == 2 && m->shape.per)
+                throw std::invalid_argument("naga::cospan: " + who + ": dimension 1 of '" + d.path +
+                                            "' is per-index and cannot become a dense dimension (use cs::ragged::counts_from)");
+            s.extents[I] = m->shape.extents[d.d];
+            mask[I]      = true;
+        } else if constexpr (std::is_same_v<Dsc, dim::FromValue>) {
+            const std::shared_ptr<VarMeta> m = source(I, who, d.path);
+            reads.emplace_back(I, queue_value_read(rt, *m, d.index, evs));
+            mask[I] = true;
+        } else if constexpr (std::is_same_v<Dsc, dim::Custom>) {
+            ShapeHookCtx ctx{rt, resolve_, path_};
+            s.extents[I] = d.fn(ctx);
+            mask[I]      = true;
+        } else {
+            throw std::invalid_argument("naga::cospan: " + who + ": a ragged descriptor is for a ragged target, as its only descriptor");
+        }
+    }
+
+    std::tuple<D...>                     ds_;
+    std::string                          path_;  ///< the target's path in the declaring System's namespace, for messages
+    std::uint32_t                        owner_;
+    InstanceResolver                     resolve_;  ///< for the context of custom descriptors
+    std::weak_ptr<Instance>              target_;
+    std::array<std::weak_ptr<Instance>, N> src_;  ///< the named sources, resolved by the System (declaration and replay)
+    std::shared_ptr<DeviceColumn>        column_;   ///< a ragged hook's device counts and offsets, reused across forwards
 };
 
 }  // namespace detail

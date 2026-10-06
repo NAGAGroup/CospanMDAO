@@ -94,6 +94,27 @@ struct ComponentAccess;
 
 }  // namespace detail
 
+/// cs::as_is: in set_shape, "leave this dimension alone" (it is whatever the definition, a hook or an earlier set made it).
+struct AsIsTag {};
+inline constexpr AsIsTag as_is{};
+
+namespace detail {
+/// What set_shape takes per dimension: an integer, or cs::as_is.
+template <class E>
+concept DimEntry = std::integral<std::remove_cvref_t<E>> || std::same_as<std::remove_cvref_t<E>, AsIsTag>;
+
+template <DimEntry E>
+std::optional<std::size_t> dim_entry_value(const E& e) {
+    if constexpr (std::same_as<std::remove_cvref_t<E>, AsIsTag>) {
+        return std::nullopt;
+    } else {
+        if constexpr (std::is_signed_v<E>)
+            if (e < 0) throw std::invalid_argument("naga::cospan: set_shape: an extent cannot be negative");
+        return static_cast<std::size_t>(e);
+    }
+}
+}  // namespace detail
+
 /// The shape of a ragged port (rank 2: N indices and one count per index), as a copyable handle: what a component's
 /// shape_of returns for a RaggedInput / RaggedOutput, and what its set_shape takes. The counts are on the host or, for a
 /// hooked ragged variable, on the device (`column`: they never come down to the host unless asked for).
@@ -251,29 +272,53 @@ public:
         return ragged_shape_of(&m);
     }
 
-    /// Gives an output's variable this shape (checked against its definition: a fixed dimension must equal).
-    template <DType DT, int Rank>
-    void set_shape(Output<DT, Rank>& m, sycl::range<Rank> shape) {
+    /// set_shape(out, e0, e1, ...): one entry per dimension, each an integer or cs::as_is (the number of entries must equal
+    /// the rank). A number is allowed only on an UNSPECIFIED dimension: on a specified or hook-owned one it is an error at
+    /// the call, even when the value matches, naming the dimension and its owner. as_is leaves a dimension alone; one that
+    /// is still unknown at materialization is the shape-not-known error.
+    template <DType DT, int Rank, detail::DimEntry... E>
+    void set_shape(Output<DT, Rank>& m, E... entries) {
         detail::Instance& inst = settable_output(&m, "set_shape");
-        detail::ResolvedShape s;
-        s.known = true;
-        for (int d = 0; d < Rank; ++d) s.extents[static_cast<std::size_t>(d)] = shape[d];
-        inst.meta->set_shape(*rt_, s, detail::SetterId{detail::SetterId::Kind::producer, 0, inst.full_path()});
+        if (sizeof...(E) != static_cast<std::size_t>(Rank))
+            throw std::invalid_argument("naga::cospan: set_shape('" + inst.full_path() + "') takes one entry per dimension (" +
+                                        std::to_string(Rank) + ") but was given " + std::to_string(sizeof...(E)));
+        std::array<std::optional<std::size_t>, 3> given{};  // the count check above makes sizeof...(E) == Rank <= 3
+        std::size_t                               k = 0;
+        ((given[k++] = detail::dim_entry_value(entries)), ...);
+        inst.meta->set_by_producer(*rt_, given, inst.full_path());
     }
-    /// A ragged output's shape from a RaggedShape (read from an input's shape_of, or built).
+    /// A ragged output's shape from a RaggedShape (read from an input's shape_of, or built): N and the counts, each only on a
+    /// dimension that is unspecified.
     template <DType DT, int Rank>
     void set_shape(RaggedOutput<DT, Rank>& m, const RaggedShape& shape) {
         static_assert(Rank == 2, "cospan: a ragged port is rank 2");
         detail::Instance& inst = settable_output(&m, "set_shape");
-        inst.meta->set_shape(*rt_, shape.to_resolved(), detail::SetterId{detail::SetterId::Kind::producer, 0, inst.full_path()});
+        inst.meta->set_ragged_by_producer(*rt_, shape.to_resolved(), /*set_n=*/true, /*set_counts=*/true, inst.full_path());
     }
-    /// A ragged output's shape from N and its host counts (counts.size() == n).
-    template <DType DT, int Rank>
-    void set_shape(RaggedOutput<DT, Rank>& m, std::size_t n, std::vector<std::size_t> counts) {
-        RaggedShape rs;
-        rs.n      = n;
-        rs.counts = std::move(counts);
-        set_shape(m, rs);
+    /// A ragged output's shape from N (a number, or cs::as_is) and its host counts (counts.size() == n).
+    template <DType DT, int Rank, detail::DimEntry N>
+    void set_shape(RaggedOutput<DT, Rank>& m, N n, std::vector<std::size_t> counts) {
+        static_assert(Rank == 2, "cospan: a ragged port is rank 2");
+        detail::Instance&            inst = settable_output(&m, "set_shape");
+        const std::optional<std::size_t> nn = detail::dim_entry_value(n);
+        detail::ResolvedShape s;
+        s.known     = true;
+        s.per       = true;
+        s.per_index = std::move(counts);
+        s.extents   = {nn ? *nn : s.per_index.size(), 0, 1};
+        s.settle_total();
+        inst.meta->set_ragged_by_producer(*rt_, s, nn.has_value(), /*set_counts=*/true, inst.full_path());
+    }
+    /// A ragged output's N alone (the counts are left to their definition or a hook).
+    template <DType DT, int Rank, detail::DimEntry N>
+    void set_shape(RaggedOutput<DT, Rank>& m, N n, AsIsTag) {
+        static_assert(Rank == 2, "cospan: a ragged port is rank 2");
+        detail::Instance&            inst = settable_output(&m, "set_shape");
+        const std::optional<std::size_t> nn = detail::dim_entry_value(n);
+        if (!nn) return;
+        detail::ResolvedShape s = inst.meta->shape;
+        s.extents[0]            = *nn;
+        inst.meta->set_ragged_by_producer(*rt_, s, /*set_n=*/true, /*set_counts=*/false, inst.full_path());
     }
 
     // ---- initial values (legal inside setup() only) -----------------------
@@ -532,13 +577,14 @@ private:
         return *it->second;
     }
 
-    /// The output instance a set_shape is for: not a member of a tie_outputs (its tie's System owns the shape).
+    /// The output instance a set_shape is for: not a member of a tie_outputs (the tie call marked it: its tie's System owns
+    /// the shape).
     detail::Instance& settable_output(const void* member, const char* what) {
         detail::Instance& inst = member_instance(member, what);
-        for (const auto& i : inst.meta->live_instances())
-            if (detail::is_tie_output(*i))
-                throw std::invalid_argument("naga::cospan: '" + inst.full_path() +
-                                            "' is tied; its shape is set by its tie's System (a shape hook), not by a member");
+        // (a member reached through a promotion is not marked itself, but its variable is a tied output)
+        if (inst.tied_member || inst.meta->tied_output)
+            throw std::invalid_argument("naga::cospan: '" + inst.full_path() +
+                                        "' is tied; its shape is set by its tie's System (a shape hook), not by a member");
         return inst;
     }
 

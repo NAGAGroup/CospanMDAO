@@ -115,14 +115,18 @@ class Gen : public cs::Component<GenBody> {
     cs::Input<DType::u32, 1>        counts_;
     cs::RaggedInput<DType::f32, 2>  layout_;
     cs::RaggedOutput<DType::f32, 2> pts_;
+    int                             mode_;  // 0 copy layout's shape; 1 pts's counts come from a definition (set nothing); 2 copy anyway
 
 public:
+    explicit Gen(int mode = 0) : mode_{mode} {}
     void setup() override {
         declare_input(counts_, "counts", cs::unspecified);
         declare_input(layout_, "layout");
         declare_output(pts_, "pts");
     }
-    void pre_forward() override { set_shape(pts_, shape_of(layout_)); }
+    void pre_forward() override {
+        if (mode_ != 1) set_shape(pts_, shape_of(layout_));
+    }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return create_launch_config(sycl::range<1>{layout_.size()}, {counts_, layout_}, {pts_}, {});
     }
@@ -225,7 +229,7 @@ public:
         declare_input(pts_, "pts");
         declare_output(sums_, "sums", cs::unspecified);
     }
-    void pre_forward() override { set_shape(sums_, sycl::range<1>{shape_of(pts_).n}); }
+    void pre_forward() override { set_shape(sums_, shape_of(pts_).n); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return create_launch_config(sums_.shape(), {pts_}, {sums_}, {});
     }
@@ -325,7 +329,7 @@ public:
         this->declare_input(pts_, "pts");
         this->declare_output(sums_, "sums", cs::unspecified);
     }
-    void pre_forward() override { this->set_shape(sums_, sycl::range<1>{this->shape_of(pts_).n}); }
+    void pre_forward() override { this->set_shape(sums_, this->shape_of(pts_).n); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return this->create_launch_config(sums_.shape(), {pts_}, {sums_}, {});
     }
@@ -354,12 +358,14 @@ public:
 class TieInDeclTop : public cs::System {
     Counts init_;
     Sizes  declared_;
+    int    gen_mode_;
 
 public:
-    TieInDeclTop(Counts init, Sizes declared) : init_{std::move(init)}, declared_{std::move(declared)} {}
+    TieInDeclTop(Counts init, Sizes declared, int gen_mode = 1)
+        : init_{std::move(init)}, declared_{std::move(declared)}, gen_mode_{gen_mode} {}
     void setup() override {
         add_subsystem(cs::subsystem_desc<CProd>("sz", init_));
-        add_subsystem(cs::subsystem_desc<Gen>("gen"));
+        add_subsystem(cs::subsystem_desc<Gen>("gen", gen_mode_));
         add_subsystem(cs::subsystem_desc<SumK<1>>("sa"));
         add_subsystem(cs::subsystem_desc<SumK<2>>("sb"));
         connect("sz.counts", "gen.counts");
@@ -434,7 +440,7 @@ public:
         declare_input(in_, "in", cs::unspecified);
         declare_output(out_, "out", cs::unspecified);
     }
-    void pre_forward() override { set_shape(out_, shape_of(in_)); }
+    void pre_forward() override { set_shape(out_, shape_of(in_)[0]); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return create_launch_config(out_.shape(), {in_}, {out_}, {});
     }
@@ -820,13 +826,14 @@ TEST_CASE("Ragged ties: a connected tie_inputs alias that declares cs::counts is
         REQUIRE(pa.n() == 4);
         for (std::size_t i = 0; i < 4; ++i) CHECK(pa.block(i).size() == sizes[i]);
     }
-    SECTION("a mismatching declared counts is an error at the forward") {
-        // the alias declares [2,0,3,1]; gen.pts gets [2,0,1,1] from the counts: they differ first at index 2
-        cs::Model m = cs::create_model<trt::TieInDeclTop>(default_config(), trt::Counts{2, 0, 1, 1}, trt::Sizes{2, 0, 3, 1});
-        m.setup();
-        trt::expect_throws([&] { m.forward(); },
-                           {"dimension 1", "declared as the per-index counts [2,0,3,1]", "[2,0,1,1]", "gen.pts"});
-        m.wait();
+    SECTION("a producer that sets the shape of a declared-counts output is an error at the forward, even when they match") {
+        // P5: a number on a specified dimension throws (the ragged copy form sets n and counts)
+        for (const trt::Counts& c : {trt::Counts{2, 0, 1, 1}, trt::Counts{2, 0, 3, 1}}) {
+            cs::Model m = cs::create_model<trt::TieInDeclTop>(default_config(), c, trt::Sizes{2, 0, 3, 1}, 2);
+            m.setup();
+            trt::expect_throws([&] { m.forward(); }, {"gen.pts", "takes a number only on an unspecified dimension"});
+            m.wait();
+        }
     }
 }
 
@@ -914,10 +921,9 @@ TEST_CASE("Ragged ties: errors", "[ragged][tie]") {
         cs::Model m = cs::create_model<trt::ErrTop>(default_config(), 2);
         trt::expect_throws([&] { m.setup(); }, {"shape_hook", "'src.x'", "must have an integer dtype"});
     }
-    SECTION("a source produced by a later child: a setup error naming the hook, the source and both children") {
+    SECTION("a source produced by a later child is no setup error any more (P5: no source-ordering check)") {
         cs::Model m = cs::create_model<trt::ErrTop>(default_config(), 3);
-        trt::expect_throws([&] { m.setup(); },
-                           {"shape_hook", "'t'", "'late.counts'", "is produced by 'late'", "does not come before 'p'"});
+        CHECK_NOTHROW(m.setup());
     }
     SECTION("a free input whose owner is registered after the alias's first member is fine: it has no producer to order") {
         cs::Model m = cs::create_model<trt::ErrTop>(default_config(), 4);

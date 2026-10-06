@@ -95,20 +95,31 @@ struct ShProdBody {
     };
     void operator()(sycl::id<1> i, Inputs, Outputs o) const { o.y[i] = static_cast<float>(i[0] + 1); }
 };
+/// ShProd's n: the producer passes cs::as_is (its dimension comes from the definition or a hook).
+inline constexpr std::size_t kAsIs = static_cast<std::size_t>(-1);
+
+/// n: the number it sets (kAsIs: cs::as_is). A producer sets a number only on an UNSPECIFIED dimension, so with a declared
+/// (fixed) y it sets nothing unless `force` asks for the refused call.
 class ShProd : public cs::Component<ShProdBody> {
     std::size_t               n_;
     int                       declared_;
+    bool                      force_;
     cs::Output<DType::f32, 1> y_;
 
 public:
-    explicit ShProd(std::size_t n, int declared = -1) : n_{n}, declared_{declared} {}
+    explicit ShProd(std::size_t n, int declared = -1, bool force = false) : n_{n}, declared_{declared}, force_{force} {}
     void setup() override {
         if (declared_ >= 0)
             declare_output(y_, "y", declared_);
         else
             declare_output(y_, "y", cs::unspecified);
     }
-    void pre_forward() override { set_shape(y_, sycl::range<1>{n_}); }
+    void pre_forward() override {
+        if (n_ == kAsIs)
+            set_shape(y_, cs::as_is);
+        else if (declared_ < 0 || force_)
+            set_shape(y_, n_);
+    }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(y_.shape(), {}, {y_}, {}); }
 };
 
@@ -118,9 +129,9 @@ class ShBad : public cs::Component<ShProdBody> {
 
 public:
     void setup() override { declare_output(y_, "y", cs::unspecified); }
-    void pre_forward() override { set_shape(y_, sycl::range<1>{3}); }  // legal: the output has its shape when compute_forward runs
+    void pre_forward() override { set_shape(y_, 3); }  // legal: the output has its shape when compute_forward runs
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        set_shape(y_, sycl::range<1>{3});  // illegal here
+        set_shape(y_, 3);  // illegal here
         return create_launch_config(y_.shape(), {}, {y_}, {});
     }
 };
@@ -149,7 +160,7 @@ public:
             declare_input(x_, "x", cs::unspecified);
         declare_output(y_, "y", cs::unspecified);
     }
-    void pre_forward() override { set_shape(y_, shape_of(x_)); }
+    void pre_forward() override { set_shape(y_, shape_of(x_)[0]); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(x_.shape(), {x_}, {y_}, {}); }
 };
 
@@ -181,7 +192,7 @@ public:
             declare_input(x_, "x", cs::unspecified_shape<2>());
         declare_output(y_, "y", cs::unspecified_shape<2>());
     }
-    void pre_forward() override { set_shape(y_, shape_of(x_)); }
+    void pre_forward() override { set_shape(y_, shape_of(x_)[0], shape_of(x_)[1]); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(x_.shape(), {x_}, {y_}, {}); }
 };
 
@@ -248,7 +259,7 @@ public:
         declare_input(r_, "r");
         declare_output(sums_, "sums", cs::unspecified);
     }
-    void pre_forward() override { set_shape(sums_, sycl::range<1>{shape_of(r_).n}); }
+    void pre_forward() override { set_shape(sums_, shape_of(r_).n); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(sums_.shape(), {r_}, {sums_}, {}); }
 };
 
@@ -313,9 +324,9 @@ TEST_CASE("shape definitions: an unspecified dimension takes the fixed one it me
         CHECK(cst::synced_input<DType::f32, 1>(m, "c.x").shape()[0] == 4);
         CHECK(cst::to_vector(cst::synced_output<DType::f32, 1>(m, "c.y")) == tshape::sh_iota(4, 2.0f));
     }
-    SECTION("an unspecified output feeds a fixed input: the dimension is 4, the producer must set 4") {
+    SECTION("an unspecified output feeds a fixed input: the dimension is 4 and comes from the definition (as_is)") {
         auto m = tshape::sh_make([](cs::System& s) {
-            s.add_subsystem(cs::subsystem_desc<tshape::ShProd>("p", std::size_t{4}));
+            s.add_subsystem(cs::subsystem_desc<tshape::ShProd>("p", tshape::kAsIs));
             s.add_subsystem(cs::subsystem_desc<tshape::ShScale>("c", 4));
             s.connect("p.y", "c.x");
         });
@@ -324,14 +335,16 @@ TEST_CASE("shape definitions: an unspecified dimension takes the fixed one it me
         m.wait();
         CHECK(cst::to_vector(cst::synced_output<DType::f32, 1>(m, "c.y")) == tshape::sh_iota(4, 2.0f));
     }
-    SECTION("an unspecified output feeds a fixed input: a producer that sets 3 throws at the forward") {
-        auto m = tshape::sh_make([](cs::System& s) {
-            s.add_subsystem(cs::subsystem_desc<tshape::ShProd>("p", std::size_t{3}));
-            s.add_subsystem(cs::subsystem_desc<tshape::ShScale>("c", 4));
-            s.connect("p.y", "c.x");
-        });
-        m.setup();
-        tshape::sh_forward_throws(m, {"dimension 0 is declared as 4", "gave 3"});
+    SECTION("an unspecified output feeds a fixed input: a producer that sets a number throws at the forward, even 4") {
+        for (const std::size_t n : {std::size_t{3}, std::size_t{4}}) {
+            auto m = tshape::sh_make([n](cs::System& s) {
+                s.add_subsystem(cs::subsystem_desc<tshape::ShProd>("p", n));
+                s.add_subsystem(cs::subsystem_desc<tshape::ShScale>("c", 4));
+                s.connect("p.y", "c.x");
+            });
+            m.setup();
+            tshape::sh_forward_throws(m, {"dimension 0 is declared as 4", "takes a number only on an unspecified dimension"});
+        }
     }
 }
 
@@ -368,7 +381,7 @@ TEST_CASE("shape definitions: promote carries no shape", "[shapes][definition][p
     class Inner : public cs::System {
     public:
         void setup() override {
-            add_subsystem(cs::subsystem_desc<tshape::ShProd>("p", std::size_t{5}));
+            add_subsystem(cs::subsystem_desc<tshape::ShProd>("p", tshape::kAsIs));  // the 5 comes from the connected input
             promote<DType::f32, 1>("p.y", "y");
         }
     };
@@ -387,10 +400,12 @@ TEST_CASE("shape definitions: promote carries no shape", "[shapes][definition][p
 // =============================================================================================================================
 // 2. set_shape checks
 // =============================================================================================================================
-TEST_CASE("set_shape: a producer setting a declared-fixed output dimension differently throws at the first forward", "[shapes][set_shape]") {
-    auto m = tshape::sh_make([](cs::System& s) { s.add_subsystem(cs::subsystem_desc<tshape::ShProd>("p", std::size_t{3}, 4)); });
-    CHECK_NOTHROW(m.setup());
-    tshape::sh_forward_throws(m, {"dimension 0 is declared as 4", "gave 3"});
+TEST_CASE("set_shape: a number on a declared-fixed output dimension throws at the call, even when it matches", "[shapes][set_shape]") {
+    for (const std::size_t n : {std::size_t{3}, std::size_t{4}}) {
+        auto m = tshape::sh_make([n](cs::System& s) { s.add_subsystem(cs::subsystem_desc<tshape::ShProd>("p", n, 4, true)); });
+        CHECK_NOTHROW(m.setup());
+        tshape::sh_forward_throws(m, {"dimension 0 is declared as 4", "takes a number only on an unspecified dimension", "'p.y'"});
+    }
 }
 
 TEST_CASE("set_shape: on a tied output throws the tied message", "[shapes][set_shape][tie]") {
@@ -545,14 +560,16 @@ TEST_CASE("hook ragged counts_from and offsets_from: n(), block_offsets() and to
 }
 
 TEST_CASE("hook errors at setup", "[shapes][hook][errors]") {
-    SECTION("a target that is a component output") {
+    SECTION("a target that is an output tie member: hook the alias instead") {
         tshape::sh_setup_throws(
             [](cs::System& s) {
                 s.add_subsystem(cs::subsystem_desc<tshape::ShN>("nn", 3.0f));
-                s.add_subsystem(cs::subsystem_desc<tshape::ShProd>("p", std::size_t{3}));
-                s.shape_hook("p.y", cs::dim::from_value("nn.n", 0));
+                s.add_subsystem(cs::subsystem_desc<tshape::ShProd>("a", tshape::kAsIs));
+                s.add_subsystem(cs::subsystem_desc<tshape::ShProd>("b", tshape::kAsIs));
+                s.tie_outputs<DType::f32, 1>({"a.y", "b.y"}, "t", cs::shape(), cs::TieOutputsPolicy::allow_plain);
+                s.shape_hook("a.y", cs::dim::from_value("nn.n", 0));
             },
-            {"shape_hook", "'p.y'", "a shape hook targets an input or a tie alias"});
+            {"shape_hook", "'a.y'", "member of a tie_outputs", "hook the tie alias instead", "'t'"});
     }
     SECTION("a target that is already connected") {
         tshape::sh_setup_throws(
@@ -593,14 +610,13 @@ TEST_CASE("hook errors at setup", "[shapes][hook][errors]") {
             },
             {"shape_hook", "'c.x'", "dimension 0 is set by a shape hook", "only one hook owns it"});
     }
-    SECTION("a source produced by a later child") {
-        tshape::sh_setup_throws(
-            [](cs::System& s) {
-                s.add_subsystem(cs::subsystem_desc<tshape::ShScale>("c"));
-                s.add_subsystem(cs::subsystem_desc<tshape::ShProd>("p", std::size_t{3}));  // registered AFTER the target's child
-                s.shape_hook("c.x", cs::dim::from_shape("p.y", 0));
-            },
-            {"shape_hook", "'c.x'", "'p.y'", "is produced by 'p'", "which does not come before 'c'"});
+    SECTION("a source produced by a later child is no setup error any more: the hook works or fails when it runs") {
+        auto m = tshape::sh_make([](cs::System& s) {
+            s.add_subsystem(cs::subsystem_desc<tshape::ShScale>("c"));
+            s.add_subsystem(cs::subsystem_desc<tshape::ShProd>("p", std::size_t{3}));  // registered AFTER the target's child
+            s.shape_hook("c.x", cs::dim::from_shape("p.y", 0));
+        });
+        CHECK_NOTHROW(m.setup());
     }
 }
 

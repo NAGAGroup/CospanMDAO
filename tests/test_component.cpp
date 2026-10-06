@@ -95,7 +95,10 @@ public:
         }
         this->declare_output(y_, "y", cs::unspecified_shape<R>());
     }
-    void pre_forward() override { this->set_shape(y_, this->shape_of(x_)); }
+    void pre_forward() override {
+        const sycl::range<R> s = this->shape_of(x_);  // one entry per dimension
+        [&]<std::size_t... I>(std::index_sequence<I...>) { this->set_shape(y_, s[I]...); }(std::make_index_sequence<R>{});
+    }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return this->create_launch_config(x_.shape(), {x_}, {y_}, {});
     }
@@ -325,7 +328,7 @@ public:
     }
     void pre_forward() override {
         const sycl::range<2> s = shape_of(in_);
-        set_shape(out_, sycl::range<2>{s[1], s[0]});  // the transpose
+        set_shape(out_, s[1], s[0]);  // the transpose
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         TransposeBody::Scratch s;
@@ -383,7 +386,7 @@ public:
         declare_input(z_, "z", cs::unspecified_shape<1>());
         declare_output(w_, "w", cs::unspecified_shape<1>());
     }
-    void pre_forward() override { set_shape(w_, shape_of(z_)); }
+    void pre_forward() override { set_shape(w_, shape_of(z_)[0]); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return create_launch_config(z_.shape(), {z_}, {w_}, {});
     }
@@ -416,7 +419,7 @@ public:
         declare_input(y_, "y", cs::unspecified_shape<1>());
         declare_output(z_, "z", cs::unspecified_shape<1>());
     }
-    void pre_forward() override { set_shape(z_, shape_of(y_)); }
+    void pre_forward() override { set_shape(z_, shape_of(y_)[0]); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return create_launch_config({y_}, {z_}, {});
     }
@@ -460,7 +463,7 @@ public:
         declare_input(x_, "x", cs::unspecified_shape<1>());
         declare_output(y_, "y", cs::unspecified_shape<1>());
     }
-    void pre_forward() override { set_shape(y_, shape_of(x_)); }
+    void pre_forward() override { set_shape(y_, shape_of(x_)[0]); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return create_launch_config({x_}, {y_}, {&in_rec, &out_rec});
     }
@@ -537,7 +540,7 @@ public:
 
     // Hooks for the phase-guard checks, called by the test after setup.
     void try_declare() { declare_output(extra_, "extra", 1); }
-    void try_reshape() { set_shape(y_, sycl::range<1>{2}); }
+    void try_reshape() { set_shape(y_, 2); }
     void try_init() { init_input("x", cs::init::zero()); }
 };
 
@@ -563,12 +566,18 @@ public:
             declare_input(x_, "x", cs::unspecified_shape<1>());  // a tie_inputs member: the tie alias owns the shape
         else
             declare_input(x_, "x", 4);
-        declare_output(y_, "y", cs::unspecified_shape<1>());
+        // y has the size of x: declared (4) when x is, else set by this producer from x (a number only on an unspecified dimension)
+        if (tied_x_)
+            declare_output(y_, "y", cs::unspecified_shape<1>());
+        else
+            declare_output(y_, "y", 4);
         if (init_) init_input("x", *init_);
         if (mode_ == 1) init_input("y", cs::init::zero());
         if (mode_ == 2) init_input("x", cs::init::fill(3.0f));
     }
-    void pre_forward() override { set_shape(y_, shape_of(x_)); }
+    void pre_forward() override {
+        if (tied_x_) set_shape(y_, shape_of(x_)[0]);
+    }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return create_launch_config(x_.shape(), {x_}, {y_}, {});
     }

@@ -23,8 +23,9 @@
 // holds the device copies of the block offsets and the counts.
 //
 // THE SHAPE (design review, section 10). The DEFINITION (one DimRecord per dimension) is fixed once setup ends; the
-// ACTUAL shape (ResolvedShape) changes at run time, and ONLY through VarMeta::set_shape / set_dims, which check every
-// change against the definition (who may set which dimension, fixed values, agreement within a forward).
+// ACTUAL shape (ResolvedShape) changes at run time, and ONLY through VarMeta::set_by_producer / set_dims, which check
+// every change against the definition. Each dimension has exactly one setter: a SPECIFIED dimension comes from the
+// definition, a HOOK-OWNED one from its hook, an UNSPECIFIED one from the producer (or, for a free input, its initializer).
 //
 // RULES ENFORCED HERE. materialize (below) is the one function that brings data into being. It never
 // runs outside a Runtime (runtime.hpp), allocates on every device that has an instance, and initializes
@@ -349,11 +350,11 @@ class VarMeta;
 inline std::shared_ptr<VarMeta> meta_of(const Instance& i);  // the instance's variable
 inline void check_init_shape(const VarMeta& v, const ResolvedShape& r, const InitShape& s);
 
-/// Who sets a dimension (design review, section 10). A producer sets its outputs (a component's pre_forward), an initializer
-/// (or the definition itself) sets a free input, a shape hook sets the dimensions it owns (`hook` is its owner id).
+/// Who sets a dimension (design review, 11.5). The definition sets a specified dimension, a shape hook the dimensions it owns
+/// (`hook` is its owner id), a producer (a component's pre_forward) or a free input's initializer an unspecified one.
 /// `who` names the setter in errors.
 struct SetterId {
-    enum class Kind : uint8_t { producer, initializer, hook };
+    enum class Kind : uint8_t { producer, initializer, hook, definition };
     Kind          kind = Kind::producer;
     std::uint32_t hook = 0;
     std::string   who;
@@ -574,19 +575,44 @@ public:
                                 (unknown.empty() ? std::string{} : ": " + unknown));
     }
 
-    /// Gives the variable a whole new shape (every dimension), checked against the definition: see set_dims.
-    void set_shape(Runtime& rt, const ResolvedShape& s, const SetterId& by) {
-        DimMask all{};
-        for (int d = 0; d < rank; ++d) all[static_cast<std::size_t>(d)] = true;
-        set_dims(rt, s, all, by);
+    /// A producer's set_shape(out, e0, e1, ...): one entry per dimension, a number or nothing (cs::as_is). A number is
+    /// allowed only on an UNSPECIFIED dimension: on a specified or hook-owned one it is an error here, even when the value
+    /// matches (the owner is named). Every entry is checked before anything is changed. `who` is the output's path.
+    void set_by_producer(Runtime& rt, const std::array<std::optional<std::size_t>, 3>& entries, const std::string& who) {
+        ResolvedShape s = shape;
+        DimMask       mask{};
+        for (int d = 0; d < rank; ++d) {
+            const auto u = static_cast<std::size_t>(d);
+            if (!entries[u]) continue;
+            refuse_number(u, who);
+            mask[u] = true;
+            if (u == 1 && rank == 2) s.per = false;
+            s.extents[u] = *entries[u];
+        }
+        set_dims(rt, s, mask, SetterId{SetterId::Kind::producer, 0, who});
     }
 
-    /// Sets the dimensions in `mask` from `s`. EVERY set is checked against the definition (section 10): a fixed dimension
-    /// must equal its declared extent (or counts); a dimension owned by a shape hook is set by that hook only, and a hook
-    /// sets only the dimensions it owns (and fixed ones, with their own value); an unspecified one is set by a producer or
-    /// an initializer; and two sets of one dimension in one forward must agree. Nothing is changed when a check throws.
-    /// Once every dimension has a value the shape is known; when it changed, every live data is resized in place (contents
-    /// are kept, and the variable never becomes stale).
+    /// A ragged producer's set_shape(out, n, counts) or the copy of a RaggedShape: `s` carries dimension 0 (`set_n`) and the
+    /// per-index dimension (`set_counts`). Counts may be given only when the per-index dimension is unspecified.
+    void set_ragged_by_producer(Runtime& rt, const ResolvedShape& s, bool set_n, bool set_counts, const std::string& who) {
+        if (rank != 2) shape_fail("a ragged set_shape needs a rank-2 variable");
+        DimMask mask{};
+        if (set_n) {
+            refuse_number(0, who);
+            mask[0] = true;
+        }
+        if (set_counts) {
+            refuse_number(1, who);
+            mask[1] = true;
+        }
+        set_dims(rt, s, mask, SetterId{SetterId::Kind::producer, 0, who});
+    }
+
+    /// Sets the dimensions in `mask` from `s`. EVERY set is checked against the definition (design review, 11.5): a
+    /// specified dimension comes from the definition (a hook may repeat it with its own value); a dimension owned by a shape
+    /// hook is set by that hook only, and a hook sets only the dimensions it owns; an unspecified one is set by a producer
+    /// or an initializer. Nothing is changed when a check throws. Once every dimension has a value the shape is known; when
+    /// it changed, every live data is resized in place (contents are kept, and the variable never becomes stale).
     void set_dims(Runtime& rt, const ResolvedShape& s, const DimMask& mask, const SetterId& by) {
         if (s.per && rank != 2)
             shape_fail("only a rank-2 variable can be ragged (" + by.who + " gave per-index extents for a rank " + std::to_string(rank) +
@@ -595,7 +621,6 @@ public:
             const auto u = static_cast<std::size_t>(d);
             if (!mask[u]) continue;
             check_setter(u, s, by, rt);
-            check_same_forward(u, s, by, rt);
         }
         // the per-index counts have one entry per index of dimension 0
         if (rank == 2 && ((mask[0] && mask[1] && s.per) || (mask[1] && s.per && dim_known_[0]) || (mask[0] && !mask[1] && shape.per && dim_known_[1]))) {
@@ -621,9 +646,7 @@ public:
             } else {
                 shape.extents[u] = s.extents[u];
             }
-            dim_known_[u]  = true;
-            set_forward_[u] = rt.forward;
-            set_log_[u].emplace(by.who, s);
+            dim_known_[u] = true;
         }
         shape.known = all_dims_known();
         if (shape.known) shape.settle_total();
@@ -651,7 +674,7 @@ public:
                 s.extents[u] = definition[u].extent;
             }
         }
-        if (any) set_dims(rt, s, mask, SetterId{SetterId::Kind::initializer, 0, "the definition of '" + display_path() + "'"});
+        if (any) set_dims(rt, s, mask, SetterId{SetterId::Kind::definition, 0, "the definition of '" + display_path() + "'"});
     }
 
     /// A variable nothing produces takes its shape from its definition (fixed dimensions) and its initializer's shape
@@ -728,24 +751,21 @@ private:
         throw std::invalid_argument("naga::cospan: shape of '" + display_path() + "': " + why);
     }
 
-    /// One dimension of `r` as text, for messages.
-    std::string dim_text(const ResolvedShape& r, std::size_t u, Runtime& rt) const {
-        return (u == 1 && rank == 2 && r.per) ? extents_str(r.per_index_on_host(rt)) : std::to_string(r.extents[u]);
+    /// A number given to a producer's set_shape on dimension u: only an unspecified dimension takes one.
+    void refuse_number(std::size_t u, const std::string& who) const {
+        const DimRecord&  r   = definition[u];
+        const std::string dim = "dimension " + std::to_string(u);
+        if (r.how == DimRecord::How::hook)
+            shape_fail(dim + " is owned by a shape hook; set_shape('" + who + "') cannot give it a number (pass cs::as_is)");
+        if (r.how == DimRecord::How::fixed)
+            shape_fail(dim + " is " + (u == 1 && def_counts ? "declared as the per-index counts " + extents_str(*def_counts)
+                                                           : "declared as " + std::to_string(r.extent)) +
+                       "; set_shape('" + who + "') takes a number only on an unspecified dimension (pass cs::as_is)");
     }
 
-    /// Dimension u of two shapes is the same value (the same device column and version is the same extents).
-    bool dim_equal(std::size_t u, const ResolvedShape& a, const ResolvedShape& b, Runtime& rt) const {
-        if (u == 1 && rank == 2) {
-            if (a.per != b.per) return false;
-            if (a.per) {
-                if (a.dev_per && a.dev_per == b.dev_per && a.dev_version == b.dev_version) return true;
-                return a.per_index_on_host(rt) == b.per_index_on_host(rt);
-            }
-        }
-        return a.extents[u] == b.extents[u];
-    }
-
-    /// Dimension u of `s` against the definition and the setter's right to touch it.
+    /// Dimension u of `s` against the definition and the setter's right to touch it: a hook-owned dimension is its hook's; a
+    /// specified one comes from the definition (a hook may repeat it, with the same value); an unspecified one is the
+    /// producer's or the initializer's, never a hook's.
     void check_setter(std::size_t u, const ResolvedShape& s, const SetterId& by, Runtime& rt) const {
         const DimRecord&  r   = definition[u];
         const std::string who = by.who.empty() ? std::string{"<unknown>"} : by.who;
@@ -755,6 +775,8 @@ private:
                 shape_fail(dim + " is set by a shape hook; " + who + " cannot set it");
         } else if (by.kind == SetterId::Kind::hook && r.how != DimRecord::How::fixed) {
             shape_fail(dim + " is " + declared_rule(static_cast<int>(u)) + ", not owned by " + who + ": a hook sets only the dimensions it owns");
+        } else if (r.how == DimRecord::How::fixed && (by.kind == SetterId::Kind::producer || by.kind == SetterId::Kind::initializer)) {
+            shape_fail(dim + " is " + declared_rule(static_cast<int>(u)) + "; " + who + " cannot set it (a specified dimension comes from the definition)");
         }
         if (r.how != DimRecord::How::fixed) return;
         if (u == 1 && def_counts) {
@@ -771,15 +793,6 @@ private:
             if (s.extents[u] != r.extent)
                 shape_fail(dim + " is declared as " + std::to_string(r.extent) + " but " + who + " gave " + std::to_string(s.extents[u]));
         }
-    }
-
-    /// A second set of dimension u in one forward must agree with the first.
-    void check_same_forward(std::size_t u, const ResolvedShape& s, const SetterId& by, Runtime& rt) const {
-        if (set_forward_[u] != rt.forward || !set_log_[u]) return;
-        const auto& prev = *set_log_[u];
-        if (dim_equal(u, prev.second, s, rt)) return;
-        shape_fail("dimension " + std::to_string(u) + " was set to " + dim_text(prev.second, u, rt) + " by " + prev.first + " and to " +
-                   dim_text(s, u, rt) + " by " + by.who + " in the same forward; two sets of one dimension must agree");
     }
 
     /// The initializer's shape against the fixed dimensions of the definition (and the rank).
@@ -812,9 +825,7 @@ private:
         }
     }
 
-    std::array<bool, 3>          dim_known_{};                          ///< which dimensions have a value
-    std::array<std::uint64_t, 3> set_forward_{~0ull, ~0ull, ~0ull};     ///< the forward of each dimension's last set
-    std::array<std::optional<std::pair<std::string, ResolvedShape>>, 3> set_log_{};  ///< who set it, and the shape given
+    std::array<bool, 3> dim_known_{};  ///< which dimensions have a value
 };
 
 /// The shape an init carries against the variable's resolved shape: the rank and EVERY dimension (fixed, inherited, hooked,

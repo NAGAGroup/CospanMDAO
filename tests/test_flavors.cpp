@@ -166,7 +166,10 @@ public:
         this->declare_input(x_, "x", cs::unspecified_shape<R>());
         this->declare_output(y_, "y", cs::unspecified_shape<R>());
     }
-    void pre_forward() override { this->set_shape(y_, this->shape_of(x_)); }  // the output follows the input (section 10: no derived dims)
+    void pre_forward() override {  // the output follows the input (section 10: no derived dims), one entry per dimension
+        const sycl::range<R> s = this->shape_of(x_);
+        [&]<std::size_t... I>(std::index_sequence<I...>) { this->set_shape(y_, s[I]...); }(std::make_index_sequence<R>{});
+    }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return this->create_launch_config(x_.shape(), {x_}, {y_}, {});
     }
@@ -203,7 +206,7 @@ public:
         declare_input(x_, "x", cs::unspecified_shape<1>());
         declare_output(y_, "y", cs::unspecified_shape<1>());
     }
-    void pre_forward() override { set_shape(y_, shape_of(x_)); }  // the output follows the input (section 10: no derived dims)
+    void pre_forward() override { set_shape(y_, shape_of(x_)[0]); }  // the output follows the input (section 10: no derived dims)
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return create_launch_config(sycl::range<1>{x_.shape()[0] / 2}, {x_}, {y_}, {});
     }
@@ -262,7 +265,7 @@ public:
         this->declare_input(x_, "x", cs::unspecified_shape<1>());
         this->declare_output(y_, "y", cs::unspecified_shape<1>());
     }
-    void pre_forward() override { this->set_shape(y_, this->shape_of(x_)); }  // the output follows the input (section 10: no derived dims)
+    void pre_forward() override { this->set_shape(y_, this->shape_of(x_)[0]); }  // the output follows the input (section 10: no derived dims)
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         typename Body::Scratch s;
         s.tile.reshape(sycl::range<1>{wg_});
@@ -295,7 +298,7 @@ public:
         declare_input(x_, "x", cs::unspecified_shape<1>());
         declare_output(z_, "z", cs::unspecified_shape<1>());
     }
-    void pre_forward() override { set_shape(z_, shape_of(x_)); }  // the output follows the input (section 10: no derived dims)
+    void pre_forward() override { set_shape(z_, shape_of(x_)[0]); }  // the output follows the input (section 10: no derived dims)
     std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config({x_}, {z_}, {}); }
 };
 
@@ -317,9 +320,10 @@ class Sum3 : public cs::Component<Sum3Body> {
 public:
     explicit Sum3(int n) : n_{n} {}
     void setup() override {
-        declare_input(p_, "p", n_);
-        declare_input(g_, "g", n_);
-        declare_input(h_, "h", n_);
+        // unspecified: the producers set the sizes (a fixed input would make a connected producer's number an error, P5)
+        declare_input(p_, "p", cs::unspecified_shape<1>());
+        declare_input(g_, "g", cs::unspecified_shape<1>());
+        declare_input(h_, "h", cs::unspecified_shape<1>());
         declare_output(s_, "s", n_);
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
@@ -410,7 +414,7 @@ public:
         declare_input(ref_, "ref", cs::unspecified);
         declare_output(bins_, "bins", cs::unspecified);
     }
-    void pre_forward() override { set_shape(bins_, shape_of(ref_)); }
+    void pre_forward() override { set_shape(bins_, shape_of(ref_)[0]); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return create_launch_config(bins_.shape(), {n_, ref_}, {bins_}, {});
     }
@@ -449,7 +453,7 @@ public:
         declare_input(x_, "x", cs::unspecified_shape<1>());
         declare_output(y_, "y", cs::unspecified_shape<1>());
     }
-    void pre_forward() override { set_shape(y_, shape_of(x_)); }  // the output follows the input (section 10: no derived dims)
+    void pre_forward() override { set_shape(y_, shape_of(x_)[0]); }  // the output follows the input (section 10: no derived dims)
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         BigBody::Scratch s;
         s.tile.reshape(sycl::range<1>{elems_});
@@ -476,7 +480,7 @@ public:
         declare_input(x_, "x", cs::unspecified_shape<1>());
         declare_output(y_, "y", cs::unspecified_shape<1>());
     }
-    void pre_forward() override { set_shape(y_, shape_of(x_)); }  // the output follows the input (section 10: no derived dims)
+    void pre_forward() override { set_shape(y_, shape_of(x_)[0]); }  // the output follows the input (section 10: no derived dims)
     std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config({x_}, {y_}, {}); }
 };
 struct NopHostBody {
@@ -497,7 +501,7 @@ public:
         declare_input(x_, "x", cs::unspecified_shape<1>());
         declare_output(y_, "y", cs::unspecified_shape<1>());
     }
-    void pre_forward() override { set_shape(y_, shape_of(x_)); }  // the output follows the input (section 10: no derived dims)
+    void pre_forward() override { set_shape(y_, shape_of(x_)[0]); }  // the output follows the input (section 10: no derived dims)
     std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config({x_}, {y_}, {}); }
 };
 
@@ -891,10 +895,8 @@ TEST_CASE("fused: a value-driven size driven by a stage of the same fuse is refu
                                                            cs::subsystem_desc<tfl::Bins>("b")));
             tfl::hook_bins(s, "f.b");
         });
-        // REVIEW: the old setup-end check of the fuse ("f.b", "f.a", "VALUE") is gone from fused_component.hpp. The hook's source
-        // f.b.n is produced by f.a, inside the same child f, so system.hpp compute_hook_slots should reject it ("produced by 'f',
-        // which does not come before 'f'"); whether a hook path into a fused component resolves that way is not settled.
-        tfl::expect_throws([&] { model.setup(); }, {"shape_hook", "'f.b.ref'", "'f.b.n'", "does not come before 'f'"});
+        // P5: the source-ordering check is gone; the hook runs before the child f that holds its target and the model sets up.
+        CHECK_NOTHROW(model.setup());
     }
     SECTION("parallel: the connect itself is rejected, before that check") {
         cs::Model model = tfl::make([](cs::System& s) {

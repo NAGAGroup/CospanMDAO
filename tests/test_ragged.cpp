@@ -81,7 +81,7 @@ public:
         declare_input(raw_, "raw", n_);
         declare_output(counts_, "counts", cs::unspecified);
     }
-    void pre_forward() override { set_shape(counts_, shape_of(raw_)); }
+    void pre_forward() override { set_shape(counts_, shape_of(raw_)[0]); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return create_launch_config(counts_.shape(), {raw_}, {counts_}, {});
     }
@@ -174,7 +174,7 @@ public:
         this->declare_input(pts_, "pts");
         this->declare_output(sums_, "sums", cs::unspecified);
     }
-    void pre_forward() override { this->set_shape(sums_, sycl::range<1>{this->shape_of(pts_).n}); }
+    void pre_forward() override { this->set_shape(sums_, this->shape_of(pts_).n); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return this->create_launch_config(sums_.shape(), {pts_}, {sums_}, {});
     }
@@ -303,7 +303,7 @@ public:
         declare_input(pts_, "pts", cs::counts(sizes_));
         declare_output(sums_, "sums", cs::unspecified);
     }
-    void pre_forward() override { set_shape(sums_, sycl::range<1>{shape_of(pts_).n}); }
+    void pre_forward() override { set_shape(sums_, shape_of(pts_).n); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return create_launch_config(sums_.shape(), {pts_}, {sums_}, {});
     }

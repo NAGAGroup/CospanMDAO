@@ -449,7 +449,7 @@ public:
         declare_input(ref_, "ref", cs::unspecified);
         declare_output(bins_, "bins", cs::unspecified);
     }
-    void pre_forward() override { set_shape(bins_, shape_of(ref_)); }
+    void pre_forward() override { set_shape(bins_, shape_of(ref_)[0]); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return create_launch_config(bins_.shape(), {n_, ref_}, {bins_}, {});
     }
@@ -511,7 +511,7 @@ public:
         declare_input(x_, "x", cs::unspecified_shape<1>());
         declare_output(y_, "y", cs::unspecified_shape<1>());
     }
-    void pre_forward() override { set_shape(y_, shape_of(x_)); }  // the output follows the input (section 10: no derived dims)
+    void pre_forward() override { set_shape(y_, shape_of(x_)[0]); }  // the output follows the input (section 10: no derived dims)
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return create_launch_config(y_.shape(), {x_}, {y_}, {});
     }

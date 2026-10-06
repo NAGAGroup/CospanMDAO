@@ -231,7 +231,7 @@ public:
         declare_input(x_, "x", cs::unspecified_shape<1>());
         declare_output(y_, "y", cs::unspecified_shape<1>());
     }
-    void pre_forward() override { set_shape(y_, shape_of(x_)); }  // the output follows the input (section 10: no derived dims)
+    void pre_forward() override { set_shape(y_, shape_of(x_)[0]); }  // the output follows the input (section 10: no derived dims)
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return create_launch_config(x_.shape(), {x_}, {y_}, {});
     }
@@ -256,7 +256,7 @@ public:
         declare_input(x_, "x", cs::unspecified_shape<2>());
         declare_output(y_, "y", cs::unspecified_shape<2>());
     }
-    void pre_forward() override { set_shape(y_, shape_of(x_)); }  // the output follows the input (section 10: no derived dims)
+    void pre_forward() override { set_shape(y_, shape_of(x_)[0], shape_of(x_)[1]); }  // the output follows the input (section 10: no derived dims)
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return create_launch_config(x_.shape(), {x_}, {y_}, {});
     }
@@ -1916,7 +1916,7 @@ TEST_CASE("structural errors", "[system][errors]") {
         CHECK_NOTHROW(sys.connect("a.y", "b.x"));
         tsys::expect_throws([&] { sys.tie_inputs<DType::f32, 1>({"a.x", "b.x"}, "t", cs::shape(1)); }, "not a free input");
         tsys::expect_throws([&] { sys.add_design_var("a.x"); }, "setup() only");
-        tsys::expect_throws([&] { sys.depends_on("b", "a"); }, "setup() only");
+        CHECK_NOTHROW(sys.depends_on("b", "a"));  // P5: depends_on is legal anywhere too
     }
     SECTION("an unknown path in view_output names the path") {
         cs::Model model = cs::create_model<tsys::ThreeAxpb>(default_config());
@@ -2024,8 +2024,10 @@ class VBins : public cs::Component<VBinsBody> {
     cs::Input<DType::u32, 1>  n_;
     cs::Input<DType::f32, 1>  ref_;
     cs::Output<DType::f32, 1> b_;
+    bool                      as_is_;  // true: b's size comes from a definition (an alias), so the producer passes cs::as_is
 
 public:
+    explicit VBins(bool as_is = false) : as_is_{as_is} {}
     // REVIEW: a component cannot read a value and a hook cannot target an output (section 10), so the size by value goes
     // through the free input `ref`: the System hooks it (add_bins: from_value of `n`) and b copies its shape in pre_forward.
     void setup() override {
@@ -2033,15 +2035,20 @@ public:
         declare_input(ref_, "ref", cs::unspecified);
         declare_output(b_, "b", cs::unspecified);
     }
-    void pre_forward() override { set_shape(b_, shape_of(ref_)); }
+    void pre_forward() override {
+        if (as_is_)
+            set_shape(b_, cs::as_is);
+        else
+            set_shape(b_, shape_of(ref_)[0]);
+    }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return create_launch_config(b_.shape(), {n_, ref_}, {b_}, {});
     }
 };
 
 /// Adds a VBins child and hooks its `ref` with the value of its `n`.
-inline void add_bins(cs::System& s, const char* name = "v") {
-    s.add_subsystem(cs::subsystem_desc<VBins>(name));
+inline void add_bins(cs::System& s, const char* name = "v", bool as_is = false) {
+    s.add_subsystem(cs::subsystem_desc<VBins>(name, as_is));
     s.shape_hook(std::string{name} + ".ref", cs::dim::from_value(std::string{name} + ".n", 0));
 }
 
@@ -2088,7 +2095,7 @@ public:
         declare_input(x_, "x", cs::unspecified_shape<1>());
         declare_output(y_, "y", cs::unspecified_shape<1>());
     }
-    void pre_forward() override { set_shape(y_, shape_of(x_)); }  // the output follows the input (section 10: no derived dims)
+    void pre_forward() override { set_shape(y_, shape_of(x_)[0]); }  // the output follows the input (section 10: no derived dims)
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return create_launch_config(y_.shape(), {x_}, {y_}, {});
     }
@@ -2183,21 +2190,17 @@ TEST_CASE("alias: views of an alias before its root's owner has run throw", "[sy
     CHECK(cst::synced_input<DType::f32, 1>(model, "a.x").shape()[0] == tsys::kLen);
 }
 
-TEST_CASE("reactive shapes: a hook whose source is produced by a later child is a setup error",
-          "[system][errors][reactive]") {
-    // was: a Component sized by a value of a producer that has not run failed at the forward. A size by value is a shape hook now
-    // and a hook's sources must be produced by an EARLIER child (section 10), so it is caught when setup ends.
+TEST_CASE("reactive shapes: a hook whose source is produced by a later child is no setup error",
+          "[system][reactive]") {
+    // P5: there is no source-ordering check. The hook runs before the first child that holds its target; a source that is not
+    // produced yet gives whatever is there (here v.n is read before nb has written it), and the model sets up.
     // v is registered BEFORE nb, but v.n is connected to nb.n: v.ref's size is the value of v.n, which nb has not produced yet.
-    tsys::expect_throws_all(
-        [&] {
-            auto model = tsys2::make([](cs::System& s) {
-                tsys2::add_bins(s);
-                s.add_subsystem(cs::subsystem_desc<tsys2::NCopy>("nb"));
-                s.connect("nb.n", "v.n");
-            });
-            model.setup();
-        },
-        {"shape_hook", "'v.ref'", "'v.n'", "is produced by 'nb'", "does not come before 'v'"});
+    auto model = tsys2::make([](cs::System& s) {
+        tsys2::add_bins(s);
+        s.add_subsystem(cs::subsystem_desc<tsys2::NCopy>("nb"));
+        s.connect("nb.n", "v.n");
+    });
+    CHECK_NOTHROW(model.setup());
 }
 
 /// std::cerr captured for the lifetime of the object (rdbuf swap).
@@ -2332,28 +2335,22 @@ TEST_CASE("alias: tie errors", "[system][alias][errors]") {
             },
             {"its shape is not known yet"});
     }
-    SECTION("a from_value hook whose source is produced by a later-registered child is a setup error") {
-        // was: from_output_values naming a producer registered after the tie's members (a forward-time error). A hook's sources
-        // must be produced by an EARLIER child (section 10): checked when setup ends, naming the hook, the source and both children.
-        setup_throws(
-            [&](cs::System& s) {
+    SECTION("a hook whose source is produced by a later-registered child sets up: no source-ordering check (P5)") {
+        for (const bool from_value : {true, false}) {
+            auto model = tsys2::make([&](cs::System& s) {
                 two_scales(s);
-                s.add_subsystem(cs::subsystem_desc<tsys2::NCopy>("nb"));  // registered AFTER the tie's members
+                if (from_value)
+                    s.add_subsystem(cs::subsystem_desc<tsys2::NCopy>("nb"));  // registered AFTER the tie's members
+                else
+                    tsys2::add_bins(s);
                 s.tie_inputs<DType::f32, 1>({"a.x", "b.x"}, "t");
-                s.shape_hook("t", cs::dim::from_value("nb.n", 0));
-            },
-            {"shape_hook", "'t'", "'nb.n'", "is produced by 'nb'", "does not come before 'a'"});
-    }
-    SECTION("a from_shape hook whose source is produced by a later-registered child is a setup error") {
-        // was: from_output_shape naming a later-registered producer.
-        setup_throws(
-            [&](cs::System& s) {
-                two_scales(s);
-                tsys2::add_bins(s);  // v is registered AFTER the tie's members
-                s.tie_inputs<DType::f32, 1>({"a.x", "b.x"}, "t");
-                s.shape_hook("t", cs::dim::from_shape("v.b", 0));
-            },
-            {"shape_hook", "'t'", "'v.b'", "is produced by 'v'", "does not come before 'a'"});
+                if (from_value)
+                    s.shape_hook("t", cs::dim::from_value("nb.n", 0));
+                else
+                    s.shape_hook("t", cs::dim::from_shape("v.b", 0));
+            });
+            CHECK_NOTHROW(model.setup());
+        }
     }
     SECTION("a from_value hook naming a float variable") {
         // was: "an alias shape rule naming an input is not an output". A hook's source may be an input now; a size by value
@@ -2462,9 +2459,9 @@ TEST_CASE("alias: tie_outputs shapes: fixed and from_output_values", "[system][a
 }
 
 TEST_CASE("alias: a connected tie_inputs alias joins the producer's root", "[system][alias][tie]") {
-    const auto build = [](std::optional<cs::ShapeSpec> shape) {  // nullopt: tie_inputs without a shape (unspecified)
-        return [shape](cs::System& s) {
-            tsys2::add_bins(s);
+    const auto build = [](std::optional<cs::ShapeSpec> shape, bool as_is = false) {  // nullopt: tie_inputs without a shape (unspecified)
+        return [shape, as_is](cs::System& s) {
+            tsys2::add_bins(s, "v", as_is);
             s.add_subsystem(cs::subsystem_desc<tsys2::TScale>("a"));
             s.add_subsystem(cs::subsystem_desc<tsys2::TScale>("b"));
             if (shape)
@@ -2494,21 +2491,29 @@ TEST_CASE("alias: a connected tie_inputs alias joins the producer's root", "[sys
         auto model = tsys2::make(build(cs::shape(5)));
         model.setup();
         model.update_input("v.n", cs::init::from_host(tsys2::one_u32(4)));
-        tsys::expect_throws_all([&] { model.forward(); }, {"dimension 0 is declared as 5", "gave 4"});
+        tsys::expect_throws_all([&] { model.forward(); }, {"dimension 0 is declared as 5", "takes a number only on an unspecified dimension"});
         model.wait();
     }
-    SECTION("a fixed AliasShape that stops agreeing when the source's size changes") {
+    SECTION("a fixed AliasShape: a producer number throws even when it matches") {
         auto model = tsys2::make(build(cs::shape(4)));
+        model.setup();
+        model.update_input("v.n", cs::init::from_host(tsys2::one_u32(4)));
+        tsys::expect_throws_all([&] { model.forward(); }, {"dimension 0 is declared as 4", "takes a number only on an unspecified dimension"});
+        model.wait();
+    }
+    SECTION("a fixed AliasShape with a producer passing as_is keeps its size when the source's size changes") {
+        auto model = tsys2::make(build(cs::shape(4), true));
         model.setup();
         model.update_input("v.n", cs::init::from_host(tsys2::one_u32(4)));
         CHECK_NOTHROW(model.forward());
         model.wait();
         model.update_input("v.n", cs::init::from_host(tsys2::one_u32(6)));
-        tsys::expect_throws_all([&] { model.forward(); }, {"dimension 0 is declared as 4", "gave 6"});
+        CHECK_NOTHROW(model.forward());
         model.wait();
+        CHECK(cst::synced_input<DType::f32, 1>(model, "a.x").shape()[0] == 4);
     }
     SECTION("a matching fixed AliasShape runs") {
-        auto model = tsys2::make(build(cs::shape(4)));
+        auto model = tsys2::make(build(cs::shape(4), true));
         model.setup();
         model.update_input("v.n", cs::init::from_host(tsys2::one_u32(4)));
         model.forward();
@@ -2978,7 +2983,7 @@ public:
         declare_input(x_, "x", cs::unspecified_shape<2>());
         declare_output(y_, "y", cs::unspecified_shape<2>());
     }
-    void pre_forward() override { set_shape(y_, shape_of(x_)); }  // the output follows the input (section 10: no derived dims)
+    void pre_forward() override { set_shape(y_, shape_of(x_)[0], shape_of(x_)[1]); }  // the output follows the input (section 10: no derived dims)
     std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(y_.shape(), {x_}, {y_}, {}); }
 };
 

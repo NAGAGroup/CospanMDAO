@@ -76,7 +76,7 @@ public:
         declare_input(x_, "x", cs::unspecified);
         declare_output(z_, "z", cs::unspecified_shape<1>());
     }
-    void pre_forward() override { set_shape(z_, shape_of(x_)); }  // the output follows the input (section 10: no derived dims)
+    void pre_forward() override { set_shape(z_, shape_of(x_)[0]); }  // the output follows the input (section 10: no derived dims)
     std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(z_.shape(), {x_}, {z_}, {}); }
 };
 
