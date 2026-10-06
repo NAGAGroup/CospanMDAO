@@ -28,6 +28,8 @@ Running log, newest entries at the bottom. Each entry: date/time (UTC), phase, w
 - The join task (collapse) breaks ordering in CoSpan on the OpenMP backend; we ship without collapse (SlabKit `7655b84`). Lists drop completed events past 64 entries. Root cause in AdaptiveCpp still to find.
 - Section 11: outside writes never wait on writes. Added (SlabKit `e86ae9f`): an outside writer still waits on the container's own write operations (resize fill, reallocation copy, copy-in), which are not outside writes.
 - add_subsystem is still setup-only; should it follow the anywhere principle?
+- (P8, tests/test_epochs.cpp, "Views: a value-driven ragged output follows its driver") Does a live host view follow a shape change of its variable, i.e. is the host copy resized? host_view.hpp only says each forward pushes a copy. The case releases its view before the driver changes; the REVIEW marker stays there as this question.
+- (P8) `onepass` on OpenMP is still expected to give a wrong q (your item); `--variant all` skips it there with its message. On cuda it runs and passes.
 
 ## Entries
 
@@ -189,3 +191,43 @@ Commit 6118a48 (code and tests) and the log commit after it. Decisions:
 - **Tests (tests/test_fused_groups.cpp, [fused_groups][tickets], [errors]).** ticket_order keeps segment/group indices; global_barrier neighbor-group read; ticket_order + `wait_group` on the neighbor group; `wait_earlier_segments` giving the same result; each of the three in a small shape (5 groups of 64) and the big shape, over 5 forwards with a new input each forward (a stale ticket state or a missed wait shows); boundary placement and plain-group traits; backward, same-stage and cross-segment backward connects. The chained prefix with look-back was NOT built (kept simple, as the task allowed): the wait_group case is a neighbor-group read.
 - **Open.** README / gemver README still describe `fuse_components<seq|par>`; diagnostics.hpp comments still say "packing-buffer uploads". The cuda big case relies on max_work_group_size (1024 on this GPU); whether it exceeds co-residency depends on the GPU (not measured).
 - Suites: default 237 cases (227 passed, 10 skipped, 2302 assertions); cuda three runs, each `All tests passed (2363 assertions in 237 test cases)`.
+
+## P8: example and cleanup
+
+Commits 03007cd (gemver, smoke), c2bc450 (REVIEW markers), 0e2762b (stale text), plus the log commit after them.
+
+- **gemver-chain.** The barrier variant is gone everywhere: `GridBarrier`, `ZeroCounters`, the `resident_items` parameter and `launch_items` of every component (only it used them), `BarrierTop`, `barrier_chain`, the `barrier` variant, `--blocks-per-cu`, `--spin-limit`, the barrier grid sizing and timeout reads in main.cpp, the same two flags and the `barrier` compare name in the cuBLAS reference (`cublas/main.cu`; the compare list now ends with `onepass`), and the README rows, flag text, barrier sweep and open-question text. Variants: unfused, parallel, fused, onepass. **parallel is still a `system_from` group** (a plain System, two launches), kept as allowed and said so in systems.hpp and the README; **fused** is P7a's port (GEMVER: one `range_mode::whole` segment; BiCGK: two one-stage segments, no boundary). The Report struct and the numerical checks are unchanged. README results were measured before P7 and are marked not re-measured; the old fused-wave overhead explanation is marked as no longer applicable.
+- **Smoke tests.** tests/smoke is a standalone project that no build target references. I built it: all six programs (smoke, smoke_component, smoke_system, smoke_parallel, smoke_fused, smoke_model) failed to compile on removed API (FusedSystem, ParallelSystem, property::fused, arena, `from_source_shape`, `Substrates`, `ExecCtx`, ...). Porting them would be a rewrite that tests/test_*.cpp already covers, so the directory was deleted (`git rm -r tests/smoke`). tests/spike (a separate dynamic-function probe with its own `StageRecord`) was left alone. References updated: tests/CMakeLists.txt comment, a header comment in test_system.cpp.
+- **Stale text.** top-level README: a fused-group example with segments, boundary items and the waits, and the stale "a view needs a run first" comment. gemver README: seq/par text, the fused example, `resident_items`. diagnostics.hpp: packing-buffer comments (the `host_tasks` counter is host-body launches only). Swept include/ for EventLists, collapse, HookStep, compute_hook_slots, FusedComponent, fuse_strategy, launch_wave, StageRecord, jit_config, adopt_live_data, attach_missing: nothing left except true uses (`ShapeHookStep` is the live class name; "collapse" in model.hpp and variable.hpp is plain English for merging update lists; diagnostics.hpp names the old arena in its history paragraph). chunked_system.hpp is dead code kept on purpose and was not touched.
+- **REVIEW markers** (22 at the start; all resolved but one):
+
+| Where | What it was | Resolution |
+|---|---|---|
+| examples/gemver-chain/main.cpp:268 | default device vs the model's | comment now states it (no default_device, section 2); marker removed |
+| examples/gemver-chain/systems.hpp:117 | ParallelSystem replaced by a plain group | comment states what parallel is; marker removed |
+| examples/gemver-chain/systems.hpp:197 | FusedSystem replaced by the helper (barrier_chain) | deleted with the barrier variant |
+| test_epochs.cpp:142 (RGen) | free-layout fixture, hook cannot target an output | kept as a hook-on-input fixture (counts_from on a ragged input); marker removed |
+| test_epochs.cpp:290 | does a live view follow a shape change | **kept as a question for Jack**, listed under Open questions |
+| test_ragged_ties.cpp:936 | depends_on on a System child | settled by system.hpp (events handed to every child for one forward); the case's values assert it; marker removed |
+| test_model.cpp:429 (Bins) | free `ref` input + hook | kept as a hook-on-input fixture; comment says hook-on-output is covered in test_shapes.cpp [p5]; marker removed |
+| test_model.cpp:928 | two devices, no default_device | settled by section 2; comment states the replacement; marker removed |
+| test_model.cpp:960 | pool bytes in use on both devices | comment cites the per-device pool; assertion unchanged and passing; marker removed |
+| test_model.cpp:981 | zero-element variable has a host copy | assertion kept and passing (present, size 0); marker removed |
+| test_ragged.cpp:104 (Fill) | free ragged layout + counts_from | kept as a hook-on-input fixture; marker removed |
+| test_ragged.cpp:461 | n = 0 allocation | assertions kept and passing; marker removed |
+| test_ragged.cpp:475 | pointer to a REVIEW in test_shapes.cpp | comment now cites shape_hook.hpp (counts_from reads column 0) |
+| test_rework.cpp:146 | does wait() throw for a host-task exception | assertion kept (wait() throws, forward() does not); comment cites wait_and_throw; marker removed |
+| test_flavors.cpp:375 (Bins) | as test_model Bins | as test_model Bins |
+| test_system.cpp:2034 (VBins) | as Bins | as Bins |
+| test_system.cpp:2333 | no test for an unspecified tie_outputs alias nothing supplies | **new section added**: `forward` throws "its shape is not known yet" |
+| test_system.cpp:2626 | do_once producer, transient reader | comment states the replay_connect / resolve_free_shape behavior the case asserts; marker removed |
+| test_system.cpp:3157 | where the unset-output-dim error comes from | the case asserts both needles; comment cites shape_unknown; marker removed |
+| test_shapes.cpp:432 | promote carries no shape | comment states it; marker removed |
+| test_shapes.cpp:498 | batched reads not observable | parenthetical comment; marker removed |
+| test_shapes.cpp:567 | fill(v) not used; Adders without set_shape | comment states it; marker removed |
+
+  Decision on the four "free ref input + hook" fixtures (Bins x2, VBins, Fill, RGen): they were left as written, as the task said, rather than switched to a hook on the output, because they are the tests of a hook on an input (counts_from / from_value on a free input); hooks on outputs have their own cases in test_shapes.cpp.
+- **gemver `--variant all --check` at the default size (n = 16384, R = 64), tolerance 1e-4, B2 skipped for n > 4096.** Relative L2 against the host double reference (x1 w1 q s x2 w2):
+  - OpenMP (default env): unfused, parallel and fused all `1.93e-07 4.11e-08 4.11e-08 2.38e-07 1.78e-07 4.14e-08`, bitwise equal to each other; onepass skipped with its message ("onepass: skipped on omp: q incorrect on this backend, under investigation"); ALL OK. Times 971 / 929 / 884 ms per chain (unfused / parallel / fused).
+  - cuda: unfused, parallel and fused all `1.93e-07 4.23e-08 4.23e-08 2.38e-07 1.78e-07 4.03e-08`, bitwise equal to each other; onepass `1.93e-07 4.23e-08 1.19e-07 2.38e-07 1.78e-07 4.04e-08` (not bitwise equal to unfused, worst rel L2 1.26e-07, as designed); ALL OK. Times 11.76 (unfused), 9.04 (onepass), 15.34 (parallel), 14.80 (fused) ms per chain, single run, not a benchmark.
+- Suites: default 237 cases (227 passed, 10 skipped, 2303 assertions); cuda `All tests passed (2364 assertions in 237 test cases)`.
