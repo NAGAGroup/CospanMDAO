@@ -33,3 +33,20 @@ Running log, newest entries at the bottom. Each entry: date/time (UTC), phase, w
 - **Tests:** none (docs only).
 - **Decisions taken:** none.
 - **Open questions for Jack:** none.
+
+### 2026-10-06 09:15 UTC, P1a + P1b: fork change committed, toolchain release dispatched
+- **Done:**
+  - P1a, in `/home/jack/projects/acpp-fork`, branch `naga/develop`: the indexed call sequence and the cross-TU linking fix, plus tests and a doc entry in `doc/extensions.md`. The fork was not built locally.
+  - P1b: dispatched `.github/workflows/build.yml` in `NAGAGroup/acpp-toolchain`, linux-64 publish monitored (monitor `m1`).
+- **Commits:** acpp-fork `f815ee1efa0e887d18307e8d4169e320c702a1b6` ("jit: indexed call sequences; link dynamic-function definitions from other TUs").
+- **Release:**
+  - Date (UTC) 2026.10.06; staging had no `naga-acpp` build of that date on linux-64 (newest was 2026.10.01), so `build_number` = 0.
+  - Run id 37441431821, https://github.com/NAGAGroup/acpp-toolchain/actions/runs/37441431821.
+  - Dispatch: `gh workflow run build.yml -f fork_sha=f815ee1efa0e887d18307e8d4169e320c702a1b6 -f 'platforms=linux-64 linux-aarch64 osx-arm64 win-64 win-arm64' -f publish=true -f build_number=0`.
+- **Test results:** none yet; the fork's lit tests (`dynamic_function_indexed.cpp`, `dynamic-function-cross-tu/`) are verified only through the published build and the CoSpan probe (P1c).
+- **Decisions taken (fork):**
+  - The index position is stored per entry in `fcall_specialized_config::function_call_map`, which is now a vector of `fcall_specialization_entry{function, replacements, index_param}`. It enters the configuration hash through each entry's `unique_hash` term, which `kernel_configuration::generate_id` already folds in, so `kernel_configuration.hpp` needed no edit.
+  - Under `LinkOnlyNeeded`, a symbol is linked only if the module declares it, and a replacement named only in the config is not declared. `resolveExternalSymbols` therefore declares each missing replacement (with the type of the function it replaces) before resolving, and `jit.hpp` adds the replacement names to the imported symbols, as the plan says.
+  - A replacement that is still only a declaration when specializations are applied is now reported as "Could not find function call specialization target". Before, it was a late backend failure.
+  - The plain call sequence hashes one more value (index -1), so existing configurations get new cache keys. Their behavior is unchanged.
+- **Open questions for Jack:** none.
