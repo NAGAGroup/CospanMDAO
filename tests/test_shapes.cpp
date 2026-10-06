@@ -296,6 +296,60 @@ public:
     std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(acc_.shape(), {}, {acc_}, {v_}); }
 };
 
+// ---- ShCube: a rank-3 producer, y [?, ?, 3]; `mode` picks which set_shape call it makes ---------------------------------------
+// 0: set_shape(y, as_is, 7, as_is)     the legal one: dimension 1 is the producer's
+// 1: set_shape(y, 5, 7, as_is)         a number on dimension 0 (hook-owned in the tests that use it)
+// 2: set_shape(y, as_is, 7, 3)         a number on the declared dimension 2, even though it matches
+// 3: set_shape(y, as_is, 7)            two entries for a rank-3 output
+struct ShCubeBody {
+    struct Inputs {};
+    struct Outputs {
+        cs::Output<DType::f32, 3> y;
+    };
+    void operator()(sycl::id<3> i, Inputs, Outputs o) const { o.y[i] = static_cast<float>(i[0] * 100 + i[1] * 10 + i[2]); }
+};
+class ShCube : public cs::Component<ShCubeBody> {
+    int                       mode_;
+    cs::Output<DType::f32, 3> y_;
+
+public:
+    explicit ShCube(int mode = 0) : mode_{mode} {}
+    void setup() override { declare_output(y_, "y", cs::unspecified, cs::unspecified, 3); }
+    void pre_forward() override {
+        switch (mode_) {
+            case 0: set_shape(y_, cs::as_is, 7, cs::as_is); break;
+            case 1: set_shape(y_, 5, 7, cs::as_is); break;
+            case 2: set_shape(y_, cs::as_is, 7, 3); break;
+            default: set_shape(y_, cs::as_is, 7); break;
+        }
+    }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(y_.shape(), {}, {y_}, {}); }
+};
+
+// ---- ShRagGen: a ragged producer [N, c_i]: set_shape(pts, as_is, counts), the n left to a hook ---------------------------------
+struct ShRagGenBody {
+    struct Inputs {};
+    struct Outputs {
+        cs::RaggedOutput<DType::f32, 2> pts;
+    };
+    void operator()(sycl::id<1> id, Inputs, Outputs o) const {
+        auto b = o.pts.block(id[0]);
+        for (std::size_t q = 0; q < b.size(); ++q) b[q] = static_cast<float>(id[0] * 10 + q);
+    }
+};
+class ShRagGen : public cs::Component<ShRagGenBody> {
+    std::vector<std::size_t>        counts_;
+    cs::RaggedOutput<DType::f32, 2> pts_;
+
+public:
+    explicit ShRagGen(std::vector<std::size_t> counts) : counts_{std::move(counts)} {}
+    void setup() override { declare_output(pts_, "pts"); }
+    void pre_forward() override { set_shape(pts_, cs::as_is, counts_); }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+        return create_launch_config(sycl::range<1>{counts_.size()}, {}, {pts_}, {});
+    }
+};
+
 }  // namespace tshape
 
 // =============================================================================================================================
@@ -654,4 +708,119 @@ TEST_CASE("hook run point: a hook declared after the target's child still runs b
     m.wait();
     CHECK(cst::synced_input<DType::f32, 1>(m, "c.x").shape()[0] == 5);
     CHECK(cst::synced_output<DType::f32, 1>(m, "later.y").shape()[0] == 5);
+}
+
+
+// =============================================================================================================================
+// 5. P5: per-dimension set_shape, hooks on outputs, wiring anywhere
+// =============================================================================================================================
+TEST_CASE("set_shape rank 3: a hooked dimension, a producer's dimension and a declared one", "[shapes][set_shape][p5]") {
+    auto m = tshape::sh_make([](cs::System& s) {
+        s.add_subsystem(cs::subsystem_desc<tshape::ShN>("nn", 5.0f));
+        s.add_subsystem(cs::subsystem_desc<tshape::ShCube>("p", 0));
+        s.shape_hook("p.y", cs::dim::from_value("nn.n", 0), cs::dim::as_is(), cs::dim::as_is());  // a hook on an untied output
+    });
+    m.setup();
+    m.forward();
+    m.wait();
+    const auto y = cst::synced_output<DType::f32, 3>(m, "p.y");
+    CHECK(y.shape()[0] == 5);
+    CHECK(y.shape()[1] == 7);
+    CHECK(y.shape()[2] == 3);
+}
+
+TEST_CASE("set_shape: a number on a specified dimension throws at the call", "[shapes][set_shape][p5]") {
+    auto m = tshape::sh_make([](cs::System& s) { s.add_subsystem(cs::subsystem_desc<tshape::ShCube>("p", 2)); });
+    CHECK_NOTHROW(m.setup());
+    tshape::sh_forward_throws(m, {"dimension 2 is declared as 3", "takes a number only on an unspecified dimension", "'p.y'"});
+}
+
+TEST_CASE("set_shape: a number on a hook-owned dimension throws at the call", "[shapes][set_shape][p5]") {
+    auto m = tshape::sh_make([](cs::System& s) {
+        s.add_subsystem(cs::subsystem_desc<tshape::ShN>("nn", 5.0f));
+        s.add_subsystem(cs::subsystem_desc<tshape::ShCube>("p", 1));
+        s.shape_hook("p.y", cs::dim::from_value("nn.n", 0), cs::dim::as_is(), cs::dim::as_is());
+    });
+    CHECK_NOTHROW(m.setup());
+    tshape::sh_forward_throws(m, {"dimension 0 is owned by a shape hook", "cannot give it a number", "'p.y'"});
+}
+
+TEST_CASE("set_shape: an entry count that differs from the rank throws", "[shapes][set_shape][p5]") {
+    auto m = tshape::sh_make([](cs::System& s) { s.add_subsystem(cs::subsystem_desc<tshape::ShCube>("p", 3)); });
+    CHECK_NOTHROW(m.setup());
+    tshape::sh_forward_throws(m, {"set_shape('p.y')", "one entry per dimension"});
+}
+
+TEST_CASE("hook on an untied output: the hook runs before the producer, which passes as_is", "[shapes][hook][p5]") {
+    auto m = tshape::sh_make([](cs::System& s) {
+        s.add_subsystem(cs::subsystem_desc<tshape::ShN>("nn", 6.0f));
+        s.add_subsystem(cs::subsystem_desc<tshape::ShProd>("p", tshape::kAsIs));
+        s.add_subsystem(cs::subsystem_desc<tshape::ShScale>("c"));
+        s.connect("p.y", "c.x");
+        s.shape_hook("p.y", cs::dim::from_value("nn.n", 0));
+    });
+    m.setup();
+    m.forward();
+    m.wait();
+    CHECK(cst::to_vector(cst::synced_output<DType::f32, 1>(m, "c.y")) == tshape::sh_iota(6, 2.0f));
+}
+
+TEST_CASE("hook on a tied member output throws and points at the alias", "[shapes][hook][tie][p5]") {
+    tshape::sh_setup_throws(
+        [](cs::System& s) {
+            s.add_subsystem(cs::subsystem_desc<tshape::ShN>("nn", 3.0f));
+            s.add_subsystem(cs::subsystem_desc<tshape::ShProd>("a", tshape::kAsIs));
+            s.add_subsystem(cs::subsystem_desc<tshape::ShProd>("b", tshape::kAsIs));
+            s.tie_outputs<DType::f32, 1>({"a.y", "b.y"}, "t", cs::shape(), cs::TieOutputsPolicy::allow_plain);
+            s.shape_hook("b.y", cs::dim::from_value("nn.n", 0));
+        },
+        {"shape_hook", "'b.y'", "hook the tie alias instead", "'t'"});
+}
+
+TEST_CASE("shape_hook and depends_on called after setup work", "[shapes][hook][p5]") {
+    auto m = tshape::sh_make([](cs::System& s) {
+        s.add_subsystem(cs::subsystem_desc<tshape::ShN>("nn", 4.0f));
+        s.add_subsystem(cs::subsystem_desc<tshape::ShProd>("a", std::size_t{2}));
+        s.add_subsystem(cs::subsystem_desc<tshape::ShProd>("b", std::size_t{2}));
+        s.add_subsystem(cs::subsystem_desc<tshape::ShScale>("c"));
+        s.init_input("c.x", cs::init::fill(1.5f));
+    });
+    m.setup();
+    CHECK_NOTHROW(m.root().shape_hook("c.x", cs::dim::from_value("nn.n", 0)));
+    CHECK_NOTHROW(m.root().depends_on("b", "a"));
+    m.forward();
+    m.wait();
+    CHECK(cst::synced_input<DType::f32, 1>(m, "c.x").shape()[0] == 4);
+    CHECK(cst::to_vector(cst::synced_output<DType::f32, 1>(m, "c.y")) == std::vector<float>(4, 3.0f));
+}
+
+TEST_CASE("a late init_input on a materialized free input re-initializes at the next forward", "[shapes][init][p5]") {
+    auto m = tshape::sh_make([](cs::System& s) {
+        s.add_subsystem(cs::subsystem_desc<tshape::ShScale>("c"));
+        s.init_input("c.x", cs::init::fill(1.0f, {4}));
+    });
+    m.setup();
+    m.forward();
+    m.wait();
+    CHECK(cst::to_vector(cst::synced_output<DType::f32, 1>(m, "c.y")) == std::vector<float>(4, 2.0f));
+    m.root().init_input("c.x", cs::init::fill(3.0f, {4}));  // after the variable was materialized
+    m.forward();
+    m.wait();
+    CHECK(cst::to_vector(cst::synced_output<DType::f32, 1>(m, "c.y")) == std::vector<float>(4, 6.0f));
+}
+
+TEST_CASE("ragged set_shape(out, as_is, counts): the n is owned by a hook", "[shapes][set_shape][hook][ragged][p5]") {
+    auto m = tshape::sh_make([](cs::System& s) {
+        s.add_subsystem(cs::subsystem_desc<tshape::ShN>("nn", 4.0f));
+        s.add_subsystem(cs::subsystem_desc<tshape::ShRagGen>("g", std::vector<std::size_t>{2, 0, 3, 1}));
+        s.shape_hook("g.pts", cs::dim::from_value("nn.n", 0), cs::dim::as_is());  // n alone; the counts are the producer's
+    });
+    m.setup();
+    m.forward();
+    m.wait();
+    auto v = m.view_ragged_output<DType::f32, 2>("g.pts");
+    v.sync();
+    CHECK(v.n() == 4);
+    const std::vector<std::size_t> counts{2, 0, 3, 1};
+    for (std::size_t i = 0; i < counts.size(); ++i) CHECK(v.block(i).size() == counts[i]);
 }

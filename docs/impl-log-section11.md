@@ -27,6 +27,7 @@ Running log, newest entries at the bottom. Each entry: date/time (UTC), phase, w
 
 - The join task (collapse) breaks ordering in CoSpan on the OpenMP backend; we ship without collapse (SlabKit `7655b84`). Lists drop completed events past 64 entries. Root cause in AdaptiveCpp still to find.
 - Section 11: outside writes never wait on writes. Added (SlabKit `e86ae9f`): an outside writer still waits on the container's own write operations (resize fill, reallocation copy, copy-in), which are not outside writes.
+- add_subsystem is still setup-only; should it follow the anywhere principle?
 
 ## Entries
 
@@ -119,3 +120,20 @@ Commit f2b72ae. Tests: tests/test_p4.cpp (new), plus edits in test_model.cpp and
 - **Merges.** Source wins on connect, alias on tie, member on promote, definitions merge; adopt_containers is unchanged. Test: a connect after setup keeps the host holder's container (identity) in the device variable.
 - **Open.** Two materialized variables merging stays deferred. A declare_init on a materialized free input does not mark it stale (not in the spec). The cycle test covers a two-component cycle; nested-System cycles use the same detection as before (child positions in the calling System) and are not tested.
 - Suites: default 208 cases (198 passed, 10 skipped, 2164 assertions); cuda all passed (2225 assertions in 208 cases); the two-device cases ran on cuda (7 cases, 43 assertions).
+
+## P5: shapes and hooks
+
+Commits 1cad7ab (code and converted tests) and the tests/log commit after it. Decisions:
+
+- **set_shape(out, e0, e1, ...).** One entry per dimension, an integer or `cs::as_is`; an entry count that differs from the rank throws. `VarMeta::set_by_producer` refuses every number first (`refuse_number`), then sets; nothing changes when a check throws. A number on a specified dimension throws at the call, even when it matches ("dimension N is declared as V; set_shape('x') takes a number only on an unspecified dimension (pass cs::as_is)"); on a hook-owned one: "dimension N is owned by a shape hook; ... cannot give it a number". Ragged keeps the RaggedShape copy form and (n, counts); n may be `cs::as_is`; `(n, cs::as_is)` sets n alone. The old full-range form, `check_same_forward`, `dim_text`, `dim_equal`, `set_forward_` and `set_log_` are removed (no "two sets in one forward must agree").
+- **Ownership rules.** `SetterId::Kind` gained `definition` (fixed dimensions are applied by the definition). `check_setter`: a producer or initializer setting a fixed dimension fails ("a specified dimension comes from the definition"); the hook rules are unchanged.
+- **Tied members.** `Instance::tied_member`, set by `tie_outputs` and by the replay of a tie on a rebuilt member. `settable_output` throws the existing tied message when `tied_member` or the variable's `tied_output` is set (the second covers a member reached through a promotion).
+- **Hook targets.** A hook may target an untied output; it runs before the first child holding it (the producer, which passes `as_is` for hooked dimensions). A tied member output is refused at the call: "... hook the tie alias instead ('t')".
+- **Templated step.** One `detail::ShapeHookStep<D...>` per shape_hook call (descriptor types as template parameters, compile-time dispatch), stored in the System as a `HookEntry` behind `detail::HookBase` (only `forward(Runtime&)`). Behavior kept: from_value reads batched into one wait; counts_from / offsets_from use the device scan and bring back only the total.
+- **Run point.** `compute_hook_slots` and the source-ordering check are removed. `place_hooks()` finds each hook's slot (the first child holding the target) at the start of the System's compute; the loop runs the hook when it reaches it. A gone source keeps the last shape; a shape never known throws the shape-not-known error. Tests that expected the setup error now check that setup succeeds.
+- **Anywhere.** `shape_hook` and `depends_on` lost the setup-only guard. add_subsystem and the marks keep it.
+- **declare_init / init_input** on an already-materialized free input marks it stale, like update_input (`System::init_input` passes restale; replay does not).
+- **Beyond the spec.** A ragged hook marks both dimensions (n and counts) as hook-owned, so a declared N is checked against the source. `shape_hook` on a ragged target also accepts `(dense descriptor, cs::dim::as_is())`: the hook owns n alone and the producer sets the counts with `set_shape(out, cs::as_is, counts)`.
+- **Test fixtures.** Producers whose output has a declared (or downstream-fixed) dimension now pass `as_is` (ShProd, VBins, Gen modes, InitAffine); Sum3's inputs are unspecified so a connected producer's number is legal. Old "declared as N but ... gave M" tests became "takes a number only on an unspecified dimension" tests. New tests (tests/test_shapes.cpp, [p5]): rank-3 {hook value, 7, 3}, number on a declared dimension, number on a hooked dimension, entry-count mismatch, hook on an untied output, hook on a tied member, shape_hook and depends_on after setup, a late init_input, ragged (as_is, counts) with a hooked n.
+- **Open.** add_subsystem's guard (see the open questions). Docs other than this log (README, design review, plan) still show the old set_shape in places; not rewritten.
+- Suites: default 217 cases (207 passed, 10 skipped, 2187 assertions); cuda all passed (2248 assertions in 217 cases).
