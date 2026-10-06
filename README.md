@@ -79,7 +79,7 @@ int main() {
     model.update_input("a.x", cs::init::from_host(std::vector<float>{1, 2, 3, 4}));  // supplies a.x and its shape
     model.forward();                                         // enqueues and returns; the update is applied here
 
-    auto y = model.view_output<DType::f32, 1>("b.y");        // a view needs a run first
+    auto y = model.view_output<DType::f32, 1>("b.y");        // a view can be made any time, once its shape is known
     y.sync();                                                // wait for the data before reading
     // y.shape()[0] == 4, y[0] == 4.0f, y[3] == 16.0f
 }
@@ -92,6 +92,25 @@ add_subsystem(cs::subsystem_desc<Producer>("p"));
 add_subsystem(cs::subsystem_desc<Double>("c"));
 shape_hook("c.x", cs::dim::from_shape("p.y", 0));
 ```
+
+### Fused groups
+
+Components with plain or work-group bodies can run as the stages of ONE kernel launch. A *segment* is a run of consecutive
+stages that share work-groups; a bare component is a one-stage segment. Segment options pick the range
+(`range_mode::own`, the default: a stage runs for its own groups; `whole`: every stage runs for every group of the
+segment) and the local memory (`local_mem::partitioned`, the default: each stage its own slice; `shared`: one block):
+
+```cpp
+add_subsystem(cs::fuse_components(
+    "f", cs::connects_desc({{"a.y", "b.x"}}),                    // connects run forward in stage order
+    cs::segment<cs::range_mode::whole>(cs::subsystem_desc<StageA>("a"),   // a and b share their groups
+                                       cs::subsystem_desc<StageB>("b")),
+    cs::segment(cs::subsystem_desc<StageC>("c"))));            // c has its own groups, in the same launch
+```
+
+Between two segments of work-group stages a boundary item (`cs::ticket_order()` or `cs::global_barrier()`) puts the launch in
+ticket mode, where a group can wait for earlier groups (`GroupItem::wait_group`, `wait_earlier_segments`) without every group
+being resident. See `examples/gemver-chain` for fused groups in a real chain.
 
 ## Using CospanMDAO
 

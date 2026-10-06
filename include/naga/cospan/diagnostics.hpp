@@ -1,6 +1,6 @@
 #pragma once
 // Event counters (diagnostics): how often CoSpan itself waits on a queue (Model::wait) and submits host tasks
-// (host-body launches and a fused component's packing-buffer uploads). They only MEASURE: nothing in CoSpan reads them
+// (host-body launches). They only MEASURE: nothing in CoSpan reads them
 // to decide anything. One process-wide object of relaxed atomics, always compiled in.
 //
 // Only counters with a live caller are kept (docs/design-review-2026-10-03.md: the allocation, free, host-read,
@@ -15,7 +15,7 @@ namespace naga::cospan::diag {
 
 struct EventCounts {
     std::uint64_t queue_waits = 0;  ///< Model::wait calls (.wait_and_throw() on both queues)
-    std::uint64_t host_tasks  = 0;  ///< host-body launches and fused-component packing-buffer uploads
+    std::uint64_t host_tasks  = 0;  ///< host-body launches
 };
 
 inline EventCounts operator-(const EventCounts& a, const EventCounts& b) {
