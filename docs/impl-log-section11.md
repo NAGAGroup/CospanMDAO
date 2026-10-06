@@ -50,3 +50,16 @@ Running log, newest entries at the bottom. Each entry: date/time (UTC), phase, w
   - A replacement that is still only a declaration when specializations are applied is now reported as "Could not find function call specialization target". Before, it was a late backend failure.
   - The plain call sequence hashes one more value (index -1), so existing configurations get new cache keys. Their behavior is unchanged.
 - **Open questions for Jack:** none.
+
+### 2026-10-06 UTC, P2: SlabKit container events
+- **Done:** `usm_vector` keeps a read list and a write list; they replace `last_` and the registered list. API: `read_deps()` (the write list, collapsed), `write_deps()` (the read list, collapsed), `register_read` / `register_write` with span overloads. `last_event`, `events`, `register_event(s)` and `registered_event_count` are gone. A list with more than one event is collapsed on access by an empty `single_task` on the container's queue.
+- **Commits:** SlabKit `340b0244d5275d805c16525df802b4673afb8888` ("usm_vector: read/write event lists, collapse on access"), on main, pushed. CoSpan's slabkit pin is unchanged (P3 moves it).
+- **Tests:** default suite: 169 test cases, 165 passed, 4 skipped (the OpenMP overlap skips), 1052443 assertions passed. CUDA suite three times: "All tests passed (1053886 assertions in 169 test cases)" each time.
+- **Decisions taken:**
+  - Both lists are emptied after a free, since the free waited on every event in them.
+  - A free with no storage still waits on the lists.
+  - An empty container's `reserve` leaves the lists alone.
+  - Calls that submit nothing (fill of an empty container, a resize that does not grow, assign of an empty source) return the container's last write, or a completed event if there is none.
+- **Open questions for Jack:**
+  - An outside writer given `write_deps()` does not wait on the container's own earlier writes (writes never wait on writes), so a kernel that writes data() right after `fill()` may run before the fill unless the caller also passes `read_deps()`.
+  - The collapse task runs on the container's slabkit queue, so it is ordered like any kernel task there, behind earlier kernel tasks of that stream.
