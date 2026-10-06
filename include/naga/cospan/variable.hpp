@@ -434,6 +434,15 @@ public:
     }
     void note_resize(const sycl::event& e) { resize_events_.push_back(e); }
 
+    /// A resize of a shape hook's column containers (shape_hook.hpp), made for this variable as the hook's target: noted like
+    /// any other, and counted in `hook_resize_notes` (a diagnostic for tests: how many column resizes handed over an event).
+    void note_hook_resize(const std::optional<sycl::event>& e) {
+        if (!e) return;
+        ++hook_resize_notes;
+        note_resize(*e);
+    }
+    std::size_t hook_resize_notes = 0;
+
     /// The pending resize events: reading drops the ones that have completed (a status query) and returns the rest.
     std::vector<sycl::event> resize_events() const {
         std::erase_if(resize_events_, [](const sycl::event& e) {

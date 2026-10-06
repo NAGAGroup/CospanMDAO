@@ -445,7 +445,87 @@ void run_counts(cs::Model& model, const std::vector<std::uint32_t>& counts) {
     CHECK(peer.block_offsets() == ref.offsets);
 }
 
+// ---- HookedOut: a ragged OUTPUT whose shape is owned by a hook (counts_from its own free input) -----------------------
+// No set_shape: the hook gives the output its n, its counts and its offsets (a device column built on the source's device).
+// v.block(i)[j] = i*100 + j.
+struct HookedOutBody {
+    struct Inputs {
+        cs::Input<DType::u32, 1> cnt;
+    };
+    struct Outputs {
+        cs::RaggedOutput<DType::f32, 2> v;
+    };
+    void operator()(sycl::id<1> id, Inputs, Outputs out) const {
+        const std::size_t i = id[0];
+        auto              b = out.v.block(i);
+        for (std::size_t j = 0; j < b.shape()[0]; ++j) b[j] = static_cast<float>(i * 100 + j);
+    }
+};
+class HookedOut : public cs::Component<HookedOutBody> {
+    cs::Input<DType::u32, 1>        cnt_;
+    cs::RaggedOutput<DType::f32, 2> v_;
+
+public:
+    void setup() override {
+        declare_input(cnt_, "cnt", cs::unspecified);
+        declare_output(v_, "v");
+    }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+        return create_launch_config(sycl::range<1>{cnt_.shape()[0]}, {cnt_}, {v_}, {});
+    }
+};
+class HookedOutTop : public cs::System {
+public:
+    void setup() override {
+        add_subsystem(cs::subsystem_desc<HookedOut>("c"));
+        shape_hook("c.v", cs::ragged::counts_from("c.cnt"));
+    }
+};
+
 }  // namespace trag
+
+// A hook on a ragged OUTPUT: when the counts grow past the column's capacity the hook's column reallocates, and the event of
+// that resize must reach the TARGET variable's resize-event slot (the producer, and any other writer of the target, waits on
+// it). The producer's values and offsets stay right over forwards with growing and shrinking counts.
+TEST_CASE("Ragged: a hook on a ragged output hands its column's resize events to the target's slot", "[ragged][hook][events]") {
+    cs::Model model = cs::create_model<trag::HookedOutTop>(default_config());
+    model.setup();
+
+    const std::vector<std::vector<std::uint32_t>> runs{
+        {1, 2},                                // the column is made (n = 2)
+        {3, 1, 0, 2},                          // n = 4 > capacity 2: the column reallocates with data
+        {1, 1, 1, 1, 1, 1, 1, 1, 1},           // n = 9
+        {2, 0},                                // shrinks: within capacity, no event
+        {5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5},  // n = 12 > capacity 9
+    };
+    const std::vector<bool> grows{false, true, true, false, true};
+    for (std::size_t r = 0; r < runs.size(); ++r) {
+        const auto& counts = runs[r];
+        INFO("forward " << r + 1 << ", n = " << counts.size());
+        const auto        meta   = model.root().instance_at("c.v")->meta;
+        const std::size_t before = meta->hook_resize_notes;
+
+        model.update_input("c.cnt", cs::init::from_host(counts));
+        model.forward();
+        model.wait();
+
+        // the slot received the column's resize event exactly when the column reallocated with data
+        if (grows[r]) CHECK(meta->hook_resize_notes > before);
+        else CHECK(meta->hook_resize_notes == before);
+
+        trag::FillRef ref;
+        for (std::size_t i = 0; i < counts.size(); ++i) {
+            for (std::size_t j = 0; j < counts[i]; ++j) ref.data.push_back(static_cast<float>(i * 100 + j));
+            ref.offsets.push_back(ref.data.size());
+        }
+        auto v = model.view_ragged_output<DType::f32, 2>("c.v");
+        v.sync();
+        CHECK(v.n() == counts.size());
+        CHECK(v.block_offsets() == ref.offsets);
+        CHECK(trag::flat_of(v) == ref.data);
+        for (std::size_t i = 0; i < counts.size(); ++i) CHECK(v.block(i).size() == counts[i]);
+    }
+}
 
 TEST_CASE("Ragged: fill / scale / sum over forwards with changing counts", "[ragged]") {
     cs::Model model = cs::create_model<trag::RaggedTop>(default_config(), std::size_t{6});

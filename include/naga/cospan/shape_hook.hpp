@@ -184,7 +184,10 @@ inline std::function<std::size_t()> queue_value_read(Runtime& rt, VarMeta& m, st
 ///                 a negative value, offs[0] != 0, or a decrease.
 /// A tiny task then copies [total, flag] to the host buffer. Returns the event of that task (also col.ev). The column's
 /// vectors are reused across forwards; `version` is bumped.
-inline sycl::event build_column(Runtime& rt, VarMeta& m, DeviceColumn& col, bool offsets_mode) {
+/// `target` is the variable the hook shapes: every resize of the column's containers, and the task that writes them, is
+/// noted in the TARGET's resize-event slot (the target may be an output, so every component that writes it waits on them),
+/// besides being in the containers' own write lists.
+inline sycl::event build_column(Runtime& rt, VarMeta& m, VarMeta& target, DeviceColumn& col, bool offsets_mode) {
     const std::string path = m.display_path();
     if (!is_integer_value_dtype(m.dtype))
         throw std::invalid_argument("naga::cospan: shape hook: '" + path + "' drives per-index extents by value and must have an integer dtype");
@@ -212,8 +215,10 @@ inline sycl::event build_column(Runtime& rt, VarMeta& m, DeviceColumn& col, bool
         col.neg_flag.emplace(1, rt.allocator_for<std::uint64_t>(dev, sk::kind::device));
         col.host_total.emplace(2, rt.allocator_for<std::uint64_t>(dev, sk::kind::host));
     } else {
-        if (col.extents->size() != n) col.extents->resize(n);  // the container's own write: waits on both its lists
-        if (col.offs->size() != n + 1) col.offs->resize(n + 1);
+        // A resize that reallocates copies the old elements: its event is the container's own write (in its write list)
+        // and goes into the target's slot.
+        if (col.extents->size() != n) target.note_hook_resize(col.extents->resize(n));
+        if (col.offs->size() != n + 1) target.note_hook_resize(col.offs->resize(n + 1));
     }
     col.n = n;
 
@@ -315,6 +320,7 @@ inline sycl::event build_column(Runtime& rt, VarMeta& m, DeviceColumn& col, bool
     col.offs->register_write(e);
     col.neg_flag->register_write(e);
     col.host_total->register_write(e);
+    target.note_resize(e);  // the task that wrote the column (it follows every kernel above): a writer of the target waits on it
     col.ev = e;
     ++col.version;
     return e;
@@ -414,7 +420,7 @@ public:
             using R = std::tuple_element_t<0, std::tuple<D...>>;
             const std::shared_ptr<VarMeta> m = source(0, who, std::get<0>(ds_).path);
             if (!column_) column_ = std::make_shared<DeviceColumn>();
-            evs.push_back(build_column(rt, *m, *column_, std::is_same_v<R, ragged::OffsetsFrom>));
+            evs.push_back(build_column(rt, *m, tm, *column_, std::is_same_v<R, ragged::OffsetsFrom>));
             // dimension 0 is the hook's, or specified (set_dims then checks the source's count against the declared N)
             mask[0] = mask[1] = true;
         } else {

@@ -245,7 +245,11 @@ Every container (`sk::usm_vector`) keeps a **read list** and a **write list**. V
   copy's event as `std::optional<sycl::event>`; every other case returns an empty optional. Nothing in CoSpan may rely on
   zeroed memory: a variable with no initializer holds undefined values until a producer writes it.
 - **The resize-event slot.** `VarMeta` keeps a list of pending resize events. Every container resize made for the variable
-  (materialization sizing, `set_shape`, hooks, initializer shapes, the ragged index arrays) appends the event it returned.
+  (materialization sizing, `set_shape`, shape hooks, initializer shapes, the ragged index arrays) appends the event it returned.
+  EVERY resize of a variable's containers, by any path, feeds its slot: a shape hook's device column (extents, offsets) resizes
+  and the task that writes them are noted in the hook's TARGET variable, because the target can be an output (and ragged), and
+  every component that writes it, both members of a tied output included, must wait on them; the hook's own tasks waiting on
+  them is not enough.
   Reading the slot drops the completed events and returns the rest. Every launch adds the slot events of each variable it
   writes to its dependencies, together with the containers' `write_deps()`: bare components, every stage of a fused group,
   and both members of a tied output (they share the variable).
