@@ -47,6 +47,15 @@ inline std::size_t pool_in_use(const cs::Model& m) {
     return total;
 }
 
+/// The pool's node size (ModelConfig::pool_node_size, 1024 by default).
+inline constexpr std::size_t pool_node_bytes = 1024;
+
+/// What a container of `bytes` takes from a pool: its capacity rounded up to whole nodes (0 for no storage). The pool's
+/// bytes in use on a device are the sum of this over the live containers on that device.
+constexpr std::size_t pool_bytes_of(std::size_t bytes) {
+    return (bytes + pool_node_bytes - 1) / pool_node_bytes * pool_node_bytes;
+}
+
 // ---- host-reference comparison ------------------------------------------------
 /// |got - want| <= abs_tol + rel_tol * |want| (a NaN never compares close).
 inline bool close(float got, float want, float abs_tol = 1e-6f, float rel_tol = 1e-5f) {

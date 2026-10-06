@@ -1517,9 +1517,9 @@ TEST_CASE("transient: deleted after its turn, kept outputs, back-to-back forward
     model.setup();
     CHECK(model.get_subsystem("tr") != nullptr);  // built at setup, deleted after its first turn
 
-    // REVIEW: the old cases compared the pool with `base + kEternalNode` (one node for the eternal output). With no arena
-    // every eternal variable (sink.x's and sink.y's) is a pool node and node rounding is not settled by the headers, so
-    // the absolute number is not asserted; the sections that ran more than one forward assert a steady state instead.
+    // The pool's bytes in use are the sum of the live containers' capacities rounded up to whole nodes. After the first
+    // forward the transient's prod.y and mid.y are gone; the eternal cons.y (= sink.x) and sink.y stay: two nodes of 8 floats.
+    constexpr std::size_t kEternal = 2 * cst::pool_node_bytes;
     SECTION("host access to a deleted subsystem's variable throws") {
         model.forward();
         model.wait();
@@ -1538,9 +1538,11 @@ TEST_CASE("transient: deleted after its turn, kept outputs, back-to-back forward
     }
 
     SECTION("a second forward rebuilds it and gives the same values") {
+        CHECK(pool_in_use(model) == 0);  // nothing at setup
         model.forward();
         model.wait();
         const std::size_t after1 = pool_in_use(model);
+        CHECK(after1 == kEternal);
         model.forward();
         model.wait();
         CHECK(to_vector(cst::synced_input<DType::f32, 1>(model, "sink.x")) == want_cons());
@@ -1679,8 +1681,10 @@ TEST_CASE("run-N subtree: its variables live for the n runs and are freed after 
 
     // run 1: the variables come into scope, the free input is initialized once; the consumer's output feeds the sink
     // outside (eternal), the rest stays allocated for run 2
-    // REVIEW: only relations of the pool's in-use bytes are asserted (more after run 1 than at setup, less after the
-    // last run, unchanged afterwards); the old per-root has_storage()/present() checks have no counterpart.
+    // The pool's bytes in use are the sum of the live containers' capacities rounded up to whole nodes (8 floats = one
+    // node each). Run 1 holds five containers: prod.x (the free input), prod.y (= mid.x), mid.y (= cons.x), cons.y
+    // (= sink.x) and sink.y; after the last run the subtree's three are freed and the two eternal ones stay.
+    CHECK(base == 0);
     model.forward();
     model.wait();
     CHECK(tsys::count_of("op.prod") == 1);
@@ -1689,7 +1693,7 @@ TEST_CASE("run-N subtree: its variables live for the n runs and are freed after 
     CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "op.cons.y")) == tsys::filled(11.0f));  // 2 * 4 + 3
     CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "sink.y")) == tsys::filled(11.5f));
     const std::size_t after1 = tsys::pool_in_use_of(model);
-    CHECK(after1 > base);
+    CHECK(after1 == 5 * cst::pool_node_bytes);
 
     // run 2 is the last: the subtree's variables are freed, the eternal one stays; the init is not applied again
     model.forward();
@@ -1698,7 +1702,7 @@ TEST_CASE("run-N subtree: its variables live for the n runs and are freed after 
     CHECK(model.get_subsystem("op") == nullptr);  // deleted after its last run: mid.y went with it
     CHECK(to_vector(cst::synced_input<DType::f32, 1>(model, "sink.x")) == tsys::filled(11.0f));  // op.cons.y's variable, held by the sink
     const std::size_t after2 = tsys::pool_in_use_of(model);
-    CHECK(after2 < after1);
+    CHECK(after2 == 2 * cst::pool_node_bytes);
 
     // forward 3: past n, nothing runs, so nothing is allocated, initialized or released
     model.forward();
@@ -1722,11 +1726,15 @@ TEST_CASE("run-N subtree: n = 3, the roots stay for runs 1..3 and the pool drops
         model.forward();
         model.wait();
         const std::size_t now = tsys::pool_in_use_of(model);
-        if (k == 1) held = now;
+        if (k == 1) {
+            held = now;
+            CHECK(held == 5 * cst::pool_node_bytes);  // prod.x, prod.y, mid.y, cons.y, sink.y: a node each
+        }
         if (k <= 3 && k >= 1 && k < 3) CHECK(now == held);  // runs 1 and 2: everything stays allocated
         if (k == 3) {
             freed = now;
             CHECK(freed < held);
+            CHECK(freed == 2 * cst::pool_node_bytes);  // cons.y (= sink.x) and sink.y
         }
         if (k > 3) CHECK(now == freed);
         CHECK(tsys::count_of("op.prod") == 1);  // allocated and initialized once, with the first run
@@ -2550,7 +2558,7 @@ TEST_CASE("alias: a tie alias inside a transient subsystem is released and the p
 TEST_CASE("lifetime: a bare transient producer and a transient reader are deleted every run, values right on run 2", "[system][lifetime]") {
     cs::Model model = cs::create_model<tsys::TransChain>(cst::pooled_config());
     model.setup();
-    std::size_t steady = 0;  // the pool in use after the first run (see the REVIEW in the transient case)
+    std::size_t steady = 0;  // the pool in use after the first run: t.y (= sink.x) and sink.y, a node each
     for (int run = 1; run <= 3; ++run) {
         INFO("run " << run);
         model.forward();
@@ -2558,10 +2566,12 @@ TEST_CASE("lifetime: a bare transient producer and a transient reader are delete
         CHECK(model.get_subsystem("p") == nullptr);  // transient: deleted after its turn
         CHECK(model.get_subsystem("t") == nullptr);
         CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "sink.y")) == tsys::iota_plus(1.0f, tsys::kLen, 2.0f, 1.0f));
-        if (run == 1)
+        if (run == 1) {
             steady = pool_in_use(model);
-        else
+            CHECK(steady == 2 * cst::pool_node_bytes);
+        } else {
             CHECK(pool_in_use(model) == steady);
+        }
     }
 }
 

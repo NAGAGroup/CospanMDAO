@@ -838,12 +838,14 @@ TEST_CASE("Memory report: a static model computes; the pool report after setup a
                 tmod::kExpectedStatic, tmod::kGenBytes, tmod::kCvtBytes, tmod::kBcBytes, tmod::kOutBytes, after_fwd.pool_bytes,
                 after_setup.pool_bytes_in_use, after_fwd.pool_bytes_in_use, after_fwd.os_allocations, after_fwd.os_bytes_in_use);
 
-    // REVIEW: the old equality (arena capacity less the setup slack == the sum of the distinct static roots) has no
-    // counterpart. The pool counts nodes (1024 B), so whether in-use bytes equal, or only bound, the sum of the roots
-    // depends on node rounding and on which allocations the pool serves; the headers do not settle it. Only "in use > 0"
-    // and "in use <= capacity" are asserted.
-    CHECK(after_fwd.pool_bytes_in_use > 0);
-    CHECK(after_fwd.pool_bytes >= after_fwd.pool_bytes_in_use);
+    // The rule: the pool's bytes in use on a device are the sum, over the live containers on it, of each container's
+    // capacity rounded up to whole nodes. The live containers after a forward are the four distinct roots (the peers
+    // cvt.a, comb.e, comb.b/c and the promoted out share their root's container): 400, 512, 32 and 64 bytes, a node each.
+    CHECK(after_fwd.pool_bytes == (std::size_t{1} << 20));  // a pool is sized up front
+    CHECK(after_fwd.pool_bytes_in_use == cst::pool_bytes_of(tmod::kGenBytes) + cst::pool_bytes_of(tmod::kCvtBytes) +
+                                             cst::pool_bytes_of(tmod::kBcBytes) + cst::pool_bytes_of(tmod::kOutBytes));
+    CHECK(after_fwd.pool_bytes_in_use == 4 * cst::pool_node_bytes);
+    CHECK(after_fwd.os_allocations == 0);  // everything came from the pool
 }
 
 TEST_CASE("Memory report: a device without a configured pool is a zero-byte pool, and its allocations count as OS ones",
@@ -874,9 +876,9 @@ TEST_CASE("Pool: a value-driven root allocates from the pool and follows update_
     cfg.default_pool_bytes = std::size_t{1} << 20;  // 1 MiB, in nodes of the default 1024 B
     auto model             = cs::create_model<tmod::PoolTop>(std::move(cfg));
     model.setup();
-    // REVIEW: asserted after setup in the old case (arena era). A pool is sized up front (section 2), so its capacity
-    // should already be reported; not settled from the headers whether slot_count() is nonzero before the first allocation.
-    CHECK(tmod::report_on(model, dev).pool_bytes > 0);
+    // A pool is sized up front (section 2): its whole capacity is reported before the first allocation, with nothing in use.
+    CHECK(tmod::report_on(model, dev).pool_bytes == (std::size_t{1} << 20));
+    CHECK(tmod::report_on(model, dev).pool_bytes_in_use == 0);
 
     std::uint32_t n = 8;
     model.update_input("bins.n", cs::init::from_host(std::vector<std::uint32_t>{n}));
@@ -884,7 +886,9 @@ TEST_CASE("Pool: a value-driven root allocates from the pool and follows update_
     {
         const auto rep = tmod::report_on(model, dev);
         std::printf("[pool] n=%u: pool %zu B, in use %zu B\n", n, rep.pool_bytes, rep.pool_bytes_in_use);
-        CHECK(rep.pool_bytes_in_use > 0);
+        // Three live containers: bins.n (u32[1]), bins.ref (f32[n], sized by the hook) and bins.bins (f32[n]).
+        CHECK(rep.pool_bytes_in_use == cst::pool_bytes_of(sizeof(std::uint32_t)) + 2 * cst::pool_bytes_of(n * sizeof(float)));
+        CHECK(rep.pool_bytes_in_use == 3 * cst::pool_node_bytes);
         const auto bins = to_vector(cst::synced_output<DType::f32, 1>(model, "bins.bins"));
         REQUIRE(bins.size() == n);
         for (std::size_t i = 0; i < bins.size(); ++i) CHECK(bins[i] == static_cast<float>(i + 1));
@@ -896,7 +900,9 @@ TEST_CASE("Pool: a value-driven root allocates from the pool and follows update_
     {
         const auto rep = tmod::report_on(model, dev);
         std::printf("[pool] n=%u: pool %zu B, in use %zu B\n", n, rep.pool_bytes, rep.pool_bytes_in_use);
-        CHECK(rep.pool_bytes_in_use > 0);
+        // 12000 B is twelve nodes (12288 B); the old, smaller storage was freed when the containers grew.
+        CHECK(rep.pool_bytes_in_use == cst::pool_bytes_of(sizeof(std::uint32_t)) + 2 * cst::pool_bytes_of(n * sizeof(float)));
+        CHECK(rep.pool_bytes_in_use == cst::pool_node_bytes + 2 * 12 * cst::pool_node_bytes);
         const auto bins = to_vector(cst::synced_output<DType::f32, 1>(model, "bins.bins"));
         REQUIRE(bins.size() == n);
         bool ok = true;

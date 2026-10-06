@@ -1013,9 +1013,11 @@ TEST_CASE("transient: a system_from group and a fused component release after th
         INFO(p);
         tfl::expect_throws([&] { (void)cst::synced_output<DType::f32, 1>(model, p); }, {"was deleted"});
     }
-    // REVIEW: the equality below assumes a steady state after the first forward (the pool returns what a rebuilt group
-    // allocates, and the fused staging buffers go with the group). Nothing in the headers states the pool accounting.
+    // The pool's bytes in use are the sum of the live containers' capacities rounded up to whole nodes. With the group gone
+    // only the eternal src.y is left: 12 floats (48 B) are one node.
     const auto base = cst::pool_in_use(model);
+    CHECK(base == cst::pool_bytes_of(tfl::kLen * sizeof(float)));
+    CHECK(base == cst::pool_node_bytes);
     model.forward();
     model.forward();
     model.wait();
