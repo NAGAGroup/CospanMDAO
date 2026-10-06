@@ -594,32 +594,49 @@ TEST_CASE("plain body: y = 2x + 1 at ranks 1, 2 and 3", "[component][plain]") {
     SECTION("rank 3, 7 x 9 x 11") { tc::check_affine<3>(sycl::range<3>{7, 9, 11}); }
 }
 
-TEST_CASE("a launch's event is registered on the storage of every port it touched", "[component][plain][events]") {
+TEST_CASE("a launch's event is registered on the container of every port it touched", "[component][plain][events]") {
     auto model = cs::create_model<tc::TopAffine<1>>(default_config(), sycl::range<1>{1000});
     model.setup();
 
-    // Before any forward nothing is materialized (setup allocates nothing, design review section 2): the instances
-    // have no data, so nothing is registered.
+    // Before any forward every holder already has its container (declaration creates it), but it is empty and unbound:
+    // setup allocates nothing (design review section 2), so there are no events either.
     const auto xi = model.root().instance_at("aff.x");
     const auto yi = model.root().instance_at("aff.y");
-    CHECK(xi->data == nullptr);
-    CHECK(yi->data == nullptr);
+    REQUIRE(xi->data != nullptr);
+    REQUIRE(yi->data != nullptr);
+    CHECK_FALSE(xi->data->bound());
+    CHECK_FALSE(yi->data->bound());
+    CHECK(xi->data->size() == 0);
+    CHECK(xi->data->read_deps().empty());
+    CHECK(xi->data->write_deps().empty());
+    CHECK(yi->data->read_deps().empty());
+    CHECK(yi->data->write_deps().empty());
 
     model.update_input("aff.x", cs::init::fill(1.0f));
     model.forward();
 
-    // The kernel read x and wrote y: its event is registered on both ports' data (component.hpp, record_launch).
-    // Checked before any wait. REVIEW: whether usm_vector::events() still reports an event once it has completed
-    // (pruning) is not settled by the headers, so this is read straight after the forward, not after wait().
-    REQUIRE(xi->data != nullptr);
-    REQUIRE(yi->data != nullptr);
-    CHECK(xi->data->events().size() >= 1);
-    CHECK(yi->data->events().size() >= 1);
+    // The kernel READ x and WROTE y. Its event is the component's last event, and it is behind both containers' lists: a
+    // writer of x (which waits on x's reads) and a reader of y (which waits on y's writes) both come after it. Checked
+    // through the events themselves: after waiting on those lists the kernel's event is complete.
+    const sycl::event kernel = [&] {
+        const std::vector<sycl::event> ev = model.get_subsystem("aff")->events();
+        REQUIRE(ev.size() == 1);
+        return ev.front();
+    }();
+    REQUIRE(xi->data->bound());
+    REQUIRE(yi->data->bound());
+    const std::vector<sycl::event> x_writers_wait_on = xi->data->write_deps();
+    const std::vector<sycl::event> y_readers_wait_on = yi->data->read_deps();
+    REQUIRE_FALSE(x_writers_wait_on.empty());
+    REQUIRE_FALSE(y_readers_wait_on.empty());
+    sycl::event::wait(x_writers_wait_on);
+    CHECK(kernel.get_info<sycl::info::event::command_execution_status>() == sycl::info::event_command_status::complete);
+    sycl::event::wait(y_readers_wait_on);
     model.wait();
 
     // A second forward registers again, and the result is still right.
     model.forward();
-    CHECK(yi->data->events().size() >= 1);
+    CHECK_FALSE(yi->data->read_deps().empty());
     auto y = wait_and_view<DType::f32, 1>(model, "aff.y");
     CHECK(to_vector(y) == std::vector<float>(1000, 3.0f));
 }

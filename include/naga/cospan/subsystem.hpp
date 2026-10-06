@@ -22,7 +22,7 @@
 // call wins.
 //
 // THE FORWARD. The three steps and the event getter below belong to section 3 of the record and to r02 section 3.
-// They are implemented by components and by Systems; deleting a child waits on its events().
+// They are implemented by components and by Systems; deleting a child waits on nothing (its containers free after their own events).
 
 #include <memory>
 #include <span>
@@ -80,8 +80,8 @@ public:
     /// A component: its postcompute work. A System: the same for its children.
     virtual void run_postcompute(detail::Runtime& rt) = 0;
 
-    /// A component: its launch event(s). A System: its children's events plus its own push events. The same getter
-    /// serves deletion (the parent waits on a child's events only) and depends_on.
+    /// A component: its launch event(s). A System: its children's events plus its own push events. What depends_on
+    /// hands on.
     virtual std::vector<sycl::event> events() const = 0;
 
     /// depends_on: events added to every submission of this subsystem for ONE forward.

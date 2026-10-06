@@ -20,7 +20,11 @@
 //   promote: the MEMBER's metadata wins: the promotion joins the member's variable directly.
 // One exception, in merge_into: when exactly one side already holds data (a rebuilt child rejoining live data),
 // that side's object survives, carrying the merged shape definition, and keeping its own
-// resolved shape, initializer, stale flag, events and data. A merge never touches stale flags, events or data.
+// resolved shape, initializer, stale and materialized flags and data. A merge never touches stale flags or the data
+// of a placement that has some; it only moves HOLDERS: the survivor adopts the loser's containers for the keys it has
+// none for, and every holder of the loser switches to the survivor's container for its own key (Instance::rebind).
+// "Holds data" below means the variable is materialized (VarMeta::materialized), not that a container exists:
+// every holder has an empty container from its declaration.
 //
 // EVERY RULE IS CHECKED IN ITS OWN CALL, BEFORE ANYTHING IS CHANGED: a call that throws has changed nothing
 // that outlives it (a tie builds its alias first, but that is only reachable once the call returns).
@@ -210,6 +214,7 @@ inline std::shared_ptr<VarMeta> merge_into(const WiringSite& site, std::shared_p
         survivor->definition  = winner->definition;
         survivor->def_counts  = winner->def_counts;
     }
+    survivor->adopt_containers(*other);  // a key the survivor has no container for takes the loser's (identity kept)
     for (const std::shared_ptr<Instance>& i : other->live_instances()) i->rebind(survivor);
     return survivor;
 }
@@ -299,6 +304,7 @@ std::shared_ptr<Instance> promote(const WiringSite& site, const std::shared_ptr<
                                                       member->dims, member->can_be_source,
                                                       member->can_be_target, member->meta);
     a->device = member->device;
+    a->refresh_container();
     return a;
 }
 
@@ -367,7 +373,10 @@ std::shared_ptr<Instance> build_tie_alias(const WiringSite& site, const char* ve
                                                           Role::tie, std::move(dims), /*can_source=*/!input,
                                                           /*can_target=*/input, std::move(meta));
     alias->def_counts = std::move(counts);
-    if (device) alias->device = *device;
+    if (device) {
+        alias->device = *device;
+        alias->refresh_container();
+    }
     return alias;
 }
 

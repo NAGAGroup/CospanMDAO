@@ -148,12 +148,13 @@ namespace detail {
 
 using InstanceResolver = std::function<std::shared_ptr<Instance>(std::string_view)>;
 
-/// The data a read of `m` goes through: a live device-kind data if there is one, else any live data.
+/// The data a read of `m` goes through: a live device-kind data if there is one, else any live data (one that holds
+/// elements: a container no materialization has reached yet is empty).
 inline std::shared_ptr<DeviceDataBase> source_data(VarMeta& m) {
     std::shared_ptr<DeviceDataBase> src;
     for (const auto& p : m.data) {
         const std::shared_ptr<DeviceDataBase> b = p.second.lock();
-        if (!b) continue;
+        if (!b || !b->bound()) continue;
         if (!src || (b->key.kind == sk::kind::device && src->key.kind != sk::kind::device)) src = b;
     }
     return src;
@@ -176,12 +177,13 @@ inline std::function<std::size_t()> queue_value_read(Runtime& rt, VarMeta& m, st
     dispatch_dtype(m.dtype, [&](auto tag) {
         using E   = typename decltype(tag)::type;
         auto host = std::make_shared<sk::usm_vector<E>>(1, rt.allocator_for<E>(src->key.dev, sk::kind::host));
-        std::vector<sycl::event> deps = m.events.read_deps();
-        for (const std::vector<sycl::event>& v : {src->events(), host->events()}) deps.insert(deps.end(), v.begin(), v.end());
+        // The copy READS the source (it waits on the source's writes) and WRITES the private host buffer, right after
+        // the buffer's own fill (so it waits on both of the buffer's lists).
+        std::vector<sycl::event> deps = src->read_deps();
+        for (const std::vector<sycl::event>& v : {host->read_deps(), host->write_deps()}) deps.insert(deps.end(), v.begin(), v.end());
         const sycl::event e = rt.q.copy(src->key.dev, deps, static_cast<const E*>(src->raw()) + index, host->data(), 1);
-        src->register_event(e);  // a later writer of the source waits for the read
-        host->register_event(e);
-        m.events.record_read(e);
+        src->register_read(e);  // a later writer of the source waits for the read
+        host->register_write(e);
         evs.push_back(e);
         getter = [host, path, index]() -> std::size_t {
             const E v = host->data()[0];
@@ -231,15 +233,17 @@ inline sycl::event build_column(Runtime& rt, VarMeta& m, DeviceColumn& col, bool
         col.neg_flag.emplace(1, rt.allocator_for<std::uint64_t>(dev, sk::kind::device));
         col.host_total.emplace(2, rt.allocator_for<std::uint64_t>(dev, sk::kind::host));
     } else {
-        if (col.extents->size() != n) col.extents->resize(n, std::span<const sycl::event>{col.extents->events()});
-        if (col.offs->size() != n + 1) col.offs->resize(n + 1, std::span<const sycl::event>{col.offs->events()});
+        if (col.extents->size() != n) col.extents->resize(n);  // the container's own write: waits on both its lists
+        if (col.offs->size() != n + 1) col.offs->resize(n + 1);
     }
     col.n = n;
 
-    std::vector<sycl::event> deps = m.events.read_deps();
-    for (const std::vector<sycl::event>& v :
-         {src->events(), col.extents->events(), col.offs->events(), col.host_total->events(), col.neg_flag->events()})
-        deps.insert(deps.end(), v.begin(), v.end());
+    // The tasks below READ the source and WRITE the column's containers (right after their own fills, and after the
+    // previous rebuild's readers): they wait on the source's writes and on both lists of every column container.
+    std::vector<sycl::event> deps = src->read_deps();
+    for (const sk::usm_vector<std::uint64_t>* c : {&*col.extents, &*col.offs, &*col.host_total, &*col.neg_flag}) {
+        for (const std::vector<sycl::event>& v : {c->read_deps(), c->write_deps()}) deps.insert(deps.end(), v.begin(), v.end());
+    }
 
     std::uint64_t* ex   = col.extents->data();
     std::uint64_t* of   = col.offs->data();
@@ -327,12 +331,11 @@ inline sycl::event build_column(Runtime& rt, VarMeta& m, DeviceColumn& col, bool
         tot[0] = of[nn];
         tot[1] = flag[0];
     });
-    src->register_event(ev_read);  // the first pass is the only read of the source
-    col.extents->register_event(e);
-    col.offs->register_event(e);
-    col.neg_flag->register_event(e);
-    col.host_total->register_event(e);
-    m.events.record_read(ev_read);  // a later writer of the source waits until it has been read
+    src->register_read(ev_read);  // the first pass is the only read of the source; a later writer of it waits
+    col.extents->register_write(e);
+    col.offs->register_write(e);
+    col.neg_flag->register_write(e);
+    col.host_total->register_write(e);
     col.ev = e;
     ++col.version;
     return e;

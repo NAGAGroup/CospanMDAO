@@ -183,7 +183,7 @@ InitSpec fill_impl(T value, std::optional<InitShape> shape) {
         detail::dispatch_dtype(c.var.dtype, [&](auto tag) {
             using E = typename decltype(tag)::type;
             auto& d = static_cast<detail::DeviceData<E>&>(c.data);
-            e       = d.vec.fill(static_cast<E>(value), std::span<const sycl::event>{c.deps});
+            e       = d.v().fill(static_cast<E>(value), std::span<const sycl::event>{c.deps});
         });
         return e;
     }, std::move(shape)};
@@ -194,7 +194,7 @@ inline InitSpec zero_impl(std::optional<InitShape> shape) {
         detail::dispatch_dtype(c.var.dtype, [&](auto tag) {
             using E = typename decltype(tag)::type;
             auto& d = static_cast<detail::DeviceData<E>&>(c.data);
-            e       = d.vec.fill(E{}, std::span<const sycl::event>{c.deps});
+            e       = d.v().fill(E{}, std::span<const sycl::event>{c.deps});
         });
         return e;
     }, std::move(shape)};
@@ -230,7 +230,7 @@ InitSpec from_host_impl(std::vector<T> values, std::optional<InitShape> shape) {
             std::vector<E> converted(values.size());
             for (std::size_t i = 0; i < values.size(); ++i) converted[i] = static_cast<E>(values[i]);
             auto& d = static_cast<detail::DeviceData<E>&>(c.data);
-            e       = d.vec.from_host(std::span<const E>{converted.data(), converted.size()}, std::span<const sycl::event>{c.deps});
+            e       = d.v().from_host(std::span<const E>{converted.data(), converted.size()}, std::span<const sycl::event>{c.deps});
         });
         return e;
     }, std::move(shape)};
@@ -311,7 +311,7 @@ InitSpec custom_host_impl(std::function<void(HostInit<DT, Rank>&)> fn, std::opti
         sycl::event::wait(c.deps);  // the host function may read what its dependencies produced
         fn(host);
         auto& d = static_cast<detail::DeviceData<E>&>(c.data);
-        return d.vec.from_host(std::span<const E>{host.data(), host.size()}, std::span<const sycl::event>{});
+        return d.v().from_host(std::span<const E>{host.data(), host.size()}, std::span<const sycl::event>{});
     }, std::move(shape)};
 }
 }  // namespace impl

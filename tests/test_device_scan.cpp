@@ -36,8 +36,11 @@ std::vector<std::uint64_t> device_scan(const std::vector<std::uint64_t>& values)
     // host, or the late initialization zeroes what was written and the scan reads zeros.
     in.sync();
     for (std::size_t i = 0; i < n; ++i) in.data()[i] = values[i];
-    std::vector<sycl::event> deps = in.events();
-    for (const sycl::event& e : out.events()) deps.push_back(e);
+    // The scan reads `in` (it waits on its writes) and writes `out` right after the container's own fill (it waits on
+    // both of its lists).
+    std::vector<sycl::event> deps = in.read_deps();
+    for (const sycl::event& e : out.read_deps()) deps.push_back(e);
+    for (const sycl::event& e : out.write_deps()) deps.push_back(e);
 
     sycl::event ev = cs::detail::exclusive_scan_u64(rt, dev, deps, in.data(), out.data(), n);
     ev.wait();

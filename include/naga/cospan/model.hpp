@@ -293,7 +293,8 @@ private:
                                                                               meta->definition, false, false, meta);
         view->device       = dev;
         view->storage_kind = sk::kind::host;
-        meta->attach_missing(s.rt);
+        view->refresh_container();               // its own (host) container, empty
+        meta->attach_holder(s.rt, *view);        // sized and copied from the first live container with data
         return view;
     }
 

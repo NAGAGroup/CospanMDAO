@@ -437,6 +437,7 @@ public:
         forced_device_ = d;
         for (const auto& inst : alias_order_) {
             inst->device = d;
+            inst->refresh_container();  // the container of the new placement
             if (inst->role == detail::Role::tie && inst->kind == IOKind::input && inst->meta->init_device) inst->meta->init_device = d;
         }
         for (Subsystem* c : child_ptrs_)
@@ -470,9 +471,9 @@ public:
     }
 
     /// Calls each live child's forward in declaration order, and nothing else. A child that has run its last turn
-    /// (run_n reached 0, or a transient's one forward) is deleted right away: this waits on ITS events only, not the
-    /// queue, so memory is freed before later children allocate while independent work already submitted keeps
-    /// running. Add subsystems that can go out of scope as late as possible in setup().
+    /// (run_n reached 0, or a transient's one forward) is deleted right away: its containers' frees wait on their own
+    /// events only, not the queue, so memory is freed before later children allocate while independent work already
+    /// submitted keeps running. Add subsystems that can go out of scope as late as possible in setup().
     void run_compute(detail::Runtime& rt) override {
         forward_events_.clear();
         std::vector<std::vector<sycl::event>> dep_in(slots_.size());
@@ -503,22 +504,19 @@ public:
     }
 
     /// The System that owns a tie alias pushes the tied outputs to the variable's other placements after ALL members
-    /// have submitted, depending on all their writes (section 3). Then the user's post_forward().
+    /// have submitted (section 3): the container assignment waits on the source's write list, which holds every member's
+    /// write of this forward, and registers the read. Then the user's post_forward(). (A later phase moves these pushes.)
     void run_postcompute([[maybe_unused]] detail::Runtime& rt) override {
         for (const auto& alias : alias_order_) {
             if (alias->role != detail::Role::tie || alias->kind != IOKind::output) continue;
             const std::shared_ptr<detail::DeviceDataBase> src = alias->data;
-            if (!src) continue;  // nothing was written this forward, or the variable is not materialized
+            if (!src || !src->bound()) continue;  // the variable is not materialized
             const std::shared_ptr<detail::VarMeta> m = alias->meta;
+            if (m->push_suppressed) continue;
             for (const auto& entry : m->data) {
                 const std::shared_ptr<detail::DeviceDataBase> dst = entry.second.lock();
-                if (!dst || dst == src || entry.first == src->key) continue;
-                std::vector<sycl::event> deps = m->events.read_deps();  // every member's write of this forward
-                const std::vector<sycl::event> own = src->events();
-                deps.insert(deps.end(), own.begin(), own.end());
-                const sycl::event e = dst->copy_from(*src, deps);
-                src->register_event(e);  // a later writer of the source waits for the read
-                forward_events_.push_back(e);
+                if (!dst || dst == src || !dst->bound()) continue;
+                forward_events_.push_back(dst->copy_from(*src, std::span<const sycl::event>{}));
             }
         }
         post_forward();
@@ -578,13 +576,11 @@ protected:
         slots_[i].ran     = false;
     }
 
-    /// Deletes slot i's child. It waits on THAT child's events only, never the queue (section 3); the child's
-    /// instances then release their data. The slot, its name and its declarations stay.
+    /// Deletes slot i's child. It waits on nothing: the child's instances release their containers, and a container's
+    /// free waits on its own read and write lists (so on the child's kernels), in the thread that drops the last holder.
+    /// The slot, its name and its declarations stay.
     void delete_child(std::size_t i) {
-        if (children_[i]) {
-            sycl::event::wait(children_[i]->events());
-            children_[i].reset();
-        }
+        children_[i].reset();
         child_ptrs_[i] = nullptr;
     }
 

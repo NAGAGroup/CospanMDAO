@@ -295,7 +295,10 @@ public:
 
     /// Section 2: each of this component's instances goes to `d`. The outer call wins.
     void set_device(const sycl::device& d) override {
-        for (const auto& inst : order_) inst->device = d;
+        for (const auto& inst : order_) {
+            inst->device = d;
+            inst->refresh_container();  // the container of the new placement
+        }
     }
 
     std::shared_ptr<detail::Instance> find_instance(std::string_view name) const override {
@@ -306,7 +309,8 @@ public:
         for (const auto& i : order_) out.push_back(i);
     }
 
-    /// The last launch's event(s): what deleting this component waits on, and what depends_on hands on.
+    /// The last launch's event(s): what depends_on hands on. (Deleting a component waits on nothing: the containers
+    /// it held free themselves after their own events.)
     std::vector<sycl::event> events() const override { return last_events_; }
 
     /// depends_on: these events are added to this component's submission for ONE forward.
@@ -318,9 +322,11 @@ public:
     void run_precompute(detail::Runtime& rt) override {
         PtrScope rt_scope{rt_, &rt};
 
-        // (1) Every distinct input variable is materialized (a free input takes its initializer, and its initializer's
-        // shape, here). Shape hooks of the enclosing System have already run (docs/design-review-2026-10-03.md, section 10).
-        for (detail::VarMeta* m : metas_of(IOKind::input)) m->materialize(rt);
+        // (1) Every input variable is materialized (a free input takes its initializer, and its initializer's shape,
+        // here), by the holder that asks: the first materialization is global, a later one checks only this holder's
+        // container. Shape hooks of the enclosing System have already run (docs/design-review-2026-10-03.md, section 10).
+        for (const auto& inst : order_)
+            if (inst->kind == IOKind::input) inst->meta->materialize(rt, inst.get());
 
         // (2) The user's pre_forward(): where an output is reshaped (set_shape) within its definition.
         {
@@ -330,17 +336,19 @@ public:
 
         // (3) Every distinct output variable is materialized: an unknown dimension is the not-known error, naming who
         // should have set it.
-        for (detail::VarMeta* m : metas_of(IOKind::output)) m->materialize(rt);
+        for (const auto& inst : order_)
+            if (inst->kind == IOKind::output) inst->meta->materialize(rt, inst.get());
 
         // (4) The member wrappers (a dense port on a ragged variable is an error).
         for (const auto& inst : order_) check_dense(*inst, inst->meta->shape);
         for (const auto& inst : order_) inst->point_wrapper();
     }
 
-    /// Submits the launch and records its event: describe, submit, record. Writers in one forward never wait on each
-    /// other (write_deps returns the PREVIOUS generation), so tied outputs run concurrently; there is no queue-wide wait
-    /// anywhere (section 3). The pieces are protected so a fused component (section 4) can submit ONE launch for its
-    /// stages and still give each stage the event as if it had submitted alone.
+    /// Submits the launch and records its event: describe, submit, record. The launch waits on each input container's
+    /// read_deps (its writes) and each output container's write_deps (its reads), and writes never wait on writes, so
+    /// tied outputs run concurrently; there is no queue-wide wait anywhere (section 3). The pieces are protected so a
+    /// fused component (section 4) can submit ONE launch for its stages and still give each stage the event as if it had
+    /// submitted alone.
     void run_compute(detail::Runtime& rt) override {
         const std::unique_ptr<LaunchDescription> desc = compute_forward_impl();
         if (!desc) throw std::logic_error("naga::cospan: " + describe() + ": compute_forward returned no launch");
@@ -348,25 +356,24 @@ public:
         record_launch(ev);
     }
 
-    /// Pushes each output variable this component wrote to the variable's OTHER placements, ordered after the launch
-    /// and the data's own events. A tied output is pushed by the tie's System (phase 6). Then the user's hook.
+    /// Pushes each output variable this component wrote to the variable's OTHER live placements (host views included)
+    /// by container assignment, which waits on the output's writes and registers the read, unless the variable's push is
+    /// suppressed. A tied output is pushed by the tie's System (phase 6). Then the user's hook. (The launch's events were
+    /// registered on the containers at submit, in record_launch.)
     void run_postcompute(detail::Runtime& rt) override {
+        (void)rt;
         std::vector<detail::VarMeta*> seen;
         for (const auto& inst : order_) {
             if (inst->kind != IOKind::output) continue;
             detail::VarMeta* m = inst->meta.get();
             if (std::find(seen.begin(), seen.end(), m) != seen.end()) continue;
             seen.push_back(m);
-            if (m->is_tied_output() || !inst->data) continue;
+            if (m->is_tied_output() || m->push_suppressed || !inst->data || last_events_.empty()) continue;
             const std::shared_ptr<detail::DeviceDataBase> own = inst->data;
             for (const auto& entry : m->data) {
                 const std::shared_ptr<detail::DeviceDataBase> dst = entry.second.lock();
-                if (!dst || dst == own || entry.first == own->key) continue;
-                std::vector<sycl::event> deps = last_events_;
-                const std::vector<sycl::event> own_ev = own->events();
-                deps.insert(deps.end(), own_ev.begin(), own_ev.end());
-                const sycl::event e = dst->copy_from(*own, deps);
-                own->register_event(e);  // a later writer of this copy waits for the read
+                if (!dst || dst == own || !dst->bound()) continue;  // a holder not materialized yet fills itself
+                dst->copy_from(*own, std::span<const sycl::event>{});
             }
         }
         post_forward();
@@ -405,31 +412,34 @@ protected:
 
     std::string describe() const { return path().empty() ? std::string{"component"} : "'" + path() + "'"; }
 
-    /// What a submission of this component must come after: its inputs' write events, its outputs' read events, the
-    /// events of the data it touches, and any depends_on events (which last one forward: they are cleared here).
+    /// What a submission of this component must come after: each input container's read_deps (its writes), each output
+    /// container's write_deps (its reads, and the container's own writes such as a resize fill), and any depends_on events
+    /// (which last one forward: they are cleared here). Outside writes never wait on each other.
     std::vector<sycl::event> gather_deps(detail::Runtime& rt) {
-        const std::vector<detail::VarMeta*> ins  = metas_of(IOKind::input);
-        const std::vector<detail::VarMeta*> outs = metas_of(IOKind::output);
-        std::vector<sycl::event>            deps;
-        const auto                          add = [&](const std::vector<sycl::event>& v) { deps.insert(deps.end(), v.begin(), v.end()); };
-        for (detail::VarMeta* m : ins) add(m->events.read_deps());
-        for (detail::VarMeta* m : outs) add(m->events.write_deps(rt.forward));
-        for (detail::DeviceDataBase* d : distinct_data()) add(d->events());
+        (void)rt;
+        std::vector<sycl::event> deps;
+        const auto               add = [&](const std::vector<sycl::event>& v) { deps.insert(deps.end(), v.begin(), v.end()); };
+        for (const auto& inst : order_) {
+            if (!inst->data) continue;
+            add(inst->kind == IOKind::input ? inst->data->read_deps() : inst->data->write_deps());
+        }
         add(pending_deps_);
         pending_deps_.clear();
         return deps;
     }
 
-    /// Records the event(s) of this component's launch: a write on each output's variable, a read on each input's,
-    /// and an event of outside work over every data it touches (so a later mutation or free waits for it).
+    /// Records the event(s) of this component's launch THE MOMENT IT IS SUBMITTED: a READ on every input container, a
+    /// WRITE on every output container, and the component's last event (what depends_on hands on). Registered at submit,
+    /// so nothing that frees or reallocates a container before postcompute can miss the kernel still using it.
     void record_launch(const std::vector<sycl::event>& ev) {
-        const std::vector<detail::VarMeta*> ins  = metas_of(IOKind::input);
-        const std::vector<detail::VarMeta*> outs = metas_of(IOKind::output);
-        const std::vector<detail::DeviceDataBase*> datas = distinct_data();
-        for (const sycl::event& e : ev) {
-            for (detail::VarMeta* m : outs) m->events.record_write(e);
-            for (detail::VarMeta* m : ins) m->events.record_read(e);
-            for (detail::DeviceDataBase* d : datas) d->register_event(e);
+        std::vector<detail::DeviceDataBase*> read, written;  // a container may be both: once in each list
+        for (const auto& inst : order_) {
+            if (!inst->data) continue;
+            std::vector<detail::DeviceDataBase*>& done = inst->kind == IOKind::input ? read : written;
+            if (std::find(done.begin(), done.end(), inst->data.get()) != done.end()) continue;
+            done.push_back(inst->data.get());
+            if (inst->kind == IOKind::input) inst->data->register_read(std::span<const sycl::event>{ev});
+            else inst->data->register_write(std::span<const sycl::event>{ev});  // the kernel writes it
         }
         last_events_ = ev;
     }
@@ -559,6 +569,7 @@ private:
             throw std::invalid_argument("naga::cospan: " + describe() + ": member wrapper of '" + key +
                                         "' is already declared");
         inst->storage_kind = default_storage_kind();
+        inst->refresh_container();  // the container of its placement, empty until the first materialization
         if (ragged) ragged_ports_.insert(inst.get());
         order_.push_back(inst);
         by_member_.emplace(member, inst.get());

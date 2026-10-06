@@ -11,7 +11,8 @@
 //
 //   - the variable's shared metadata (VarMeta, held by every instance of the variable);
 //   - its own device (section 2: devices are never on the metadata) and storage kind;
-//   - a shared pointer to the data of ITS device, given to it by materialize;
+//   - a shared pointer to the data (the container) of ITS placement: created empty when the instance is declared
+//     (or when its device or kind is set, or it joins another variable) and kept for its whole life;
 //   - its connect flags (can it be a source, can it be a target);
 //   - for a port, the wrapper its component's kernel reads (the typed leaves below).
 //
@@ -113,7 +114,7 @@ public:
     bool can_be_target;
 
     std::shared_ptr<VarMeta>         meta;  ///< shared by every instance of the variable
-    std::shared_ptr<DeviceDataBase>  data;  ///< the data of THIS instance's device, once materialized
+    std::shared_ptr<DeviceDataBase>  data;  ///< the data of THIS instance's placement: empty until materialized (a holder)
 
     /// The instance's dotted path from the root System: its declarer's path plus its name, or the name alone
     /// at the root.
@@ -124,14 +125,18 @@ public:
     /// Where this instance's data lives.
     DataKey key() const { return DataKey{device, storage_kind}; }
 
-    void set_data(std::shared_ptr<DeviceDataBase> sp) { data = std::move(sp); }
+    /// Takes the container of this instance's current key from its variable (a new empty one if the variable has no live
+    /// one for it). Called whenever the key or the variable changes: declaration, set_device, a merge. The variable keeps
+    /// the container weakly, so the holders are what keeps it alive.
+    void refresh_container() { data = meta ? meta->container_for(key()) : nullptr; }
 
-    /// Joins another variable: drops this instance's data, takes the metadata, and enters its instance list. The
-    /// merge walks of connect, tie and promote re-point the instances of the losing metadata with this.
+    /// Joins another variable: takes the metadata, enters its instance list, and takes the container of its key there
+    /// (the winner's, or one the winner adopted from the loser: VarMeta::adopt_containers). The merge walks of connect,
+    /// tie and promote re-point the instances of the losing metadata with this.
     void rebind(std::shared_ptr<VarMeta> m) {
-        data.reset();
         meta = std::move(m);
         if (meta) meta->add_instance(weak_from_this());
+        refresh_container();
     }
 
     /// Writes the component's member wrapper from the current shape and data. Aliases have none.
@@ -143,8 +148,9 @@ public:
 
 // What variable.hpp declared for VarMeta's sake.
 inline DataKey             key_of(const Instance& i) { return i.key(); }
-inline void                give_data(Instance& i, std::shared_ptr<DeviceDataBase> d) { i.set_data(std::move(d)); }
-inline bool                has_data(const Instance& i) { return static_cast<bool>(i.data); }
+inline std::shared_ptr<DeviceDataBase> data_of(const Instance& i) { return i.data; }
+inline void                refresh_container(Instance& i) { i.refresh_container(); }
+inline IOKind              kind_of(const Instance& i) { return i.kind; }
 inline bool                is_output_port(const Instance& i) { return i.kind == IOKind::output && i.role == Role::port; }
 inline std::string         path_of(const Instance& i) { return i.full_path(); }
 inline const sycl::device& device_of(const Instance& i) { return i.device; }
@@ -296,6 +302,7 @@ inline void adopt_new_meta(const std::shared_ptr<Instance>& inst, DType dt, int 
     inst->meta             = make_var_meta(dt, rank, inst->dims, ragged);
     inst->meta->def_counts = inst->def_counts;
     inst->meta->add_instance(inst);
+    inst->refresh_container();  // its (still default) placement; refreshed again when the device or kind is set
 }
 
 /// The caller owns the returned instance (a component keeps its ports; a System its aliases).
@@ -351,6 +358,7 @@ inline std::shared_ptr<Instance> make_alias_instance(DType dt, int rank, std::st
     if (meta) {
         inst->meta = std::move(meta);
         inst->meta->add_instance(inst);
+        inst->refresh_container();
     } else {
         adopt_new_meta(inst, dt, rank, false);
     }

@@ -226,7 +226,8 @@ public:
             const std::vector<sycl::event> d = ComponentAccess::gather_deps(*s, rt);
             deps.insert(deps.end(), d.begin(), d.end());
         }
-        for (const std::vector<sycl::event>& e : {recs_->events(), in_->events(), out_->events(), body_->events()})
+        // The wave READS the packing buffers: it waits on their writes (the uploads above).
+        for (const std::vector<sycl::event>& e : {recs_->read_deps(), in_->read_deps(), out_->read_deps(), body_->read_deps()})
             deps.insert(deps.end(), e.begin(), e.end());
 
         // 7. ONE outer launch, with the cached call sequence of the stages' functions in stage order.
@@ -248,12 +249,12 @@ public:
             default: ev = launch_wave<3>(rt.uq, dev, deps, cfg, wave_nd_range<3>(total_groups, w), rp, ip, op, bp, local_bytes); break;
         }
 
-        // 8. The wave's event: on the packing buffers it reads (the next rewrite waits), and on every stage, so each
-        // stage's variables get their event lists as if it had submitted alone.
-        recs_->register_event(ev);
-        in_->register_event(ev);
-        out_->register_event(ev);
-        body_->register_event(ev);
+        // 8. The wave's event: a read of the packing buffers (the next rewrite waits), and on every stage, so each
+        // stage's containers get their reads (here) and writes (in the stage's postcompute) as if it had submitted alone.
+        recs_->register_read(ev);
+        in_->register_read(ev);
+        out_->register_read(ev);
+        body_->register_read(ev);
         last_wave_ = {ev};
         for (ComponentBase* s : st) ComponentAccess::record_launch(*s, last_wave_);
     }

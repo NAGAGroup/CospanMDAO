@@ -14,7 +14,7 @@
 //   - A view can be obtained only AFTER A RUN (Model::view_input and friends throw before the first forward). It starts
 //     as a copy of a live placement and never initializes anything: a view made after Model::update_input shows the
 //     old values until the next run.
-//   - CALL sync() BEFORE READING: it waits on the variable's write events and on the host copy's own container events.
+//   - CALL sync() BEFORE READING: it waits on the host container's write events (its pushes and copies).
 //     Reading without syncing, or while work is running, is the caller's responsibility.
 //   - A view OUTLIVES THE MODEL: it keeps the metadata and its host memory, and the container's handle keeps the queue
 //     alive. When the model goes, every device copy is freed (each waiting on its own events first).
@@ -51,13 +51,11 @@ DeviceData<T>& host_store(const std::shared_ptr<Instance>& inst) {
     return static_cast<DeviceData<T>&>(*inst->data);
 }
 
-/// Waits on what a read of the view must come after (section 5).
+/// Waits on what a read of the view must come after (section 5): the host container's write list, which holds the
+/// pushes (each copy waited on the producer's writes) and the copy that made it.
 template <class T>
 void sync_view(const std::shared_ptr<Instance>& inst) {
-    std::vector<sycl::event> ev  = inst->meta->events.all_writes();
-    const auto               own = host_store<T>(inst).events();
-    ev.insert(ev.end(), own.begin(), own.end());
-    sycl::event::wait(ev);
+    sycl::event::wait(host_store<T>(inst).read_deps());
 }
 
 }  // namespace detail

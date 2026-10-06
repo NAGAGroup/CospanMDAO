@@ -6,14 +6,18 @@
 //
 // One VarMeta per variable, held by shared_ptr by EVERY instance that belongs to it
 // (docs/design-review-2026-10-03.md, section 1). It carries what the variable IS: dtype, rank, the shape
-// definition, the resolved shape, the initializer, the stale flag, the event lists, and weak pointers
-// to the instances that share it and to each device's data. It holds no memory and keeps nothing alive:
+// definition, the resolved shape, the initializer, the stale and materialized flags, and weak pointers
+// to the instances that share it and to each placement's data. It holds no memory and keeps nothing alive. It holds
+// NO EVENTS: every container keeps its own read and write lists (SlabKit's usm_vector), and a task orders itself
+// through the containers it touches.
 //
 //   - the metadata lives while any instance holding it exists;
-//   - a device's data (a DeviceData, a SlabKit container) lives while any instance on that device holds
-//     it, and the metadata's entry for it is weak;
-//   - "initialized" means some device has live data: there is no flag for it, only the stale flag of
-//     section 5 (a variable that is not materialized is always stale).
+//   - a placement's data (a DeviceData, which owns a SlabKit container) is created EMPTY when an instance (a
+//     holder) is declared on that placement, lives while any holder of it exists, and the metadata's entry for it is
+//     weak. Entries are never removed: a key whose data is gone gets a new empty one when a holder asks again;
+//   - `materialized` is set when the first materialization (section 3) has sized every live container; until then
+//     the variable is always stale. After it, a holder checks only its own container (an empty one is sized and
+//     copied from the first live container with data).
 //
 // A ragged variable (rank 2 only) is a different metadata type (RaggedVar) on the same idea: its device data also
 // holds the device copies of the block offsets and the counts.
@@ -70,42 +74,93 @@ struct DataKey {
     friend bool operator==(const DataKey& a, const DataKey& b) { return a.dev == b.dev && a.kind == b.kind; }
 };
 
-/// One device's data of a variable, type-erased. Held by shared_ptr by every instance on that device; the
+/// One placement's data of a variable, type-erased: the container (a SlabKit usm_vector) and, through it, the
+/// events of everything that read or wrote it. Held by shared_ptr by every holder (instance) on that placement; the
 /// VarMeta keeps a weak pointer.
+///
+/// The data exists from the declaration of its first holder, EMPTY and UNBOUND: no Runtime is available at setup, so
+/// the container itself (which needs an allocator) is made by bind(), at the first materialization that touches it.
+/// An unbound data is size 0, has no events and holds no memory.
+///
+/// EVENTS (SlabKit's rules): a READER of the data (a kernel that reads it, a copy out of it) waits on read_deps() (the
+/// writes) and registers a read; a WRITER (a kernel that writes it) waits on write_deps() (the reads) and registers a
+/// write. Writes never wait on writes. The container's own operations (resize, a copy in, a free) wait on both lists.
 struct DeviceDataBase {
     DataKey key;
 
     explicit DeviceDataBase(DataKey k) : key{std::move(k)} {}
     virtual ~DeviceDataBase() = default;
 
-    /// What a submission that touches this data must come after (the container's own events).
-    virtual std::vector<sycl::event> events() const = 0;
-    /// Hands the container an event of outside work over its data, so a later mutation or the free waits for it.
-    virtual void register_event(const sycl::event& e) = 0;
+    /// What an outside READER must wait on: the write list(s), collapsed.
+    virtual std::vector<sycl::event> read_deps() const = 0;
+    /// What an outside WRITER must wait on: the read list(s), collapsed.
+    virtual std::vector<sycl::event> write_deps() const = 0;
+    /// Hands the container the events of outside work that read (wrote) its data.
+    virtual void register_read(std::span<const sycl::event> evs)  = 0;
+    virtual void register_write(std::span<const sycl::event> evs) = 0;
+    void         register_read(const sycl::event& e) { register_read(std::span<const sycl::event>{&e, 1}); }
+    void         register_write(const sycl::event& e) { register_write(std::span<const sycl::event>{&e, 1}); }
+
+    /// Makes the container (size 0, no allocation) from the Runtime's allocator for this key. Idempotent.
+    virtual void bind(Runtime& rt) = 0;
+    virtual bool bound() const     = 0;
+    /// Null while unbound or empty.
     virtual void*       raw()        = 0;
     virtual std::size_t size() const = 0;
-    /// Makes this data a copy of `src` (the same element type, another placement), after `deps`: the container's
-    /// assign, so it resizes to the source. Returns the event of the copy. A ragged variable's index arrays follow.
-    virtual sycl::event copy_from(DeviceDataBase& src, const std::vector<sycl::event>& deps) = 0;
+    /// The allocated bytes of the element container (its capacity), for the pool accounting.
+    virtual std::size_t capacity_bytes() const = 0;
+    /// Makes this data a copy of `src` (the same element type, another placement): the container's assign, so it
+    /// waits on the source's write list and on both of its own, resizes to the source, and registers a read on the
+    /// source and a write on this. `deps` are extra dependencies. Returns the event of the copy. A ragged variable's
+    /// index arrays follow. Both must be bound.
+    virtual sycl::event copy_from(DeviceDataBase& src, std::span<const sycl::event> deps) = 0;
+    /// A ragged variable's data (it carries index arrays).
+    virtual bool is_ragged_data() const noexcept { return false; }
 };
 
 template <class T>
 struct DeviceData : DeviceDataBase {
-    sk::usm_vector<T> vec;
+    std::optional<sk::usm_vector<T>> vec;  ///< engaged by bind()
 
-    DeviceData(DataKey k, sk::usm_vector<T> v) : DeviceDataBase{std::move(k)}, vec{std::move(v)} {}
+    explicit DeviceData(DataKey k) : DeviceDataBase{std::move(k)} {}
 
-    std::vector<sycl::event> events() const override { return vec.events(); }
-    void                     register_event(const sycl::event& e) override { vec.register_event(e); }
-    void*                    raw() override { return vec.data(); }
-    std::size_t              size() const override { return vec.size(); }
-    sycl::event              copy_from(DeviceDataBase& src, const std::vector<sycl::event>& deps) override {
-        return vec.assign(static_cast<DeviceData<T>&>(src).vec, std::span<const sycl::event>{deps});
+    /// The container. \throws std::logic_error while unbound.
+    sk::usm_vector<T>& v() {
+        if (!vec) throw std::logic_error("naga::cospan: a data was used before it was bound to a Runtime");
+        return *vec;
+    }
+    const sk::usm_vector<T>& v() const {
+        if (!vec) throw std::logic_error("naga::cospan: a data was used before it was bound to a Runtime");
+        return *vec;
+    }
+
+    std::vector<sycl::event> read_deps() const override { return vec ? vec->read_deps() : std::vector<sycl::event>{}; }
+    std::vector<sycl::event> write_deps() const override { return vec ? vec->write_deps() : std::vector<sycl::event>{}; }
+    void register_read(std::span<const sycl::event> evs) override {
+        if (vec) vec->register_read(evs);
+    }
+    void register_write(std::span<const sycl::event> evs) override {
+        if (vec) vec->register_write(evs);
+    }
+    using DeviceDataBase::register_read;
+    using DeviceDataBase::register_write;
+
+    void bind(Runtime& rt) override {
+        if (!vec) vec.emplace(rt.allocator_for<T>(key.dev, key.kind));
+    }
+    bool        bound() const override { return vec.has_value(); }
+    void*       raw() override { return vec ? vec->data() : nullptr; }
+    std::size_t size() const override { return vec ? vec->size() : 0; }
+    std::size_t capacity_bytes() const override { return vec ? vec->capacity() * sizeof(T) : 0; }
+    sycl::event copy_from(DeviceDataBase& src, std::span<const sycl::event> deps) override {
+        return v().assign(static_cast<DeviceData<T>&>(src).v(), deps);
     }
 };
 
 /// A ragged variable's device data (rank 2): the elements, the N + 1 block offsets and the counts (the extents of the
-/// per-index dimension). The index arrays are containers of their own, so their events count as the data's.
+/// per-index dimension). The index arrays are containers of their own and COUNT AS THE DATA: a kernel that reads or
+/// writes the elements READS the index arrays (so it registers a read on them and waits on their writes); reshaping or
+/// setting them (fill_index, a copy) is a write of theirs, which waits on both their lists.
 template <class T>
 struct RaggedDeviceData : DeviceData<T> {
     std::optional<sk::usm_vector<std::uint64_t>> offs;
@@ -113,32 +168,56 @@ struct RaggedDeviceData : DeviceData<T> {
 
     using DeviceData<T>::DeviceData;
 
-    std::vector<sycl::event> events() const override {
-        std::vector<sycl::event> out = DeviceData<T>::events();
-        const auto               add = [&](const std::optional<sk::usm_vector<std::uint64_t>>& v) {
-            if (!v) return;
-            const std::vector<sycl::event> e = v->events();
-            out.insert(out.end(), e.begin(), e.end());
-        };
-        add(offs);
-        add(per);
+    static void append(std::vector<sycl::event>& out, const std::optional<sk::usm_vector<std::uint64_t>>& v) {
+        if (!v) return;
+        const std::vector<sycl::event> e = v->read_deps();  // the index arrays' writes
+        out.insert(out.end(), e.begin(), e.end());
+    }
+    /// The elements' writes and the index arrays' writes (a kernel reads the index arrays too).
+    std::vector<sycl::event> read_deps() const override {
+        std::vector<sycl::event> out = DeviceData<T>::read_deps();
+        append(out, offs);
+        append(out, per);
         return out;
     }
-    void register_event(const sycl::event& e) override {
-        DeviceData<T>::register_event(e);
-        if (offs) offs->register_event(e);  // the kernel reads the index arrays too
-        if (per) per->register_event(e);
+    /// The elements' reads, and the index arrays' writes (a writing kernel reads them).
+    std::vector<sycl::event> write_deps() const override {
+        std::vector<sycl::event> out = DeviceData<T>::write_deps();
+        append(out, offs);
+        append(out, per);
+        return out;
     }
-    /// The elements, then the index arrays that both sides have (each after the source array's own events). The
-    /// returned event is the elements' copy; the index copies are tracked by their containers, which `events()` reports.
-    sycl::event copy_from(DeviceDataBase& src, const std::vector<sycl::event>& deps) override {
+    void register_read(std::span<const sycl::event> evs) override {
+        DeviceData<T>::register_read(evs);
+        if (offs) offs->register_read(evs);
+        if (per) per->register_read(evs);
+    }
+    /// A write of the elements; the kernel that did it also read the index arrays.
+    void register_write(std::span<const sycl::event> evs) override {
+        DeviceData<T>::register_write(evs);
+        if (offs) offs->register_read(evs);
+        if (per) per->register_read(evs);
+    }
+    using DeviceDataBase::register_read;
+    using DeviceDataBase::register_write;
+
+    void bind(Runtime& rt) override {
+        DeviceData<T>::bind(rt);
+        const auto alloc = rt.allocator_for<std::uint64_t>(this->key.dev, this->key.kind);
+        if (!offs) offs.emplace(alloc);
+        if (!per) per.emplace(alloc);
+    }
+    bool is_ragged_data() const noexcept override { return true; }
+
+    /// The elements, then the index arrays that both sides have (each assign waits on the source array's writes).
+    /// The returned event is the elements' copy.
+    sycl::event copy_from(DeviceDataBase& src, std::span<const sycl::event> deps) override {
         const sycl::event e = DeviceData<T>::copy_from(src, deps);
         auto&             s = static_cast<RaggedDeviceData<T>&>(src);
         const auto        assign = [](std::optional<sk::usm_vector<std::uint64_t>>& to,
                                const std::optional<sk::usm_vector<std::uint64_t>>& from) {
             if (!to || !from) return;
-            const std::vector<sycl::event> ev = from->events();
-            to->assign(*from, std::span<const sycl::event>{ev});
+            to->assign(*from, std::span<const sycl::event>{});
         };
         assign(offs, s.offs);
         assign(per, s.per);
@@ -233,9 +312,14 @@ struct ResolvedShape {
         const DeviceColumn&        col = *dev_per;
         std::vector<std::uint64_t> h(col.n);
         std::vector<sycl::event>   deps{col.ev};
-        const std::vector<sycl::event> own = col.extents->events();
+        const std::vector<sycl::event> own = col.extents->read_deps();  // the extents' writes
         deps.insert(deps.end(), own.begin(), own.end());
-        if (col.n != 0) rt.q.copy(col.key.dev, deps, static_cast<const std::uint64_t*>(col.extents->data()), h.data(), col.n).wait();
+        if (col.n != 0) {
+            sycl::event e =
+                rt.q.copy(col.key.dev, deps, static_cast<const std::uint64_t*>(col.extents->data()), h.data(), col.n);
+            col.extents->register_read(e);  // a later rebuild of the column waits for this read
+            e.wait();
+        }
         return std::vector<std::size_t>(h.begin(), h.end());
     }
 
@@ -246,81 +330,6 @@ struct ResolvedShape {
 };
 
 // -----------------------------------------------------------------------------
-// Event lists
-// -----------------------------------------------------------------------------
-
-inline bool event_complete(const sycl::event& e) {
-    return e.get_info<sycl::info::event::command_execution_status>() == sycl::info::event_command_status::complete;
-}
-
-/// The events of the writes and reads of a variable, in two generations (docs/design-review-2026-10-03.md,
-/// section 3). A WRITER waits on the last generation's writers and readers and never on another writer of its
-/// own forward, so tied outputs (atomic or disjoint) run concurrently. A READER waits on this forward's writers if
-/// there are any, else on the last generation's: a reader that runs before any writer this forward (a cycle) reads
-/// the previous value. The generation rolls over when a writer asks in a new forward.
-///
-/// Container operations (resize, cross-device copy, ragged index uploads) put their events on the CONTAINERS, not
-/// here; a submission also depends on the events of its own device's containers.
-class EventLists {
-public:
-    /// The events a write in `forward` must come after. Rolls the generation first when `forward` is new.
-    std::vector<sycl::event> write_deps(std::uint64_t forward) {
-        roll(forward);
-        return joined(prev_writes_, prev_reads_);
-    }
-    /// What write_deps would return, without rolling.
-    std::vector<sycl::event> peek_write_deps(std::uint64_t forward) const {
-        return forward != gen_forward_ ? joined(cur_writes_, cur_reads_) : joined(prev_writes_, prev_reads_);
-    }
-    /// The events a read must come after.
-    std::vector<sycl::event> read_deps() const { return cur_has_writer_ ? cur_writes_ : prev_writes_; }
-
-    void record_write(sycl::event e) {
-        ++write_count_;
-        cur_writes_.push_back(std::move(e));
-        cur_has_writer_ = true;
-        prune(cur_writes_);
-    }
-    void record_read(sycl::event e) {
-        cur_reads_.push_back(std::move(e));
-        prune(cur_reads_);
-    }
-
-    /// How many writes were ever recorded: a consumer's cached copy of a value is valid while this has not changed.
-    std::uint64_t write_count() const { return write_count_; }
-
-    /// Every write still tracked (this forward's and the last's), for a host sync.
-    std::vector<sycl::event> all_writes() const { return joined(cur_writes_, prev_writes_); }
-
-private:
-    static std::vector<sycl::event> joined(const std::vector<sycl::event>& a, const std::vector<sycl::event>& b) {
-        std::vector<sycl::event> out;
-        out.reserve(a.size() + b.size());
-        out.insert(out.end(), a.begin(), a.end());
-        out.insert(out.end(), b.begin(), b.end());
-        return out;
-    }
-    static void prune(std::vector<sycl::event>& v) { std::erase_if(v, event_complete); }
-
-    void roll(std::uint64_t forward) {
-        if (forward == gen_forward_) return;
-        prev_writes_ = std::move(cur_writes_);
-        prev_reads_  = std::move(cur_reads_);
-        cur_writes_.clear();
-        cur_reads_.clear();
-        cur_has_writer_ = false;
-        gen_forward_    = forward;
-        prune(prev_writes_);
-        prune(prev_reads_);
-    }
-
-    std::vector<sycl::event> cur_writes_, cur_reads_, prev_writes_, prev_reads_;
-    bool                     cur_has_writer_ = false;
-    std::uint64_t            write_count_    = 0;
-    std::uint64_t            gen_forward_    = ~std::uint64_t{0};
-};
-
-// -----------------------------------------------------------------------------
 // The shared metadata
 // -----------------------------------------------------------------------------
 
@@ -328,8 +337,9 @@ class Instance;  // instance.hpp
 
 // What VarMeta needs to know of an instance, defined in instance.hpp (which includes this header).
 inline DataKey             key_of(const Instance& i);
-inline void                give_data(Instance& i, std::shared_ptr<DeviceDataBase> d);
-inline bool                has_data(const Instance& i);
+inline std::shared_ptr<DeviceDataBase> data_of(const Instance& i);  // the container the holder holds
+inline void                refresh_container(Instance& i);           // fetch the holder's container for its key
+inline IOKind              kind_of(const Instance& i);
 inline bool                is_output_port(const Instance& i);
 inline bool                is_tie_output(const Instance& i);
 inline std::string         path_of(const Instance& i);
@@ -383,14 +393,20 @@ public:
     /// See is_stale(): this flag alone says nothing for a variable that is not materialized.
     bool stale_ = true;
 
+    /// The first materialization has sized every live container (variable.hpp, Var::materialize). Never cleared.
+    bool materialized = false;
+
+    /// Set (by a later phase) to stop the post-compute pushes of this variable's output to its other placements.
+    bool push_suppressed = false;
+
     /// Connected inside one fused component; a later phase may keep such an intermediate in local memory (section 4).
     bool internal = false;
 
     /// The instances that share this metadata (weak; used by merges and to answer where the variable lives).
     std::vector<std::weak_ptr<Instance>> instances;
-    /// Each device's data, weak: the data lives while an instance on that device holds it.
+    /// Each placement's data, weak: it lives while a holder on that placement holds it. Entries are never removed; one
+    /// whose data is gone is given a new empty data when a holder asks for it (container_for).
     std::vector<std::pair<DataKey, std::weak_ptr<DeviceDataBase>>> data;
-    EventLists                                                      events;
 
     // ---- instances ---------------------------------------------------------------------------------
     void add_instance(std::weak_ptr<Instance> w) { instances.push_back(std::move(w)); }
@@ -466,13 +482,44 @@ public:
 
     sycl::device pick_init_device() const { return init_device ? *init_device : busiest_device(); }
 
-    // ---- state -------------------------------------------------------------------------------------
-    /// Some device has live data.
-    bool is_materialized() const {
-        for (const auto& p : data)
-            if (!p.second.expired()) return true;
-        return false;
+    // ---- containers ----------------------------------------------------------------------------------
+    /// A new EMPTY, unbound data of this variable's type for `key`.
+    virtual std::shared_ptr<DeviceDataBase> new_container(const DataKey& key) const = 0;
+
+    /// The live data of `key`, or a new empty one (recorded weakly here: the caller, a holder, keeps it alive).
+    std::shared_ptr<DeviceDataBase> container_for(const DataKey& key) {
+        for (auto& p : data)
+            if (p.first == key) {
+                if (std::shared_ptr<DeviceDataBase> live = p.second.lock()) return live;
+                std::shared_ptr<DeviceDataBase> fresh = new_container(key);
+                p.second                              = fresh;
+                return fresh;
+            }
+        std::shared_ptr<DeviceDataBase> fresh = new_container(key);
+        data.emplace_back(key, fresh);
+        return fresh;
     }
+
+    /// A merge: this variable survives and takes the live data of `other`'s keys it has none for (of the same kind:
+    /// ragged or not). The holders of `other` are rebound next and find them.
+    void adopt_containers(const VarMeta& other) {
+        for (const auto& p : other.data) {
+            const std::shared_ptr<DeviceDataBase> theirs = p.second.lock();
+            if (!theirs || data_on(p.first) || theirs->is_ragged_data() != is_ragged()) continue;
+            bool placed = false;
+            for (auto& mine : data)
+                if (mine.first == p.first) {
+                    mine.second = theirs;
+                    placed      = true;
+                    break;
+                }
+            if (!placed) data.emplace_back(p.first, theirs);
+        }
+    }
+
+    // ---- state -------------------------------------------------------------------------------------
+    /// The first materialization has happened.
+    bool is_materialized() const { return materialized; }
     /// A variable that is not materialized is always stale; a materialized one is stale after mark_stale()
     /// until its initializer has run again (docs/design-review-2026-10-03.md, section 5).
     bool is_stale() const { return !is_materialized() || stale_; }
@@ -646,18 +693,23 @@ public:
 
     virtual bool is_ragged() const noexcept { return false; }
 
-    /// Brings the variable's data into being on every device that has an instance, then initializes it or
-    /// copies it, as section 3 says. A no-op when everything is live and not stale.
-    virtual void materialize(Runtime& rt) = 0;
+    /// MATERIALIZATION (section 3). The FIRST one of a variable is global: it sizes EVERY live container to the shape
+    /// and, unless `trigger` (the holder that asked) is an output, runs the initializer on one placement (the tie's
+    /// init_device, else the trigger's, else the busiest device) and copies the result to the other containers. After
+    /// it a holder checks only ITS OWN container: an empty one is sized and copied from the first live container that
+    /// holds data. A stale variable (update_input) is initialized again in place. `trigger` may be null (a shape hook
+    /// reading a variable that is not materialized yet).
+    virtual void materialize(Runtime& rt, const Instance* trigger = nullptr) = 0;
 
-    /// The shape changed (and is known): resizes every live data in place (contents are kept, and the variable never
-    /// becomes stale) and rebuilds a ragged variable's index arrays. Called by set_dims.
+    /// The shape changed (and is known): resizes every live, bound container in place (contents are kept, and the
+    /// variable never becomes stale) and rebuilds a ragged variable's index arrays. Called by set_dims. Before the
+    /// first materialization it does nothing (materialize sizes everything).
     virtual void apply_shape(Runtime& rt) = 0;
 
-    /// Makes a placement that is MISSING live (a host view's, a new instance's) by copying from a live one. It NEVER
+    /// Makes `holder`'s own container live (a host view's, a new instance's) by copying from a live one. It NEVER
     /// initializes, even when the variable is stale (section 5: a view made after update_input shows the old values
-    /// until the next run). \throws std::logic_error when nothing holds data.
-    virtual void attach_missing(Runtime& rt) = 0;
+    /// until the next run). \throws std::logic_error when the variable is not materialized.
+    virtual void attach_holder(Runtime& rt, const Instance& holder) = 0;
 
 private:
     [[noreturn]] void shape_fail(const std::string& why) const {
@@ -805,181 +857,159 @@ public:
 
     Var(DType dt, int r, std::vector<DimRecord> def) : VarMeta{dt, r, std::move(def)} {}
 
-    void materialize(Runtime& rt) override {
+    std::shared_ptr<DeviceDataBase> new_container(const DataKey& key) const override { return std::make_shared<Data>(key); }
+
+    void materialize(Runtime& rt, const Instance* trigger) override {
         const std::vector<std::shared_ptr<Instance>> insts = live_instances();
         if (insts.empty()) return;
-        std::erase_if(data, [](const auto& p) { return p.second.expired(); });
-        adopt_live_data(insts);  // an instance that joined a key with live data (a second view, a rebuilt child) takes it
+        for (const auto& i : insts) refresh_container(*i);  // every holder has the container of its own key
 
-        // The keys that have an instance, and those among them without live data.
-        const std::vector<DataKey> needed  = keys_of(insts);
-        const std::vector<DataKey> missing = missing_of(needed);
+        if (!materialized) {
+            first_materialization(rt, trigger);
+            return;
+        }
+        // Materialized: a stale variable (update_input) is initialized again in place; then the holder that asked checks
+        // only its own container.
+        if (stale_ && !has_producer()) reinitialize(rt, trigger);
+        if (trigger != nullptr) populate(rt, std::static_pointer_cast<Data>(data_of(*trigger)));
+    }
 
-        const bool stale = is_stale();
-        if (!stale && missing.empty()) return;  // (c) nothing to do
+    void attach_holder(Runtime& rt, const Instance& holder) override {
+        if (!is_materialized())
+            throw std::logic_error("naga::cospan: '" + display_path() +
+                                   "' has no data: nothing that uses it has run, or its data was freed");
+        populate(rt, std::static_pointer_cast<Data>(data_of(holder)));
+    }
 
+    /// The shape changed and is known (set_dims): every live, bound container is resized in place (the prefix is kept)
+    /// and a ragged variable's index arrays follow. Nothing before the first materialization, which sizes everything.
+    void apply_shape(Runtime& rt) override {
+        if (!materialized) return;
+        for (const auto& d : live_containers(/*bound_only=*/true)) size_container(rt, *d);
+    }
+
+protected:
+    /// A ragged variable's index arrays follow the host shape. Nothing for a dense one.
+    virtual void fill_index(Runtime&, Data&, const DataKey&) {}
+
+private:
+    /// THE FIRST MATERIALIZATION (global): the shape, then every live container sized to it, then the initializer.
+    void first_materialization(Runtime& rt, const Instance* trigger) {
         // The shape: the dimensions the definition fixes, and for a variable nothing produces, its initializer's shape
         // (section 10). Anything still unknown is an error naming the dimension and who should set it.
         if (!shape.known) {
             fill_fixed_dims(rt);
             if (!has_producer()) resolve_free_shape(rt);
             if (!shape.known) throw shape_unknown();
-        } else if (stale && !has_producer()) {
-            resolve_free_shape(rt);  // update_input may have supplied a new shape
+        } else if (!has_producer()) {
+            resolve_free_shape(rt);  // an initializer's shape, or update_input's
         }
 
-        // A live data to copy from, if the variable is live somewhere already.
-        std::shared_ptr<Data> donor = live_donor();
+        // Size every live container (bound here: this is where the Runtime first reaches them).
+        const std::vector<std::shared_ptr<Data>> live = live_containers(/*bound_only=*/false);
+        for (const auto& d : live) size_container(rt, *d);
 
-        // Allocate on every missing key. The new data are held here until every instance has taken its own.
-        const std::vector<std::shared_ptr<Data>> fresh = allocate_missing(rt, insts, missing);
+        // Unless the holder that asked is an output (its producer writes the data), initialize and copy to the others.
+        // A variable with no initializer is all zeros already (a container is sized by value-initialization).
+        const bool output_asked = trigger != nullptr && kind_of(*trigger) == IOKind::output;
+        if (!output_asked && init) initialize(rt, live, trigger);
+        materialized = true;
+        stale_       = false;
+    }
 
-        // (a) Live elsewhere and not stale: a placement that comes back is a COPY of a live one, never recomputed.
-        if (!stale) {
-            if (donor)
-                for (const auto& d : fresh) {
-                    const std::vector<sycl::event> dev = donor->events();
-                    const sycl::event e = d->vec.assign(donor->vec, std::span<const sycl::event>{dev});
-                    donor->register_event(e);  // a later writer of the donor's copy waits for the read
-                    copy_index(*d, *donor);
-                }
-            return;
-        }
-
-        // (b) Stale (or never materialized): initialize on the init device, then copy to the other placements.
-        for (const auto& d : fresh) fill_index(rt, *d, d->key);
-        const sycl::device idev = pick_init_device();
-        DataKey            ikey = needed.front();
-        bool               found = false;
-        for (const DataKey& k : needed)
-            if (k.dev == idev && k.kind == sk::kind::device) {
-                ikey  = k;
-                found = true;
-                break;
-            }
-        if (!found)
-            for (const DataKey& k : needed)
-                if (k.dev == idev) {
-                    ikey  = k;
-                    found = true;
-                    break;
-                }
-        const std::shared_ptr<Data> idata = std::static_pointer_cast<Data>(data_on(ikey));
-
-        if (!has_producer()) {  // an output is never initialized: its producer writes it
-            std::vector<sycl::event> deps = events.write_deps(rt.forward);
-            {
-                const std::vector<sycl::event> own = idata->events();
-                deps.insert(deps.end(), own.begin(), own.end());
-            }
-            sycl::event e;
-            if (init) {
-                if (init->shape()) check_init_shape(*this, shape, *init->shape());
-                InitCtx ctx{*this, *idata, rt, deps};
-                e = init->apply(ctx);
-            } else {
-                e = idata->vec.fill(T{}, std::span<const sycl::event>{deps});
-            }
-            events.record_write(e);
-            idata->register_event(e);
-            const std::array<sycl::event, 1> after{e};
-            for (const DataKey& k : needed) {
-                if (k == ikey) continue;
-                const std::shared_ptr<Data> other = std::static_pointer_cast<Data>(data_on(k));
-                other->vec.assign(idata->vec, std::span<const sycl::event>{after});
-            }
-        }
+    /// A stale, materialized variable with no producer (update_input): the (possibly new) shape, then the initializer
+    /// again, in place, on the live containers that hold data.
+    void reinitialize(Runtime& rt, const Instance* trigger) {
+        resolve_free_shape(rt);  // update_input may have supplied a new shape (set_dims resizes the live containers)
+        const std::vector<std::shared_ptr<Data>> live = live_containers(/*bound_only=*/true);
+        if (!live.empty()) initialize(rt, live, trigger);
         stale_ = false;
     }
 
-    void attach_missing(Runtime& rt) override {
-        if (!is_materialized())
-            throw std::logic_error("naga::cospan: '" + display_path() +
-                                   "' has no data: nothing that uses it has run, or its data was freed");
-        std::erase_if(data, [](const auto& p) { return p.second.expired(); });
-        const std::vector<std::shared_ptr<Instance>> insts   = live_instances();
-        adopt_live_data(insts);
-        const std::vector<DataKey> missing = missing_of(keys_of(insts));
-        if (missing.empty()) return;
-        const std::shared_ptr<Data> donor = live_donor();
-        for (const auto& d : allocate_missing(rt, insts, missing)) {
-            const std::vector<sycl::event> dev = donor->events();
-            const sycl::event              e   = d->copy_from(*donor, dev);  // a ragged variable's index arrays follow
-            donor->register_event(e);                                         // a later writer of the donor's copy waits for the read
+    /// Runs the initializer (or zero-fills) on one of `live`, then copies the result to the others. The initializer is a
+    /// WRITER of its container: it waits on both its lists, and what it enqueued is registered as a write and, so that a
+    /// later kernel writer waits for it too, as a read.
+    void initialize(Runtime& rt, const std::vector<std::shared_ptr<Data>>& live, const Instance* trigger) {
+        const std::shared_ptr<Data> d = pick_init_container(live, trigger);
+        if (!d) return;
+        std::vector<sycl::event> deps = d->read_deps();
+        {
+            const std::vector<sycl::event> w = d->write_deps();
+            deps.insert(deps.end(), w.begin(), w.end());
+        }
+        sycl::event e;
+        if (init) {
+            if (init->shape()) check_init_shape(*this, shape, *init->shape());
+            InitCtx ctx{*this, *d, rt, deps};
+            e = init->apply(ctx);
+        } else {
+            e = d->v().fill(T{}, std::span<const sycl::event>{deps});
+        }
+        d->register_write(e);
+        d->register_read(e);
+        for (const auto& o : live) {
+            if (o == d) continue;
+            const sycl::event c = o->copy_from(*d, std::span<const sycl::event>{});  // waits on d's writes, incl. e
+            o->register_read(c);
         }
     }
 
-    /// The shape changed and is known (set_dims): every live data is resized in place (the prefix is kept) and a ragged
-    /// variable's index arrays follow.
-    void apply_shape(Runtime& rt) override {
-        const std::vector<sycl::event> base = events.peek_write_deps(rt.forward);
-        for (auto& entry : data) {
-            const std::shared_ptr<DeviceDataBase> b = entry.second.lock();
-            if (!b) continue;
-            const std::shared_ptr<Data> d = std::static_pointer_cast<Data>(b);
-            std::vector<sycl::event>    deps = base;
-            const std::vector<sycl::event> own = d->events();
-            deps.insert(deps.end(), own.begin(), own.end());
-            d->vec.resize(shape.elements(), std::span<const sycl::event>{deps});  // the prefix is kept
-            fill_index(rt, *d, d->key);
+    /// Where the initializer runs: the tie's init_device, else the holder that asked, else the busiest device (a
+    /// device-kind container preferred on it).
+    std::shared_ptr<Data> pick_init_container(const std::vector<std::shared_ptr<Data>>& live, const Instance* trigger) const {
+        const auto on = [&](const sycl::device& dev) -> std::shared_ptr<Data> {
+            std::shared_ptr<Data> any;
+            for (const auto& d : live) {
+                if (!(d->key.dev == dev)) continue;
+                if (d->key.kind == sk::kind::device) return d;
+                if (!any) any = d;
+            }
+            return any;
+        };
+        if (init_device)
+            if (std::shared_ptr<Data> d = on(*init_device)) return d;
+        if (trigger != nullptr) {
+            const std::shared_ptr<Data> t = std::static_pointer_cast<Data>(data_of(*trigger));
+            if (t && std::find(live.begin(), live.end(), t) != live.end()) return t;
         }
+        if (std::shared_ptr<Data> d = on(busiest_device())) return d;
+        return live.empty() ? nullptr : live.front();
     }
 
-protected:
-    /// Allocates this variable's data on `key` (its elements; a ragged variable adds its index arrays).
-    virtual std::shared_ptr<Data> make_data(Runtime& rt, const DataKey& key) {
-        return std::make_shared<Data>(key, sk::usm_vector<T>(shape.elements(), rt.allocator_for<T>(key.dev, key.kind)));
+    /// `own` is the holder's container. An empty one is bound, sized and copied from the first live container that
+    /// holds data (or, with none, just sized: a variable nothing wrote yet is zeros).
+    void populate(Runtime& rt, const std::shared_ptr<Data>& own) {
+        if (!own) return;
+        own->bind(rt);
+        // A ragged variable with no elements still has its index arrays (N + 1 zero offsets): size it, do not return.
+        if (own->size() != 0 || (shape.elements() == 0 && !is_ragged())) return;
+        for (const auto& p : data) {
+            const std::shared_ptr<DeviceDataBase> b = p.second.lock();
+            if (!b || b == own || !b->bound() || b->size() == 0) continue;
+            const sycl::event e = own->copy_from(*b, std::span<const sycl::event>{});  // sizes to the source; a ragged one's index follows
+            own->register_read(e);  // a later kernel writer of this container waits for the copy
+            return;
+        }
+        size_container(rt, *own);
     }
-    /// A ragged variable's index arrays follow the host shape. Nothing for a dense one.
-    virtual void fill_index(Runtime&, Data&, const DataKey&) {}
-    /// A ragged variable's index arrays copied from a donor's.
-    virtual void copy_index(Data&, Data&) {}
 
-private:
-    /// The distinct keys of the instances' placements.
-    static std::vector<DataKey> keys_of(const std::vector<std::shared_ptr<Instance>>& insts) {
-        std::vector<DataKey> keys;
-        for (const auto& i : insts) {
-            const DataKey k = key_of(*i);
-            if (std::find(keys.begin(), keys.end(), k) == keys.end()) keys.push_back(k);
-        }
-        return keys;
+    /// Binds `d` and sizes it to the shape (the prefix is kept; new elements are zero), then its index arrays. The
+    /// resize is the container's own write; it is also registered as a read, so that a kernel that writes the container
+    /// (a writer waits on the read list) comes after it.
+    void size_container(Runtime& rt, Data& d) {
+        d.bind(rt);
+        const std::size_t n = shape.elements();
+        if (d.size() != n) d.register_read(d.v().resize(n));
+        fill_index(rt, d, d.key);
     }
-    /// Hands the live data of its key to every instance that has none yet: a second host view on the host key, or a new or
-    /// rebuilt instance on a device that is already live. allocate_missing and missing_of only look at keys WITHOUT live
-    /// data, so nothing else would ever give such an instance its data.
-    void adopt_live_data(const std::vector<std::shared_ptr<Instance>>& insts) {
-        for (const auto& i : insts) {
-            if (has_data(*i)) continue;
-            if (std::shared_ptr<DeviceDataBase> d = data_on(key_of(*i))) give_data(*i, std::move(d));
-        }
-    }
-    /// Those among `keys` without live data.
-    std::vector<DataKey> missing_of(const std::vector<DataKey>& keys) const {
-        std::vector<DataKey> missing;
-        for (const DataKey& k : keys)
-            if (!data_on(k)) missing.push_back(k);
-        return missing;
-    }
-    /// The first live data, if any.
-    std::shared_ptr<Data> live_donor() const {
+
+    /// The live data (every key that has one), optionally only those already bound to the Runtime.
+    std::vector<std::shared_ptr<Data>> live_containers(bool bound_only) const {
+        std::vector<std::shared_ptr<Data>> out;
         for (const auto& p : data)
-            if (std::shared_ptr<DeviceDataBase> b = p.second.lock()) return std::static_pointer_cast<Data>(b);
-        return nullptr;
-    }
-    /// Allocates the data of every missing key and hands each to the instances on that key (the shared step of
-    /// materialize and attach_missing). The metadata keeps them weakly: the caller holds the returned pointers.
-    std::vector<std::shared_ptr<Data>> allocate_missing(Runtime& rt, const std::vector<std::shared_ptr<Instance>>& insts,
-                                                        const std::vector<DataKey>& missing) {
-        std::vector<std::shared_ptr<Data>> fresh;
-        for (const DataKey& k : missing) {
-            std::shared_ptr<Data> d = make_data(rt, k);
-            data.emplace_back(k, std::weak_ptr<DeviceDataBase>{d});
-            fresh.push_back(d);
-            for (const auto& i : insts)
-                if (key_of(*i) == k) give_data(*i, d);
-        }
-        return fresh;
+            if (std::shared_ptr<DeviceDataBase> b = p.second.lock())
+                if (!bound_only || b->bound()) out.push_back(std::static_pointer_cast<Data>(b));
+        return out;
     }
 };
 
@@ -995,52 +1025,33 @@ public:
 
     bool is_ragged() const noexcept override { return true; }
 
-protected:
-    std::shared_ptr<Data> make_data(Runtime& rt, const DataKey& key) override {
-        auto d = std::make_shared<RaggedDeviceData<T>>(
-            key, sk::usm_vector<T>(this->shape.elements(), rt.allocator_for<T>(key.dev, key.kind)));
-        const auto alloc = rt.allocator_for<std::uint64_t>(key.dev, key.kind);
-        d->offs.emplace(alloc);
-        if (this->shape.per) d->per.emplace(alloc);
-        return d;
+    std::shared_ptr<DeviceDataBase> new_container(const DataKey& key) const override {
+        return std::make_shared<RaggedDeviceData<T>>(key);
     }
+
+protected:
 
     /// The offsets and the counts, from the resolved shape (rank 2): host counts from the host array (from_host: the same
     /// rules as the dense path); a device-sourced dimension from its DeviceColumn, assigned across (SlabKit routes it
     /// between devices) after the column's event (section 10). Nothing here touches the host for a hooked ragged shape.
-    void fill_index(Runtime& rt, Data& base, const DataKey& key) override {
+    void fill_index(Runtime& rt, Data& base, const DataKey&) override {
         const ResolvedShape& s = this->shape;
         if (!s.ragged()) return;
-        auto&      d     = static_cast<RaggedDeviceData<T>&>(base);
-        const auto alloc = rt.allocator_for<std::uint64_t>(key.dev, key.kind);
-        if (!d.offs) d.offs.emplace(alloc);
-        if (!d.per) d.per.emplace(alloc);
+        auto& d = static_cast<RaggedDeviceData<T>&>(base);
+        d.bind(rt);  // the index arrays
         if (s.dev_per) {
+            // assign waits on the column's writes (build_column registered its task as one) and registers the read, so a
+            // later rebuild of the column waits for it.
             const DeviceColumn&              col = *s.dev_per;
             const std::array<sycl::event, 1> dep{col.ev};
-            const sycl::event e = d.per->assign(*col.extents, std::span<const sycl::event>{dep});
-            col.extents->register_event(e);  // a later rebuild of the column waits for this read
-            const sycl::event a = d.offs->assign(*col.offs, std::span<const sycl::event>{dep});  // resizes to n + 1
-            col.offs->register_event(a);
+            d.per->assign(*col.extents, std::span<const sycl::event>{dep});
+            d.offs->assign(*col.offs, std::span<const sycl::event>{dep});  // resizes to n + 1
             return;
         }
         const std::vector<std::uint64_t> conv(s.per_index.begin(), s.per_index.end());
         d.per->from_host(std::span<const std::uint64_t>{conv});
         const std::vector<std::uint64_t> offs = s.block_offsets();
         d.offs->from_host(std::span<const std::uint64_t>{offs});
-    }
-
-    void copy_index(Data& dst, Data& src) override {
-        auto& D = static_cast<RaggedDeviceData<T>&>(dst);
-        auto& S = static_cast<RaggedDeviceData<T>&>(src);
-        const auto assign = [](std::optional<sk::usm_vector<std::uint64_t>>& to,
-                               const std::optional<sk::usm_vector<std::uint64_t>>& from) {
-            if (!to || !from) return;
-            const std::vector<sycl::event> ev = from->events();
-            to->assign(*from, std::span<const sycl::event>{ev});
-        };
-        assign(D.offs, S.offs);
-        assign(D.per, S.per);
     }
 };
 

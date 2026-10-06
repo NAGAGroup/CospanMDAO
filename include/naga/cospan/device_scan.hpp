@@ -62,9 +62,16 @@ inline sycl::event exclusive_scan_u64(Runtime& rt, const sycl::device& dev, cons
     std::uint64_t*                s = sums.data();
     std::uint64_t*                b = block_offs.data();
 
+    // These two are private to this call and kernels write them right after the container's own zero-fill, so a kernel
+    // here waits on BOTH of a container's lists (writes never wait on writes, and the fill is a write).
+    const auto both = [](const sk::usm_vector<std::uint64_t>& c, std::vector<sycl::event>& into) {
+        for (const sycl::event& e : c.read_deps()) into.push_back(e);
+        for (const sycl::event& e : c.write_deps()) into.push_back(e);
+    };
+
     // (a) each work-group scans its chunk and writes its sum
     std::vector<sycl::event> da = deps;
-    for (const sycl::event& e : sums.events()) da.push_back(e);
+    both(sums, da);
     const sycl::event ev_a = rt.uq.parallel_for(
         dev, da, sycl::nd_range<1>{sycl::range<1>{groups * wg}, sycl::range<1>{wg}}, [=](sycl::nd_item<1> it) {
             const std::size_t   i     = it.get_global_id(0);
@@ -74,14 +81,14 @@ inline sycl::event exclusive_scan_u64(Runtime& rt, const sycl::device& dev, cons
             if (i < n) out[i] = ex;
             if (it.get_local_id(0) == 0) s[it.get_group(0)] = chunk;
         });
-    sums.register_event(ev_a);
+    sums.register_write(ev_a);
 
     // (b) the block sums, scanned the same way (recursively when they need more than one work-group)
     std::vector<sycl::event> db{ev_a};
-    for (const sycl::event& e : block_offs.events()) db.push_back(e);
+    both(block_offs, db);
     const sycl::event ev_b = exclusive_scan_u64(rt, dev, db, s, b, groups);
-    sums.register_event(ev_b);
-    block_offs.register_event(ev_b);
+    sums.register_read(ev_b);
+    block_offs.register_write(ev_b);
 
     // (c) each chunk gets its block's offset; out[n] is the total
     const std::vector<sycl::event> dc{ev_a, ev_b};
@@ -92,8 +99,8 @@ inline sycl::event exclusive_scan_u64(Runtime& rt, const sycl::device& dev, cons
         else
             out[n] = b[groups];
     });
-    sums.register_event(ev_c);
-    block_offs.register_event(ev_c);
+    sums.register_read(ev_c);  // the frees of both wait for every kernel above
+    block_offs.register_read(ev_c);
     return ev_c;
 }
 
