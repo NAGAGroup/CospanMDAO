@@ -846,9 +846,11 @@ TEST_CASE("Memory report: a static model computes; the pool report after setup a
     // capacity rounded up to whole nodes. The live containers after a forward are the four distinct roots (the peers
     // cvt.a, comb.e, comb.b/c and the promoted out share their root's container): 400, 512, 32 and 64 bytes, a node each.
     CHECK(after_fwd.pool_bytes == (std::size_t{1} << 20));  // a pool is sized up front
+    // Plus what each of the three kernel components keeps for its own launch (argument, pointer and geometry arrays).
     CHECK(after_fwd.pool_bytes_in_use == cst::pool_bytes_of(tmod::kGenBytes) + cst::pool_bytes_of(tmod::kCvtBytes) +
-                                             cst::pool_bytes_of(tmod::kBcBytes) + cst::pool_bytes_of(tmod::kOutBytes));
-    CHECK(after_fwd.pool_bytes_in_use == 4 * cst::pool_node_bytes);
+                                             cst::pool_bytes_of(tmod::kBcBytes) + cst::pool_bytes_of(tmod::kOutBytes) +
+                                             cst::solo_launch_bytes(3));
+    CHECK(after_fwd.pool_bytes_in_use == 4 * cst::pool_node_bytes + cst::solo_launch_bytes(3));
     CHECK(after_fwd.os_allocations == 0);  // everything came from the pool
 }
 
@@ -891,8 +893,9 @@ TEST_CASE("Pool: a value-driven root allocates from the pool and follows update_
         const auto rep = tmod::report_on(model, dev);
         std::printf("[pool] n=%u: pool %zu B, in use %zu B\n", n, rep.pool_bytes, rep.pool_bytes_in_use);
         // Three live containers: bins.n (u32[1]), bins.ref (f32[n], sized by the hook) and bins.bins (f32[n]).
-        CHECK(rep.pool_bytes_in_use == cst::pool_bytes_of(sizeof(std::uint32_t)) + 2 * cst::pool_bytes_of(n * sizeof(float)));
-        CHECK(rep.pool_bytes_in_use == 3 * cst::pool_node_bytes);
+        // ... and the launch arrays of the one kernel component (bins).
+        CHECK(rep.pool_bytes_in_use == cst::pool_bytes_of(sizeof(std::uint32_t)) + 2 * cst::pool_bytes_of(n * sizeof(float)) + cst::solo_launch_bytes(1));
+        CHECK(rep.pool_bytes_in_use == 3 * cst::pool_node_bytes + cst::solo_launch_bytes(1));
         const auto bins = to_vector(cst::synced_output<DType::f32, 1>(model, "bins.bins"));
         REQUIRE(bins.size() == n);
         for (std::size_t i = 0; i < bins.size(); ++i) CHECK(bins[i] == static_cast<float>(i + 1));
@@ -905,8 +908,8 @@ TEST_CASE("Pool: a value-driven root allocates from the pool and follows update_
         const auto rep = tmod::report_on(model, dev);
         std::printf("[pool] n=%u: pool %zu B, in use %zu B\n", n, rep.pool_bytes, rep.pool_bytes_in_use);
         // 12000 B is twelve nodes (12288 B); the old, smaller storage was freed when the containers grew.
-        CHECK(rep.pool_bytes_in_use == cst::pool_bytes_of(sizeof(std::uint32_t)) + 2 * cst::pool_bytes_of(n * sizeof(float)));
-        CHECK(rep.pool_bytes_in_use == cst::pool_node_bytes + 2 * 12 * cst::pool_node_bytes);
+        CHECK(rep.pool_bytes_in_use == cst::pool_bytes_of(sizeof(std::uint32_t)) + 2 * cst::pool_bytes_of(n * sizeof(float)) + cst::solo_launch_bytes(1));
+        CHECK(rep.pool_bytes_in_use == cst::pool_node_bytes + 2 * 12 * cst::pool_node_bytes + cst::solo_launch_bytes(1));
         const auto bins = to_vector(cst::synced_output<DType::f32, 1>(model, "bins.bins"));
         REQUIRE(bins.size() == n);
         bool ok = true;

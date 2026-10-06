@@ -1,21 +1,34 @@
 #pragma once
 
 // =============================================================================
-// naga/cospan/kernel.hpp — kernel machinery (r02 sections 4 and 5)
+// naga/cospan/kernel.hpp — kernel machinery (design review, sections 4 and 11.6)
 // =============================================================================
 //
-// The KernelBody contract (concepts read off the call operator's signature),
-// GroupItem, Local layout, the stage record and its cursor, the generated
-// device function kb_fn<KB>, the placeholders the JIT replaces, and the outer
-// launch helper. All header-only: placeholders, outer kernels and stages
-// instantiate in the consumer's translation unit (D2, D4).
+// The KernelBody contract (concepts read off the call operator's signature), GroupItem, the Local layout, the
+// per-component argument struct (StageArgs) and the per-stage geometry entry (StageGeometry), the STAGE FUNCTION
+// stage_fn<KB> (one per body type), the placeholder run_stages_rN the JIT replaces, and the group launch helper.
+// All header-only: placeholders, outer kernels and stage functions instantiate in the consumer's translation unit.
+//
+// THE LAUNCH PATH (every plain-body and group-body component, bare or in a fused group; custom-op and host bodies keep
+// their own). ONE generic kernel per rank calls the declared dynamic function
+//     run_stages_rN(StageItem<R>, const StageGeometry* geometry, const void* const* args, int stage)
+// whose definition is an INDEXED CALL SEQUENCE of stage functions: stage k of the sequence is called with the same
+// arguments and `stage` = k (fork: define_as_indexed_call_sequence(&run_stages, {ids...}, 3)). A stage function reads
+// geometry[k] and args[k] (its own StageArgs, a one-element device array every component keeps), builds the item
+// wrapper (GroupItem) and calls the user's body. The configuration of a sequence lives in a process-wide cache
+// (group_config), created once per distinct sequence and never destroyed: the runtime reads a configuration on a worker
+// thread after the submission, and a transient group can be deleted before its kernel has even been compiled.
 
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -51,17 +64,61 @@ struct CustomOp {
 struct Host {};
 
 // -----------------------------------------------------------------------------
+// Segment options: cs::segment<cs::local_mem::shared, cs::range_mode::whole>(descs...)
+// -----------------------------------------------------------------------------
+
+/// Local memory of a segment. partitioned (the default): every stage gets its own slice, the segment's size is the sum.
+/// shared: every stage gets the same block, the size is the max.
+namespace local_mem {
+struct partitioned {};
+struct shared {};
+}  // namespace local_mem
+
+/// Range of a segment. own (the default): a stage runs only for its first N groups of the segment's block and skips the
+/// rest. whole: every stage runs for every group of the block.
+namespace range_mode {
+struct own {};
+struct whole {};
+}  // namespace range_mode
+
+namespace detail {
+enum class LocalMem : std::uint8_t { partitioned = 0, shared = 1 };
+enum class RangeMode : std::uint8_t { own = 0, whole = 1 };
+
+/// One entry per stage, in a device array the group owns and refills every forward. Followed (after `stages` entries) by
+/// the segment table: one std::uint64_t per segment, that segment's block of groups.
+struct StageGeometry {
+    std::uint64_t group_count    = 0;  ///< this stage's own number of groups
+    std::uint64_t group_base     = 0;  ///< the groups before this stage's segment
+    std::uint64_t segment_groups = 0;  ///< this segment's block (the largest group count of its stages)
+    void*         ticket_state   = nullptr;  ///< null: no boundary primitive (none exists yet)
+    std::uint32_t segment        = 0;
+    std::uint32_t segments       = 0;
+    std::uint32_t stages         = 0;  ///< the number of stage entries (where the segment table starts)
+    std::uint32_t local_offset   = 0;  ///< bytes into the launch's local block
+    std::uint32_t local_bytes    = 0;  ///< this stage's slice
+    std::uint32_t range_mode     = 0;  ///< RangeMode
+};
+static_assert(std::is_trivially_copyable_v<StageGeometry>);
+static_assert(sizeof(StageGeometry) % 8 == 0);
+
+/// The native item of a stage function: the nd_item and the launch's local block (the one thing a stage function cannot
+/// obtain by itself).
+template <int R>
+struct StageItem {
+    sycl::nd_item<R> item;
+    std::byte*       local;
+};
+
+struct ItemFixup;
+}  // namespace detail
+
+// -----------------------------------------------------------------------------
 // GroupItem<R>
 // -----------------------------------------------------------------------------
 
-struct StageRecord;
-
-namespace detail {
-struct ItemFixup;
-}
-
-/// What a group body receives: the API of sycl::nd_item<R> with every
-/// group-level index STAGE-LOCAL. Local ids and ranges are the physical ones.
+/// What a group body receives: the API of sycl::nd_item<R> with every group-level index relative to the stage's SEGMENT
+/// (group ids count from 0 within the segment's block). Local ids and ranges are the physical ones.
 template <int R>
 struct GroupItem {
     sycl::id<R>    get_local_id() const { return it_.get_local_id(); }
@@ -74,6 +131,7 @@ struct GroupItem {
     std::size_t    get_group(int d) const { return group_id_[d]; }
     sycl::range<R> get_group_range() const { return group_range_; }
     std::size_t    get_group_range(int d) const { return group_range_[d]; }
+    /// The group's index within its segment, from 0.
     std::size_t    get_group_linear_id() const {
         std::size_t l = 0;
         for (int d = 0; d < R; ++d) l = l * group_range_[d] + group_id_[d];
@@ -101,57 +159,58 @@ struct GroupItem {
         return l;
     }
 
+    /// The segment this stage belongs to, and how many segments the launch has.
+    std::size_t get_segment() const { return segment_; }
+    std::size_t get_segment_count() const { return segments_; }
+    /// Segment `s`'s block of groups (the same for every stage of the segment).
+    std::size_t get_segment_group_count(std::size_t s) const { return segment_groups_[s]; }
+
+    /// `n` elements of T from this stage's slice of the launch's local memory (a typed bump allocator: each call hands out
+    /// the next aligned bytes, after the stage's Scratch). nullptr when the slice, as the stage requested it in its launch
+    /// config (request_local_bytes), is exhausted. In a `shared` segment every stage's slice is the same block, so stages
+    /// that allocate the same way see the same memory.
+    template <class T>
+    T* local(std::size_t n) {
+        const std::size_t off = (used_ + alignof(T) - 1) / alignof(T) * alignof(T);
+        const std::size_t end = off + n * sizeof(T);
+        if (end > cap_) return nullptr;
+        used_ = static_cast<std::uint32_t>(end);
+        return reinterpret_cast<T*>(base_ + off);
+    }
+
     /// The PHYSICAL group, for group functions (barriers, reductions).
     sycl::group<R>  get_group() const { return it_.get_group(); }
     sycl::sub_group get_sub_group() const { return it_.get_sub_group(); }
 
 private:
-    GroupItem(const sycl::nd_item<R>& it, const sycl::id<R>& gid, const sycl::range<R>& grange)
-        : it_{it}, group_id_{gid}, group_range_{grange} {}
+    GroupItem(const sycl::nd_item<R>& it, const sycl::id<R>& gid, const sycl::range<R>& grange, std::uint32_t segment,
+              std::uint32_t segments, const std::uint64_t* segment_groups, std::byte* base, std::uint32_t used, std::uint32_t cap)
+        : it_{it}, group_id_{gid}, group_range_{grange}, segment_{segment}, segments_{segments}, segment_groups_{segment_groups},
+          base_{base}, used_{used}, cap_{cap} {}
 
-    sycl::nd_item<R> it_;
-    sycl::id<R>      group_id_;     // stage-local
-    sycl::range<R>   group_range_;  // this stage's group grid
+    sycl::nd_item<R>     it_;
+    sycl::id<R>          group_id_;     // within the segment
+    sycl::range<R>       group_range_;  // this stage's group grid
+    std::uint32_t        segment_;
+    std::uint32_t        segments_;
+    const std::uint64_t* segment_groups_;
+    std::byte*           base_;  // this stage's slice of the local block
+    std::uint32_t        used_;
+    std::uint32_t        cap_;
     friend struct detail::ItemFixup;
 };
 
 // -----------------------------------------------------------------------------
-// StageRecord, FnOffsetInfo (r02 section 5)
+// Launch facts a fused owner reads off a kernel description
 // -----------------------------------------------------------------------------
 
-struct StageRecord {
-    sycl::range<3> range{1, 1, 1};        ///< logical iteration space, 1-padded
-    std::size_t    flat_extent = 0;       ///< product of range
-    std::size_t    group_offset = 0;      ///< System-stamped
-    std::size_t    group_count = 0;       ///< System-stamped
-    sycl::range<3> group_range{1, 1, 1};  ///< System-stamped; group_count is its product
-    uint32_t       input_off = 0;
-    uint32_t       output_off = 0;
-    uint32_t       body_off = 0;
-    uint32_t       scratch_off = 0;
-    uint32_t       scratch_bytes = 0;
-    uint32_t       local_off = 0;         ///< owner-stamped: this stage's byte offset into the launch's local buffer (individual launches: 0)
-    uint8_t        rank = 0;
-};
-
-static_assert(std::is_trivially_copyable_v<StageRecord>);
-
-/// Position-as-identity for the chained executor: every stage function's
-/// FIRST, unconditional statement is info.next().
-struct FnOffsetInfo {
-    const StageRecord* records;
-    uint32_t           i;
-    const StageRecord& next() { return records[i++]; }
-};
-
-/// What a fused owner reads off a kernel description.
+/// What a group launcher reads off a kernel description.
 struct KernelParts {
-    int                                 rank        = 0;
-    bool                                group_body  = false;
-    bool                                has_scratch = false;
-    StageRecord                         record;  ///< offsets 0-relative; group_* stamped by the owner
-    std::span<const std::byte>          inputs, outputs, body, scratch;
-    std::optional<sycl::range<3>>       wg;
+    int                           rank        = 0;
+    bool                          group_body  = false;
+    std::size_t                   flat_extent = 0;  ///< the stage's iteration space (0: nothing to run)
+    std::size_t                   local_bytes = 0;  ///< the stage's slice: its Scratch plus the bytes it requested, each rounded to 16
+    std::optional<sycl::range<3>> wg;               ///< the work-group shape the stage asked for, if any
 };
 
 // -----------------------------------------------------------------------------
@@ -395,6 +454,19 @@ constexpr sycl::id<R> delinearize(std::size_t flat, const sycl::range<3>& r) {
     return idx;
 }
 
+/// The same, but dimension 0 is not wrapped: a flat index past the range gives a dimension-0 index past it (a `whole`
+/// segment runs a stage over groups beyond its own grid).
+template <int R>
+constexpr sycl::id<R> delinearize_open(std::size_t flat, const sycl::range<3>& r) {
+    sycl::id<R> idx;
+    for (int d = R - 1; d >= 1; --d) {
+        idx[d] = flat % r[d];
+        flat /= r[d];
+    }
+    idx[0] = flat;
+    return idx;
+}
+
 template <int R>
 constexpr sycl::range<R> first_dims(const sycl::range<3>& r) {
     if constexpr (R == 1)
@@ -405,102 +477,176 @@ constexpr sycl::range<R> first_dims(const sycl::range<3>& r) {
         return r;
 }
 
-/// The sole constructor of GroupItem (friendship): the stage-local view of the
-/// physical item. Stage-local group = physical linear group - group_offset,
-/// delinearized over the stage's group grid.
+template <int R>
+sycl::range<3> pad3(const sycl::range<R>& r) {
+    sycl::range<3> out{1, 1, 1};
+    for (int d = 0; d < R; ++d) out[d] = r[d];
+    return out;
+}
+
+// -----------------------------------------------------------------------------
+// StageArgs: the argument struct of a component (body, inputs, outputs, scratch, launch parameters)
+// -----------------------------------------------------------------------------
+
+struct NoScratch {};
+
+template <class KB>
+struct scratch_of {
+    using type = NoScratch;
+};
+template <class KB>
+    requires HasScratch<KB>
+struct scratch_of<KB> {
+    using type = typename KB::Scratch;
+};
+template <class KB>
+using scratch_t = typename scratch_of<KB>::type;
+
+/// The Scratch argument of a body that has none.
+template <class KB>
+scratch_t<KB> NoScratchValue() {
+    return scratch_t<KB>{};
+}
+
+/// Everything a stage function reads of its component: trivially copyable, one element in a device array the component
+/// keeps, copied in from a host member every forward. `group_range` is set by the group launcher once the group's
+/// work-group shape is known.
+template <class KB>
+struct StageArgs {
+    StageArgs(typename KB::Inputs i, typename KB::Outputs o, KB b, scratch_t<KB> s) : in{i}, out{o}, body{b}, scratch{s} {}
+
+    sycl::range<3> range{1, 1, 1};        ///< the logical iteration space, 1-padded
+    sycl::range<3> group_range{1, 1, 1};  ///< the stage's own group grid (a plain body: {groups, 1, 1})
+    std::uint64_t  flat_extent   = 0;     ///< the product of range
+    std::uint32_t  scratch_bytes = 0;     ///< the laid-out Scratch, rounded to 16
+    typename KB::Inputs  in;
+    typename KB::Outputs out;
+    KB                   body;
+    scratch_t<KB>        scratch;
+};
+
+/// The stage-local view of the physical item. The group id is the physical linear group minus the segment's first group,
+/// delinearized over the stage's group grid (a `whole` segment widens dimension 0 to cover the block).
 struct ItemFixup {
     template <int R>
-    static GroupItem<R> make(const sycl::nd_item<R>& it, const StageRecord& r) {
-        const std::size_t local_group = it.get_group_linear_id() - r.group_offset;
-        return GroupItem<R>{it, delinearize<R>(local_group, r.group_range),
-                            first_dims<R>(r.group_range)};
+    static GroupItem<R> make(const StageItem<R>& si, const StageGeometry& g, const std::uint64_t* segment_groups,
+                             std::size_t segment_group, const sycl::range<3>& grange, std::uint32_t free_off) {
+        sycl::range<3> gr = grange;
+        if (g.range_mode == static_cast<std::uint32_t>(RangeMode::whole)) {
+            const std::size_t per = gr[1] * gr[2];
+            gr[0]                 = per ? (g.segment_groups + per - 1) / per : g.segment_groups;
+        }
+        return GroupItem<R>{si.item,       delinearize_open<R>(segment_group, gr), first_dims<R>(gr),
+                            g.segment,     g.segments,                            segment_groups,
+                            si.local + g.local_offset, free_off,                   g.local_bytes};
     }
 };
 
 }  // namespace detail
 
 // -----------------------------------------------------------------------------
-// The generated device function and its placeholders (r02 section 5)
+// The placeholders, the stage function and the launch (design review, 11.6)
 // -----------------------------------------------------------------------------
 
-/// Placeholders: one per launch rank; declarations only, the JIT replaces them.
-SYCL_EXTERNAL void kb_entry_r1(sycl::nd_item<1>, FnOffsetInfo&, const std::byte*, std::byte*,
-                               const std::byte*, std::byte*);
-SYCL_EXTERNAL void kb_entry_r2(sycl::nd_item<2>, FnOffsetInfo&, const std::byte*, std::byte*,
-                               const std::byte*, std::byte*);
-SYCL_EXTERNAL void kb_entry_r3(sycl::nd_item<3>, FnOffsetInfo&, const std::byte*, std::byte*,
-                               const std::byte*, std::byte*);
+/// Placeholders: one per launch rank; declarations only, the JIT replaces them with the indexed call sequence.
+[[clang::noinline]] SYCL_EXTERNAL void run_stages_r1(detail::StageItem<1>, const detail::StageGeometry*, const void* const*, int);
+[[clang::noinline]] SYCL_EXTERNAL void run_stages_r2(detail::StageItem<2>, const detail::StageGeometry*, const void* const*, int);
+[[clang::noinline]] SYCL_EXTERNAL void run_stages_r3(detail::StageItem<3>, const detail::StageGeometry*, const void* const*, int);
 
-/// One stage function per KernelBody type, at the body's rank.
+/// ONE stage function per KernelBody type, at the body's rank. Every instantiation has the same signature: (the native
+/// item, the geometry array, the argument-pointer array, the stage index). All the conditions below are group-uniform.
 template <class KB>
-SYCL_EXTERNAL void kb_fn(sycl::nd_item<kernel_rank_v<KB>> it, FnOffsetInfo& info,
-                         const std::byte* inputs, std::byte* outputs, const std::byte* bodies,
-                         std::byte* local_base) {
+SYCL_EXTERNAL void stage_fn(detail::StageItem<kernel_rank_v<KB>> si, const detail::StageGeometry* geometry,
+                            const void* const* args, int k) {
     constexpr int R = kernel_rank_v<KB>;
-    // LAW: the cursor advance is the first statement and unconditional.
-    const StageRecord& r = info.next();
+    const detail::StageGeometry& g = geometry[k];
+    const auto&                  a = *static_cast<const detail::StageArgs<KB>*>(args[k]);
+    const sycl::nd_item<R>&      it = si.item;
 
-    // Whole-group slice check: group-uniform by construction.
+    // This stage's block: the segment's groups only; `own` also stops at the stage's own group count.
     const std::size_t glid = it.get_group_linear_id();
-    if (glid < r.group_offset || glid - r.group_offset >= r.group_count) return;
+    if (g.group_count == 0 || glid < g.group_base) return;
+    const std::size_t seg_group = glid - g.group_base;
+    if (seg_group >= g.segment_groups) return;
+    if (g.range_mode == static_cast<std::uint32_t>(detail::RangeMode::own) && seg_group >= g.group_count) return;
 
-    // Stage-local flat index, contiguous per stage under any geometry.
-    const std::size_t flat =
-        (glid - r.group_offset) * it.get_local_range().size() + it.get_local_linear_id();
+    auto in   = a.in;
+    auto out  = a.out;
+    auto body = a.body;
 
-    // id-only bodies: the tail mask is here; the body sees only its range.
-    if constexpr (PlainBody<KB>)
-        if (flat >= r.flat_extent) return;
-
-    auto in   = *reinterpret_cast<const typename KB::Inputs*>(inputs + r.input_off);
-    auto out  = *reinterpret_cast<const typename KB::Outputs*>(outputs + r.output_off);
-    auto body = *reinterpret_cast<const KB*>(bodies + r.body_off);
-
-    if constexpr (HasScratch<KB>) {
-        GroupItem<R> gi = detail::ItemFixup::make(it, r);
-        auto s = *reinterpret_cast<const typename KB::Scratch*>(bodies + r.scratch_off);
-        detail::fixup_scratch(s, local_base + r.local_off);  // this stage's own slice of the local buffer
-        body(gi, in, out, s);
-    } else if constexpr (GroupBody<KB>) {
-        GroupItem<R> gi = detail::ItemFixup::make(it, r);
-        body(gi, in, out);
-    } else {
-        const auto idx = detail::delinearize<R>(flat, r.range);
+    if constexpr (PlainBody<KB>) {
+        // The stage's flat index, contiguous under any geometry; the tail mask is here, the body sees only its range.
+        const std::size_t flat = seg_group * it.get_local_range().size() + it.get_local_linear_id();
+        if (flat >= a.flat_extent) return;
+        const auto idx = detail::delinearize<R>(flat, a.range);
         body(idx, in, out);
+    } else if constexpr (HasScratch<KB>) {
+        const std::uint64_t* seg = reinterpret_cast<const std::uint64_t*>(geometry + g.stages);
+        GroupItem<R>         gi  = detail::ItemFixup::make(si, g, seg, seg_group, a.group_range, a.scratch_bytes);
+        auto                 s   = a.scratch;
+        detail::fixup_scratch(s, si.local + g.local_offset);  // this stage's own slice of the local block
+        body(gi, in, out, s);
+    } else {
+        const std::uint64_t* seg = reinterpret_cast<const std::uint64_t*>(geometry + g.stages);
+        GroupItem<R>         gi  = detail::ItemFixup::make(si, g, seg, seg_group, a.group_range, a.scratch_bytes);
+        body(gi, in, out);
     }
 }
 
 namespace detail {
 
-/// The dynamic_function_config of a kernel-body type: ONE per KB, built once, with static lifetime. The runtime
-/// reads a config on a worker thread AFTER the kernel is submitted, so it must outlive every component and every
-/// launch in flight; a function-local static does, which is why no retire list is needed
-/// (docs/design-review-2026-10-03.md, section 3). Only plain and group bodies have one (custom-op and host
-/// bodies compile no kernel).
+using JitId = sycl::AdaptiveCpp_jit::dynamic_function_id;
+
+/// The signature of the placeholder and of every stage function, as the type-erased id types need it.
+template <int R>
+using run_stages_fn_t = sycl::AdaptiveCpp_jit::dynamic_function<void, StageItem<R>, const StageGeometry*, const void* const*, int>;
+template <int R>
+using stage_def_t = sycl::AdaptiveCpp_jit::dynamic_function_definition<void, StageItem<R>, const StageGeometry*, const void* const*, int>;
+
+/// The id of stage_fn<KB>: what a group puts in its call sequence. Obtained once per body type, through a function-local
+/// static; the component reaches it through a virtual.
 template <class KB>
-sycl::AdaptiveCpp_jit::dynamic_function_config& jit_config() {
-    constexpr int R = kernel_rank_v<KB>;
-    static sycl::AdaptiveCpp_jit::dynamic_function_config cfg;
-    static const bool defined = [] {
-        if constexpr (R == 1)
-            cfg.define(&kb_entry_r1, &kb_fn<KB>);
-        else if constexpr (R == 2)
-            cfg.define(&kb_entry_r2, &kb_fn<KB>);
-        else
-            cfg.define(&kb_entry_r3, &kb_fn<KB>);
-        return true;
-    }();
-    (void)defined;
-    return cfg;
+JitId stage_definition_id() {
+    static const JitId id = stage_def_t<kernel_rank_v<KB>>{&stage_fn<KB>}.id();
+    return id;
 }
 
-}  // namespace detail
+/// The id of the placeholder of rank `rank` (1..3).
+inline JitId run_stages_id(int rank) {
+    switch (rank) {
+        case 1: return run_stages_fn_t<1>{&run_stages_r1}.id();
+        case 2: return run_stages_fn_t<2>{&run_stages_r2}.id();
+        case 3: return run_stages_fn_t<3>{&run_stages_r3}.id();
+        default: break;
+    }
+    throw std::logic_error("naga::cospan: no kernel of that rank");
+}
 
-// -----------------------------------------------------------------------------
-// The outer launch (individual: one-stage wave)
-// -----------------------------------------------------------------------------
+/// The dynamic_function_config of a stage sequence: ONE per distinct (rank, sequence of stage definitions), created
+/// the first time and NEVER destroyed. A config must outlive every kernel that uses it (the runtime reads it on a worker
+/// thread after the submission, possibly before the kernel has been compiled), and a transient group that used it can be
+/// deleted at any moment, so the cache is process-wide and leaked on purpose. The key is the definitions' symbol names
+/// (an id's handle is its name).
+inline sycl::AdaptiveCpp_jit::dynamic_function_config& group_config(int rank, const std::vector<JitId>& defs) {
+    using Config = sycl::AdaptiveCpp_jit::dynamic_function_config;
+    struct Cache {
+        std::mutex                                                                  mu;
+        std::map<std::pair<int, std::vector<std::string>>, std::unique_ptr<Config>> map;
+    };
+    static Cache* const cache = new Cache;  // never destroyed
 
-namespace detail {
+    std::vector<std::string> names;
+    names.reserve(defs.size());
+    for (const JitId& d : defs) names.emplace_back(reinterpret_cast<const char*>(d.get_handle()));
+
+    const std::lock_guard<std::mutex> lock{cache->mu};
+    std::unique_ptr<Config>&          slot = cache->map[{rank, std::move(names)}];
+    if (!slot) {
+        slot = std::make_unique<Config>();
+        slot->define_as_indexed_call_sequence(run_stages_id(rank), defs, /*index_param=*/3);
+    }
+    return *slot;
+}
 
 /// Default work-group shape per rank (implementation-tunable, r02 section 4.2).
 template <int R>
@@ -515,101 +661,31 @@ sycl::range<3> default_wg() {
 
 /// nd_range<R> with the groups laid along dimension 0 only.
 template <int R>
-sycl::nd_range<R> wave_nd_range(std::size_t groups, const sycl::range<3>& wg) {
+sycl::nd_range<R> group_nd_range(std::size_t groups, const sycl::range<3>& wg) {
     sycl::range<R> local  = first_dims<R>(wg);
     sycl::range<R> global = local;
     global[0] = groups * wg[0];
     return sycl::nd_range<R>{global, local};
 }
 
-template <class T>
-const std::byte* bytes_of(const T* p) {
-    return reinterpret_cast<const std::byte*>(p);
-}
-
-/// Submit the ONE outer kernel of rank R on the unordered queue `q`, for device `dev`. It is ordered ONLY by `deps`
-/// (docs/design-review-2026-10-03.md, section 3): nothing else in the queue orders it. `payload` (a trivially
-/// copyable struct with members rec, in, out, body) is captured by value; the stage function reads the private copies
-/// through FnOffsetInfo and byte pointers. Returns its event.
-template <int R, class Payload>
-sycl::event launch_individual(sk::unordered_queue& q, const sycl::device& dev, const std::vector<sycl::event>& deps,
-                              sycl::AdaptiveCpp_jit::dynamic_function_config& cfg, const sycl::nd_range<R>& nd,
-                              const Payload& payload, std::size_t scratch_bytes) {
-    auto cgf = [&](sycl::handler& h) {
-        sycl::local_accessor<std::byte, 1> local{sycl::range<1>{scratch_bytes ? scratch_bytes : 1}, h};
-        h.parallel_for(nd, cfg.apply([=](sycl::nd_item<R> it) {
-            FnOffsetInfo info{&payload.rec, 0};  // fresh per work-item
-            const std::byte* in_b   = bytes_of(&payload.in);
-            std::byte*       out_b  = const_cast<std::byte*>(bytes_of(&payload.out));
-            const std::byte* body_b = bytes_of(&payload.body);
-            std::byte*       lb = local.template get_multi_ptr<sycl::access::decorated::no>().get();
-            if constexpr (R == 1)
-                kb_entry_r1(it, info, in_b, out_b, body_b, lb);
-            else if constexpr (R == 2)
-                kb_entry_r2(it, info, in_b, out_b, body_b, lb);
-            else
-                kb_entry_r3(it, info, in_b, out_b, body_b, lb);
-        }));
-    };
-    return q.submit(dev, deps, cgf);
-}
-
-// -----------------------------------------------------------------------------
-// The chained wave (fused owners, r02 section 5)
-// -----------------------------------------------------------------------------
-
-using JitId = sycl::AdaptiveCpp_jit::dynamic_function_id;
-
-/// The REAL six-argument signature of the entry placeholder and of every stage
-/// function, as the type-erased id types need it (the spike's four-argument
-/// version was illustrative only).
+/// Submit the ONE kernel of a group, of rank R, on the unordered queue `q` for `dev`: ordered ONLY by `deps` (section 3).
+/// `geometry` and `args` are device arrays the group owns; the kernel passes stage 0 as the index placeholder, the
+/// configuration replaces it by each stage's position. Returns its event.
 template <int R>
-using entry_fn_t =
-    sycl::AdaptiveCpp_jit::dynamic_function<void, sycl::nd_item<R>, FnOffsetInfo&, const std::byte*,
-                                            std::byte*, const std::byte*, std::byte*>;
-template <int R>
-using stage_def_t =
-    sycl::AdaptiveCpp_jit::dynamic_function_definition<void, sycl::nd_item<R>, FnOffsetInfo&,
-                                                       const std::byte*, std::byte*, const std::byte*,
-                                                       std::byte*>;
-
-/// The type-erased id of kb_fn<KB>: what a fused owner puts in a call sequence.
-template <class KB>
-JitId stage_definition_id() {
-    return stage_def_t<kernel_rank_v<KB>>{&kb_fn<KB>}.id();
-}
-
-/// The id of the entry placeholder of rank `rank` (1..3).
-inline JitId wave_entry_id(int rank) {
-    switch (rank) {
-        case 1: return entry_fn_t<1>{&kb_entry_r1}.id();
-        case 2: return entry_fn_t<2>{&kb_entry_r2}.id();
-        case 3: return entry_fn_t<3>{&kb_entry_r3}.id();
-        default: break;
-    }
-    throw std::logic_error("naga::cospan: no kernel entry of that rank");
-}
-
-/// Submit the ONE outer kernel of a fused wave: like launch_individual, but the
-/// records and the three byte streams are USM the owner staged, captured as
-/// raw pointers. Every work-item starts with a fresh cursor at record 0; the
-/// call sequence in `cfg` walks the records in position order. Submitted on the unordered queue `q` for `dev`, ordered
-/// ONLY by `deps` (section 3). Returns its event.
-template <int R>
-sycl::event launch_wave(sk::unordered_queue& q, const sycl::device& dev, const std::vector<sycl::event>& deps,
-                        sycl::AdaptiveCpp_jit::dynamic_function_config& cfg, const sycl::nd_range<R>& nd, const StageRecord* records, const std::byte* in_bytes,
-                        std::byte* out_bytes, const std::byte* body_bytes, std::size_t local_bytes) {
+sycl::event launch_group(sk::unordered_queue& q, const sycl::device& dev, const std::vector<sycl::event>& deps,
+                         sycl::AdaptiveCpp_jit::dynamic_function_config& cfg, const sycl::nd_range<R>& nd,
+                         const StageGeometry* geometry, const void* const* args, std::size_t local_bytes) {
     auto cgf = [&](sycl::handler& h) {
         sycl::local_accessor<std::byte, 1> local{sycl::range<1>{local_bytes ? local_bytes : 1}, h};
         h.parallel_for(nd, cfg.apply([=](sycl::nd_item<R> it) {
-            FnOffsetInfo info{records, 0};  // fresh per work-item
-            std::byte*   lb = local.template get_multi_ptr<sycl::access::decorated::no>().get();
+            std::byte* lb = local.template get_multi_ptr<sycl::access::decorated::no>().get();
+            const StageItem<R> si{it, lb};
             if constexpr (R == 1)
-                kb_entry_r1(it, info, in_bytes, out_bytes, body_bytes, lb);
+                run_stages_r1(si, geometry, args, 0);
             else if constexpr (R == 2)
-                kb_entry_r2(it, info, in_bytes, out_bytes, body_bytes, lb);
+                run_stages_r2(si, geometry, args, 0);
             else
-                kb_entry_r3(it, info, in_bytes, out_bytes, body_bytes, lb);
+                run_stages_r3(si, geometry, args, 0);
         }));
     };
     return q.submit(dev, deps, cgf);

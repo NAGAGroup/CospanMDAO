@@ -56,6 +56,12 @@ constexpr std::size_t pool_bytes_of(std::size_t bytes) {
     return (bytes + pool_node_bytes - 1) / pool_node_bytes * pool_node_bytes;
 }
 
+/// The arrays a plain or group component keeps for launching ALONE: its argument array (one element), and its launcher's
+/// pointer array and geometry array. Each is far below one node, so each takes one. Custom-op and host components keep none.
+constexpr std::size_t solo_launch_bytes(std::size_t kernel_components) { return 3 * kernel_components * pool_node_bytes; }
+/// The same for a fused group of `stages` stages: one argument array per stage, one pointer array, one geometry array.
+constexpr std::size_t group_launch_bytes(std::size_t stages) { return (stages + 2) * pool_node_bytes; }
+
 // ---- host-reference comparison ------------------------------------------------
 /// |got - want| <= abs_tol + rel_tol * |want| (a NaN never compares close).
 inline bool close(float got, float want, float abs_tol = 1e-6f, float rel_tol = 1e-5f) {

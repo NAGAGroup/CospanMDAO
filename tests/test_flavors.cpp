@@ -1018,8 +1018,9 @@ TEST_CASE("transient: a system_from group and a fused component release after th
     // The pool's bytes in use are the sum of the live containers' capacities rounded up to whole nodes. With the group gone
     // only the eternal src.y is left: 12 floats (48 B) are one node.
     const auto base = cst::pool_in_use(model);
-    CHECK(base == cst::pool_bytes_of(tfl::kLen * sizeof(float)));
-    CHECK(base == cst::pool_node_bytes);
+    // ... and the launch arrays of the eternal src (argument, pointer and geometry arrays).
+    CHECK(base == cst::pool_bytes_of(tfl::kLen * sizeof(float)) + cst::solo_launch_bytes(1));
+    CHECK(base == cst::pool_node_bytes + cst::solo_launch_bytes(1));
     model.forward();
     model.forward();
     model.wait();

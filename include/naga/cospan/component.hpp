@@ -33,6 +33,7 @@
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -42,6 +43,7 @@
 #include <string_view>
 #include <type_traits>
 #include <unordered_map>
+#include <variant>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -52,6 +54,7 @@
 
 #include "naga/cospan/diagnostics.hpp"
 #include "naga/cospan/dtype.hpp"
+#include "naga/cospan/group_launch.hpp"
 #include "naga/cospan/host_view.hpp"
 #include "naga/cospan/init.hpp"
 #include "naga/cospan/instance.hpp"
@@ -78,6 +81,8 @@ public:
                                             const std::vector<sycl::event>& deps) const = 0;
     /// Null for custom-op and host descriptions.
     virtual const KernelParts* kernel() const { return nullptr; }
+    /// Asks for `bytes` of local memory in this stage's slice, for GroupItem::local<T> (kernel launches only).
+    virtual void request_local_bytes(std::size_t) { throw std::logic_error("naga::cospan: request_local_bytes is for plain and group bodies"); }
 };
 
 namespace detail {
@@ -365,7 +370,18 @@ public:
     }
 
     // ---- the forward (section 3) ---------------------------------------------
+    /// The precompute steps below; a kernel component that launches by itself (not as a stage of a fused group) then keeps
+    /// its argument array and, at the first precompute, its launcher's pointer array.
     void run_precompute(detail::Runtime& rt) override {
+        precompute_steps(rt);
+        if (is_kernel_stage()) {
+            stage_args_ensure(rt);
+            solo_.prepare(rt, std::vector<ComponentBase*>{this});
+        }
+    }
+
+    /// Steps (1) to (4) of the precompute (what a fused group runs for each of its stages).
+    void precompute_steps(detail::Runtime& rt) {
         PtrScope rt_scope{rt_, &rt};
 
         // (1) Every input variable is materialized (a free input takes its initializer, and its initializer's shape,
@@ -396,6 +412,12 @@ public:
     /// fused component (section 4) can submit ONE launch for its stages and still give each stage the event as if it had
     /// submitted alone.
     void run_compute(detail::Runtime& rt) override {
+        if (is_kernel_stage()) {
+            // A plain or group body launches through the one path: a group of one stage in one default segment.
+            (void)solo_.launch(rt, std::vector<ComponentBase*>{this}, std::vector<detail::SegmentSpec>{detail::SegmentSpec{}}, describe());
+            return;
+        }
+        // Custom-op and host bodies keep their own path.
         const std::unique_ptr<LaunchDescription> desc = compute_forward_impl();
         if (!desc) throw std::logic_error("naga::cospan: " + describe() + ": compute_forward returned no launch");
         const std::vector<sycl::event> ev = desc->submit(rt.uq, device_of(), gather_deps(rt));
@@ -441,11 +463,26 @@ public:
     virtual bool has_scratch() const { return false; }
     virtual bool is_custom_op() const { return false; }
     virtual bool is_host() const { return false; }
-    /// The type-erased id of this body's stage function (kb_fn<KB>), for a
+    /// A plain or group body: it launches through a GroupLauncher (alone, or as a stage of a fused group).
+    virtual bool is_kernel_stage() const { return false; }
+    /// The type-erased id of this body's stage function (stage_fn<KB>), for a
     /// call sequence. Throws for a custom-op or host body (nothing is compiled).
     virtual detail::JitId definition_id() const {
         throw std::logic_error("naga::cospan: " + describe() + " has no stage function");
     }
+
+    // ---- the stage interface of a group launcher (kernel bodies only; implemented by Component<KB>) ----
+    /// The component's one-element argument array on its device: created (capacity 1, so its address is final) the first
+    /// time.
+    virtual void stage_args_ensure(detail::Runtime&) { throw_no_stage(); }
+    /// Its device address, as the type-erased pointer the group's pointer array holds.
+    virtual const void* stage_args_ptr() const { throw_no_stage(); }
+    /// What a launch reading the array must wait on (its write list), and the hand-over of that launch's event.
+    virtual std::vector<sycl::event> stage_args_deps() const { throw_no_stage(); }
+    virtual void                     stage_args_register_read(const sycl::event&) { throw_no_stage(); }
+    /// Finishes this forward's description for the group's work-group shape `wg`, copies its arguments into the array
+    /// (a container write) and returns the stage's group count.
+    virtual std::size_t stage_upload(detail::Runtime&, LaunchDescription&, const sycl::range<3>&) { throw_no_stage(); }
 
 protected:
     ComponentBase() = default;
@@ -514,6 +551,10 @@ protected:
 
     std::vector<sycl::event> last_events_;  ///< the last launch's events
     std::vector<sycl::event> pending_deps_; ///< depends_on events, for the next submission only
+
+    [[noreturn]] void throw_no_stage() const {
+        throw std::logic_error("naga::cospan: " + describe() + " is not a plain or group body: it has no stage interface");
+    }
 
 private:
     friend struct detail::ComponentAccess;
@@ -679,6 +720,8 @@ private:
                                         "' is ragged; declare it with RaggedInput/RaggedOutput");
     }
 
+    detail::GroupLauncher solo_;  ///< the launcher of a kernel component that is not a stage of a fused group
+
     std::unordered_map<std::string, std::shared_ptr<detail::Instance>> by_name_;
     std::unordered_map<const void*, detail::Instance*>                 by_member_;
     std::vector<std::shared_ptr<detail::Instance>>                     order_;  // declaration order
@@ -699,6 +742,169 @@ struct ComponentAccess {
     static sycl::device                        device_of(const ComponentBase& c) { return c.device_of(); }
 };
 
+// ---- GroupLauncher (declared in group_launch.hpp) ----------------------------------------------------------------------------
+
+inline void GroupLauncher::prepare(Runtime& rt, const std::vector<ComponentBase*>& stages) {
+    if (ptrs_ || stages.empty()) return;  // once: redone only when the group is rebuilt (a new launcher)
+    const sycl::device       dev = ComponentAccess::device_of(*stages.front());
+    std::vector<const void*> p;
+    p.reserve(stages.size());
+    for (ComponentBase* s : stages) p.push_back(s->stage_args_ptr());
+    ptrs_.emplace(rt.allocator_for<const void*>(dev, sk::kind::device));
+    ptrs_->from_host(std::span<const void* const>{p});
+    sycl::event::wait(ptrs_->read_deps());  // filled and waited on: the array is final
+    geo_.emplace(rt.allocator_for<StageGeometry>(dev, sk::kind::device));
+}
+
+inline std::vector<sycl::event> GroupLauncher::launch(Runtime& rt, const std::vector<ComponentBase*>& st,
+                                                      const std::vector<SegmentSpec>& segs, const std::string& who) {
+    if (st.empty()) throw std::invalid_argument("naga::cospan: " + who + ": a group has no stages");
+    if (!ptrs_) throw std::logic_error("naga::cospan: " + who + ": forward before the first precompute");
+    const std::size_t n = st.size();
+    {
+        std::size_t covered = 0;
+        for (const SegmentSpec& s : segs) covered += s.count;
+        if (covered != n) throw std::logic_error("naga::cospan: " + who + ": the segments do not cover the stages");
+    }
+
+    // 1. Every stage's description of this forward, kept alive until the arguments are uploaded.
+    std::vector<std::unique_ptr<LaunchDescription>> ds;
+    std::vector<const KernelParts*>                  parts;
+    int                                              rank = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+        std::unique_ptr<LaunchDescription> d = ComponentAccess::describe(*st[i]);
+        if (!d)
+            throw std::logic_error("naga::cospan: " + who + ": forward: '" + st[i]->path() + "' returned no launch description; a stage must describe its work");
+        const KernelParts* p = (d->is_custom_op() || d->is_host()) ? nullptr : d->kernel();
+        if (p == nullptr)
+            throw std::logic_error("naga::cospan: " + who + ": forward: '" + st[i]->path() + "' described no kernel; a stage must be a kernel body");
+        if (i == 0)
+            rank = p->rank;
+        else if (p->rank != rank)
+            throw std::logic_error("naga::cospan: " + who + ": forward: '" + st[i]->path() + "' described a rank-" + std::to_string(p->rank) +
+                                   " launch; the group is rank " + std::to_string(rank));
+        parts.push_back(p);
+        ds.push_back(std::move(d));
+    }
+
+    // 2. The group's work-group shape: every stage that asks for one must agree (checked here, every forward, before any
+    // launch: a component may choose its shape at run time); none asking, the default for the rank.
+    std::optional<sycl::range<3>> wg_opt;
+    std::size_t                   first = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+        if (!parts[i]->wg) continue;
+        if (!wg_opt) {
+            wg_opt = parts[i]->wg;
+            first  = i;
+        } else if (*wg_opt != *parts[i]->wg) {
+            throw std::invalid_argument("naga::cospan: " + who + ": forward: '" + st[first]->path() + "' and '" + st[i]->path() +
+                                        "' ask for different work-group shapes; the stages of a group share one");
+        }
+    }
+    if (!wg_opt) {
+        switch (rank) {
+            case 1: wg_opt = default_wg<1>(); break;
+            case 2: wg_opt = default_wg<2>(); break;
+            default: wg_opt = default_wg<3>(); break;
+        }
+    }
+    sycl::range<3> wg = *wg_opt;
+    for (int d = rank; d < 3; ++d) wg[d] = 1;  // dimensions past the rank do not exist
+
+    // 3. Every stage's arguments into its own array (a container write), and its group count.
+    std::vector<std::size_t> counts(n);
+    for (std::size_t i = 0; i < n; ++i) counts[i] = st[i]->stage_upload(rt, *ds[i], wg);
+
+    // 4. The geometry: per segment the block (the largest count), the groups before it, the local slices.
+    const std::size_t table = (segs.size() * sizeof(std::uint64_t) + sizeof(StageGeometry) - 1) / sizeof(StageGeometry);
+    host_geo_.assign(n + table, StageGeometry{});
+    std::vector<std::uint64_t> blocks(segs.size(), 0);
+    std::uint64_t              base = 0;
+    std::size_t                local_bytes = 0;
+    for (std::size_t s = 0; s < segs.size(); ++s) {
+        const SegmentSpec& sp = segs[s];
+        std::uint64_t      block = 0;
+        for (std::size_t j = sp.first; j < sp.first + sp.count; ++j) block = std::max<std::uint64_t>(block, counts[j]);
+        std::size_t seg_local = 0;
+        for (std::size_t j = sp.first; j < sp.first + sp.count; ++j) {
+            StageGeometry& g = host_geo_[j];
+            g.group_count    = counts[j];
+            g.group_base     = base;
+            g.segment_groups = block;
+            g.segment        = static_cast<std::uint32_t>(s);
+            g.segments       = static_cast<std::uint32_t>(segs.size());
+            g.stages         = static_cast<std::uint32_t>(n);
+            g.range_mode     = static_cast<std::uint32_t>(sp.range);
+            g.local_bytes    = static_cast<std::uint32_t>(parts[j]->local_bytes);
+            if (sp.local == LocalMem::partitioned) {
+                g.local_offset = static_cast<std::uint32_t>(seg_local);
+                seg_local += parts[j]->local_bytes;  // each slice is a multiple of 16
+            } else {
+                g.local_offset = 0;
+                seg_local      = std::max(seg_local, parts[j]->local_bytes);
+            }
+        }
+        blocks[s] = block;
+        base += block;
+        local_bytes = std::max(local_bytes, seg_local);
+    }
+    const sycl::device dev         = ComponentAccess::device_of(*st.front());
+    const std::size_t  local_limit = dev.get_info<sycl::info::device::local_mem_size>();
+    if (local_bytes > local_limit) {
+        std::string scratch_stages;
+        for (std::size_t i = 0; i < n; ++i)
+            if (parts[i]->local_bytes != 0)
+                scratch_stages += (scratch_stages.empty() ? "'" : ", '") + st[i]->path() + "' (" + std::to_string(parts[i]->local_bytes) + " bytes)";
+        throw std::invalid_argument("naga::cospan: " + who + ": forward: the launch needs " + std::to_string(local_bytes) +
+                                    " bytes of local memory (the largest segment's) but the device offers " + std::to_string(local_limit) +
+                                    "; stages with local memory: " + scratch_stages);
+    }
+    if (base == 0) {  // every stage is empty: nothing launched, and no stale events are kept
+        for (ComponentBase* s : st) {
+            (void)ComponentAccess::gather_deps(*s, rt);  // depends_on events last one forward, launched or not
+            ComponentAccess::record_launch(*s, {});
+        }
+        last_.clear();
+        return {};
+    }
+    if (!blocks.empty()) std::memcpy(static_cast<void*>(&host_geo_[n]), blocks.data(), blocks.size() * sizeof(std::uint64_t));
+    if (geo_->capacity() < host_geo_.size()) geo_->reserve(host_geo_.size());
+    geo_->from_host(std::span<const StageGeometry>{host_geo_});  // a container write, ordered after the last launch's read
+
+    // 5. What the launch must come after: every stage's dependencies (as for one component) and the arrays it reads.
+    std::vector<sycl::event> deps;
+    const auto               add = [&](const std::vector<sycl::event>& v) { deps.insert(deps.end(), v.begin(), v.end()); };
+    for (ComponentBase* s : st) {
+        add(ComponentAccess::gather_deps(*s, rt));
+        add(s->stage_args_deps());
+    }
+    add(geo_->read_deps());
+    add(ptrs_->read_deps());
+
+    // 6. ONE launch, with the cached call sequence of the stages' functions in stage order.
+    std::vector<JitId> defs;
+    defs.reserve(n);
+    for (const ComponentBase* s : st) defs.push_back(s->definition_id());
+    sycl::AdaptiveCpp_jit::dynamic_function_config& cfg = group_config(rank, defs);
+    const StageGeometry*                            gp  = geo_->data();
+    const void* const*                              ap  = ptrs_->data();
+    sycl::event                                     ev;
+    switch (rank) {
+        case 1: ev = launch_group<1>(rt.uq, dev, deps, cfg, group_nd_range<1>(base, wg), gp, ap, local_bytes); break;
+        case 2: ev = launch_group<2>(rt.uq, dev, deps, cfg, group_nd_range<2>(base, wg), gp, ap, local_bytes); break;
+        default: ev = launch_group<3>(rt.uq, dev, deps, cfg, group_nd_range<3>(base, wg), gp, ap, local_bytes); break;
+    }
+
+    // 7. The launch's event: a read of the geometry, the pointer array and every argument array, and on every stage (its
+    // inputs' reads and its outputs' writes), registered here, at submit.
+    geo_->register_read(ev);
+    ptrs_->register_read(ev);
+    for (ComponentBase* s : st) s->stage_args_register_read(ev);
+    last_ = {ev};
+    for (ComponentBase* s : st) ComponentAccess::record_launch(*s, last_);
+    return last_;
+}
+
 }  // namespace detail
 
 // -----------------------------------------------------------------------------
@@ -707,37 +913,9 @@ struct ComponentAccess {
 
 namespace detail {
 
-struct NoScratch {};
-
-template <class KB>
-struct scratch_of {
-    using type = NoScratch;
-};
-template <class KB>
-    requires HasScratch<KB>
-struct scratch_of<KB> {
-    using type = typename KB::Scratch;
-};
-template <class KB>
-using scratch_t = typename scratch_of<KB>::type;
-
-/// The Scratch argument of a body that has none.
-template <class KB>
-scratch_t<KB> NoScratchValue() {
-    return scratch_t<KB>{};
-}
-
-template <int R>
-sycl::range<3> pad3(const sycl::range<R>& r) {
-    sycl::range<3> out{1, 1, 1};
-    for (int d = 0; d < R; ++d) out[d] = r[d];
-    return out;
-}
-
-/// A kernel-body launch submitted on its own: the record and the typed
-/// Inputs/Outputs/body/Scratch are captured BY VALUE in the outer kernel; there
-/// is no staging allocation (fused waves stage through device buffers instead). The JIT
-/// configuration is the body type's static one (jit_config<KB>()), read at submit.
+/// A kernel-body description of one forward: the stage's argument struct (the HOST MEMBER the component copies into its
+/// argument array) and the facts a group launcher reads (KernelParts). It submits nothing itself: a plain or group body
+/// launches through the group launcher, whose stage function reads the copy.
 template <class KB>
 class KernelLaunch final : public LaunchDescription {
 public:
@@ -746,40 +924,15 @@ public:
 
     KernelLaunch(sycl::range<R> range, std::optional<sycl::range<R>> wg,
                  typename KB::Inputs in, typename KB::Outputs out, KB body, Scratch scratch)
-        : payload_{StageRecord{}, in, out, BodyPack{body, scratch}} {
-        wg3_ = wg ? pad3<R>(*wg) : default_wg<R>();
-        StageRecord& r = payload_.rec;
-        r.range        = pad3<R>(range);
-        r.flat_extent  = range.size();
-        r.rank         = static_cast<uint8_t>(R);
-        const std::size_t wg_size = wg3_[0] * wg3_[1] * wg3_[2];
-        if constexpr (GroupBody<KB>) {
-            r.group_range = sycl::range<3>{(r.range[0] + wg3_[0] - 1) / wg3_[0],
-                                           (r.range[1] + wg3_[1] - 1) / wg3_[1],
-                                           (r.range[2] + wg3_[2] - 1) / wg3_[2]};
-            r.group_count = r.group_range[0] * r.group_range[1] * r.group_range[2];
-        } else {
-            r.group_count = (r.flat_extent + wg_size - 1) / wg_size;
-            r.group_range = sycl::range<3>{r.group_count, 1, 1};
-        }
-        if constexpr (HasScratch<KB>) {
-            scratch_bytes_  = layout_scratch(payload_.body.scratch);
-            r.scratch_bytes = scratch_bytes_;
-            r.scratch_off   = static_cast<uint32_t>(
-                reinterpret_cast<const std::byte*>(&payload_.body.scratch) -
-                reinterpret_cast<const std::byte*>(&payload_.body));
-        }
+        : args_{in, out, body, scratch} {
+        args_.range       = pad3<R>(range);
+        args_.flat_extent = range.size();
+        if constexpr (HasScratch<KB>) args_.scratch_bytes = layout_scratch(args_.scratch);
         parts_.rank        = R;
         parts_.group_body  = GroupBody<KB>;
-        parts_.has_scratch = HasScratch<KB>;
-        parts_.record      = r;  // offsets are 0-relative to the spans below
-        parts_.inputs      = {reinterpret_cast<const std::byte*>(&payload_.in), sizeof(payload_.in)};
-        parts_.outputs     = {reinterpret_cast<const std::byte*>(&payload_.out), sizeof(payload_.out)};
-        parts_.body        = {reinterpret_cast<const std::byte*>(&payload_.body), sizeof(payload_.body)};
-        if constexpr (HasScratch<KB>)
-            parts_.scratch = {reinterpret_cast<const std::byte*>(&payload_.body.scratch),
-                              sizeof(Scratch)};
-        if (wg) parts_.wg = wg3_;
+        parts_.flat_extent = args_.flat_extent;
+        parts_.local_bytes = args_.scratch_bytes;
+        if (wg) parts_.wg = pad3<R>(*wg);
     }
 
     KernelLaunch(const KernelLaunch&)            = delete;
@@ -789,30 +942,37 @@ public:
     bool is_host() const override { return false; }
     const KernelParts* kernel() const override { return &parts_; }
 
-    std::vector<sycl::event> submit(sk::unordered_queue& q, const sycl::device& dev,
-                                    const std::vector<sycl::event>& deps) const override {
-        if (payload_.rec.flat_extent == 0) return {};  // nothing to run for an empty range
-        return {launch_individual<R>(q, dev, deps, jit_config<KB>(), wave_nd_range<R>(payload_.rec.group_count, wg3_),
-                                     payload_, scratch_bytes_)};
+    /// The stage's local slice is its Scratch plus these bytes (rounded up to 16), for GroupItem::local<T>.
+    void request_local_bytes(std::size_t bytes) override {
+        parts_.local_bytes = args_.scratch_bytes + (bytes + 15) / 16 * 16;
     }
 
-private:
-    struct BodyPack {
-        KB      body;
-        Scratch scratch;
-    };
-    struct Payload {
-        StageRecord           rec;
-        typename KB::Inputs   in;
-        typename KB::Outputs  out;
-        BodyPack              body;
-    };
-    static_assert(std::is_trivially_copyable_v<Payload>);
+    std::vector<sycl::event> submit(sk::unordered_queue&, const sycl::device&, const std::vector<sycl::event>&) const override {
+        throw std::logic_error("naga::cospan: a plain or group body launches through its group launcher, not through submit");
+    }
 
-    Payload        payload_;
-    sycl::range<3> wg3_{1, 1, 1};
-    uint32_t       scratch_bytes_ = 0;
-    KernelParts    parts_;
+    /// This forward's arguments for a group of work-group shape `wg`: the stage's group grid and count.
+    const StageArgs<KB>& finalize(const sycl::range<3>& wg) {
+        const std::size_t wg_size = wg[0] * wg[1] * wg[2];
+        if constexpr (GroupBody<KB>) {
+            args_.group_range = sycl::range<3>{(args_.range[0] + wg[0] - 1) / wg[0], (args_.range[1] + wg[1] - 1) / wg[1],
+                                               (args_.range[2] + wg[2] - 1) / wg[2]};
+            group_count_      = args_.group_range[0] * args_.group_range[1] * args_.group_range[2];
+        } else {
+            group_count_      = (args_.flat_extent + wg_size - 1) / wg_size;
+            args_.group_range = sycl::range<3>{group_count_, 1, 1};
+        }
+        if (args_.flat_extent == 0) group_count_ = 0;
+        return args_;
+    }
+    std::size_t group_count() const { return group_count_; }
+
+private:
+    static_assert(std::is_trivially_copyable_v<StageArgs<KB>>);
+
+    StageArgs<KB> args_;
+    std::size_t   group_count_ = 0;
+    KernelParts   parts_;
 };
 
 /// A custom-operation launch (D1): the body runs at submission as an
@@ -898,12 +1058,58 @@ public:
     bool has_scratch() const override { return HasScratch<KB>; }
     bool is_custom_op() const override { return CustomOpBody<KB>; }
     bool is_host() const override { return HostBody<KB>; }
+    bool is_kernel_stage() const override { return PlainBody<KB> || GroupBody<KB>; }
     detail::JitId definition_id() const override {
         if constexpr (CustomOpBody<KB> || HostBody<KB>)
             throw std::logic_error("naga::cospan: " + describe() +
                                    " is a custom-op or host body: it has no stage function");
         else
-            return detail::stage_definition_id<KB>();
+            return detail::stage_definition_id<KB>();  // a function-local static, one per body type
+    }
+
+    // ---- the stage interface (plain and group bodies) ------------------------------
+    void stage_args_ensure(detail::Runtime& rt) override {
+        if constexpr (PlainBody<KB> || GroupBody<KB>) {
+            if (!args_) {
+                args_.emplace(rt.allocator_for<detail::StageArgs<KB>>(this->device_of(), sk::kind::device));
+                args_->reserve(1);  // capacity 1 from the start: the address the pointer array holds is final
+            }
+        } else {
+            this->throw_no_stage();
+        }
+    }
+    const void* stage_args_ptr() const override {
+        if constexpr (PlainBody<KB> || GroupBody<KB>) {
+            if (!args_) throw std::logic_error("naga::cospan: " + this->describe() + ": the argument array does not exist yet (precompute first)");
+            return args_->data();
+        } else {
+            this->throw_no_stage();
+        }
+    }
+    std::vector<sycl::event> stage_args_deps() const override {
+        if constexpr (PlainBody<KB> || GroupBody<KB>) {
+            return args_->read_deps();
+        } else {
+            this->throw_no_stage();
+        }
+    }
+    void stage_args_register_read(const sycl::event& e) override {
+        if constexpr (PlainBody<KB> || GroupBody<KB>) {
+            args_->register_read(e);
+        } else {
+            this->throw_no_stage();
+        }
+    }
+    std::size_t stage_upload([[maybe_unused]] detail::Runtime& rt, [[maybe_unused]] LaunchDescription& d,
+                             [[maybe_unused]] const sycl::range<3>& wg) override {
+        if constexpr (PlainBody<KB> || GroupBody<KB>) {
+            auto&                        kl = dynamic_cast<detail::KernelLaunch<KB>&>(d);
+            const detail::StageArgs<KB>& a  = kl.finalize(wg);
+            args_->from_host(std::span<const detail::StageArgs<KB>>{&a, 1});  // the host member into the array: a container write
+            return kl.group_count();
+        } else {
+            this->throw_no_stage();
+        }
     }
 
 protected:
@@ -961,6 +1167,10 @@ protected:
     }
 
 private:
+    /// The component's argument array (plain and group bodies only).
+    using ArgsVec = sk::usm_vector<detail::StageArgs<KB>>;
+    std::conditional_t<PlainBody<KB> || GroupBody<KB>, std::optional<ArgsVec>, std::monostate> args_;
+
     std::unique_ptr<LaunchDescription> make_launch(sycl::range<LR> range,
                                                    std::optional<sycl::range<LR>> wg,
                                                    typename KB::Inputs in, typename KB::Outputs out,
