@@ -816,9 +816,12 @@ inline std::vector<sycl::event> GroupLauncher::launch(Runtime& rt, const std::ve
     for (std::size_t i = 0; i < n; ++i) counts[i] = st[i]->stage_upload(rt, *ds[i], wg);
 
     // 4. The geometry: per segment the block (the largest count), the groups before it, the local slices.
-    const std::size_t table = (segs.size() * sizeof(std::uint64_t) + sizeof(StageGeometry) - 1) / sizeof(StageGeometry);
+    // The segment table after the n entries: the S block sizes, then the S boundary kinds.
+    const std::size_t nseg  = segs.size();
+    const std::size_t table = (2 * nseg * sizeof(std::uint64_t) + sizeof(StageGeometry) - 1) / sizeof(StageGeometry);
     host_geo_.assign(n + table, StageGeometry{});
-    std::vector<std::uint64_t> blocks(segs.size(), 0);
+    std::vector<std::uint64_t> blocks(2 * nseg, 0);
+    bool                       ticket_mode = false;
     std::uint64_t              base = 0;
     std::size_t                local_bytes = 0;
     for (std::size_t s = 0; s < segs.size(); ++s) {
@@ -844,7 +847,9 @@ inline std::vector<sycl::event> GroupLauncher::launch(Runtime& rt, const std::ve
                 seg_local      = std::max(seg_local, parts[j]->local_bytes);
             }
         }
-        blocks[s] = block;
+        blocks[s]        = block;
+        blocks[nseg + s] = static_cast<std::uint64_t>(sp.boundary);
+        if (sp.boundary != Boundary::none) ticket_mode = true;
         base += block;
         local_bytes = std::max(local_bytes, seg_local);
     }
@@ -867,7 +872,19 @@ inline std::vector<sycl::event> GroupLauncher::launch(Runtime& rt, const std::ve
         last_.clear();
         return {};
     }
-    if (!blocks.empty()) std::memcpy(static_cast<void*>(&host_geo_[n]), blocks.data(), blocks.size() * sizeof(std::uint64_t));
+    std::memcpy(static_cast<void*>(&host_geo_[n]), blocks.data(), blocks.size() * sizeof(std::uint64_t));
+
+    // Ticket mode: the ticket state (counter, per-segment completed counters, per-ticket flags) is sized for this launch and
+    // reset with a container fill, ordered after the previous launch (an outside writer of it). The launch then waits on
+    // the fill (read_deps). Its address goes into every geometry entry.
+    if (ticket_mode) {
+        if (!ticket_) ticket_.emplace(rt.allocator_for<std::uint32_t>(dev, sk::kind::device));
+        const std::size_t       words = 1 + nseg + static_cast<std::size_t>(base);
+        const std::vector<sycl::event> prior = ticket_->read_deps();  // the previous launch, registered as a write
+        if (ticket_->size() != words) (void)ticket_->resize(words, std::span<const sycl::event>{prior});
+        (void)ticket_->fill(std::uint32_t{0}, std::span<const sycl::event>{prior});
+        for (std::size_t i = 0; i < n; ++i) host_geo_[i].ticket_state = ticket_->data();
+    }
     if (geo_->capacity() < host_geo_.size()) geo_->reserve(host_geo_.size());
     geo_->from_host(std::span<const StageGeometry>{host_geo_});  // a container write, ordered after the last launch's read
 
@@ -880,6 +897,7 @@ inline std::vector<sycl::event> GroupLauncher::launch(Runtime& rt, const std::ve
     }
     add(geo_->read_deps());
     add(ptrs_->read_deps());
+    if (ticket_mode) add(ticket_->read_deps());
 
     // 6. ONE launch, with the cached call sequence of the stages' functions in stage order.
     std::vector<JitId> defs;
@@ -899,6 +917,7 @@ inline std::vector<sycl::event> GroupLauncher::launch(Runtime& rt, const std::ve
     // inputs' reads and its outputs' writes), registered here, at submit.
     geo_->register_read(ev);
     ptrs_->register_read(ev);
+    if (ticket_mode) ticket_->register_write(ev);  // the launch writes the ticket state: the next reset and launch come after it
     for (ComponentBase* s : st) s->stage_args_register_read(ev);
     last_ = {ev};
     for (ComponentBase* s : st) ComponentAccess::record_launch(*s, last_);

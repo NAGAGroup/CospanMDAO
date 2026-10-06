@@ -85,13 +85,17 @@ namespace detail {
 enum class LocalMem : std::uint8_t { partitioned = 0, shared = 1 };
 enum class RangeMode : std::uint8_t { own = 0, whole = 1 };
 
+/// What stands before a segment in a fused group (cs::ticket_order() / cs::global_barrier()). Any boundary in a group puts
+/// the whole launch in TICKET MODE; global_barrier also makes every group of the segment wait for every earlier segment.
+enum class Boundary : std::uint8_t { none = 0, ticket_order = 1, global_barrier = 2 };
+
 /// One entry per stage, in a device array the group owns and refills every forward. Followed (after `stages` entries) by
 /// the segment table: one std::uint64_t per segment, that segment's block of groups.
 struct StageGeometry {
     std::uint64_t group_count    = 0;  ///< this stage's own number of groups
     std::uint64_t group_base     = 0;  ///< the groups before this stage's segment
     std::uint64_t segment_groups = 0;  ///< this segment's block (the largest group count of its stages)
-    void*         ticket_state   = nullptr;  ///< null: no boundary primitive (none exists yet)
+    void*         ticket_state   = nullptr;  ///< the group's ticket state; null: no boundary in the group (no ticket mode)
     std::uint32_t segment        = 0;
     std::uint32_t segments       = 0;
     std::uint32_t stages         = 0;  ///< the number of stage entries (where the segment table starts)
@@ -102,13 +106,53 @@ struct StageGeometry {
 static_assert(std::is_trivially_copyable_v<StageGeometry>);
 static_assert(sizeof(StageGeometry) % 8 == 0);
 
-/// The native item of a stage function: the nd_item and the launch's local block (the one thing a stage function cannot
-/// obtain by itself).
+/// The native item of a stage function: the nd_item, the launch's local block (the one thing a stage function cannot
+/// obtain by itself) and the work-group's linear index in the launch: the hardware group id, or in ticket mode the ticket
+/// the group took (tickets are handed out in increasing order, so ticket order is segment order).
 template <int R>
 struct StageItem {
     sycl::nd_item<R> item;
     std::byte*       local;
+    std::size_t      group;
 };
+
+// ---- ticket state ---------------------------------------------------------------------------------------------
+// A device array of std::uint32_t the group owns (ticket mode only), reset every forward:
+//   [0]            the ticket counter (fetch_add by each work-group's leader at its start)
+//   [1, 1+S)       per segment, the number of its groups that have FINISHED every stage of the segment
+//   [1+S, 1+S+T)   per ticket, 1 once that group has finished (T = the launch's groups)
+// Both waits are COLLECTIVE (the leader spins with acquire loads, then a group barrier releases the group) and are
+// deadlock-free without co-residency only because a group waits for EARLIER tickets alone: every earlier ticket is held by
+// a group that has started (resident or finished).
+using TicketRef = sycl::atomic_ref<std::uint32_t, sycl::memory_order::acq_rel, sycl::memory_scope::device,
+                                   sycl::access::address_space::global_space>;
+
+/// Wait for the group with ticket (blocks[0] + ... + blocks[s-1]) + g, i.e. group g of segment s.
+template <int R>
+inline void ticket_wait_group(std::uint32_t* ts, std::size_t segments, const std::uint64_t* blocks, std::size_t s,
+                              std::size_t g, const sycl::nd_item<R>& it) {
+    if (it.get_local_linear_id() == 0) {
+        std::size_t t = g;
+        for (std::size_t i = 0; i < s; ++i) t += blocks[i];
+        TicketRef flag{ts[1 + segments + t]};
+        while (flag.load(sycl::memory_order::acquire) == 0) {}
+    }
+    sycl::group_barrier(it.get_group());
+    sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::device);
+}
+
+/// Wait until every group of segments 0 .. upto-1 has finished.
+template <int R>
+inline void ticket_wait_segments(std::uint32_t* ts, const std::uint64_t* blocks, std::size_t upto, const sycl::nd_item<R>& it) {
+    if (it.get_local_linear_id() == 0) {
+        for (std::size_t i = 0; i < upto; ++i) {
+            TicketRef done{ts[1 + i]};
+            while (static_cast<std::uint64_t>(done.load(sycl::memory_order::acquire)) != blocks[i]) {}
+        }
+    }
+    sycl::group_barrier(it.get_group());
+    sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::device);
+}
 
 struct ItemFixup;
 }  // namespace detail
@@ -178,23 +222,36 @@ struct GroupItem {
         return reinterpret_cast<T*>(base_ + off);
     }
 
+    /// COLLECTIVE (every work-item of the group calls it): wait until group `g` of segment `s` has finished all its stages.
+    /// Needs ticket mode (a group with a cs::ticket_order() or cs::global_barrier() boundary) and `s` EARLIER than this
+    /// stage's segment; with no ticket state the pointer is null and the behavior is undefined (no checks, as with
+    /// waiting on your own or a later segment, which never returns).
+    void wait_group(std::size_t s, std::size_t g) const {
+        detail::ticket_wait_group<R>(ticket_state_, segments_, segment_groups_, s, g, it_);
+    }
+    /// COLLECTIVE: wait until every group of every earlier segment has finished (what cs::global_barrier() does for you).
+    /// The same requirements as wait_group.
+    void wait_earlier_segments() const { detail::ticket_wait_segments<R>(ticket_state_, segment_groups_, segment_, it_); }
+
     /// The PHYSICAL group, for group functions (barriers, reductions).
     sycl::group<R>  get_group() const { return it_.get_group(); }
     sycl::sub_group get_sub_group() const { return it_.get_sub_group(); }
 
 private:
     GroupItem(const sycl::nd_item<R>& it, const sycl::id<R>& gid, const sycl::range<R>& grange, std::uint32_t segment,
-              std::uint32_t segments, const std::uint64_t* segment_groups, std::byte* base, std::uint32_t used, std::uint32_t cap)
+              std::uint32_t segments, const std::uint64_t* segment_groups, std::uint32_t* ticket_state, std::byte* base,
+              std::uint32_t used, std::uint32_t cap)
         : it_{it}, group_id_{gid}, group_range_{grange}, segment_{segment}, segments_{segments}, segment_groups_{segment_groups},
-          base_{base}, used_{used}, cap_{cap} {}
+          ticket_state_{ticket_state}, base_{base}, used_{used}, cap_{cap} {}
 
     sycl::nd_item<R>     it_;
     sycl::id<R>          group_id_;     // within the segment
     sycl::range<R>       group_range_;  // this stage's group grid
     std::uint32_t        segment_;
     std::uint32_t        segments_;
-    const std::uint64_t* segment_groups_;
-    std::byte*           base_;  // this stage's slice of the local block
+    const std::uint64_t* segment_groups_;  // the segment table: the blocks, then the boundary kinds
+    std::uint32_t*       ticket_state_;    // null: not in ticket mode
+    std::byte*           base_;            // this stage's slice of the local block
     std::uint32_t        used_;
     std::uint32_t        cap_;
     friend struct detail::ItemFixup;
@@ -538,7 +595,7 @@ struct ItemFixup {
         }
         return GroupItem<R>{si.item,       delinearize_open<R>(segment_group, gr), first_dims<R>(gr),
                             g.segment,     g.segments,                            segment_groups,
-                            si.local + g.local_offset, free_off,                   g.local_bytes};
+                            static_cast<std::uint32_t*>(g.ticket_state), si.local + g.local_offset, free_off, g.local_bytes};
     }
 };
 
@@ -564,7 +621,7 @@ SYCL_EXTERNAL void stage_fn(detail::StageItem<kernel_rank_v<KB>> si, const detai
     const sycl::nd_item<R>&      it = si.item;
 
     // This stage's block: the segment's groups only; `own` also stops at the stage's own group count.
-    const std::size_t glid = it.get_group_linear_id();
+    const std::size_t glid = si.group;  // the hardware group, or in ticket mode the ticket
     if (g.group_count == 0 || glid < g.group_base) return;
     const std::size_t seg_group = glid - g.group_base;
     if (seg_group >= g.segment_groups) return;
@@ -679,13 +736,53 @@ sycl::event launch_group(sk::unordered_queue& q, const sycl::device& dev, const 
         sycl::local_accessor<std::byte, 1> local{sycl::range<1>{local_bytes ? local_bytes : 1}, h};
         h.parallel_for(nd, cfg.apply([=](sycl::nd_item<R> it) {
             std::byte* lb = local.template get_multi_ptr<sycl::access::decorated::no>().get();
-            const StageItem<R> si{it, lb};
+
+            // Ticket mode (the group has a boundary): the work-group's leader takes the next ticket and broadcasts it; the
+            // ticket, not the hardware id, says which segment and group of the segment this work-group is. Without ticket
+            // state this is one load and no counters.
+            std::uint32_t* ts    = static_cast<std::uint32_t*>(geometry[0].ticket_state);
+            std::size_t    group = it.get_group_linear_id();
+            std::size_t    seg   = 0;
+            std::size_t    nseg  = 0;
+            const std::uint64_t* tbl = nullptr;
+            if (ts != nullptr) {
+                nseg = geometry[0].segments;
+                tbl  = reinterpret_cast<const std::uint64_t*>(geometry + geometry[0].stages);  // blocks[S], then kinds[S]
+                std::uint32_t t = 0;
+                if (it.get_local_linear_id() == 0) {
+                    TicketRef counter{ts[0]};
+                    t = counter.fetch_add(1u, sycl::memory_order::relaxed);
+                }
+                group = sycl::group_broadcast(it.get_group(), t);
+                std::uint64_t first = 0;  // the segment of this ticket: the block sizes in ticket order
+                while (seg + 1 < nseg && group >= first + tbl[seg]) {
+                    first += tbl[seg];
+                    ++seg;
+                }
+                if (tbl[nseg + seg] == static_cast<std::uint64_t>(Boundary::global_barrier)) ticket_wait_segments<R>(ts, tbl, seg, it);
+            }
+
+            const StageItem<R> si{it, lb, group};
             if constexpr (R == 1)
                 run_stages_r1(si, geometry, args, 0);
             else if constexpr (R == 2)
                 run_stages_r2(si, geometry, args, 0);
             else
                 run_stages_r3(si, geometry, args, 0);
+
+            // Completion: every stage of this group's segment has run (the other stages skipped this ticket). A group
+            // barrier, a device-scope release fence, then the leader's release atomics: the group's flag, and its segment's
+            // completed counter.
+            if (ts != nullptr) {
+                sycl::group_barrier(it.get_group());
+                sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::device);
+                if (it.get_local_linear_id() == 0) {
+                    TicketRef flag{ts[1 + nseg + group]};
+                    flag.store(1u, sycl::memory_order::release);
+                    TicketRef done{ts[1 + seg]};
+                    done.fetch_add(1u, sycl::memory_order::release);
+                }
+            }
         }));
     };
     return q.submit(dev, deps, cgf);

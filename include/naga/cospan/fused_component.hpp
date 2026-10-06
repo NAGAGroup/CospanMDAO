@@ -160,10 +160,41 @@ inline constexpr bool is_range_option_v = std::is_same_v<O, range_mode::own> || 
 template <class T, class... Opts>
 inline constexpr std::size_t option_count_v = (std::size_t{std::is_same_v<T, Opts>} + ... + std::size_t{0});
 
-/// The stage descriptors an item contributes: a bare descriptor is one stage; a segment holds its own.
+/// A boundary item between two segments of a group (cs::ticket_order(), cs::global_barrier()).
+template <Boundary K>
+struct BoundaryItem {
+    static constexpr Boundary kind = K;
+};
+template <class T>
+struct is_boundary : std::false_type {};
+template <Boundary K>
+struct is_boundary<BoundaryItem<K>> : std::true_type {};
+template <class... Items>
+inline constexpr bool has_boundary_v = (is_boundary<std::remove_cvref_t<Items>>::value || ...);
+
+/// A boundary goes BETWEEN two segments: not first, not last, not next to another boundary.
+template <class... Items>
+constexpr bool boundaries_placed_ok() {
+    constexpr std::size_t N = sizeof...(Items);
+    if constexpr (N == 0) {
+        return true;
+    } else {
+        constexpr bool b[N] = {is_boundary<std::remove_cvref_t<Items>>::value...};
+        if (b[0] || b[N - 1]) return false;
+        for (std::size_t i = 0; i + 1 < N; ++i)
+            if (b[i] && b[i + 1]) return false;
+        return true;
+    }
+}
+
+/// The stage descriptors an item contributes: a bare descriptor is one stage; a segment holds its own; a boundary none.
 template <class I>
 struct item_stages {
     using type = std::tuple<I>;
+};
+template <Boundary K>
+struct item_stages<BoundaryItem<K>> {
+    using type = std::tuple<>;
 };
 template <LocalMem LM, RangeMode RM, class... Ds>
 struct item_stages<SegmentDesc<LM, RM, Ds...>> {
@@ -181,25 +212,32 @@ struct stage_checks<std::tuple<Ds...>> {
     static constexpr bool components = (std::derived_from<desc_component_t<Ds>, ComponentBase> && ...);
     static constexpr bool fusible    = ((!CustomOpBody<desc_body_t<Ds>> && !HostBody<desc_body_t<Ds>>) && ...);
     static constexpr bool one_kind   = (GroupBody<desc_body_t<Ds>> && ...) || (!GroupBody<desc_body_t<Ds>> && ...);
+    static constexpr bool all_group  = (GroupBody<desc_body_t<Ds>> && ...);
     static constexpr bool one_rank   = ((kernel_rank_v<desc_body_t<Ds>> == kernel_rank_v<desc_body_t<std::tuple_element_t<0, std::tuple<Ds...>>>>) && ...);
 };
 
+/// `pending` is the boundary item just before this one, if any: it goes on the next segment.
 template <class Item>
-void add_segment_spec(std::vector<SegmentSpec>& out, std::size_t& at) {
-    if constexpr (is_segment_desc<Item>::value) {
-        out.push_back(SegmentSpec{at, Item::count, Item::local, Item::range});
+void add_segment_spec(std::vector<SegmentSpec>& out, std::size_t& at, Boundary& pending) {
+    if constexpr (is_boundary<Item>::value) {
+        pending = Item::kind;
+    } else if constexpr (is_segment_desc<Item>::value) {
+        out.push_back(SegmentSpec{at, Item::count, Item::local, Item::range, pending});
         at += Item::count;
+        pending = Boundary::none;
     } else {
-        out.push_back(SegmentSpec{at, 1, LocalMem::partitioned, RangeMode::own});  // a bare stage: a one-stage segment
+        out.push_back(SegmentSpec{at, 1, LocalMem::partitioned, RangeMode::own, pending});  // a bare stage: a one-stage segment
         at += 1;
+        pending = Boundary::none;
     }
 }
 /// The segments of a group's items, in order.
 template <class... Items>
 std::vector<SegmentSpec> segment_specs() {
     std::vector<SegmentSpec> out;
-    std::size_t              at = 0;
-    (add_segment_spec<std::remove_cvref_t<Items>>(out, at), ...);
+    std::size_t              at      = 0;
+    Boundary                 pending = Boundary::none;
+    (add_segment_spec<std::remove_cvref_t<Items>>(out, at, pending), ...);
     return out;
 }
 
@@ -234,6 +272,12 @@ class FusedGroup final : public detail::FusedBase {
     static_assert(Checks::fusible, "naga::cospan: custom-op and host bodies cannot be fused");
     static_assert(Checks::one_kind, "naga::cospan: a fused group's stages are all work-group components or all plain");
     static_assert(Checks::one_rank, "naga::cospan: the stages of a fused group share one kernel rank");
+    static_assert(detail::boundaries_placed_ok<Items...>(),
+                  "naga::cospan: a boundary (cs::ticket_order() / cs::global_barrier()) goes between two segments: not first, not "
+                  "last, and not next to another boundary");
+    static_assert(!detail::has_boundary_v<Items...> || Checks::all_group,
+                  "naga::cospan: boundaries are for groups of work-group stages: a plain-body group has no work-group to "
+                  "cooperate with");
 
 public:
     FusedGroup(ConnectsDesc c, Items... items)
@@ -242,6 +286,7 @@ public:
     void setup() override {
         std::apply([this](auto&... it) { (this->add_item(it), ...); }, items_);
         for (const auto& [a, b] : connects_.pairs) {
+            check_forward(a, b);
             connect(a, b);
             instance_at(b)->meta->internal = true;  // connected inside one fused group
         }
@@ -250,11 +295,41 @@ public:
 private:
     template <class Item>
     void add_item(Item& it) {
-        if constexpr (detail::is_segment_desc<std::remove_cvref_t<Item>>::value)
-            std::apply([this](auto&... d) { (this->add_subsystem(d), ...); }, it.descs);
-        else
-            this->add_subsystem(it);
+        if constexpr (detail::is_boundary<std::remove_cvref_t<Item>>::value) {
+            // a boundary adds no child
+        } else if constexpr (detail::is_segment_desc<std::remove_cvref_t<Item>>::value) {
+            std::apply(
+                [this](auto&... d) {
+                    (this->add_stage(d), ...);
+                },
+                it.descs);
+        } else {
+            this->add_stage(it);
+        }
     }
+    template <class D>
+    void add_stage(D& d) {
+        names_.push_back(d.name);  // the stage order, for the connect check
+        this->add_subsystem(d);
+    }
+
+    /// A connect inside the group runs forward in item order: the source stage comes before the target stage. A connect from
+    /// a stage's output to the input of the same or an earlier stage would read what has not been written yet.
+    void check_forward(const std::string& src, const std::string& dst) const {
+        const auto stage_of = [this](const std::string& p) -> std::optional<std::size_t> {
+            const std::string head = p.substr(0, p.find('.'));
+            for (std::size_t i = 0; i < names_.size(); ++i)
+                if (names_[i] == head) return i;
+            return std::nullopt;
+        };
+        const auto s = stage_of(src);
+        const auto d = stage_of(dst);
+        if (s && d && *s >= *d)
+            detail::wiring_fail(detail::WiringSite{describe()}, "connect",
+                                "'" + dst + "' reads '" + src + "', which runs after it in fused group '" + path() + "'");
+    }
+
+    std::vector<std::string> names_;
 
     ConnectsDesc         connects_;
     std::tuple<Items...> items_;
@@ -278,6 +353,13 @@ auto segment(Descs... d) {
     constexpr detail::RangeMode rm = detail::option_count_v<range_mode::whole, Opts...> ? detail::RangeMode::whole : detail::RangeMode::own;
     return detail::SegmentDesc<lm, rm, Descs...>{std::tuple<Descs...>{std::move(d)...}};
 }
+
+/// Boundary items for fuse_components, between two segments of a group of work-group stages. Either one puts the whole
+/// launch in ticket mode (each work-group takes a ticket at its start, so a group only waits for EARLIER groups and no
+/// co-residency is needed). ticket_order(): nothing more. global_barrier(): every group of the segment after it waits for
+/// every group of the earlier segments before its first stage.
+inline detail::BoundaryItem<detail::Boundary::ticket_order> ticket_order() { return {}; }
+inline detail::BoundaryItem<detail::Boundary::global_barrier> global_barrier() { return {}; }
 
 /// A fused group of the given items (in order) with the given connections, as a descriptor for add_subsystem.
 template <class... Items>

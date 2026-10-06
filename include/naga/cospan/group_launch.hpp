@@ -20,6 +20,14 @@
 // the segment's size is the sum; shared: one block, the size is the max) are per segment. The launch's local block is the
 // largest segment size. THERE ARE NO FRAMEWORK BARRIERS: a stage that reads across work-items what an earlier stage wrote
 // calls its own group barrier; across groups nothing is ordered.
+//
+// BOUNDARIES (cs::ticket_order(), cs::global_barrier(), between two segments of a group of group-body stages): any
+// boundary puts the WHOLE launch in ticket mode. The group then owns a small device array, the TICKET STATE (kernel.hpp), reset
+// with a container fill before every launch; the launch is an outside writer of it. Each work-group takes a ticket at its
+// start and the ticket, not the hardware group id, says which segment and group it is, so a group only ever waits for
+// earlier tickets and no co-residency is needed. A global_barrier makes every group of the segment after it wait for every
+// group of the earlier segments; GroupItem::wait_group / wait_earlier_segments wait from inside a body. The segment
+// table after the stage entries of the geometry array is the blocks, then each segment's boundary kind.
 
 #include <cstddef>
 #include <cstdint>
@@ -46,6 +54,7 @@ struct SegmentSpec {
     std::size_t count = 1;
     LocalMem    local = LocalMem::partitioned;
     RangeMode   range = RangeMode::own;
+    Boundary    boundary = Boundary::none;  ///< what stands between the previous segment and this one
 };
 
 class GroupLauncher {
@@ -64,6 +73,7 @@ public:
 private:
     std::optional<sk::usm_vector<const void*>>   ptrs_;
     std::optional<sk::usm_vector<StageGeometry>> geo_;
+    std::optional<sk::usm_vector<std::uint32_t>> ticket_;  ///< ticket state: only in a group with a boundary, reset every forward
     std::vector<StageGeometry>                   host_geo_;  ///< the host member the geometry array is copied from
     std::vector<sycl::event>                     last_;
 };
