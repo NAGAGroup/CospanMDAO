@@ -21,7 +21,7 @@
 //   structural    fan-in, tie after connect, structural call outside setup, connect from an input, unknown paths
 //   placement     a device equal to the parent's is a no-op; the outer device wins; a rebuilt child keeps it
 //   shape         shape errors are reactive: thrown at the first forward, not at setup (design review, section 2)
-//   Sellar        the smoke_system Sellar-shaped forward, with values
+//   Sellar        a Sellar-shaped forward, with values
 //
 // The components live in namespace tsys (not tc): tests/test_component.cpp has
 // its own, and two same-named classes in one executable would be an ODR clash.

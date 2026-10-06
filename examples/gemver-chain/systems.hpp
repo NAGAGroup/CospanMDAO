@@ -17,12 +17,11 @@
 //
 // Styles (Style):
 //   unfused   every component is its own kernel
-//   parallel  as unfused, but BiCGK's gemv_q and gtp_s are a system_from group (the old ParallelSystem; the two
-//             stages are independent, so their concurrency now comes from data dependencies alone)
-//   fused     GEMVER: fuse_components(segment<whole>[r2u, gtp]), cred, gemv;
-//             BiCGK : fuse_components(gemv_q, gtp_s) (one segment each), cred_s
-// and, as its own root, BarrierTop: the whole chain as ONE fuse_components segment<whole> with
-// software grid barriers between the dependent stages (design review, section 4).
+//   parallel  as unfused, but BiCGK's gemv_q and gtp_s are a system_from group: a plain System, TWO launches (the two
+//             stages are independent, so they overlap through data dependencies alone; no fused group is involved)
+//   fused     GEMVER: fuse_components(connects, segment<range_mode::whole>(r2u, gtp)), then cred, gemv;
+//             BiCGK : fuse_components(gemv_q, gtp_s), each stage its own segment, no boundary: ONE launch, then cred_s
+//   onepass   fused GEMVERs as above, and BiCGK from ONE pass over B (BicgkOnePass, then RowReduce and ColReduce)
 
 #include <cmath>
 #include <cstddef>
@@ -114,20 +113,18 @@ public:
         }
         std::string pre;  // the path prefix of gemv_q and gtp_s
         if (style_ == Style::parallel) {
-            // REVIEW: was a ParallelSystem (independent children, no kernel fusion). A plain group of the two children is the
-            // same thing now: they share no variable, so nothing orders them and they overlap.
-            add_subsystem(cs::system_from("par", cs::subsystem_desc<Gemv>("gemv_q", n_, 1.0f, std::size_t{0}, true),
-                                          cs::subsystem_desc<GemvTPartial>("gtp_s", n_, R_, std::size_t{0}, true)));
+            // A plain group of the two children: they share no variable, so nothing orders them and they overlap.
+            add_subsystem(cs::system_from("par", cs::subsystem_desc<Gemv>("gemv_q", n_, 1.0f, true),
+                                          cs::subsystem_desc<GemvTPartial>("gtp_s", n_, R_, true)));
             pre = "par.";
         } else if (style_ == Style::fused) {
-            // Independent stages: each gets its own slice of groups.
+            // Independent stages: each is a one-stage segment with its own slice of groups.
             add_subsystem(cs::fuse_components(
-                "fw", cs::subsystem_desc<Gemv>("gemv_q", n_, 1.0f, std::size_t{0}, true),
-                cs::subsystem_desc<GemvTPartial>("gtp_s", n_, R_, std::size_t{0}, true)));
+                "fw", cs::subsystem_desc<Gemv>("gemv_q", n_, 1.0f, true), cs::subsystem_desc<GemvTPartial>("gtp_s", n_, R_, true)));
             pre = "fw.";
         } else {
-            add_subsystem(cs::subsystem_desc<Gemv>("gemv_q", n_, 1.0f, std::size_t{0}, true));
-            add_subsystem(cs::subsystem_desc<GemvTPartial>("gtp_s", n_, R_, std::size_t{0}, true));
+            add_subsystem(cs::subsystem_desc<Gemv>("gemv_q", n_, 1.0f, true));
+            add_subsystem(cs::subsystem_desc<GemvTPartial>("gtp_s", n_, R_, true));
         }
         add_subsystem(cs::subsystem_desc<ColReduce<false>>("cred_s", n_, R_, 1.0f));
 
@@ -186,106 +183,4 @@ public:
     }
 };
 
-// =============================================================================
-// The barrier variant: the whole chain as ONE sequential fused component, flat
-// =============================================================================
-// Every stage runs over `groups` resident work-groups (groups * 256 items, grid-stride),
-// and a GridBarrier stands between every pair of stages that depend on each other across
-// groups. Sequential-mode stages run one after the other inside each work-group, so the
-// barrier stage is where the groups of the WHOLE grid meet.
-//
-// REVIEW: was a FusedSystem subclass with its own connects and promotions. The helper takes neither promotions nor a
-// subclass (design review, section 4), so the connects go into connects_desc (paths relative to the group) and BarrierTop
-// promotes the ports it needs by path ("chain.r2u1.A"). Whether promote may name a stage port of a fused component
-// (and an output that is consumed inside the same wave) is not stated in fused_component.hpp; the tie_outputs below
-// already reach "chain.bar1.count" the same way.
-inline auto barrier_chain(int n, int R, std::size_t groups, std::uint32_t spin_limit) {
-    const float       ab  = 1.0f / std::sqrt(static_cast<float>(n));
-    const std::size_t res = groups * kWg;  // resident_items of every stage
-    return cs::fuse_components(
-        "chain",
-        cs::connects_desc({// G1
-                           {"r2u1.B", "gtp1.B"},
-                           {"gtp1.P", "cred1.P"},
-                           {"r2u1.B", "gemv1.B"},
-                           {"cred1.x", "gemv1.x"},
-                           // BiCGK on B1: p = x1, r = w1
-                           {"r2u1.B", "gemv_q.B"},
-                           {"cred1.x", "gemv_q.x"},
-                           {"r2u1.B", "gtp_s.B"},
-                           {"gemv1.y", "gtp_s.y"},
-                           {"gtp_s.P", "cred_s.P"},
-                           // G2: A = B1, y = q, z = s
-                           {"r2u1.B", "r2u2.A"},
-                           {"r2u2.B", "gtp2.B"},
-                           {"gemv_q.y", "gtp2.y"},
-                           {"gtp2.P", "cred2.P"},
-                           {"cred_s.x", "cred2.z"},
-                           {"r2u2.B", "gemv2.B"},
-                           {"cred2.x", "gemv2.x"}}),
-        cs::segment<cs::range_mode::whole>(
-        cs::subsystem_desc<Rank2Update>("r2u1", n, R, res), cs::subsystem_desc<GemvTPartial>("gtp1", n, R, res),
-        cs::subsystem_desc<GridBarrier>("bar1", groups, spin_limit), cs::subsystem_desc<ColReduce<true>>("cred1", n, R, ab, res),
-        cs::subsystem_desc<GridBarrier>("bar2", groups, spin_limit), cs::subsystem_desc<Gemv>("gemv1", n, ab, res),
-        cs::subsystem_desc<GridBarrier>("bar3", groups, spin_limit), cs::subsystem_desc<Gemv>("gemv_q", n, 1.0f, res),
-        cs::subsystem_desc<GemvTPartial>("gtp_s", n, R, res), cs::subsystem_desc<GridBarrier>("bar4", groups, spin_limit),
-        cs::subsystem_desc<ColReduce<false>>("cred_s", n, R, 1.0f, res), cs::subsystem_desc<GridBarrier>("bar5", groups, spin_limit),
-        cs::subsystem_desc<Rank2Update>("r2u2", n, R, res), cs::subsystem_desc<GemvTPartial>("gtp2", n, R, res),
-        cs::subsystem_desc<GridBarrier>("bar6", groups, spin_limit), cs::subsystem_desc<ColReduce<true>>("cred2", n, R, ab, res),
-        cs::subsystem_desc<GridBarrier>("bar7", groups, spin_limit), cs::subsystem_desc<Gemv>("gemv2", n, ab, res)));
-}
-
-// The barrier counters are zeroed by ONE ZeroCounters launch (14 outputs: count1..7, timeout1..7)
-// BEFORE the fused kernel (outputs are never initialized, D138). Inside the wave a late group
-// could zero a counter after another group had incremented it, so the zeroing must never be a
-// stage of the fused component.
-//
-// The barrier variant's root: the zeroing component first, then the chain, each zero output
-// tied to its barrier's counter (tie_outputs across the fuse boundary). The chain's ports are promoted
-// so the root presents the same names as the other variants; the tie aliases
-// "bar<i>_count" / "bar<i>_timeout" are the barriers' counters.
-class BarrierTop : public cs::System {
-    int           n_, R_;
-    std::size_t   groups_;
-    std::uint32_t spin_limit_;
-
-public:
-    static constexpr int kBarriers = 7;
-
-    BarrierTop(int n, int R, std::size_t groups, std::uint32_t spin_limit)
-        : n_{n}, R_{R}, groups_{groups}, spin_limit_{spin_limit} {}
-
-    void setup() override {
-        add_subsystem(cs::subsystem_desc<ZeroCounters>("zero"));
-        add_subsystem(barrier_chain(n_, R_, groups_, spin_limit_));
-        for (int i = 1; i <= kBarriers; ++i) {
-            const std::string k = std::to_string(i), b = "chain.bar" + k;
-            tie_outputs<DType::atomic_u32, 1>({"zero.count" + k, b + ".count"}, "bar" + k + "_count", cs::shape(1));
-            tie_outputs<DType::atomic_u32, 1>({"zero.timeout" + k, b + ".timeout"}, "bar" + k + "_timeout", cs::shape(1));
-        }
-        // Tied writers never wait on each other (design review, section 3): the barriers add onto what zero wrote, so the
-        // edge is declared (it used to be registration order).
-        depends_on("chain", "zero");
-
-        promote<DType::f32, 2>("chain.r2u1.A", "A");
-        promote<DType::f32, 1>("chain.r2u1.u1", "u1a");
-        promote<DType::f32, 1>("chain.r2u1.v1", "v1a");
-        promote<DType::f32, 1>("chain.r2u1.u2", "u2a");
-        promote<DType::f32, 1>("chain.r2u1.v2", "v2a");
-        promote<DType::f32, 1>("chain.gtp1.y", "ya");
-        promote<DType::f32, 1>("chain.cred1.z", "za");
-        promote<DType::f32, 1>("chain.r2u2.u1", "u1b");
-        promote<DType::f32, 1>("chain.r2u2.v1", "v1b");
-        promote<DType::f32, 1>("chain.r2u2.u2", "u2b");
-        promote<DType::f32, 1>("chain.r2u2.v2", "v2b");
-        promote<DType::f32, 2>("chain.r2u1.B", "B1");
-        promote<DType::f32, 1>("chain.cred1.x", "x1");
-        promote<DType::f32, 1>("chain.gemv1.y", "w1");
-        promote<DType::f32, 1>("chain.gemv_q.y", "q");
-        promote<DType::f32, 1>("chain.cred_s.x", "s");
-        promote<DType::f32, 2>("chain.r2u2.B", "B2");
-        promote<DType::f32, 1>("chain.cred2.x", "x2");
-        promote<DType::f32, 1>("chain.gemv2.y", "w2");
-    }
-};
 }  // namespace gc

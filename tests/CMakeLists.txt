@@ -3,8 +3,9 @@
 # project (the root CMakeLists does not add_subdirectory(tests)). Built by
 # pixi-build as the package `cospanmdao-tests`; run with `pixi run test`.
 #
-# tests/spike and tests/smoke are separate, standalone projects and are not
-# referenced from here.
+# tests/spike is a separate, standalone project and is not referenced from here.
+# (tests/smoke, the pre-section-11 smoke programs, was deleted in P8: every one
+# of them used removed API and the suite covers the same ground.)
 cmake_minimum_required(VERSION 3.24)
 project(cospanmdao-tests LANGUAGES CXX)
 

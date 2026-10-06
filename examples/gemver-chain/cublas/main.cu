@@ -74,7 +74,6 @@ Options parse(int argc, char** argv) {
         else if (a == "--iters") o.iters = std::stoi(val());
         else if (a == "--warmup") o.warmup = std::stoi(val());
         else if (a == "--variant") o.variant = val();
-        else if (a == "--blocks-per-cu" || a == "--spin-limit") (void)val();  // CoSpan-only flags
         else if (a == "--tol") o.tol = std::stod(val());
         else if (a == "--check") o.check = true;
         else if (a == "--verbose") o.verbose = true;
@@ -198,7 +197,7 @@ int main(int argc, char** argv) {
                 }
             }
             if (!o.compare.empty()) {
-                for (const char* v : {"unfused", "parallel", "fused", "barrier"}) {
+                for (const char* v : {"unfused", "parallel", "fused", "onepass"}) {
                     std::printf("  cross-check cublas vs %-8s rel L2:", v);
                     bool found = true;
                     for (int i = 0; i < 6 && found; ++i) {

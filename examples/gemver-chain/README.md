@@ -28,9 +28,7 @@ indexed only by `sycl::id<2>{i, j}`.
 | `GemvTPartial` | same mapping | `P[c][j] = sum_k B[cR+k][j] y[cR+k]`; a work-item reads the B it wrote in `Rank2Update` |
 | `ColReduce<Z>` | `n` items | `x[j] = (Z ? z[j] : 0) + scale * sum_c P[c][j]`; `Z = false` has no `z` input |
 | `Gemv` | a group per row, grid-stride over rows | `reduce_over_group`; works under the generic JIT |
-| `GridBarrier` | `G` groups | atomic counter that is never reset (crossing k waits for `k*G`), release/acquire fences, a spin limit and a `timeout` flag |
-
-Each component takes an optional `resident_items`: when set, the launch range is exactly that.
+| `BicgkOnePass`, `RowReduce` | a group per (strip, 256-column block); `n` items | q and s from one pass over `B`, and the row reducer of its q |
 
 ## Variants (`systems.hpp`)
 
@@ -38,19 +36,30 @@ Each component takes an optional `resident_items`: when set, the launch range is
 variant promotes the same names, so the driver is variant-agnostic.
 
 * **unfused**: every component its own kernel: 4 kernels per GEMVER, 3 for BiCGK (11 launches).
-* **parallel**: as unfused, but BiCGK's `gemv_q` and `gtp_s` are a `system_from` group (independent stages; concurrency comes from data dependencies).
-* **fused**: GEMVER = `fuse_components<seq> [r2u, gtp]`, then `cred`, then `gemv`;
-  BiCGK = `fuse_components<par> [gemv_q, gtp_s]`, then `cred_s`. (8 launches.)
+* **parallel**: as unfused, but BiCGK's `gemv_q` and `gtp_s` are a **`system_from` group** (still a plain System, not a fused group): two launches, independent stages, concurrency comes from data dependencies alone. (11 launches.)
+* **fused**: GEMVER = `fuse_components` of ONE segment holding `r2u` and `gtp` with `range_mode::whole`, then `cred`, then `gemv`;
+  BiCGK = `fuse_components` of `gemv_q` and `gtp_s`, each its own segment with no boundary (own slices of groups, one launch), then `cred_s`. (8 launches.)
 * **onepass**: GEMVER as in fused, BiCGK in ONE pass over `B`: a group body over (strip, 256-column
   block) that accumulates `Ps[c][j] = sum_k r[i] B[i][j]` and, per row, `reduce_over_group(B[i][j] p[j])`
   into `Pq[i][block]`, then `RowReduce` (q) and the scale-1 `ColReduce` (s). It reads `B` once for BiCGK
   instead of twice, but sums in a different order, so it is not bitwise equal to the others
   (relative L2 about 3e-6 against unfused). **Skipped by `--variant all` on omp**, where its `q` is
   wrong (see the open questions); an explicit `--variant onepass` still runs it there.
-* **barrier**: the whole chain as ONE sequential `fuse_components<seq>` (one launch), 7 software grid
-  barriers between the dependent stages, every stage on `G = SMs * blocks-per-cu` resident groups.
-  A group that waits `--spin-limit` polls (default 2^24) gives up and sets a timeout flag; the
-  driver reports "grid not co-resident at G=..." and fails the run.
+
+### A fused group with segments
+
+```cpp
+// GEMVER's first two stages: r2u and gtp share their (c, j) mapping, so they sit in ONE segment where every stage
+// runs for every group of the block (range_mode::whole); connects inside the group run forward in stage order.
+add_subsystem(cs::fuse_components(
+    "fw", cs::connects_desc({{"r2u.B", "gtp.B"}}),
+    cs::segment<cs::range_mode::whole>(cs::subsystem_desc<Rank2Update>("r2u", n, R),
+                                       cs::subsystem_desc<GemvTPartial>("gtp", n, R))));
+
+// BiCGK's independent stages: a bare descriptor is a one-stage segment, so each gets its own groups of one launch.
+add_subsystem(cs::fuse_components("fw", cs::subsystem_desc<Gemv>("gemv_q", n, 1.0f, true),
+                                        cs::subsystem_desc<GemvTPartial>("gtp_s", n, R, true)));
+```
 
 ### What can and cannot fuse
 
@@ -62,12 +71,12 @@ nothing else in GEMVER:
 * `cred` needs *every* strip's partial `P[:, j]`, and `gemv` needs the *whole* `x`
   (`w = alpha B x` reads all of `x`). `x` must be complete before `B x`: a global dependency,
   which a kernel boundary provides and a work-group cannot.
-* BiCGK's `gemv_q` and `gtp_s` are independent, so they fuse in parallel mode (disjoint
+* BiCGK's `gemv_q` and `gtp_s` are independent, so they fuse as two segments (disjoint
   groups); `cred_s` again needs all of `P`.
 
-The barrier variant forces those global dependencies into one kernel with a software
-grid barrier. That is only correct when all groups are co-resident, which the
-framework does not guarantee: the sweep below shows where it stops holding on this GPU.
+A global dependency like these can be put inside one fused group with a boundary item
+(`cs::global_barrier()` between two segments, or `cs::ticket_order()` plus `GroupItem::wait_group`).
+This example does not use them: the chain keeps its global dependencies at kernel boundaries.
 
 ## cuBLAS reference (`cublas/`)
 
@@ -82,7 +91,8 @@ update in one pass. Also each BLAS call and copy is a separate launch.
 
 ## Results
 
-RTX 4090 (128 SMs), n = 16384, R = 64, 20 iterations after 3 warm-up, one wait after the batch
+**These numbers were measured before the fused-group rework (P7) and were NOT re-measured for P8**: the fused launch path
+has changed since. RTX 4090 (128 SMs), n = 16384, R = 64, 20 iterations after 3 warm-up, one wait after the batch
 (CoSpan) / CUDA events (cuBLAS). Second run of each program (the JIT cache is warm).
 GB/s uses a **nominal** 8 * n^2 * 4 B = 8.59 GB per chain, not measured traffic
 (the unfused chain really moves about 11 matrix passes).
@@ -92,7 +102,6 @@ GB/s uses a **nominal** 8 * n^2 * 4 B = 8.59 GB per chain, not measured traffic
 | unfused | 15.99 | 1.00x | 537 |
 | parallel | 16.19 | 0.99x | 531 |
 | fused | 11.66 | 1.37x | 737 |
-| barrier (G = 256) | 13.13 | 1.22x | 654 |
 | onepass (provisional) | 11.12 / 10.95 | 1.44x / 1.47x | 772 / 784 |
 | cuBLAS | 21.07 | 0.76x | 408 |
 
@@ -102,40 +111,20 @@ Notes, honestly:
   (1.06x to 1.37x); the other variants moved by under 2%. I did not find why. Read fused as
   "1.06x to 1.37x", not 1.37x.
 * `parallel` is a wash: the two kernels are already large enough to fill the GPU.
-* `barrier` is steady (13.1 ms) and beats unfused by 1.22x, but it does not beat the plain
-  fused variant at its best. Why it trails the best fused run is not measured
-  (the 7 barriers and the smaller resident grid are the candidates).
 * **Small n is different.** At n = 2048 (`--check` runs, 5 iterations) unfused took about 0.25 ms,
-  parallel 0.32 to 0.56 ms, barrier 0.49 to 0.59 ms and fused about 1.7 ms: fusion loses badly
-  when the work is tiny. Per-forward host-side overhead of the fused wave (staging its
-  records and byte streams) is the suspect; I did not profile it.
+  parallel 0.32 to 0.56 ms and fused about 1.7 ms: fusion lost badly when the work was tiny. The suspect was
+  the per-forward host-side overhead of the old fused wave (packing and uploading its stage records, now
+  gone); not re-measured.
 * cuBLAS is the slowest, largely because of the copies and the in-place `sger` passes above.
-* All four CoSpan variants are bitwise equal at n = 2048 and n = 16384, and agree with
+* The unfused, parallel and fused variants are bitwise equal at n = 2048 and n = 16384, and agree with
   cuBLAS to a relative L2 of 3e-7 (x1, s, x2) to 2.7e-6 (w1, q, w2). Against the host double
   reference the errors are the same size (see `--check`).
-
-### Barrier sweep (`--variant barrier --n 16384`)
-
-| blocks per SM | G | ms / chain | result |
-|---:|---:|---:|---|
-| 1 | 128 | 14.91 | ok |
-| 2 | 256 | 13.24 | ok |
-| 3 | 384 | 13.11 | ok |
-| 4 | 512 | 13.22 | ok |
-| 5 | 640 | - | timeout: grid not co-resident (run took about 70 s to give up) |
-| 6 | 768 | - | timeout: grid not co-resident (about 74 s) |
-
-The chain kernel is co-resident up to 4 blocks per SM here and no more; the limit is
-whatever the JIT'd kernel's register use allows, so it can change with the compiler.
-More than one block per SM is a win (14.9 to 13.2 ms), more than two adds nothing.
-On the omp backend the barrier variant is skipped: its groups do not run concurrently.
 
 ## Running
 
 ```
 pixi run -e cuda gemver-chain --check --n 2048            # every variant vs the host reference
 pixi run -e cuda gemver-chain --n 16384 --variant all
-pixi run -e cuda gemver-chain --variant barrier --blocks-per-cu 3
 pixi run -e cuda gemver-chain --n 2048 --dump /tmp/gc       # raw f32 of x1 w1 q s x2 w2 per variant
 
 pixi run -e cublas build-cublas
@@ -143,7 +132,7 @@ pixi run -e cublas gemver-chain-cublas --check --n 2048
 pixi run -e cublas gemver-chain-cublas --n 16384 --compare /tmp/gc   # rel L2 against the CoSpan dumps
 ```
 
-Flags: `--n --R --iters --warmup --variant all|unfused|parallel|fused|barrier|onepass --blocks-per-cu --spin-limit --check --dump`.
+Flags: `--n --R --iters --warmup --variant all|unfused|parallel|fused|onepass --check --dump`.
 `--check` compares every output with the host double reference (relative L2 <= 1e-4; B2 too
 when n <= 4096) and the variants with each other (bitwise). To pick the GPU on a machine that also
 has the omp device, set `ACPP_VISIBILITY_MASK=cuda` (the default selector already picks it here).
@@ -161,9 +150,9 @@ a. **Fused is bimodal across runs** (15.05, 15.08, 14.91, 11.82, 11.66 ms) while
    one-time JIT. Try fixed adaptivity levels and repeated runs.
 b. **Compiler flags.** Check whether AdaptiveCpp enables fast-math or similar by default, and how
    that affects accuracy and timing for every variant and for the cuBLAS comparison.
-c. **Small n.** At n = 2048, fused and barrier are much slower than unfused (about 1.7 ms vs
-   0.25 ms for fused). Suspected cause: the per-forward packing and USM upload of the fused stage
-   records. This is not profiled; see the roadmap's JIT-constant and staging items.
+c. **Small n.** At n = 2048 the old fused variant was much slower than unfused (about 1.7 ms vs
+   0.25 ms). The packing buffers suspected then are gone; whether the new launch path (argument and
+   geometry arrays, one kernel) still loses at small n is not measured.
 d. **onepass gives a wrong `q` on the omp backend** (`q[0]` right, the rest garbage). `s` and every
    other variant are correct. Cause unknown: possibly the backend, possibly `reduce_over_group`
    inside the per-row loop of a group body. Not confirmed.
