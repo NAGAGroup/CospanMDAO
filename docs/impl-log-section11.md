@@ -25,6 +25,9 @@ Running log, newest entries at the bottom. Each entry: date/time (UTC), phase, w
 
 ## Open questions for Jack
 
+- The join task (collapse) breaks ordering in CoSpan on the OpenMP backend; we ship without collapse (SlabKit `7655b84`). Lists drop completed events past 64 entries. Root cause in AdaptiveCpp still to find.
+- Section 11: outside writes never wait on writes. Added (SlabKit `e86ae9f`): an outside writer still waits on the container's own write operations (resize fill, reallocation copy, copy-in), which are not outside writes.
+
 ## Entries
 
 ### 2026-10-06 09:05 UTC, P0: documents
@@ -73,3 +76,22 @@ Running log, newest entries at the bottom. Each entry: date/time (UTC), phase, w
 - **Decisions taken / findings:**
   - **A `dynamic_function_config` must outlive every kernel that uses it, until the queue has been waited on.** The first probe versions kept the config as a local inside the launch lambda. It was destroyed on return, before the wait, and AdaptiveCpp's JIT thread read it afterwards: every case aborted (`std::bad_alloc`, once `std::length_error`) right after `kernel_cache: Cache MISS`, before any `jit: Specializing function call` line. That was a bug in the probe, not in the fork. With the config declared in the test scope all five cases pass. The fused-group design has to keep the config alive in the same way.
 - **Open questions for Jack:** none.
+
+### 2026-10-06 UTC, P3: containers own events; holders own containers; launch events registered at submit
+- **Done:**
+  - Events live in the SlabKit `usm_vector` lists, not in per-variable `EventLists`. A reader waits on `read_deps()` (the write list); a writer waits on `write_deps()` (the read list plus the container's own writes). Frees wait on the containers, so deletion needs no explicit waits.
+  - Holders hold their own device's container. Declaring a holder creates the empty, unbound container; `bind()` makes the `usm_vector` at the first materialization that reaches it. The first materialization is global; later ones check only the asking holder's container and copy from the first live container with data (`populate`). `attach_missing`, `adopt_live_data`, `copy_index`, `give_data`, `has_data`, `make_data`, `metas_of` and `EventLists` are gone.
+  - A component registers its launch on its containers at submit, in `record_launch`: a read on every input container and a write on every output container. Postcompute only pushes. (Before, the write was registered in postcompute, which left a window between submit and postcompute.)
+  - `sync_view` waits on the host container's write list. Shape hooks, the device scan, the ragged column build and the fused component use the same lists.
+  - Fix found on the way: `populate` returned early for a ragged variable with no elements, so a host view of an all-empty hooked ragged output had no index arrays and `block_offsets()` threw "its block offsets live on the device". It now sizes the index arrays.
+- **Commits:** SlabKit `e86ae9f` ("usm_vector: outside writers wait on the container's own writes"; the message lost its apostrophe) and `7655b84` ("usm_vector: no collapse; event lists are handed out whole"); CoSpan `bf9e339` ("P3: containers own events; holders own containers; launch events registered at submit"), which pins SlabKit `7655b84`.
+- **Tests:** SlabKit default `172 | 168 passed | 4 skipped` (1052532 assertions; one run in four had `test_host_work.cpp:295`, "a group mixes kernel and memory subtasks", fail with `9 == 29`: that test has no `usm_vector` in it and passed 20 of 20 alone), cuda `All tests passed (1053976 assertions in 172 test cases)`. CoSpan default `182 | 178 passed | 4 skipped` (2017 assertions), cuda `All tests passed (2040 assertions in 182 test cases)`. `WeightedHistogram*` 20 runs: 20 of 20.
+- **Decisions taken / findings:**
+  - **The collapse join task broke ordering in CoSpan on the OpenMP backend.** SlabKit collapsed a list of more than one event into one event with an empty `single_task` over it. With that, the CoSpan histogram test (a hook reading a value an earlier kernel wrote) read zero instead of 8 in about half the runs, and `ini.y` zeros, zero shapes in `test_shapes` and heap corruption (`malloc(): unaligned tcache chunk`) showed up in the full suite. A join whose task increments a counter in USM (so it is not empty) failed the same way (11 of 20). With no collapse the histogram passes 20 of 20 and the full suites are clean. A standalone SlabKit test (a spinning kernel on an unordered stream, its event registered on a container, a reader depending on the container's write list) passes with the old collapse too, so it did not reproduce the bug. **The cause is not known.** SlabKit now ships without collapse: `read_deps()` and `write_deps()` return the lists whole, and a registration that makes a list longer than 64 events drops the events that have completed.
+  - Waiting on a kernel's own event right after submit also made the histogram pass, so the symptom is a dependency that was not honoured, not a wrong value computed.
+  - The own-writes rule (SlabKit `e86ae9f`) is kept: it is valid on its own, a fresh allocation's zero-fill must come before an outside writer. It did not fix the flake.
+  - Registering the launch event at submit (above) is kept: it closes a real window and does no harm.
+- **Open questions for Jack:**
+  - The join task (collapse) breaks ordering in CoSpan on the OpenMP backend; we ship without collapse. Lists drop completed events past 64 entries. Root cause in AdaptiveCpp still to find.
+  - Section 11: outside writes never wait on writes. Added (SlabKit `e86ae9f`): an outside writer still waits on the container's own write operations (resize fill, reallocation copy, copy-in), which are not outside writes. (Also in the list at the top.)
+  - Not run: the P3 tests for the destruction gate, two readers, a second holder on a new device, input-triggered materialization and the exact pool numbers (they follow in the next commit).
