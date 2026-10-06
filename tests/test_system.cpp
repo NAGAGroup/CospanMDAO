@@ -1477,8 +1477,10 @@ TEST_CASE("init: an eternal free input is initialized by its owner on the first 
     cs::Model model = cs::create_model<tsys::OneAxpbLog>(default_config());
     model.setup();
     CHECK(tsys::count_of("a") == 0);  // nothing is allocated or initialized at setup
-    tsys::expect_throws([&] { (void)cst::synced_input<DType::f32, 1>(model, "a.x"); }, "only after a run");
-    tsys::expect_throws([&] { (void)cst::synced_output<DType::f32, 1>(model, "a.y"); }, "only after a run");
+    // Design review 11.4: a view can be made at any time. It materializes a.x like any holder, so the init runs now (once)
+    // and the view shows its values after sync.
+    CHECK(to_vector(cst::synced_input<DType::f32, 1>(model, "a.x")) == tsys::filled(5.0f));
+    CHECK(tsys::count_of("a") == 1);
     model.forward();
     model.forward();
     model.forward();
@@ -2166,7 +2168,8 @@ TEST_CASE("alias: a promoted value-driven output shows its member's current shap
         s.promote<DType::u32, 1>("v.n", "n");
     });
     model.setup();
-    tsys::expect_throws([&] { (void)cst::synced_output<DType::f32, 1>(model, "b"); }, "only after a run");
+    // a view can be made at any time, but this output's size is set by its producer: not known before a run
+    tsys::expect_throws([&] { (void)cst::synced_output<DType::f32, 1>(model, "b"); }, "its shape is not known yet");
     for (const std::uint32_t n : {3u, 7u, 2u}) {  // the size changes between runs
         INFO("n = " << n);
         model.update_input("n", cs::init::from_host(tsys2::one_u32(n)));
@@ -2179,11 +2182,11 @@ TEST_CASE("alias: a promoted value-driven output shows its member's current shap
     }
 }
 
-TEST_CASE("alias: views of an alias before its root's owner has run throw", "[system][alias]") {
+TEST_CASE("alias: views of an alias before its root's owner has run work (the shape is declared)", "[system][alias]") {
     cs::Model model = cs::create_model<tsys2::TieTwoScales>(default_config());
     model.setup();
-    tsys::expect_throws([&] { (void)cst::synced_input<DType::f32, 1>(model, "x"); }, "only after a run");
-    tsys::expect_throws([&] { (void)cst::synced_input<DType::f32, 1>(model, "a.x"); }, "only after a run");
+    CHECK(cst::synced_input<DType::f32, 1>(model, "x").shape()[0] == tsys::kLen);  // design review 11.4: views any time
+    CHECK(cst::synced_input<DType::f32, 1>(model, "a.x").shape()[0] == tsys::kLen);
     model.forward();
     model.wait();
     CHECK(cst::synced_input<DType::f32, 1>(model, "x").shape()[0] == tsys::kLen);

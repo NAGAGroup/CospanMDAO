@@ -11,9 +11,12 @@
 //   - While any view exists, the host copy is one of the variable's live placements: EVERY FORWARD pushes one copy to
 //     it, after the producer's launch, like any device copy. (Each live view costs one copy per forward.) When the
 //     last view goes away, the host memory is freed; keep a view alive to avoid reallocating it.
-//   - A view can be obtained only AFTER A RUN (Model::view_input and friends throw before the first forward). It starts
-//     as a copy of a live placement and never initializes anything: a view made after Model::update_input shows the
-//     old values until the next run.
+//   - A view can be made AT ANY TIME (Model::get_input / get_output, the view_* shorthands, and a component's own
+//     view_input in pre_forward). It materializes the variable like any holder: a variable not materialized yet takes
+//     its definition and its initializer's shape (an unconnected input shows its initialized values after sync; an
+//     output shows whatever is in memory, zeros) and fails only when the shape cannot be resolved yet. On a variable
+//     that is already materialized it starts as a copy of a live placement and never initializes anything: a view
+//     made after Model::update_input shows the old values until the next run.
 //   - CALL sync() BEFORE READING: it waits on the host container's write events (its pushes and copies).
 //     Reading without syncing, or while work is running, is the caller's responsibility.
 //   - A view OUTLIVES THE MODEL: it keeps the metadata and its host memory, and the container's handle keeps the queue
@@ -34,6 +37,7 @@
 
 #include "naga/cospan/dtype.hpp"
 #include "naga/cospan/instance.hpp"
+#include "naga/cospan/runtime.hpp"
 #include "naga/cospan/variable.hpp"
 #include "naga/cospan/wrappers.hpp"
 
@@ -42,6 +46,39 @@ namespace naga::cospan {
 class Model;
 
 namespace detail {
+
+/// Wraps a view instance in a HostView / HostRagged (their constructors are private): for the Model's handles and a
+/// component's view_input.
+struct HostViewAccess {
+    template <class View>
+    static View wrap(std::shared_ptr<Instance> inst) {
+        return View{std::move(inst)};
+    }
+};
+
+/// A host view instance of the variable `inst` belongs to: a holder on a host placement on the device with the most
+/// instances (section 5), of the same kind as `inst`. It materializes like any holder: a variable that is not
+/// materialized yet is sized and (an input with an initializer) initialized here, and throws the shape-not-known error
+/// when the shape cannot be resolved; one that is materialized is only copied into the view (never initialized, even
+/// when stale: a view made after update_input shows the old values until the next run).
+inline std::shared_ptr<Instance> make_view_instance(Runtime& rt, const Instance& inst, DType dt, int rank, bool dense) {
+    const std::shared_ptr<VarMeta> meta = inst.meta;
+    if (dense && meta->shape.known && meta->shape.ragged())
+        throw std::invalid_argument("naga::cospan: '" + inst.full_path() +
+                                    "' is ragged and has no rectangular host view; use a ragged view (view_ragged_input / "
+                                    "view_ragged_output, or the handle's ragged_view)");
+    const sycl::device             dev  = meta->busiest_device();  // counted before the view joins
+    std::shared_ptr<Instance>      view = make_alias_instance(dt, rank, "<host view>", nullptr, inst.kind, Role::host_view,
+                                                              meta->definition, false, false, meta);
+    view->device       = dev;
+    view->storage_kind = sk::kind::host;
+    view->refresh_container();  // its own (host) container, empty
+    if (meta->is_materialized())
+        meta->attach_holder(rt, *view);  // sized and copied from the first live container with data
+    else
+        meta->materialize(rt, view.get());  // the first materialization, asked by this holder
+    return view;
+}
 
 /// The host data of a view instance, typed.
 template <class T>
@@ -106,6 +143,7 @@ public:
 
 private:
     friend class Model;
+    friend struct detail::HostViewAccess;
     explicit HostView(std::shared_ptr<detail::Instance> inst) : inst_{std::move(inst)} {}
 
     detail::DeviceData<value_type>& store() const { return detail::host_store<value_type>(inst_); }
@@ -152,6 +190,7 @@ public:
 
 private:
     friend class Model;
+    friend struct detail::HostViewAccess;
     explicit HostRagged(std::shared_ptr<detail::Instance> inst) : inst_{std::move(inst)} {}
 
     detail::DeviceData<value_type>& store() const { return detail::host_store<value_type>(inst_); }

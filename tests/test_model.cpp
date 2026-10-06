@@ -968,9 +968,9 @@ TEST_CASE("Two devices: a producer on one, its consumer on the other", "[model][
 TEST_CASE("empty: a size-0 root is present and empty; its consumer runs as a no-op", "[model][init][empty]") {
     auto model = cs::create_model<tmod::EmptyTop>(default_config());
     model.setup();
-    // Design review, section 5: a host view can be obtained only after a run. Before the first forward a view throws
-    // (it used to throw "has no data: it is not materialized" before the owner had run).
-    tmod::expect_throws([&] { (void)model.view_output<DType::f32, 1>("bins.bins"); }, {"only after a run"});
+    // Design review, 11.4: a view can be made at any time; it fails only when the shape cannot be resolved yet. bins.bins is
+    // sized by its producer in pre_forward, so before the first forward its shape is not known.
+    tmod::expect_throws([&] { (void)model.view_output<DType::f32, 1>("bins.bins"); }, {"bins.bins", "not known yet"});
 
     model.update_input("bins.n", cs::init::from_host(std::vector<std::uint32_t>{0}));
     cst::forward_and_wait(model);

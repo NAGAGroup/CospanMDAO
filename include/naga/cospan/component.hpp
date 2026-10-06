@@ -52,6 +52,7 @@
 
 #include "naga/cospan/diagnostics.hpp"
 #include "naga/cospan/dtype.hpp"
+#include "naga/cospan/host_view.hpp"
 #include "naga/cospan/init.hpp"
 #include "naga/cospan/instance.hpp"
 #include "naga/cospan/kernel.hpp"
@@ -448,6 +449,25 @@ public:
 
 protected:
     ComponentBase() = default;
+
+    /// A host view of one of this component's OWN inputs, made with the runtime its precompute received: legal inside
+    /// pre_forward() only. It is a host holder like any other (the host is just another device of the variable): the
+    /// variable is pushed to it every forward while it lives, so keep it as a member (an std::optional, made on the first
+    /// forward) and call sync() before reading. The typical use is to read values in pre_forward and set_shape an
+    /// output from them. There is no equivalent for outputs. The input is already materialized here (precompute step 1).
+    template <DType DT, int Rank>
+    HostView<DT, Rank> view_input(const Input<DT, Rank>& m) {
+        const detail::Instance& inst = member_instance(&m, "view_input");
+        return detail::HostViewAccess::wrap<HostView<DT, Rank>>(
+            detail::make_view_instance(*rt_, inst, DT, Rank, /*dense=*/true));
+    }
+    /// The same for a ragged input: a HostRagged view.
+    template <DType DT, int Rank>
+    HostRagged<DT, Rank> view_input(const RaggedInput<DT, Rank>& m) {
+        const detail::Instance& inst = member_instance(&m, "view_input");
+        return detail::HostViewAccess::wrap<HostRagged<DT, Rank>>(
+            detail::make_view_instance(*rt_, inst, DT, Rank, /*dense=*/false));
+    }
 
     /// The storage kind of this Component's I/O: device, or host for a host body.
     virtual sk::kind default_storage_kind() const { return sk::kind::device; }

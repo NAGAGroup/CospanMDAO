@@ -81,6 +81,69 @@ struct Mark {
 
 class Model;
 
+namespace detail {
+/// The only host write (section 5), by instance: assigns the initializer to the input's variable and marks it STALE; on an
+/// input that has a source it warns and does nothing (unless the variable is part of a cycle). Shared by
+/// Model::update_input and InputHandle::update.
+inline void update_input_instance(const std::string& path, const Instance& inst, InitSpec init) {
+    detail::VarMeta& v = *inst.meta;
+    if (detail::first_of_kind(v, IOKind::output) && !v.cycle) {  // a cycle variable keeps an initializer: update_input counts
+        std::cerr << "naga::cospan: warning: input '" << path << "' is connected to an output; update_input is never applied\n";
+        return;
+    }
+    v.init = std::move(init);  // later than every declaration made in setup, so it replaces them
+    v.mark_stale();
+}
+}  // namespace detail
+
+/// Model::get_input<DT, Rank>(path): the input at `path`. view() makes a host view (a dense variable), ragged_view() a
+/// HostRagged one (a ragged variable, Rank 2; also fine on a dense one: its blocks are the rows). update(init) is
+/// update_input. A handle is valid while its Model lives (a view it made is not tied to the Model).
+template <DType DT, int Rank>
+class InputHandle {
+public:
+    /// A host view of the variable, made now: it materializes the variable like any holder and throws only when its shape
+    /// cannot be resolved yet. Call sync() before reading.
+    HostView<DT, Rank> view() const {
+        return detail::HostViewAccess::wrap<HostView<DT, Rank>>(detail::make_view_instance(*rt_, *inst_, DT, Rank, /*dense=*/true));
+    }
+    HostRagged<DT, Rank> ragged_view() const
+        requires(Rank == 2)
+    {
+        return detail::HostViewAccess::wrap<HostRagged<DT, Rank>>(detail::make_view_instance(*rt_, *inst_, DT, Rank, /*dense=*/false));
+    }
+    /// Model::update_input on this input.
+    void update(InitSpec init) const { detail::update_input_instance(path_, *inst_, std::move(init)); }
+
+private:
+    friend class Model;
+    InputHandle(detail::Runtime* rt, std::shared_ptr<detail::Instance> inst, std::string path)
+        : rt_{rt}, inst_{std::move(inst)}, path_{std::move(path)} {}
+    detail::Runtime*                  rt_;
+    std::shared_ptr<detail::Instance> inst_;
+    std::string                       path_;
+};
+
+/// Model::get_output<DT, Rank>(path): the output at `path`; it reads only (view / ragged_view, as InputHandle).
+template <DType DT, int Rank>
+class OutputHandle {
+public:
+    HostView<DT, Rank> view() const {
+        return detail::HostViewAccess::wrap<HostView<DT, Rank>>(detail::make_view_instance(*rt_, *inst_, DT, Rank, /*dense=*/true));
+    }
+    HostRagged<DT, Rank> ragged_view() const
+        requires(Rank == 2)
+    {
+        return detail::HostViewAccess::wrap<HostRagged<DT, Rank>>(detail::make_view_instance(*rt_, *inst_, DT, Rank, /*dense=*/false));
+    }
+
+private:
+    friend class Model;
+    OutputHandle(detail::Runtime* rt, std::shared_ptr<detail::Instance> inst) : rt_{rt}, inst_{std::move(inst)} {}
+    detail::Runtime*                  rt_;
+    std::shared_ptr<detail::Instance> inst_;
+};
+
 /// THE factory: constructs the root System with `args...` and the Model around it.
 template <class Sys, class... Args>
     requires std::derived_from<Sys, System>
@@ -143,10 +206,26 @@ public:
         s.uqueue.wait_and_throw();
     }
 
-    // ---- host access (section 5), between and after runs ------------------------------------
+    // ---- host access (section 5), at any time after setup ------------------------------------
+    /// The handles (design review 11.4): get_input reads (view) and writes initializers (update); get_output reads only.
+    /// Same template parameters and path rules as the view_* / update_input shorthands below. Naming an output in
+    /// get_input, or an input in get_output, throws std::invalid_argument naming the path and its kind.
+    template <DType DT, int Rank>
+    InputHandle<DT, Rank> get_input(std::string_view path) {
+        Impl&                                   s    = ready("get_input");
+        const std::shared_ptr<detail::Instance> inst = checked_instance("get_input", path, IOKind::input, DT, Rank);
+        return InputHandle<DT, Rank>{&s.rt, inst, std::string{path}};
+    }
+    template <DType DT, int Rank>
+    OutputHandle<DT, Rank> get_output(std::string_view path) {
+        Impl&                                   s    = ready("get_output");
+        const std::shared_ptr<detail::Instance> inst = checked_instance("get_output", path, IOKind::output, DT, Rank);
+        return OutputHandle<DT, Rank>{&s.rt, inst};
+    }
+
     // A host view is an instance of the variable on a host placement. While it lives, every forward pushes one copy to it
-    // (each live view costs one copy per forward); obtain one only after a run; call sync() before reading it. See
-    // host_view.hpp.
+    // (each live view costs one copy per forward); a view can be made at any time (it materializes the variable like any
+    // holder and fails only when the shape cannot be resolved yet); call sync() before reading it. See host_view.hpp.
     template <DType DT, int Rank>
     HostView<DT, Rank> view_input(std::string_view path) {
         return HostView<DT, Rank>{make_view("view_input", path, IOKind::input, DT, Rank, /*dense=*/true)};
@@ -178,13 +257,7 @@ public:
         if (inst->kind != IOKind::input)
             throw std::invalid_argument("naga::cospan: Model::update_input: '" + std::string{path} +
                                         "' is an output; outputs are never initialized");
-        detail::VarMeta& v = *inst->meta;
-        if (detail::first_of_kind(v, IOKind::output) && !v.cycle) {  // a cycle variable keeps an initializer: update_input counts
-            std::cerr << "naga::cospan: warning: input '" << path << "' is connected to an output; update_input is never applied\n";
-            return;
-        }
-        v.init = std::move(init);  // later than every declaration made in setup, so it replaces them
-        v.mark_stale();
+        detail::update_input_instance(std::string{path}, *inst, std::move(init));
     }
 
     // ---- retrieval & observation ------------------------------------------------
@@ -271,12 +344,16 @@ private:
     }
 
     /// A host view instance of the variable at `path`: checked, joined to the variable on a host placement on the device
-    /// with the most instances (section 5), and attached (a copy of a live placement; nothing is initialized).
+    /// with the most instances (section 5), and materialized like any holder (detail::make_view_instance).
     std::shared_ptr<detail::Instance> make_view(const char* verb, std::string_view path, IOKind want, DType dt, int rank, bool dense) {
-        Impl& s = ready(verb);
-        if (s.rt.forward == 0)
-            throw std::logic_error(std::string{"naga::cospan: Model::"} + verb +
-                                   ": a host view can be obtained only after a run (call forward() first)");
+        Impl&                                   s    = ready(verb);
+        const std::shared_ptr<detail::Instance> inst = checked_instance(verb, path, want, dt, rank);
+        return detail::make_view_instance(s.rt, *inst, dt, rank, dense);
+    }
+
+    /// The instance at `path`, of kind `want`, of this dtype and rank; else a throw naming the path (and its kind).
+    std::shared_ptr<detail::Instance> checked_instance(const char* verb, std::string_view path, IOKind want, DType dt, int rank) const {
+        Impl&                                   s    = ready(verb);
         const std::shared_ptr<detail::Instance> inst = s.root->instance_at(path);
         if (inst->kind != want)
             throw std::invalid_argument(std::string{"naga::cospan: Model::"} + verb + ": '" + std::string{path} + "' is " +
@@ -284,18 +361,7 @@ private:
         if (!dtype_compatible(inst->meta->dtype, dt) || inst->meta->rank != rank)
             throw std::invalid_argument(std::string{"naga::cospan: Model::"} + verb + ": '" + std::string{path} +
                                         "' was asked for with the wrong dtype or rank");
-        if (dense && inst->meta->shape.known && inst->meta->shape.ragged())
-            throw std::invalid_argument("naga::cospan: '" + std::string{path} +
-                                        "' is ragged and has no rectangular host view; use view_ragged_input / view_ragged_output");
-        const std::shared_ptr<detail::VarMeta> meta = inst->meta;
-        const sycl::device                     dev  = meta->busiest_device();  // counted before the view joins
-        std::shared_ptr<detail::Instance> view = detail::make_alias_instance(dt, rank, "<host view>", nullptr, inst->kind, detail::Role::host_view,
-                                                                              meta->definition, false, false, meta);
-        view->device       = dev;
-        view->storage_kind = sk::kind::host;
-        view->refresh_container();               // its own (host) container, empty
-        meta->attach_holder(s.rt, *view);        // sized and copied from the first live container with data
-        return view;
+        return inst;
     }
 
     /// Releases the Impl in the order the header names. Does not wait.

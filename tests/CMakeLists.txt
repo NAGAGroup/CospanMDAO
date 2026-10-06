@@ -24,6 +24,7 @@ set(COSPAN_TEST_SOURCES
     test_device_scan.cpp
     test_events.cpp
     test_flavors.cpp
+    test_host_access.cpp
     test_init_shapes.cpp
     test_model.cpp
     test_p4.cpp
