@@ -28,7 +28,6 @@ Running log, newest entries at the bottom. Each entry: date/time (UTC), phase, w
 - The join task (collapse) breaks ordering in CoSpan on the OpenMP backend; we ship without collapse (SlabKit `7655b84`). Lists drop completed events past 64 entries. Root cause in AdaptiveCpp still to find.
 - Section 11: outside writes never wait on writes. Added (SlabKit `e86ae9f`): an outside writer still waits on the container's own write operations (resize fill, reallocation copy, copy-in), which are not outside writes.
 - add_subsystem is still setup-only; should it follow the anywhere principle?
-- (P8, tests/test_epochs.cpp, "Views: a value-driven ragged output follows its driver") Does a live host view follow a shape change of its variable, i.e. is the host copy resized? host_view.hpp only says each forward pushes a copy. The case releases its view before the driver changes; the REVIEW marker stays there as this question.
 - (P8) `onepass` on OpenMP is still expected to give a wrong q (your item); `--variant all` skips it there with its message. On cuda it runs and passes.
 
 ## Entries

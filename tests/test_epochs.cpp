@@ -287,22 +287,28 @@ TEST_CASE("Views: a value-driven ragged output follows its driver", "[epoch][vie
     cs::Model                        m = cs::create_model<tep::RGenTop>(default_config(), counts);
     m.setup();
     for (int r = 0; r < 4; ++r) forward_and_wait(m);
-    // REVIEW (question for Jack): does a live view follow a shape change of its variable (a resize of the host copy)? host_view.hpp
-    // only says each forward pushes a copy. This case releases the view before the driver changes.
-    {
-        const auto v = m.view_ragged_output<DType::f32, 2>("g.r");
-        v.sync();
-        REQUIRE(v.n() == counts.size());
-        for (std::size_t i = 0; i < counts.size(); ++i) {
-            const auto b = v.block(i);
-            REQUIRE(b.size() == static_cast<std::size_t>(counts[i]));
-            for (std::size_t q = 0; q < b.size(); ++q) CHECK(b[q] == static_cast<float>(i * 1000 + q));
-        }
+    // Design review 11.1: a shape change resizes every container of the variable, the host one included. So this FIRST view
+    // stays alive across the change and follows it; spans taken before the change are invalid and are re-taken below.
+    const auto v = m.view_ragged_output<DType::f32, 2>("g.r");
+    v.sync();
+    REQUIRE(v.n() == counts.size());
+    for (std::size_t i = 0; i < counts.size(); ++i) {
+        const auto b = v.block(i);
+        REQUIRE(b.size() == static_cast<std::size_t>(counts[i]));
+        for (std::size_t q = 0; q < b.size(); ++q) CHECK(b[q] == static_cast<float>(i * 1000 + q));
     }
-    // a changed driver is seen
+    // a changed driver is seen by the same view after the next forward and a sync
     const std::vector<std::uint32_t> next{1, 1, 1, 5, 0, 2};
     m.update_input("g.counts", cs::init::from_host(next));
     forward_and_wait(m);
+    v.sync();
+    REQUIRE(v.n() == next.size());
+    for (std::size_t i = 0; i < next.size(); ++i) {
+        const auto b = v.block(i);
+        REQUIRE(b.size() == static_cast<std::size_t>(next[i]));
+        for (std::size_t q = 0; q < b.size(); ++q) CHECK(b[q] == static_cast<float>(i * 1000 + q));
+    }
+    // a view made after the change agrees
     const auto w = m.view_ragged_output<DType::f32, 2>("g.r");
     w.sync();
     REQUIRE(w.n() == next.size());
