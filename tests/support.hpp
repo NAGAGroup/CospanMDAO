@@ -15,7 +15,9 @@
 #include <cmath>
 #include <cstddef>
 #include <span>
+#include <string>
 #include <string_view>
+#include <utility>
 #include <type_traits>
 #include <vector>
 
@@ -61,6 +63,24 @@ constexpr std::size_t pool_bytes_of(std::size_t bytes) {
 constexpr std::size_t solo_launch_bytes(std::size_t kernel_components) { return 3 * kernel_components * pool_node_bytes; }
 /// The same for a fused group of `stages` stages: one argument array per stage, one pointer array, one geometry array.
 constexpr std::size_t group_launch_bytes(std::size_t stages) { return (stages + 2) * pool_node_bytes; }
+
+// ---- the removed fuse strategies, as a test helper -------------------------------
+/// What cs::fuse_components<seq|par> was, spelled with the segment API (P7a): seq = ONE segment holding every stage, range
+/// mode whole; par = every stage its own segment (a bare descriptor is a one-stage segment).
+enum class FuseMode { seq, par };
+
+template <FuseMode S, class... D>
+auto fuse(std::string name, cs::ConnectsDesc c, D... d) {
+    if constexpr (S == FuseMode::seq)
+        return cs::fuse_components(std::move(name), std::move(c), cs::segment<cs::range_mode::whole>(std::move(d)...));
+    else
+        return cs::fuse_components(std::move(name), std::move(c), std::move(d)...);
+}
+template <FuseMode S, class... D>
+    requires(sizeof...(D) >= 1 && !cs::detail::leads_with_connects_v<D...>)
+auto fuse(std::string name, D... d) {
+    return fuse<S>(std::move(name), cs::ConnectsDesc{}, std::move(d)...);
+}
 
 // ---- host-reference comparison ------------------------------------------------
 /// |got - want| <= abs_tol + rel_tol * |want| (a NaN never compares close).

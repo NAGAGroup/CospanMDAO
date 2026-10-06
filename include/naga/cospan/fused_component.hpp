@@ -42,8 +42,6 @@
 
 namespace naga::cospan {
 
-enum class fuse_strategy : uint8_t { seq, par };
-
 /// The connections of a helper-built group, as (source path, target path) pairs in the group's namespace:
 /// connects_desc({{"a.y", "b.x"}, {"b.z", "c.w"}}). The same connect, with the same rules, scoped to the group.
 struct ConnectsDesc {
@@ -58,10 +56,11 @@ inline ConnectsDesc connects_desc(std::initializer_list<std::pair<std::string_vi
 
 namespace detail {
 
-/// A fused group's machinery: not the user path, a base for FusedComponent.
+/// A fused group's machinery: not the user path, a base for FusedGroup. `segments` says which consecutive stages share
+/// groups and how (range mode, local memory); they cover the stages in order.
 class FusedBase : public System {
 public:
-    explicit FusedBase(fuse_strategy s) : strategy_{s} {}
+    explicit FusedBase(std::vector<SegmentSpec> segments) : segments_{std::move(segments)} {}
     ~FusedBase() override = default;
 
     /// Setup, then the setup-end check: no ragged ports.
@@ -83,7 +82,7 @@ public:
     void run_compute(Runtime& rt) override {
         const std::vector<ComponentBase*> st = stages();
         if (st.empty()) throw std::invalid_argument("naga::cospan: " + describe() + ": a fused group has no stages");
-        (void)launcher_.launch(rt, st, segments(st.size()), describe());
+        (void)launcher_.launch(rt, st, segments_, describe());
     }
 
     void run_postcompute(Runtime& rt) override {
@@ -98,17 +97,6 @@ public:
     }
 
 private:
-    /// seq: one segment (every stage starts at group 0, each runs for its own groups); par: every stage its own segment.
-    std::vector<SegmentSpec> segments(std::size_t n) const {
-        std::vector<SegmentSpec> out;
-        if (strategy_ == fuse_strategy::seq) {
-            out.push_back(SegmentSpec{0, n, LocalMem::partitioned, RangeMode::own});
-        } else {
-            for (std::size_t i = 0; i < n; ++i) out.push_back(SegmentSpec{i, 1, LocalMem::partitioned, RangeMode::own});
-        }
-        return out;
-    }
-
     /// The live children, as components: a fused group's children are components only.
     std::vector<ComponentBase*> stages() const {
         std::vector<ComponentBase*> out;
@@ -130,8 +118,8 @@ private:
                                             "' is a ragged port: ragged ports are not supported in fused components yet");
     }
 
-    fuse_strategy strategy_;
-    GroupLauncher launcher_;
+    std::vector<SegmentSpec> segments_;
+    GroupLauncher            launcher_;
 };
 
 /// The component type of a SubsystemDesc.
@@ -152,6 +140,69 @@ inline constexpr bool leads_with_connects_v = false;
 template <class D, class... Ds>
 inline constexpr bool leads_with_connects_v<D, Ds...> = std::is_same_v<std::remove_cvref_t<D>, ConnectsDesc>;
 
+/// A segment descriptor: consecutive stages that share groups, with the segment's options.
+template <LocalMem LM, RangeMode RM, class... Descs>
+struct SegmentDesc {
+    static constexpr LocalMem    local = LM;
+    static constexpr RangeMode   range = RM;
+    static constexpr std::size_t count = sizeof...(Descs);
+    std::tuple<Descs...>         descs;
+};
+template <class T>
+struct is_segment_desc : std::false_type {};
+template <LocalMem LM, RangeMode RM, class... Ds>
+struct is_segment_desc<SegmentDesc<LM, RM, Ds...>> : std::true_type {};
+
+template <class O>
+inline constexpr bool is_local_option_v = std::is_same_v<O, local_mem::partitioned> || std::is_same_v<O, local_mem::shared>;
+template <class O>
+inline constexpr bool is_range_option_v = std::is_same_v<O, range_mode::own> || std::is_same_v<O, range_mode::whole>;
+template <class T, class... Opts>
+inline constexpr std::size_t option_count_v = (std::size_t{std::is_same_v<T, Opts>} + ... + std::size_t{0});
+
+/// The stage descriptors an item contributes: a bare descriptor is one stage; a segment holds its own.
+template <class I>
+struct item_stages {
+    using type = std::tuple<I>;
+};
+template <LocalMem LM, RangeMode RM, class... Ds>
+struct item_stages<SegmentDesc<LM, RM, Ds...>> {
+    using type = std::tuple<Ds...>;
+};
+template <class... Items>
+using all_stage_descs_t = decltype(std::tuple_cat(std::declval<typename item_stages<std::remove_cvref_t<Items>>::type>()...));
+
+/// What a fused group requires of its stages, checked at compile time.
+template <class T>
+struct stage_checks;
+template <class... Ds>
+struct stage_checks<std::tuple<Ds...>> {
+    static constexpr bool nonempty   = sizeof...(Ds) >= 1;
+    static constexpr bool components = (std::derived_from<desc_component_t<Ds>, ComponentBase> && ...);
+    static constexpr bool fusible    = ((!CustomOpBody<desc_body_t<Ds>> && !HostBody<desc_body_t<Ds>>) && ...);
+    static constexpr bool one_kind   = (GroupBody<desc_body_t<Ds>> && ...) || (!GroupBody<desc_body_t<Ds>> && ...);
+    static constexpr bool one_rank   = ((kernel_rank_v<desc_body_t<Ds>> == kernel_rank_v<desc_body_t<std::tuple_element_t<0, std::tuple<Ds...>>>>) && ...);
+};
+
+template <class Item>
+void add_segment_spec(std::vector<SegmentSpec>& out, std::size_t& at) {
+    if constexpr (is_segment_desc<Item>::value) {
+        out.push_back(SegmentSpec{at, Item::count, Item::local, Item::range});
+        at += Item::count;
+    } else {
+        out.push_back(SegmentSpec{at, 1, LocalMem::partitioned, RangeMode::own});  // a bare stage: a one-stage segment
+        at += 1;
+    }
+}
+/// The segments of a group's items, in order.
+template <class... Items>
+std::vector<SegmentSpec> segment_specs() {
+    std::vector<SegmentSpec> out;
+    std::size_t              at = 0;
+    (add_segment_spec<std::remove_cvref_t<Items>>(out, at), ...);
+    return out;
+}
+
 /// A plain System of the given children in order, with the given connections.
 template <class... Descs>
 class ComposedSystem : public System {
@@ -170,54 +221,74 @@ private:
 
 }  // namespace detail
 
-/// One kernel, one submission: the stages `Descs` (descriptors of components), added in order, run as one wave.
-/// Connections (seq only) are made after the stages are added and their variables are marked `internal`. Tied outputs of
-/// its stages follow the ordinary tie policy (section 9).
-template <fuse_strategy S, class... Descs>
-class FusedComponent final : public detail::FusedBase {
-    static_assert(sizeof...(Descs) >= 1, "naga::cospan: a fused component needs at least one stage");
-    static_assert((std::derived_from<detail::desc_component_t<Descs>, ComponentBase> && ...),
-                  "naga::cospan: the stages of a fused component are components (subsystem_desc<T> with T a Component)");
-    static_assert(((!CustomOpBody<detail::desc_body_t<Descs>> && !HostBody<detail::desc_body_t<Descs>>) && ...),
-                  "naga::cospan: custom-op and host bodies cannot be fused");
-    static_assert((GroupBody<detail::desc_body_t<Descs>> && ...) || (!GroupBody<detail::desc_body_t<Descs>> && ...),
-                  "naga::cospan: a fused component's stages are all work-group components or all plain");
-    static_assert(((kernel_rank_v<detail::desc_body_t<Descs>> == kernel_rank_v<detail::desc_body_t<std::tuple_element_t<0, std::tuple<Descs...>>>>) && ...),
-                  "naga::cospan: the stages of a fused component share one kernel rank");
+/// One kernel, one submission: the stages of `Items` (a bare stage descriptor is a one-stage segment; cs::segment groups
+/// consecutive stages that share groups), added in order, run as ONE launch. Connections are made after the stages are
+/// added and their variables are marked `internal`; they are allowed in either range mode. Tied outputs of its stages
+/// follow the ordinary tie policy (section 9).
+template <class... Items>
+class FusedGroup final : public detail::FusedBase {
+    using Checks = detail::stage_checks<detail::all_stage_descs_t<Items...>>;
+    static_assert(Checks::nonempty, "naga::cospan: a fused group needs at least one stage");
+    static_assert(Checks::components,
+                  "naga::cospan: the stages of a fused group are components (subsystem_desc<T> with T a Component)");
+    static_assert(Checks::fusible, "naga::cospan: custom-op and host bodies cannot be fused");
+    static_assert(Checks::one_kind, "naga::cospan: a fused group's stages are all work-group components or all plain");
+    static_assert(Checks::one_rank, "naga::cospan: the stages of a fused group share one kernel rank");
 
 public:
-    FusedComponent(ConnectsDesc c, Descs... d) : detail::FusedBase{S}, connects_{std::move(c)}, descs_{std::move(d)...} {}
+    FusedGroup(ConnectsDesc c, Items... items)
+        : detail::FusedBase{detail::segment_specs<Items...>()}, connects_{std::move(c)}, items_{std::move(items)...} {}
 
     void setup() override {
-        std::apply([this](auto&... d) { (this->add_subsystem(d), ...); }, descs_);
+        std::apply([this](auto&... it) { (this->add_item(it), ...); }, items_);
         for (const auto& [a, b] : connects_.pairs) {
-            if constexpr (S == fuse_strategy::par) {
-                detail::wiring_fail(detail::WiringSite{describe()}, "connect",
-                                    "a par fused component's stages run unordered: connect is rejected ('" + a + "' -> '" + b + "')");
-            } else {
-                connect(a, b);
-                instance_at(b)->meta->internal = true;  // connected inside one fused component
-            }
+            connect(a, b);
+            instance_at(b)->meta->internal = true;  // connected inside one fused group
         }
     }
 
 private:
-    ConnectsDesc        connects_;
-    std::tuple<Descs...> descs_;
+    template <class Item>
+    void add_item(Item& it) {
+        if constexpr (detail::is_segment_desc<std::remove_cvref_t<Item>>::value)
+            std::apply([this](auto&... d) { (this->add_subsystem(d), ...); }, it.descs);
+        else
+            this->add_subsystem(it);
+    }
+
+    ConnectsDesc         connects_;
+    std::tuple<Items...> items_;
 };
 
 // ---- helpers: the simple case only -------------------------------------------------
 
-/// A fused component of the given stages (in order) with the given connections, as a descriptor for add_subsystem.
-template <fuse_strategy S, class... Descs>
-auto fuse_components(std::string name, ConnectsDesc c, Descs... d) {
-    return subsystem_desc<FusedComponent<S, Descs...>>(std::move(name), std::move(c), std::move(d)...);
+/// A segment of consecutive stages that share groups: cs::segment(descs...) takes the defaults (local_mem::partitioned,
+/// range_mode::own); cs::segment<cs::local_mem::shared, cs::range_mode::whole>(descs...) names options (at most one of
+/// each kind).
+template <class... Opts, class... Descs>
+auto segment(Descs... d) {
+    static_assert(sizeof...(Descs) >= 1, "naga::cospan: a segment needs at least one stage");
+    static_assert(((detail::is_local_option_v<Opts> || detail::is_range_option_v<Opts>) && ...),
+                  "naga::cospan: segment options are cs::local_mem::partitioned / shared and cs::range_mode::own / whole");
+    static_assert(detail::option_count_v<local_mem::partitioned, Opts...> + detail::option_count_v<local_mem::shared, Opts...> <= 1,
+                  "naga::cospan: a segment takes at most one local-memory option");
+    static_assert(detail::option_count_v<range_mode::own, Opts...> + detail::option_count_v<range_mode::whole, Opts...> <= 1,
+                  "naga::cospan: a segment takes at most one range-mode option");
+    constexpr detail::LocalMem  lm = detail::option_count_v<local_mem::shared, Opts...> ? detail::LocalMem::shared : detail::LocalMem::partitioned;
+    constexpr detail::RangeMode rm = detail::option_count_v<range_mode::whole, Opts...> ? detail::RangeMode::whole : detail::RangeMode::own;
+    return detail::SegmentDesc<lm, rm, Descs...>{std::tuple<Descs...>{std::move(d)...}};
+}
+
+/// A fused group of the given items (in order) with the given connections, as a descriptor for add_subsystem.
+template <class... Items>
+auto fuse_components(std::string name, ConnectsDesc c, Items... items) {
+    return subsystem_desc<FusedGroup<Items...>>(std::move(name), std::move(c), std::move(items)...);
 }
 /// The same with no connections.
-template <fuse_strategy S, class... Descs>
-    requires(sizeof...(Descs) >= 1 && !detail::leads_with_connects_v<Descs...>)
-auto fuse_components(std::string name, Descs... d) {
-    return subsystem_desc<FusedComponent<S, Descs...>>(std::move(name), ConnectsDesc{}, std::move(d)...);
+template <class... Items>
+    requires(sizeof...(Items) >= 1 && !detail::leads_with_connects_v<Items...>)
+auto fuse_components(std::string name, Items... items) {
+    return subsystem_desc<FusedGroup<Items...>>(std::move(name), ConnectsDesc{}, std::move(items)...);
 }
 
 /// A plain System of the given children (in order) with the given connections, as a descriptor for add_subsystem.

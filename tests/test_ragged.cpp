@@ -376,10 +376,10 @@ public:
     }
 };
 /// A fused component (a helper-built descriptor) whose only stage has a ragged output.
-template <cs::fuse_strategy S>
+template <cst::FuseMode S>
 class FusedRagged : public cs::System {
 public:
-    void setup() override { add_subsystem(cs::fuse_components<S>("w", cs::subsystem_desc<Make>("make", Sizes{1, 0, 3, 2}))); }
+    void setup() override { add_subsystem(cst::fuse<S>("w", cs::subsystem_desc<Make>("make", Sizes{1, 0, 3, 2}))); }
 };
 
 // ---- references ------------------------------------------------------------------------------------------------------
@@ -588,11 +588,11 @@ TEST_CASE("Ragged: declaration and binding errors", "[ragged][errors]") {
         model.wait();
     }
     SECTION("a ragged port in a fused component: refused at setup") {
-        cs::Model model = cs::create_model<trag::FusedRagged<cs::fuse_strategy::seq>>(default_config());
+        cs::Model model = cs::create_model<trag::FusedRagged<cst::FuseMode::seq>>(default_config());
         trag::expect_throws([&] { model.setup(); }, {"ragged ports are not supported in fused components yet"});
     }
     SECTION("a ragged port in a parallel fused component: refused at setup") {
-        cs::Model model = cs::create_model<trag::FusedRagged<cs::fuse_strategy::par>>(default_config());
+        cs::Model model = cs::create_model<trag::FusedRagged<cst::FuseMode::par>>(default_config());
         trag::expect_throws([&] { model.setup(); }, {"ragged ports are not supported in fused components yet"});
     }
 }

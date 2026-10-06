@@ -1,0 +1,389 @@
+// Fused groups (P7a): segments, range modes and local memory, every case through a cospan::Model.
+//
+//   segments        two segments: values right, each stage sees its own segment's group count
+//   range modes     own: a stage sees its own group range; whole: every stage runs over the segment's block
+//   local memory    partitioned: stages have disjoint slices; shared: stage 2 reads what stage 1 left (after a group barrier)
+//   errors          stages with different work-group shapes are refused at forward, naming both
+//   paths           a bare component (a group of one stage); one component type in two groups; a transient group rebuilt
+//                   every forward (the process-wide config cache outlives every kernel)
+//
+// The components live in namespace tfg.
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
+
+#include <sycl/sycl.hpp>
+
+#include <naga/cospan/cospan.hpp>
+
+#include "support.hpp"
+
+namespace cs = naga::cospan;
+using cs::DType;
+using cst::default_config;
+using cst::to_vector;
+
+namespace tfg {
+
+constexpr std::size_t kWg = 64;
+
+/// `f` must throw with every needle in its message.
+template <class F>
+void expect_throws(F&& f, const std::vector<std::string>& needles) {
+    std::string what = "<no exception>";
+    try {
+        f();
+    } catch (const std::exception& e) {
+        what = e.what();
+    }
+    INFO("thrown: " << what);
+    for (const auto& n : needles) CHECK_THAT(what, Catch::Matchers::ContainsSubstring(n));
+}
+
+using Build = std::function<void(cs::System&)>;
+
+class Top : public cs::System {
+    Build build_;
+
+public:
+    explicit Top(Build b) : build_{std::move(b)} {}
+    void setup() override { build_(*this); }
+};
+
+cs::Model make(Build b) { return cs::create_model<Top>(default_config(), std::move(b)); }
+
+std::vector<float> out_of(cs::Model& m, const char* path) { return to_vector(cst::synced_output<DType::f32, 1>(m, path)); }
+
+// ---- Src: y[i] = i + 1 ---------------------------------------------------------------------------
+struct SrcBody {
+    struct Inputs {};
+    struct Outputs {
+        cs::Output<DType::f32, 1> y;
+    };
+    void operator()(sycl::id<1> i, Inputs, Outputs out) const { out.y[i] = static_cast<float>(i[0] + 1); }
+};
+class Src : public cs::Component<SrcBody> {
+    int n_;
+
+public:
+    explicit Src(int n) : n_{n} {}
+    void setup() override { declare_output(y_, "y", n_); }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(y_.shape(), {}, {y_}, {}); }
+
+private:
+    cs::Output<DType::f32, 1> y_;
+};
+
+// ---- Plus1 (plain): y = x + 1, the output follows the input ----------------------------------------
+struct Plus1Body {
+    struct Inputs {
+        cs::Input<DType::f32, 1> x;
+    };
+    struct Outputs {
+        cs::Output<DType::f32, 1> y;
+    };
+    void operator()(sycl::id<1> i, Inputs in, Outputs out) const { out.y[i] = in.x[i] + 1.0f; }
+};
+class Plus1 : public cs::Component<Plus1Body> {
+    cs::Input<DType::f32, 1>  x_;
+    cs::Output<DType::f32, 1> y_;
+
+public:
+    void setup() override {
+        declare_input(x_, "x", cs::unspecified_shape<1>());
+        declare_output(y_, "y", cs::unspecified_shape<1>());
+    }
+    void pre_forward() override { set_shape(y_, shape_of(x_)[0]); }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(x_.shape(), {x_}, {y_}, {}); }
+};
+
+// ---- group bodies ---------------------------------------------------------------------------------
+/// y[g] = segment * 1000 + groups(segment 0) * 100 + groups(segment 1) * 10 + segment count (the second term is 0 with one
+/// segment): what the stage sees of its segment structure.
+struct TagBody {
+    struct Inputs {
+        cs::Input<DType::f32, 1> x;
+    };
+    struct Outputs {
+        cs::Output<DType::f32, 1> y;
+    };
+    void operator()(cs::GroupItem<1> it, Inputs in, Outputs out) const {
+        const std::size_t g = it.get_global_id(0);
+        if (g >= in.x.shape()[0]) return;
+        const std::size_t segs = it.get_segment_count();
+        const std::size_t gc0  = it.get_segment_group_count(0);
+        const std::size_t gc1  = segs > 1 ? it.get_segment_group_count(1) : 0;
+        out.y[g]               = static_cast<float>(it.get_segment() * 1000 + gc0 * 100 + gc1 * 10 + segs);
+    }
+};
+/// y[g] = the group range the stage sees (own: its own groups; whole: the segment's block).
+struct RangeBody {
+    struct Inputs {
+        cs::Input<DType::f32, 1> x;
+    };
+    struct Outputs {
+        cs::Output<DType::f32, 1> y;
+    };
+    void operator()(cs::GroupItem<1> it, Inputs in, Outputs out) const {
+        const std::size_t g = it.get_global_id(0);
+        if (g < in.x.shape()[0]) out.y[g] = static_cast<float>(it.get_group_range(0));
+    }
+};
+/// Shared local memory, stage 1: leaves t[l] = l + 1 in the stage's slice and passes x through.
+struct LeaveBody {
+    struct Inputs {
+        cs::Input<DType::f32, 1> x;
+    };
+    struct Outputs {
+        cs::Output<DType::f32, 1> y;
+    };
+    void operator()(cs::GroupItem<1> it, Inputs in, Outputs out) const {
+        float*            t = it.local<float>(kWg);
+        const std::size_t g = it.get_global_id(0);
+        if (t != nullptr) t[it.get_local_linear_id()] = static_cast<float>(it.get_local_linear_id() + 1);
+        if (g < in.x.shape()[0]) out.y[g] = in.x[g];
+    }
+};
+/// Shared local memory, stage 2: reads the reversed tile after a group barrier, writing nothing itself.
+struct TakeBody {
+    struct Inputs {
+        cs::Input<DType::f32, 1> x;
+    };
+    struct Outputs {
+        cs::Output<DType::f32, 1> y;
+    };
+    void operator()(cs::GroupItem<1> it, Inputs in, Outputs out) const {
+        float*            t = it.local<float>(kWg);
+        const std::size_t g = it.get_global_id(0);
+        sycl::group_barrier(it.get_group());
+        if (g < in.x.shape()[0]) out.y[g] = t != nullptr ? t[kWg - 1 - it.get_local_linear_id()] : -1.0f;
+    }
+};
+/// Partitioned local memory: write t[l] = Base + l into the stage's OWN slice, barrier, read the reversed tile.
+template <int Base>
+struct OwnTileBody {
+    struct Inputs {
+        cs::Input<DType::f32, 1> x;
+    };
+    struct Outputs {
+        cs::Output<DType::f32, 1> y;
+    };
+    void operator()(cs::GroupItem<1> it, Inputs in, Outputs out) const {
+        float*            t = it.local<float>(kWg);
+        const std::size_t g = it.get_global_id(0);
+        if (t != nullptr) t[it.get_local_linear_id()] = static_cast<float>(Base + it.get_local_linear_id());
+        sycl::group_barrier(it.get_group());
+        if (g < in.x.shape()[0]) out.y[g] = t != nullptr ? t[kWg - 1 - it.get_local_linear_id()] : -1.0f;
+    }
+};
+
+/// A group stage over its input's shape, with work-group `wg` and `local_bytes` of requested local memory.
+template <class Body>
+class GStage : public cs::Component<Body> {
+    cs::Input<DType::f32, 1>  x_;
+    cs::Output<DType::f32, 1> y_;
+    std::size_t               wg_, local_bytes_;
+
+public:
+    explicit GStage(std::size_t wg = kWg, std::size_t local_bytes = 0) : wg_{wg}, local_bytes_{local_bytes} {}
+    void setup() override {
+        this->declare_input(x_, "x", cs::unspecified_shape<1>());
+        this->declare_output(y_, "y", cs::unspecified_shape<1>());
+    }
+    void pre_forward() override { this->set_shape(y_, this->shape_of(x_)[0]); }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+        auto d = this->create_launch_config(x_.shape(), sycl::range<1>{wg_}, {x_}, {y_});
+        if (local_bytes_ != 0) d->request_local_bytes(local_bytes_);
+        return d;
+    }
+};
+
+constexpr std::size_t kTile = kWg * sizeof(float);
+
+std::vector<float> filled(std::size_t n, float v) { return std::vector<float>(n, v); }
+
+}  // namespace tfg
+
+using TagStage   = tfg::GStage<tfg::TagBody>;
+using RangeStage = tfg::GStage<tfg::RangeBody>;
+
+TEST_CASE("fused groups: two segments, each stage sees its own segment's group count", "[fused_groups]") {
+    cs::Model model = tfg::make([](cs::System& s) {
+        s.add_subsystem(cs::subsystem_desc<tfg::Src>("sa", 200));  // 4 groups of 64
+        s.add_subsystem(cs::subsystem_desc<tfg::Src>("sb", 100));  // 2 groups
+        s.add_subsystem(cs::fuse_components("f", cs::segment(cs::subsystem_desc<TagStage>("a")),
+                                            cs::segment(cs::subsystem_desc<TagStage>("b"))));
+        s.connect("sa.y", "f.a.x");
+        s.connect("sb.y", "f.b.x");
+    });
+    model.setup();
+    for (int fwd = 0; fwd < 3; ++fwd) {
+        model.forward();
+        model.wait();
+        CHECK(tfg::out_of(model, "f.a.y") == tfg::filled(200, 0 * 1000 + 4 * 100 + 2 * 10 + 2));
+        CHECK(tfg::out_of(model, "f.b.y") == tfg::filled(100, 1 * 1000 + 4 * 100 + 2 * 10 + 2));
+    }
+}
+
+TEST_CASE("fused groups: a bare descriptor is a one-stage segment", "[fused_groups]") {
+    cs::Model model = tfg::make([](cs::System& s) {
+        s.add_subsystem(cs::subsystem_desc<tfg::Src>("sa", 200));
+        s.add_subsystem(cs::subsystem_desc<tfg::Src>("sb", 100));
+        s.add_subsystem(cs::fuse_components("f", cs::subsystem_desc<TagStage>("a"), cs::subsystem_desc<TagStage>("b")));
+        s.connect("sa.y", "f.a.x");
+        s.connect("sb.y", "f.b.x");
+    });
+    model.setup();
+    model.forward();
+    model.wait();
+    CHECK(tfg::out_of(model, "f.a.y") == tfg::filled(200, 422));
+    CHECK(tfg::out_of(model, "f.b.y") == tfg::filled(100, 1422));
+}
+
+TEST_CASE("fused groups: range mode own vs whole", "[fused_groups]") {
+    const bool whole = GENERATE(false, true);
+    CAPTURE(whole);
+    cs::Model model = tfg::make([whole](cs::System& s) {
+        s.add_subsystem(cs::subsystem_desc<tfg::Src>("sa", 200));  // 4 groups
+        s.add_subsystem(cs::subsystem_desc<tfg::Src>("sb", 100));  // 2 groups
+        if (whole)
+            s.add_subsystem(cs::fuse_components("f", cs::segment<cs::range_mode::whole>(cs::subsystem_desc<RangeStage>("a"),
+                                                                                         cs::subsystem_desc<RangeStage>("b"))));
+        else
+            s.add_subsystem(cs::fuse_components(
+                "f", cs::segment<cs::range_mode::own>(cs::subsystem_desc<RangeStage>("a"), cs::subsystem_desc<RangeStage>("b"))));
+        s.connect("sa.y", "f.a.x");
+        s.connect("sb.y", "f.b.x");
+    });
+    model.setup();
+    model.forward();
+    model.wait();
+    CHECK(tfg::out_of(model, "f.a.y") == tfg::filled(200, 4.0f));              // the block is the larger count in both modes
+    CHECK(tfg::out_of(model, "f.b.y") == tfg::filled(100, whole ? 4.0f : 2.0f));  // own: its own two groups; whole: the block
+}
+
+TEST_CASE("fused groups: shared local memory carries a stage's values to the next", "[fused_groups]") {
+    cs::Model model = tfg::make([](cs::System& s) {
+        s.add_subsystem(cs::subsystem_desc<tfg::Src>("src", 128));
+        s.add_subsystem(cs::fuse_components(
+            "f", cs::connects_desc({{"a.y", "b.x"}}),
+            cs::segment<cs::local_mem::shared>(cs::subsystem_desc<tfg::GStage<tfg::LeaveBody>>("a", tfg::kWg, tfg::kTile),
+                                               cs::subsystem_desc<tfg::GStage<tfg::TakeBody>>("b", tfg::kWg, tfg::kTile))));
+        s.connect("src.y", "f.a.x");
+    });
+    model.setup();
+    for (int fwd = 0; fwd < 2; ++fwd) {
+        model.forward();
+        model.wait();
+        std::vector<float> want(128);
+        for (std::size_t g = 0; g < want.size(); ++g) want[g] = static_cast<float>(tfg::kWg - (g % tfg::kWg));  // t[63 - l] = 64 - l
+        CHECK(tfg::out_of(model, "f.b.y") == want);
+    }
+}
+
+TEST_CASE("fused groups: partitioned local memory gives each stage its own slice", "[fused_groups]") {
+    cs::Model model = tfg::make([](cs::System& s) {
+        s.add_subsystem(cs::subsystem_desc<tfg::Src>("src", 128));
+        s.add_subsystem(cs::fuse_components(
+            "f", cs::segment<cs::local_mem::partitioned>(cs::subsystem_desc<tfg::GStage<tfg::OwnTileBody<1>>>("a", tfg::kWg, tfg::kTile),
+                                                         cs::subsystem_desc<tfg::GStage<tfg::OwnTileBody<1000>>>("b", tfg::kWg, tfg::kTile))));
+        s.connect("src.y", "f.a.x");
+        s.connect("src.y", "f.b.x");
+    });
+    model.setup();
+    for (int fwd = 0; fwd < 2; ++fwd) {
+        model.forward();
+        model.wait();
+        std::vector<float> want_a(128), want_b(128);
+        for (std::size_t g = 0; g < 128; ++g) {
+            const std::size_t l = g % tfg::kWg;
+            want_a[g]           = static_cast<float>(1 + (tfg::kWg - 1 - l));
+            want_b[g]           = static_cast<float>(1000 + (tfg::kWg - 1 - l));
+        }
+        CHECK(tfg::out_of(model, "f.a.y") == want_a);
+        CHECK(tfg::out_of(model, "f.b.y") == want_b);
+    }
+}
+
+TEST_CASE("fused groups: stages with different work-group shapes throw at forward, naming both", "[fused_groups][errors]") {
+    cs::Model model = tfg::make([](cs::System& s) {
+        s.add_subsystem(cs::subsystem_desc<tfg::Src>("src", 256));
+        s.add_subsystem(cs::fuse_components("f", cs::segment(cs::subsystem_desc<RangeStage>("a", std::size_t{32}),
+                                                             cs::subsystem_desc<RangeStage>("b", std::size_t{64}))));
+        s.connect("src.y", "f.a.x");
+        s.connect("src.y", "f.b.x");
+    });
+    model.setup();
+    tfg::expect_throws([&] { model.forward(); }, {"f.a", "f.b", "different work-group shapes"});
+    model.wait();
+}
+
+TEST_CASE("fused groups: a bare component launches as a group of one stage", "[fused_groups]") {
+    cs::Model model = tfg::make([](cs::System& s) {
+        s.add_subsystem(cs::subsystem_desc<tfg::Src>("src", 256));
+        s.add_subsystem(cs::subsystem_desc<TagStage>("t"));
+        s.connect("src.y", "t.x");
+    });
+    model.setup();
+    for (int fwd = 0; fwd < 3; ++fwd) {
+        model.forward();
+        model.wait();
+        CHECK(tfg::out_of(model, "t.y") == tfg::filled(256, 401));  // segment 0, 4 groups, one segment
+    }
+}
+
+TEST_CASE("fused groups: one component type in two groups", "[fused_groups]") {
+    cs::Model model = tfg::make([](cs::System& s) {
+        s.add_subsystem(cs::subsystem_desc<tfg::Src>("s1", 200));
+        s.add_subsystem(cs::subsystem_desc<tfg::Src>("s2", 100));
+        s.add_subsystem(cs::subsystem_desc<tfg::Src>("s3", 64));
+        s.add_subsystem(cs::subsystem_desc<tfg::Src>("s4", 192));
+        s.add_subsystem(cs::fuse_components("f1", cs::subsystem_desc<TagStage>("a"), cs::subsystem_desc<TagStage>("b")));
+        s.add_subsystem(cs::fuse_components("f2", cs::subsystem_desc<TagStage>("c"), cs::subsystem_desc<TagStage>("d")));
+        s.connect("s1.y", "f1.a.x");
+        s.connect("s2.y", "f1.b.x");
+        s.connect("s3.y", "f2.c.x");
+        s.connect("s4.y", "f2.d.x");
+    });
+    model.setup();
+    for (int fwd = 0; fwd < 2; ++fwd) {
+        model.forward();
+        model.wait();
+        CHECK(tfg::out_of(model, "f1.a.y") == tfg::filled(200, 422));
+        CHECK(tfg::out_of(model, "f1.b.y") == tfg::filled(100, 1422));
+        CHECK(tfg::out_of(model, "f2.c.y") == tfg::filled(64, 132));    // 1 group, 3 groups
+        CHECK(tfg::out_of(model, "f2.d.y") == tfg::filled(192, 1132));
+    }
+}
+
+TEST_CASE("fused groups: a transient group rebuilt every forward (the config cache outlives every kernel)",
+          "[fused_groups][transient]") {
+    cs::Model model = tfg::make([](cs::System& s) {
+        s.add_subsystem(cs::subsystem_desc<tfg::Src>("sa", 200));
+        s.add_subsystem(cs::subsystem_desc<tfg::Src>("sb", 100));
+        s.add_subsystem(cs::property_list{cs::property::transient{}},
+                        cs::fuse_components("grp", cs::segment(cs::subsystem_desc<TagStage>("a")),
+                                            cs::segment(cs::subsystem_desc<TagStage>("b"))));
+        s.add_subsystem(cs::subsystem_desc<tfg::Plus1>("sink"));
+        s.connect("sa.y", "grp.a.x");
+        s.connect("sb.y", "grp.b.x");
+        s.connect("grp.b.y", "sink.x");
+    });
+    model.setup();
+    for (int fwd = 1; fwd <= 5; ++fwd) {
+        INFO("forward " << fwd);
+        model.forward();
+        model.wait();
+        CHECK(model.get_subsystem("grp") == nullptr);  // deleted after its turn; a new group is built next forward
+        CHECK(tfg::out_of(model, "sink.y") == tfg::filled(100, 1423));  // grp.b.y = 1422, plus 1
+    }
+}

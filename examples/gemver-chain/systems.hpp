@@ -19,9 +19,9 @@
 //   unfused   every component is its own kernel
 //   parallel  as unfused, but BiCGK's gemv_q and gtp_s are a system_from group (the old ParallelSystem; the two
 //             stages are independent, so their concurrency now comes from data dependencies alone)
-//   fused     GEMVER: fuse_components<seq> [r2u, gtp], cred, gemv;
-//             BiCGK : fuse_components<par> [gemv_q, gtp_s], cred_s
-// and, as its own root, BarrierTop: the whole chain as ONE fuse_components<seq> with
+//   fused     GEMVER: fuse_components(segment<whole>[r2u, gtp]), cred, gemv;
+//             BiCGK : fuse_components(gemv_q, gtp_s) (one segment each), cred_s
+// and, as its own root, BarrierTop: the whole chain as ONE fuse_components segment<whole> with
 // software grid barriers between the dependent stages (design review, section 4).
 
 #include <cmath>
@@ -57,9 +57,10 @@ public:
         if (style_ == Style::fused || style_ == Style::onepass) {
             // r2u and gtp share their (c, j) mapping, so the same work-item reads its own B writes.
             // (the work-group size 256 comes from the stages' own launch configs)
-            add_subsystem(cs::fuse_components<cs::fuse_strategy::seq>(
-                "fw", cs::connects_desc({{"r2u.B", "gtp.B"}}), cs::subsystem_desc<Rank2Update>("r2u", n_, R_),
-                cs::subsystem_desc<GemvTPartial>("gtp", n_, R_)));
+            add_subsystem(cs::fuse_components(
+                "fw", cs::connects_desc({{"r2u.B", "gtp.B"}}),
+                cs::segment<cs::range_mode::whole>(cs::subsystem_desc<Rank2Update>("r2u", n_, R_),
+                                                   cs::subsystem_desc<GemvTPartial>("gtp", n_, R_))));
             pre = "fw.";
         } else {
             add_subsystem(cs::subsystem_desc<Rank2Update>("r2u", n_, R_));
@@ -120,7 +121,7 @@ public:
             pre = "par.";
         } else if (style_ == Style::fused) {
             // Independent stages: each gets its own slice of groups.
-            add_subsystem(cs::fuse_components<cs::fuse_strategy::par>(
+            add_subsystem(cs::fuse_components(
                 "fw", cs::subsystem_desc<Gemv>("gemv_q", n_, 1.0f, std::size_t{0}, true),
                 cs::subsystem_desc<GemvTPartial>("gtp_s", n_, R_, std::size_t{0}, true)));
             pre = "fw.";
@@ -201,7 +202,7 @@ public:
 inline auto barrier_chain(int n, int R, std::size_t groups, std::uint32_t spin_limit) {
     const float       ab  = 1.0f / std::sqrt(static_cast<float>(n));
     const std::size_t res = groups * kWg;  // resident_items of every stage
-    return cs::fuse_components<cs::fuse_strategy::seq>(
+    return cs::fuse_components(
         "chain",
         cs::connects_desc({// G1
                            {"r2u1.B", "gtp1.B"},
@@ -222,6 +223,7 @@ inline auto barrier_chain(int n, int R, std::size_t groups, std::uint32_t spin_l
                            {"cred_s.x", "cred2.z"},
                            {"r2u2.B", "gemv2.B"},
                            {"cred2.x", "gemv2.x"}}),
+        cs::segment<cs::range_mode::whole>(
         cs::subsystem_desc<Rank2Update>("r2u1", n, R, res), cs::subsystem_desc<GemvTPartial>("gtp1", n, R, res),
         cs::subsystem_desc<GridBarrier>("bar1", groups, spin_limit), cs::subsystem_desc<ColReduce<true>>("cred1", n, R, ab, res),
         cs::subsystem_desc<GridBarrier>("bar2", groups, spin_limit), cs::subsystem_desc<Gemv>("gemv1", n, ab, res),
@@ -230,7 +232,7 @@ inline auto barrier_chain(int n, int R, std::size_t groups, std::uint32_t spin_l
         cs::subsystem_desc<ColReduce<false>>("cred_s", n, R, 1.0f, res), cs::subsystem_desc<GridBarrier>("bar5", groups, spin_limit),
         cs::subsystem_desc<Rank2Update>("r2u2", n, R, res), cs::subsystem_desc<GemvTPartial>("gtp2", n, R, res),
         cs::subsystem_desc<GridBarrier>("bar6", groups, spin_limit), cs::subsystem_desc<ColReduce<true>>("cred2", n, R, ab, res),
-        cs::subsystem_desc<GridBarrier>("bar7", groups, spin_limit), cs::subsystem_desc<Gemv>("gemv2", n, ab, res));
+        cs::subsystem_desc<GridBarrier>("bar7", groups, spin_limit), cs::subsystem_desc<Gemv>("gemv2", n, ab, res)));
 }
 
 // The barrier counters are zeroed by ONE ZeroCounters launch (14 outputs: count1..7, timeout1..7)

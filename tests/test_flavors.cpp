@@ -1,7 +1,7 @@
 // Fused-component and independent-children tests, every case through a cospan::Model.
 //
 // ParallelSystem and FusedSystem are gone (docs/rework-migration-2026-10-03.md). A fused group is a component built by
-// cs::fuse_components<seq|par>(name, connects_desc({...}), subsystem_desc<...>(...)...) and its ports are reached by path
+// cst::fuse<seq|par>(name, connects_desc({...}), subsystem_desc<...>(...)...) and its ports are reached by path
 // ("f.a.x"); a plain System of the same children is cs::system_from(name, ...). Concurrency of independent children
 // comes from data dependencies alone (design review, section 3).
 //
@@ -506,26 +506,26 @@ public:
 };
 
 constexpr int  kLen = 12;  // the group cases; the group body's work-group is 8, so the last group is ragged
-constexpr auto kSeq = cs::fuse_strategy::seq;
-constexpr auto kPar = cs::fuse_strategy::par;
+constexpr auto kSeq = cst::FuseMode::seq;
+constexpr auto kPar = cst::FuseMode::par;
 
 /// src -> two BigStage children (a, b) in a fused component "f" of strategy S; each stage's scratch tile has `elems` floats.
-template <cs::fuse_strategy S>
+template <cst::FuseMode S>
 cs::Model big_wave(std::size_t elems) {
     return make([elems](cs::System& s) {
         s.add_subsystem(cs::subsystem_desc<Src1>("src", std::array<int, 1>{256}));
-        s.add_subsystem(cs::fuse_components<S>("f", cs::subsystem_desc<BigStage>("a", elems), cs::subsystem_desc<BigStage>("b", elems)));
+        s.add_subsystem(cst::fuse<S>("f", cs::subsystem_desc<BigStage>("a", elems), cs::subsystem_desc<BigStage>("b", elems)));
         s.connect("src.y", "f.a.x");
         s.connect("src.y", "f.b.x");
     });
 }
 
 /// zero (ZeroAcc) and a fused "f" of two atomic Adders (1 and 2) tied into one root "sum"; f depends on zero.
-template <cs::fuse_strategy S>
+template <cst::FuseMode S>
 cs::Model tied_adders() {
     return make([](cs::System& s) {
         s.add_subsystem(cs::subsystem_desc<ZeroAcc>("zero"));
-        s.add_subsystem(cs::fuse_components<S>("f", cs::subsystem_desc<Adder>("a", 1.0f), cs::subsystem_desc<Adder>("b", 2.0f)));
+        s.add_subsystem(cst::fuse<S>("f", cs::subsystem_desc<Adder>("a", 1.0f), cs::subsystem_desc<Adder>("b", 2.0f)));
         s.tie_outputs<DType::atomic_f32, 1>({"zero.acc", "f.a.acc", "f.b.acc"}, "sum", cs::shape(12));  // atomic writers
         // Execution order is data dependencies only and tied writers never wait on each other (design review, section 3):
         // the zeroing producer needs an explicit edge.
@@ -534,11 +534,11 @@ cs::Model tied_adders() {
 }
 
 /// A value-driven size driven from OUTSIDE the fuse: it runs and follows the value.
-template <cs::fuse_strategy S>
+template <cst::FuseMode S>
 void value_from_outside() {
     cs::Model model = make([](cs::System& s) {
         s.add_subsystem(cs::subsystem_desc<Src1>("src", std::array<int, 1>{100}));
-        s.add_subsystem(cs::fuse_components<S>("f", cs::subsystem_desc<Elem<0>>("e"), cs::subsystem_desc<Bins>("b")));  // n is a free input
+        s.add_subsystem(cst::fuse<S>("f", cs::subsystem_desc<Elem<0>>("e"), cs::subsystem_desc<Bins>("b")));  // n is a free input
         s.connect("src.y", "f.e.x");
         hook_bins(s, "f.b");
     });
@@ -628,7 +628,7 @@ TEST_CASE("fused sequential: three plain stages, A -> B element-wise, C on a rag
     cs::Model model = tfl::make([](cs::System& s) {
         s.add_subsystem(cs::subsystem_desc<tfl::Src1>("src", std::array<int, 1>{1000}));
         s.add_subsystem(cs::subsystem_desc<tfl::Src1>("src2", std::array<int, 1>{333}));
-        s.add_subsystem(cs::fuse_components<tfl::kSeq>("f", cs::connects_desc({{"a.y", "b.x"}}),
+        s.add_subsystem(cst::fuse<tfl::kSeq>("f", cs::connects_desc({{"a.y", "b.x"}}),
                                                        cs::subsystem_desc<tfl::Elem<0>>("a"),
                                                        cs::subsystem_desc<tfl::Elem<1>>("b"),
                                                        cs::subsystem_desc<tfl::Elem<2>>("c")));
@@ -652,7 +652,7 @@ TEST_CASE("fused sequential: two group+scratch stages, B's own barrier, own loca
           "[flavors][fused]") {
     cs::Model model = tfl::make([](cs::System& s) {
         s.add_subsystem(cs::subsystem_desc<tfl::Src1>("src", std::array<int, 1>{200}));
-        s.add_subsystem(cs::fuse_components<tfl::kSeq>("f", cs::connects_desc({{"a.y", "b.x"}}),
+        s.add_subsystem(cst::fuse<tfl::kSeq>("f", cs::connects_desc({{"a.y", "b.x"}}),
                                                        cs::subsystem_desc<tfl::GroupStage<tfl::RevBody>>("a"),
                                                        cs::subsystem_desc<tfl::GroupStage<tfl::MirrorBody>>("b")));
         s.connect("src.y", "f.a.x");
@@ -676,7 +676,7 @@ TEST_CASE("fused sequential: a rank-2 wave and a rank-3 wave (7x9x11), the defau
     SECTION("rank 2, 40 x 30") {
         cs::Model model = tfl::make([](cs::System& s) {
             s.add_subsystem(cs::subsystem_desc<tfl::Src2>("src", std::array<int, 2>{40, 30}, 1.0f, 0.0f));
-            s.add_subsystem(cs::fuse_components<tfl::kSeq>("f", cs::connects_desc({{"a.y", "b.x"}}),
+            s.add_subsystem(cst::fuse<tfl::kSeq>("f", cs::connects_desc({{"a.y", "b.x"}}),
                                                            cs::subsystem_desc<tfl::ElemND<2, 0>>("a"),
                                                            cs::subsystem_desc<tfl::ElemND<2, 4>>("b")));
             s.connect("src.y", "f.a.x");
@@ -696,7 +696,7 @@ TEST_CASE("fused sequential: a rank-2 wave and a rank-3 wave (7x9x11), the defau
     SECTION("rank 3, 7 x 9 x 11") {
         cs::Model model = tfl::make([](cs::System& s) {
             s.add_subsystem(cs::subsystem_desc<tfl::Src3>("src", std::array<int, 3>{7, 9, 11}, 1.0f, 0.0f));
-            s.add_subsystem(cs::fuse_components<tfl::kSeq>("f", cs::connects_desc({{"a.y", "b.x"}}),
+            s.add_subsystem(cst::fuse<tfl::kSeq>("f", cs::connects_desc({{"a.y", "b.x"}}),
                                                            cs::subsystem_desc<tfl::ElemND<3, 0>>("a"),
                                                            cs::subsystem_desc<tfl::ElemND<3, 4>>("b")));
             s.connect("src.y", "f.a.x");
@@ -719,7 +719,7 @@ TEST_CASE("fused sequential: a rank-2 wave and a rank-3 wave (7x9x11), the defau
 TEST_CASE("fused sequential: stages may launch over different ranges; no inter-stage check", "[flavors][fused]") {
     cs::Model model = tfl::make([](cs::System& s) {
         s.add_subsystem(cs::subsystem_desc<tfl::Src1>("src", std::array<int, 1>{1000}));
-        s.add_subsystem(cs::fuse_components<tfl::kSeq>("f", cs::connects_desc({{"a.y", "b.x"}}),
+        s.add_subsystem(cst::fuse<tfl::kSeq>("f", cs::connects_desc({{"a.y", "b.x"}}),
                                                        cs::subsystem_desc<tfl::Elem<0>>("a"),   // launches over 1000
                                                        cs::subsystem_desc<tfl::Half>("b")));    // launches over 500, reads a's output at the same index
         s.connect("src.y", "f.a.x");
@@ -739,23 +739,23 @@ TEST_CASE("fused: stages asking for different work-group shapes throw at forward
     // New (design review, section 4: group shape belongs to the component): the wave has ONE shape, so two stages that ask
     // for different ones are refused when the launches are collected.
     const auto build = [](auto strategy_tag) {
-        constexpr cs::fuse_strategy S = decltype(strategy_tag)::value;
+        constexpr cst::FuseMode S = decltype(strategy_tag)::value;
         return tfl::make([](cs::System& s) {
             s.add_subsystem(cs::subsystem_desc<tfl::Src1>("src", std::array<int, 1>{256}));
-            s.add_subsystem(cs::fuse_components<S>("f", cs::subsystem_desc<tfl::GroupStage<tfl::RevBody>>("a", std::size_t{32}),
+            s.add_subsystem(cst::fuse<S>("f", cs::subsystem_desc<tfl::GroupStage<tfl::RevBody>>("a", std::size_t{32}),
                                                    cs::subsystem_desc<tfl::GroupStage<tfl::RevBody>>("b", std::size_t{64})));
             s.connect("src.y", "f.a.x");
             s.connect("src.y", "f.b.x");
         });
     };
     SECTION("sequential") {
-        cs::Model model = build(std::integral_constant<cs::fuse_strategy, tfl::kSeq>{});
+        cs::Model model = build(std::integral_constant<cst::FuseMode, tfl::kSeq>{});
         model.setup();
         tfl::expect_throws([&] { model.forward(); }, {"f.a", "f.b", "different work-group shapes"});
         model.wait();
     }
     SECTION("parallel") {
-        cs::Model model = build(std::integral_constant<cs::fuse_strategy, tfl::kPar>{});
+        cs::Model model = build(std::integral_constant<cst::FuseMode, tfl::kPar>{});
         model.setup();
         tfl::expect_throws([&] { model.forward(); }, {"f.a", "f.b", "different work-group shapes"});
         model.wait();
@@ -773,7 +773,7 @@ TEST_CASE("fused parallel: independent stages of different sizes, three forwards
             s.add_subsystem(cs::subsystem_desc<tfl::Src1>("src1", std::array<int, 1>{1000}));
             s.add_subsystem(cs::subsystem_desc<tfl::Src1>("src2", std::array<int, 1>{257}));
             s.add_subsystem(cs::subsystem_desc<tfl::Src1>("src3", std::array<int, 1>{640}));
-            s.add_subsystem(cs::fuse_components<tfl::kPar>("f", cs::subsystem_desc<tfl::Elem<0>>("a"),   // 1000
+            s.add_subsystem(cst::fuse<tfl::kPar>("f", cs::subsystem_desc<tfl::Elem<0>>("a"),   // 1000
                                                            cs::subsystem_desc<tfl::Elem<2>>("c"),         // 257
                                                            cs::subsystem_desc<tfl::Elem<4>>("d")));       // 640
             s.connect("src1.y", "f.a.x");
@@ -794,7 +794,7 @@ TEST_CASE("fused parallel: independent stages of different sizes, three forwards
         cs::Model model = tfl::make([](cs::System& s) {
             s.add_subsystem(cs::subsystem_desc<tfl::Src1>("src1", std::array<int, 1>{640}));
             s.add_subsystem(cs::subsystem_desc<tfl::Src1>("src2", std::array<int, 1>{200}));
-            s.add_subsystem(cs::fuse_components<tfl::kPar>("f", cs::subsystem_desc<tfl::GroupStage<tfl::RevBody>>("r"),
+            s.add_subsystem(cst::fuse<tfl::kPar>("f", cs::subsystem_desc<tfl::GroupStage<tfl::RevBody>>("r"),
                                                            cs::subsystem_desc<tfl::GroupStage<tfl::MirrorBody>>("m")));
             s.connect("src1.y", "f.r.x");
             s.connect("src2.y", "f.m.x");
@@ -809,37 +809,8 @@ TEST_CASE("fused parallel: independent stages of different sizes, three forwards
     }
 }
 
-TEST_CASE("fused parallel: a connect between stages throws at setup, naming both", "[flavors][fused][errors]") {
-    // Was a forward-time error ("run unordered"). The connection is made inside the fused component's setup, and a par
-    // component rejects it there (fused_component.hpp: FusedComponent::setup).
-    SECTION("an input with an unspecified dim takes its shape from a sibling's output") {
-        cs::Model model = tfl::make([](cs::System& s) {
-            s.add_subsystem(cs::fuse_components<tfl::kPar>("par", cs::connects_desc({{"a.y", "b.x"}}),
-                                                           cs::subsystem_desc<tfl::Src1>("a", std::array<int, 1>{4}),
-                                                           cs::subsystem_desc<tfl::Elem<0>>("b")));
-        });
-        tfl::expect_throws([&] { model.setup(); }, {"par", "connect", "stages run unordered", "'a.y' -> 'b.x'"});
-    }
-    SECTION("a fixed-shape input") {
-        cs::Model model = tfl::make([](cs::System& s) {
-            s.add_subsystem(cs::fuse_components<tfl::kPar>("par", cs::connects_desc({{"a.y", "b.p"}}),  // not a shape dependency, still a connection
-                                                           cs::subsystem_desc<tfl::Src1>("a", std::array<int, 1>{4}),
-                                                           cs::subsystem_desc<tfl::Sum3>("b", 4)));
-        });
-        tfl::expect_throws([&] { model.setup(); }, {"par", "connect", "stages run unordered", "'a.y' -> 'b.p'"});
-    }
-    SECTION("a chain A -> B") {
-        cs::Model model = tfl::make([](cs::System& s) {
-            s.add_subsystem(cs::subsystem_desc<tfl::Src1>("src", std::array<int, 1>{1000}));
-            s.add_subsystem(cs::fuse_components<tfl::kPar>("f", cs::connects_desc({{"a.y", "b.x"}}),  // B reads A's output
-                                                           cs::subsystem_desc<tfl::Elem<0>>("a"),
-                                                           cs::subsystem_desc<tfl::Elem<1>>("b")));
-            s.connect("src.y", "f.a.x");
-        });
-        tfl::expect_throws([&] { model.setup(); }, {"f", "connect", "stages run unordered", "'a.y' -> 'b.x'"});
-    }
-    // (allow_tied_outputs() is gone, so its "does not lift it" section is deleted.)
-}
+// (P7a: a connect between stages of a group is allowed in either range mode, so the old "fused parallel: a connect between
+// stages throws at setup" case is gone. The forward-order check for such connects is P7b.)
 
 TEST_CASE("fused: tied outputs follow the ordinary tie policy, in parallel and sequential mode",
           "[flavors][fused][errors]") {
@@ -855,7 +826,7 @@ TEST_CASE("fused: tied outputs follow the ordinary tie policy, in parallel and s
     SECTION("parallel, plain members with allow_plain: accepted, and it runs") {
         cs::Model model = tfl::make([](cs::System& s) {
             // identical writers (both y[i] = i + 1), so the result does not depend on how they interleave
-            s.add_subsystem(cs::fuse_components<tfl::kPar>("f", cs::subsystem_desc<tfl::Src1>("a", std::array<int, 1>{12}),
+            s.add_subsystem(cst::fuse<tfl::kPar>("f", cs::subsystem_desc<tfl::Src1>("a", std::array<int, 1>{12}),
                                                            cs::subsystem_desc<tfl::Src1>("b", std::array<int, 1>{12})));
             s.tie_outputs<DType::f32, 1>({"f.a.y", "f.b.y"}, "t", cs::shape(12), cs::TieOutputsPolicy::allow_plain);
         });
@@ -868,7 +839,7 @@ TEST_CASE("fused: tied outputs follow the ordinary tie policy, in parallel and s
     }
     SECTION("parallel, plain members with require_atomic (the default): tie_outputs throws at setup") {
         cs::Model model = tfl::make([](cs::System& s) {
-            s.add_subsystem(cs::fuse_components<tfl::kPar>("f", cs::subsystem_desc<tfl::Src1>("a", std::array<int, 1>{12}),
+            s.add_subsystem(cst::fuse<tfl::kPar>("f", cs::subsystem_desc<tfl::Src1>("a", std::array<int, 1>{12}),
                                                            cs::subsystem_desc<tfl::Src1>("b", std::array<int, 1>{12})));
             s.tie_outputs<DType::f32, 1>({"f.a.y", "f.b.y"}, "t", cs::shape(12));
         });
@@ -890,7 +861,7 @@ TEST_CASE("fused: a value-driven size driven by a stage of the same fuse is refu
     // (Unspecified dims through connections are allowed: the chains above use them; derived dims are gone, section 10.)
     SECTION("sequential: the setup-end check names both stages") {
         cs::Model model = tfl::make([](cs::System& s) {
-            s.add_subsystem(cs::fuse_components<tfl::kSeq>("f", cs::connects_desc({{"a.n", "b.n"}}),  // b's output size is the VALUE of a's output
+            s.add_subsystem(cst::fuse<tfl::kSeq>("f", cs::connects_desc({{"a.n", "b.n"}}),  // b's output size is the VALUE of a's output
                                                            cs::subsystem_desc<tfl::NSrc>("a", 8.0f),
                                                            cs::subsystem_desc<tfl::Bins>("b")));
             tfl::hook_bins(s, "f.b");
@@ -898,13 +869,13 @@ TEST_CASE("fused: a value-driven size driven by a stage of the same fuse is refu
         // P5: the source-ordering check is gone; the hook runs before the child f that holds its target and the model sets up.
         CHECK_NOTHROW(model.setup());
     }
-    SECTION("parallel: the connect itself is rejected, before that check") {
+    SECTION("one segment per stage: a connect inside the group is allowed (P7a), same as sequential") {
         cs::Model model = tfl::make([](cs::System& s) {
-            s.add_subsystem(cs::fuse_components<tfl::kPar>("f", cs::connects_desc({{"a.n", "b.n"}}),
+            s.add_subsystem(cst::fuse<tfl::kPar>("f", cs::connects_desc({{"a.n", "b.n"}}),
                                                            cs::subsystem_desc<tfl::NSrc>("a", 8.0f),
                                                            cs::subsystem_desc<tfl::Bins>("b")));
         });
-        tfl::expect_throws([&] { model.setup(); }, {"f", "connect", "stages run unordered"});
+        CHECK_NOTHROW(model.setup());  // the forward-order check for such connects is P7b
     }
 }
 
@@ -962,7 +933,7 @@ TEST_CASE("fused vs unfused: four stages as a plain System and as a sequential f
     });
     cs::Model fused = tfl::make([&](cs::System& s) {
         feed(s);
-        s.add_subsystem(cs::fuse_components<tfl::kSeq>("f", cs::connects_desc({{"a.y", "b.x"}, {"b.y", "c.x"}, {"c.y", "d.x"}}),
+        s.add_subsystem(cst::fuse<tfl::kSeq>("f", cs::connects_desc({{"a.y", "b.x"}, {"b.y", "c.x"}, {"c.y", "d.x"}}),
                                                        cs::subsystem_desc<tfl::Elem<0>>("a"),
                                                        cs::subsystem_desc<tfl::Elem<1>>("b"),
                                                        cs::subsystem_desc<tfl::Elem<3>>("c"),
@@ -999,7 +970,7 @@ TEST_CASE("transient: a system_from group and a fused component release after th
         s.add_subsystem(cs::subsystem_desc<tfl::Src1>("src", std::array<int, 1>{tfl::kLen}));
         const cs::property_list props{cs::property::transient{}};
         if (fused)
-            s.add_subsystem(props, cs::fuse_components<tfl::kPar>("grp", cs::subsystem_desc<tfl::Elem<0>>("a"), cs::subsystem_desc<tfl::Elem<0>>("b")));
+            s.add_subsystem(props, cst::fuse<tfl::kPar>("grp", cs::subsystem_desc<tfl::Elem<0>>("a"), cs::subsystem_desc<tfl::Elem<0>>("b")));
         else
             s.add_subsystem(props, cs::system_from("grp", cs::subsystem_desc<tfl::Elem<0>>("a"), cs::subsystem_desc<tfl::Elem<0>>("b")));
         s.connect("src.y", "grp.a.x");
