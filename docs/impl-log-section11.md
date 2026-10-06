@@ -95,3 +95,9 @@ Running log, newest entries at the bottom. Each entry: date/time (UTC), phase, w
   - The join task (collapse) breaks ordering in CoSpan on the OpenMP backend; we ship without collapse. Lists drop completed events past 64 entries. Root cause in AdaptiveCpp still to find.
   - Section 11: outside writes never wait on writes. Added (SlabKit `e86ae9f`): an outside writer still waits on the container's own write operations (resize fill, reallocation copy, copy-in), which are not outside writes. (Also in the list at the top.)
   - Not run: the P3 tests for the destruction gate, two readers, a second holder on a new device, input-triggered materialization and the exact pool numbers (they follow in the next commit).
+
+## P3: tests (destruction gate, materialization, exact pool numbers)
+
+- Commit 702fba9. New file tests/test_events.cpp (in tests/CMakeLists.txt): destruction gate (a spinning kernel on a host flag; the model's destructor does not return until the flag opens), two readers not waiting on each other (checked through their events and the container's read list; skipped on OpenMP), a second holder on a new placement (a host view gets its own bound container, a copy), and the first materialization asked by an input (global: the other holder is bound and sized before it runs; it initializes).
+- Every pool REVIEW marker is settled with exact numbers by the rule (capacity rounded up to whole 1024 B nodes, summed over live containers), in test_model.cpp, test_system.cpp and test_flavors.cpp. support.hpp gains `pool_node_bytes` and `pool_bytes_of`. No disagreement with the rule.
+- Suites: default 186 cases (181 passed, 5 skipped), cuda all passed (2097 assertions in 186 cases).
