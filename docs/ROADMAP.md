@@ -84,6 +84,7 @@ Topics learned while building the light-transport forcing case (2026-09-30). Eac
 - [ ] Serialization.
 - [ ] A derivative-aware paragraph per forward feature.
 - [ ] A test mocking system. Two event tests were removed in the component redesign (2026-10-11) because they held a kernel running by spinning on a host flag: (a) destroying a model waits for kernels still using its data; (b) two readers of one variable don't wait on each other and both land on its read list. Restore both on the mocking system.
+- [ ] Test coverage analysis and reporting in CI (agreed with Jack 2026-10-11). Comes with the CI/CD step of the path to a public release.
 
 ## Housekeeping
 
