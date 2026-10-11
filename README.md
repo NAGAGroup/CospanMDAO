@@ -130,8 +130,8 @@ preview = ["pixi-build"]
 cospanmdao = { git = "https://github.com/NAGAGroup/CospanMDAO.git", tag = "v0.1.0" }
 ```
 
-then in CMake: `find_package(cospanmdao CONFIG REQUIRED)` and link `naga::cospan`. Packaging note: depend on `cospanmdao` as a
-host and a run dependency, so SlabKit's shared library comes with it.
+then in CMake: `find_package(cospanmdao CONFIG REQUIRED)` and link `naga::cospan`. A host dependency is enough: cospanmdao
+run-exports SlabKit, so its shared library comes along at run time.
 
 **Support policy:** the pixi pipeline is the only officially supported way to build and consume CospanMDAO. Other embeddings
 may work, but issues specific to them will be closed.
