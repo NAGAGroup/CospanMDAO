@@ -129,13 +129,7 @@ constexpr bool same_order_as_unfused(Variant v) {
     return v == Variant::unfused || v == Variant::parallel || v == Variant::fused;
 }
 
-/// The tied constants, set once: the matrix order n and the strip height R (the crafted chain's strips are kRt rows, not --R).
-void set_constants(cs::Model& m, Variant v, const Options& o) {
-    const std::uint32_t R = v == Variant::crafted ? static_cast<std::uint32_t>(gc::kRt) : static_cast<std::uint32_t>(o.R);
-    m.update_input("n", cs::init::from_host(std::vector<std::uint32_t>{static_cast<std::uint32_t>(o.n)}));
-    m.update_input("R", cs::init::from_host(std::vector<std::uint32_t>{R}));
-}
-
+/// n and R live in the root system's constructor arguments only. The crafted chain's strips are kRt rows, not --R.
 cs::Model make_model(Variant v, const Options& o) {
     switch (v) {
         case Variant::unfused: return cs::create_model<gc::Chain>(cs::ModelConfig{}, gc::Style::unfused, o.n, o.R);
@@ -143,7 +137,7 @@ cs::Model make_model(Variant v, const Options& o) {
         case Variant::fused: return cs::create_model<gc::Chain>(cs::ModelConfig{}, gc::Style::fused, o.n, o.R);
         case Variant::onepass: return cs::create_model<gc::Chain>(cs::ModelConfig{}, gc::Style::onepass, o.n, o.R);
         case Variant::naive: return cs::create_model<gc::Chain>(cs::ModelConfig{}, gc::Style::naive, o.n, o.R);
-        case Variant::crafted: return cs::create_model<gc::Chain>(cs::ModelConfig{}, gc::Style::crafted, o.n, o.R);
+        case Variant::crafted: return cs::create_model<gc::Chain>(cs::ModelConfig{}, gc::Style::crafted, o.n, static_cast<int>(gc::kRt));
     }
     throw std::logic_error("unknown variant");
 }
@@ -163,7 +157,6 @@ Report run_variant(Variant v, const Options& o, const Data& d, bool need_B2) {
     cs::Model model = make_model(v, o);
     try {
         model.setup();
-        set_constants(model, v, o);
         set_inputs(model, d);
         for (int i = 0; i < o.warmup; ++i) {
             model.forward();

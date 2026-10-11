@@ -15,7 +15,9 @@ G2     A = B1, same u1..v2, y = q, z = s          -> B2, x2, w2
 The inputs are a deterministic integer hash of (seed, index) in [-1, 1]
 (`common/chain_data.hpp`, plain C++, shared by both programs, with a host
 double-precision reference and a relative-L2 helper). `n` must be a multiple of 256
-(the work-group size) and of `R` (rows per strip).
+(the work-group size) and of `R` (rows per strip). `n` and `R` are the constructor arguments of the root system only: the
+components read their sizes from the shapes of their ports, and the systems give the free inputs and the partial-sum outputs
+their shapes with shape hooks (`systems.hpp`).
 
 ## Components (`components.hpp`)
 
@@ -89,12 +91,12 @@ read `B` from global memory again.
 // runs for every group of the block (range_mode::whole); connects inside the group run forward in stage order.
 add_subsystem(cs::fuse_components(
     "fw", cs::connects_desc({{"r2u.B", "gtp.B"}}),
-    cs::segment<cs::range_mode::whole>(cs::subsystem_desc<Rank2Update>("r2u", n, R),
-                                       cs::subsystem_desc<GemvTPartial>("gtp", n, R))));
+    cs::segment<cs::range_mode::whole>(cs::subsystem_desc<Rank2Update>("r2u", R),
+                                       cs::subsystem_desc<GemvTPartial>("gtp"))));
 
 // BiCGK's independent stages: a bare descriptor is a one-stage segment, so each gets its own groups of one launch.
-add_subsystem(cs::fuse_components("fw", cs::subsystem_desc<Gemv>("gemv_q", n, 1.0f, true),
-                                        cs::subsystem_desc<GemvTPartial>("gtp_s", n, R, true)));
+add_subsystem(cs::fuse_components("fw", cs::subsystem_desc<Gemv>("gemv_q"),
+                                        cs::subsystem_desc<GemvTPartial>("gtp_s")));
 ```
 
 ### What can and cannot fuse
