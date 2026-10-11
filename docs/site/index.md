@@ -6,7 +6,7 @@ This page is a placeholder.
 :maxdepth: 2
 
 getting-started
-concepts
+concepts/index
 user-guides
 academy/index
 api/index

@@ -146,5 +146,5 @@ The first run takes a while, because pixi builds CoSpan's dependencies and the p
 
 ## Where next
 
-- **[Concepts](concepts.md):** the mental model behind components, systems and variables.
+- **[Concepts](concepts/index.md):** the mental model behind components, systems and variables.
 - **[Academy → Main series](academy/main-series/index.md):** building a real project step by step.
