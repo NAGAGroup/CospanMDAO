@@ -74,6 +74,10 @@ cereal  = { workspace = true }
 slabkit = { workspace = true }
 cereal  = { workspace = true }
 
+# A consumer that has cospanmdao only as a host dependency gets SlabKit's shared library at run time.
+[package.run-exports.weak]
+slabkit = { workspace = true }
+
 # ---- dev environment: full build closure of both packages, neither built -----
 [feature.dev.dev]
 cospanmdao       = { path = "." }
