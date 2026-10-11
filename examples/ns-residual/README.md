@@ -45,14 +45,19 @@ rank-2 work-group stage, work-group 16×16, one work-group per tile.
 | # | segment | stages | features used |
 |---|---|---|---|
 | 0 | **init**, one group | `InitDiagnostics`: min dt ← +inf, max wave speed ← −inf, four sums ← 0 | a segment of its own; **no barrier after it**; outputs are never initialized, so the atomics need this |
-| 1 | **tile pipeline**, `segment<local_mem::shared>` | `LoadTile` (20×20 tile with halo into local memory), `ApplyBoundary<Bc>` (swappable component: walls or periodic; nothing on interior tiles), `ToPrimitive`, `Gradients` (u, v, T), `Reconstruct<Lim>` (MUSCL, swappable limiter), `ConvFlux` ×2 (HLLC, **one** component type instanced for x and y), `ViscFlux` ×2 (one type, x and y) | `local_mem::shared` (the tile stays in local memory from stage to stage); `it.local<T>()`; swappable component types; one component type, two instances; the flux stages write the owned faces to global outputs |
-| 2 | **divergence and diagnostics**, `segment<local_mem::partitioned>` | `ConvDivergence` (writes R), `ViscDivergence` (adds into R), `LocalTimestep`, `WaveSpeed`, `ResidualSquares` | `wait_group` **inside the body**, on exactly the tile-pipeline groups read (own tile, east and north neighbour, as `sycl::id<2>`); `cs::ties_desc` with a plain dtype and `allow_plain` for R, stage order sequencing the two writes; group reductions (`cs::reduce_over_group`) then `fetch_min` / `fetch_max` / `fetch_add` on atomic outputs and a per-tile partial; the three diagnostics each `wait_group` on the init group right before their atomic. Only stages that read other groups' data wait |
+| 1 | **tile pipeline**, `segment<local_mem::shared>` | `LoadTile` (20×20 tile with halo into local memory), `ApplyBoundary<Bc>` (swappable component: walls or periodic; nothing on interior tiles), `ToPrimitive`, `Gradients` (u, v, T), `Reconstruct<Lim>` (MUSCL, swappable limiter), `ConvFlux<Dir>` ×2 (HLLC, **one** component template instanced for x, `Dir` 0, and y, `Dir` 1: the direction is a template parameter, not a runtime flag), `ViscFlux<Dir>` ×2 (the same, x and y) | `local_mem::shared` (the tile stays in local memory from stage to stage); `it.local<T>()`; swappable component types; one component type, two instances; the flux stages write the owned faces to global outputs |
+| 2 | **divergence and diagnostics**, `segment<local_mem::partitioned>` | `ConvDivergence<true>` (writes R), `ViscDivergence` (adds into R), `LocalTimestep<true>`, `WaveSpeed<true>`, `ResidualSquares<true>` | `wait_group` **inside the body**, on exactly the tile-pipeline groups read (own tile, east and north neighbour, as `sycl::id<2>`); `cs::ties_desc` with a plain dtype and `allow_plain` for R, stage order sequencing the two writes; group reductions (`cs::reduce_over_group`) then `fetch_min` / `fetch_max` / `fetch_add` on atomic outputs and a per-tile partial; the three diagnostics each `wait_group` on the init group right before their atomic. Only stages that read other groups' data wait |
 | – | `cs::global_barrier()` | | every group of the next segment waits for every group of the earlier segments |
 | 3 | **deterministic reductions**, `segment<partitioned, range_mode::own>` | `DetNorm` (4 groups, one per variable), `DetMin` (1 group), `DetMax` (1 group) | `range_mode::own`: the one-group stages skip the other groups in any dimension; reductions of the per-tile partials in a fixed order |
-| 4 | **error**, one group | `ErrorStage`: six values, each atomic − deterministic | `wait_group` on exactly the segment-3 groups it compares (groups 0–3) |
+| 4 | **error**, one group | `ErrorStage<true>`: six values, each atomic − deterministic | `wait_group` on exactly the segment-3 groups it compares (groups 0–3) |
+
+Every component is `class X : public cs::Component<X>` with a static `compute_impl`; nothing is passed to a kernel except through
+its ports. The grid (nx, ny, tx, ty) is one i32 input `geo` of extent 4 on the components that need it; the system ties those
+inputs into one alias and the driver sets it with `update_input`. The fused and unfused versions of a stage are different
+component types (`ConvDivergence<true>` waits on the tile-pipeline groups, `ConvDivergence<false>` does not), as are the two directions.
 
 The unfused variant has the same stages as separate kernels (`PadBoundary` merges load and boundary; `ToPrimitiveG`,
-`GradientsG`, `ReconstructG`, `ConvFluxG`, `ViscFluxG` work on padded global arrays) and a small `InitDiagnostics` kernel of its own.
+`GradientsG`, `ReconstructG`, `ConvFluxG<Dir>`, `ViscFluxG<Dir>` work on padded global arrays) and a small `InitDiagnostics` kernel of its own.
 The handwritten kernel takes a ticket per work-group (so ticket order is segment order and every wait targets a lower ticket),
 initializes the atomics in the group holding ticket 0 (the diagnostics wait on its flag), waits on the same neighbour tickets, has
 its own barrier (wait until every earlier group is done) before the deterministic reductions, and ends with the error group. Its
@@ -80,27 +85,27 @@ GB/s = nx * ny * 32 B / time, the nominal traffic: 4 state fields read + 4 R fie
 
 | n, nx = ny | variant | ms/eval median | min–max | GB/s nominal | R rel L2 vs reference | atomic-vs-deterministic norm gap | check |
 |---:|---|---:|---|---:|---:|---:|---|
-| 1024 | unfused | 3.133 | 3.120–3.399 | 10.71 | 9.02e-06 | 3.88e-05 | OK |
-| 1024 | fused-flatten | 1.508 | 1.503–1.542 | 22.25 | 9.02e-06 | 3.86e-05 | OK |
-| 1024 | fused-pad | 1.600 | 1.512–1.761 | 20.97 | 9.02e-06 | 3.86e-05 | OK |
-| 1024 | fused-padded | 1.522 | 1.491–1.528 | 22.05 | 9.02e-06 | 3.86e-05 | OK |
-| 1024 | handwritten | 0.264 | 0.263–0.266 | 127.2 | 9.02e-06 | 3.86e-05 | OK |
-| 2048 | unfused | 3.353 | 3.222–3.460 | 40.03 | 1.02e-05 | 1.44e-04 | OK |
-| 2048 | fused-flatten | 1.946 | 1.932–2.108 | 68.96 | 1.02e-05 | 1.44e-04 | OK |
-| 2048 | fused-pad | 1.969 | 1.951–1.990 | 68.17 | 1.02e-05 | 1.44e-04 | OK |
-| 2048 | fused-padded | 1.982 | 1.958–2.007 | 67.72 | 1.02e-05 | 1.44e-04 | OK |
-| 2048 | handwritten | 0.988 | 0.986–1.007 | 135.8 | 1.02e-05 | 1.44e-04 | OK |
-| 4096 | unfused | 9.845 | 9.736–9.909 | 54.53 | 1.11e-05 | 6.61e-04 | OK |
-| 4096 | fused-flatten | 5.852 | 5.827–5.869 | 91.74 | 1.11e-05 | 6.61e-04 | OK |
-| 4096 | fused-pad | 5.821 | 5.813–5.876 | 92.24 | 1.11e-05 | 6.61e-04 | OK |
-| 4096 | fused-padded | 5.966 | 5.927–6.059 | 89.99 | 1.11e-05 | 6.61e-04 | OK |
-| 4096 | handwritten | 3.634 | 3.624–3.655 | 147.7 | 1.11e-05 | 6.61e-04 | OK |
+| 1024 | unfused | 3.260 | 3.131–3.561 | 10.29 | 9.02e-06 | 3.88e-05 | OK |
+| 1024 | fused-flatten | 1.532 | 1.423–1.597 | 21.90 | 9.02e-06 | 3.85e-05 | OK |
+| 1024 | fused-pad | 1.551 | 1.531–1.639 | 21.64 | 9.02e-06 | 3.86e-05 | OK |
+| 1024 | fused-padded | 1.528 | 1.512–1.596 | 21.96 | 9.02e-06 | 3.84e-05 | OK |
+| 1024 | handwritten | 0.268 | 0.267–0.283 | 125.2 | 9.02e-06 | 3.85e-05 | OK |
+| 2048 | unfused | 3.263 | 3.117–3.716 | 41.14 | 1.02e-05 | 1.43e-04 | OK |
+| 2048 | fused-flatten | 1.842 | 1.765–1.881 | 72.86 | 1.02e-05 | 1.44e-04 | OK |
+| 2048 | fused-pad | 1.848 | 1.835–1.893 | 72.61 | 1.02e-05 | 1.44e-04 | OK |
+| 2048 | fused-padded | 1.934 | 1.876–1.965 | 69.40 | 1.02e-05 | 1.44e-04 | OK |
+| 2048 | handwritten | 0.945 | 0.941–0.946 | 142.0 | 1.02e-05 | 1.44e-04 | OK |
+| 4096 | unfused | 9.685 | 9.617–9.726 | 55.43 | 1.11e-05 | 6.61e-04 | OK |
+| 4096 | fused-flatten | 5.810 | 5.789–5.939 | 92.40 | 1.11e-05 | 6.61e-04 | OK |
+| 4096 | fused-pad | 6.062 | 5.715–6.145 | 88.57 | 1.11e-05 | 6.61e-04 | OK |
+| 4096 | fused-padded | 5.914 | 5.795–6.047 | 90.78 | 1.11e-05 | 6.61e-04 | OK |
+| 4096 | handwritten | 3.550 | 3.547–3.742 | 151.2 | 1.11e-05 | 6.61e-04 | OK |
 
-- n = 1024, unfused: warm-up runs needed: 2, converged; timed runs that still printed the JIT warning: 0
-- n = 1024, fused-flatten: warm-up runs needed: 2, converged; timed runs that still printed the JIT warning: 0
+- n = 1024, unfused: warm-up runs needed: 1, converged; timed runs that still printed the JIT warning: 0
+- n = 1024, fused-flatten: warm-up runs needed: 1, converged; timed runs that still printed the JIT warning: 0
 - n = 1024, fused-pad: warm-up runs needed: 1, converged; timed runs that still printed the JIT warning: 0
 - n = 1024, fused-padded: warm-up runs needed: 1, converged; timed runs that still printed the JIT warning: 0
-- n = 1024, handwritten: warm-up runs needed: 2, converged; timed runs that still printed the JIT warning: 0
+- n = 1024, handwritten: warm-up runs needed: 1, converged; timed runs that still printed the JIT warning: 0
 - n = 2048, unfused: warm-up runs needed: 1, converged; timed runs that still printed the JIT warning: 0
 - n = 2048, fused-flatten: warm-up runs needed: 1, converged; timed runs that still printed the JIT warning: 0
 - n = 2048, fused-pad: warm-up runs needed: 1, converged; timed runs that still printed the JIT warning: 0
@@ -114,9 +119,9 @@ GB/s = nx * ny * 32 B / time, the nominal traffic: 4 state fields read + 4 R fie
 
 Notes (facts, not analysis):
 
-- The fused variant is 1.9 to 5.7 times the handwritten kernel's time (1024: 5.7x, 2048: 2.0x, 4096: 1.6x). Why is NOT investigated yet.
-- The three `cs::range_split` strategies are within about 5 percent of each other at every size (1024: 1.51 to 1.60 ms); no strategy is consistently fastest.
-- The unfused time barely changes between 1024 and 2048 (3.13 and 3.35 ms), while the fused and handwritten times grow; the cause is not investigated.
+- The fused variant is 1.6 to 5.8 times the handwritten kernel's time (1024: 5.7 to 5.8x, 2048: 1.95 to 2.05x, 4096: 1.6 to 1.7x). Why is NOT investigated yet.
+- The three `cs::range_split` strategies are within about 5 percent of each other at every size (1024: 1.53 to 1.55 ms); no strategy is consistently fastest.
+- The unfused time barely changes between 1024 and 2048 (3.26 and 3.26 ms), while the fused and handwritten times grow; the cause is not investigated.
 - The atomic-vs-deterministic norm gap grows with the number of tiles (4096 tiles at 1024, 65536 at 4096): the atomic sum is a float running sum of one `fetch_add` per tile. It is reported, not checked; the deterministic sums are within 1e-6 of the double reference.
 - Atomic min and max equal the deterministic ones in every run, and uniform periodic flow gives R exactly 0 (`--check`, every variant and strategy, OpenMP and CUDA).
 - GB/s is the nominal traffic, not measured: the fluxes and partials the kernels also move are not counted.

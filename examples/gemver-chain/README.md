@@ -139,49 +139,49 @@ relative L2 error is the worst of x1 w1 q s x2 w2 (and B2 for n <= 4096) against
 
 | n | variant | ms / chain | min-max | GB/s (nominal) | worst rel L2 |
 |---:|---|---:|---|---:|---:|
-| 2048 | naive | 1.224 | 1.196-1.270 | 109.6 | 1.12e-7 |
-| 2048 | crafted | 1.223 | 1.172-1.299 | 109.7 | 1.24e-7 |
-| 2048 | cuBLAS | 0.172 | 0.170-0.205 | 782.8 | 1.26e-7 |
-| 4096 | naive | 1.433 | 1.346-1.447 | 374.7 | 1.38e-7 |
-| 4096 | crafted | 1.259 | 1.237-1.308 | 426.5 | 1.7e-7 |
-| 4096 | cuBLAS | 0.813 | 0.793-0.817 | 660.5 | 1.24e-7 |
-| 8192 | naive | 2.386 | 2.383-2.408 | 900.0 | 1.69e-7 |
-| 8192 | crafted | 2.384 | 2.376-2.417 | 900.9 | 2.4e-7 |
-| 8192 | cuBLAS | 5.185 | 5.173-5.193 | 414.2 | 1.85e-7 |
-| 16384 | naive | 8.997 | 8.964-9.121 | 954.8 | 2.38e-7 |
-| 16384 | crafted | 8.901 | 8.866-8.949 | 965.1 | 3.4e-7 |
-| 16384 | cuBLAS | 21.01 | 21.01-21.02 | 408.8 | 2.33e-7 |
+| 2048 | naive | 1.169 | 1.133-1.183 | 114.9 | 1.12e-7 |
+| 2048 | crafted | 1.132 | 1.122-1.205 | 118.6 | 1.24e-7 |
+| 2048 | cuBLAS | 0.155 | 0.148-0.166 | 866.3 | 1.26e-7 |
+| 4096 | naive | 1.339 | 1.328-1.441 | 400.9 | 1.38e-7 |
+| 4096 | crafted | 1.238 | 1.166-1.546 | 433.5 | 1.7e-7 |
+| 4096 | cuBLAS | 0.789 | 0.787-0.812 | 680.1 | 1.24e-7 |
+| 8192 | naive | 2.230 | 2.229-2.231 | 962.9 | 1.69e-7 |
+| 8192 | crafted | 2.229 | 2.222-2.734 | 963.4 | 2.4e-7 |
+| 8192 | cuBLAS | 5.102 | 5.089-5.178 | 420.9 | 1.85e-7 |
+| 16384 | naive | 8.531 | 8.469-8.589 | 1007.0 | 2.38e-7 |
+| 16384 | crafted | 8.359 | 8.296-10.25 | 1027.7 | 3.4e-7 |
+| 16384 | cuBLAS | 20.68 | 20.67-20.75 | 415.4 | 2.33e-7 |
 
 The other variants, the same way (one process each):
 
 | n | variant | ms / chain | min-max | GB/s (nominal) |
 |---:|---|---:|---|---:|
-| 2048 | unfused | 1.982 | 1.921-2.066 | 67.7 |
-| 2048 | parallel | 1.963 | 1.933-1.982 | 68.4 |
-| 2048 | fused | 1.675 | 1.613-1.702 | 80.1 |
-| 2048 | onepass | 1.755 | 1.743-1.905 | 76.5 |
-| 4096 | unfused | 1.950 | 1.919-1.951 | 275.3 |
-| 4096 | parallel | 1.946 | 1.924-1.983 | 275.9 |
-| 4096 | fused | 1.735 | 1.648-1.850 | 309.4 |
-| 4096 | onepass | 1.899 | 1.870-1.950 | 282.7 |
-| 8192 | unfused | 3.183 | 3.163-3.834 | 674.7 |
-| 8192 | parallel | 3.790 | 3.153-3.830 | 566.6 |
-| 8192 | fused | 2.621 | 2.607-2.644 | 819.3 |
-| 8192 | onepass | 2.550 | 2.544-2.563 | 842.0 |
-| 16384 | unfused | 12.11 | 12.07-12.15 | 709.1 |
-| 16384 | parallel | 12.12 | 12.06-12.19 | 708.6 |
-| 16384 | fused | 9.858 | 9.834-9.935 | 871.4 |
-| 16384 | onepass | 9.309 | 9.244-9.367 | 922.8 |
+| 2048 | unfused | 1.925 | 1.861-2.007 | 69.7 |
+| 2048 | parallel | 1.970 | 1.899-2.146 | 68.1 |
+| 2048 | fused | 1.582 | 1.560-1.699 | 84.8 |
+| 2048 | onepass | 1.707 | 1.690-1.733 | 78.6 |
+| 4096 | unfused | 1.948 | 1.895-2.121 | 275.6 |
+| 4096 | parallel | 1.882 | 1.863-2.267 | 285.2 |
+| 4096 | fused | 1.661 | 1.637-1.812 | 323.2 |
+| 4096 | onepass | 1.742 | 1.689-1.935 | 308.1 |
+| 8192 | unfused | 2.994 | 2.976-3.036 | 717.2 |
+| 8192 | parallel | 2.984 | 2.979-3.108 | 719.7 |
+| 8192 | fused | 2.447 | 2.436-2.464 | 877.5 |
+| 8192 | onepass | 2.368 | 2.354-2.421 | 906.9 |
+| 16384 | unfused | 11.41 | 11.33-11.81 | 753.1 |
+| 16384 | parallel | 11.43 | 11.27-12.08 | 751.4 |
+| 16384 | fused | 9.150 | 8.987-9.372 | 938.8 |
+| 16384 | onepass | 8.655 | 8.543-9.040 | 992.5 |
 
 Notes, honestly:
 
-* **At n = 16384 (a 1 GiB matrix) the three-launch variants and onepass are all near 9 ms (about 950 GB/s of nominal
-  traffic, against a 1008 GB/s card); `crafted` is 1% ahead of `naive` and 4%
+* **At n = 16384 (a 1 GiB matrix) the three-launch variants and onepass are all near 8.5 ms (about 1000 GB/s of nominal
+  traffic, against a 1008 GB/s card); `crafted` is 2% ahead of `naive` and 3%
   ahead of `onepass`.** The local-memory tiles save `B` traffic that the nominal figure does not count, so they show up
   only as a small difference here; I did not profile why they do not show up as more.
 * **cuBLAS at n = 2048 runs out of the L2 cache**: the matrix is 16 MB (2048 * 2048 * 4 B) and the 4090 has
-  72 MB of L2, so its 0.17 ms is not a memory-bound figure, and at n = 4096 (64 MB) it is still mostly cached. At n = 16384
-  the data comes from DRAM and cuBLAS takes 21 ms (it copies `A` into `B` before each in-place `sger`, see above). The CoSpan
+  72 MB of L2, so its 0.155 ms is not a memory-bound figure, and at n = 4096 (64 MB) it is still mostly cached. At n = 16384
+  the data comes from DRAM and cuBLAS takes 20.7 ms (it copies `A` into `B` before each in-place `sger`, see above). The CoSpan
   variants at n <= 4096 take about 1.2 ms whatever n is, which is not bandwidth; launch and barrier costs are the suspect, not profiled.
 * **Running all the variants in one process (`--variant all`) slows the fused ones down and makes them bimodal; the cause
   was not investigated.** At n = 16384 `crafted` and `naive` measured 13-14 ms (min-max 12.97-16.19 ms) as the last variants
