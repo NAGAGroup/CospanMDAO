@@ -1,0 +1,32 @@
+[workspace]
+name      = "getting-started"
+version   = "0.1.0"
+channels  = ["https://prefix.dev/jackm97/naga-labs-staging"]
+platforms = ["linux-64"]
+preview   = ["pixi-build"]
+
+[workspace.build-variants]
+c_compiler           = ["naga-acpp-clang"]
+cxx_compiler         = ["naga-acpp-clangxx"]
+c_compiler_version   = ["2026.10.06"]
+cxx_compiler_version = ["2026.10.06"]
+naga-acpp-llvm       = ["21"]
+cmake                = ["3.31.*"]
+
+[package]
+name    = "getting-started"
+version = "0.1.0"
+
+[package.build.backend]
+name     = "pixi-build-cmake"
+version  = "*"
+channels = ["https://prefix.dev/pixi-build-backends"]
+
+[package.host-dependencies]
+cospanmdao = { git = "https://github.com/NAGAGroup/CospanMDAO.git" }
+
+[dependencies]
+getting-started = { path = "." }
+
+[tasks]
+getting-started = "getting-started"
