@@ -469,7 +469,7 @@ their own submission and cannot be stages.
   host member every forward as a container write. The group's **pointer array** (one pointer per stage) is allocated, filled
   and waited on once, at the group's first precompute (devices are final then); it is redone only if the group is rebuilt. The
   group's **geometry array** is refilled every forward from a host member with event ordering: one `StageGeometry` per stage
-  (`group_count`, `group_base`, `segment_groups`, the wait-state pointer, `segment`, `segments`, `stages`, `local_offset`,
+  (`group_count`, `group_base`, `segment_groups`, `ticket_state`, `segment`, `segments`, `stages`, `local_offset`,
   `local_bytes`, `range_mode`), followed by the segment table (6.3).
 
 ### 6.2 The descriptor
@@ -517,7 +517,7 @@ hardware group id and no atomics.
 - **Segment table.** After the `stages` geometry entries: the S block sizes, then the S boundary kinds (`none`,
   `global_barrier`), as `std::uint64_t`.
 
-### 6.4 Group waits and the global barrier
+### 6.4 Group waits, the global barrier and ticket mode
 
 **`cs::global_barrier()` is the only boundary item.** It goes **between two segments**, never first, never last, never next to
 another barrier. **Group waits are a property of the fused group**, `cs::group_waits_enabled`, a tag type given as a template
@@ -533,14 +533,14 @@ cooperate with). These are `static_assert`s of `FusedGroup` (traits `detail::bou
 plain-body group has no work-group to wait with", "cs::global_barrier() is for groups of work-group stages: a plain-body group
 has no work-group to cooperate with", "the only fuse_components option is cs::group_waits_enabled".
 
-If a group has the property or a barrier, **the whole launch has a wait state**:
+If a group has the property or a barrier, **the whole launch uses tickets**:
 
-- At the start of each work-group the leader takes the next number with a relaxed `fetch_add` on the start counter and
-  broadcasts it to the group (`StageItem::group` carries it). That number, not the hardware id, gives the work-group's segment
-  and its group within the segment through the segment table, in start order. Every earlier number is held by a group that has
-  started, so a group waiting only on earlier groups cannot deadlock **and no co-residency is needed**.
-- **The wait state** is a device container owned by the group, `uint32` words: `[0]` the start counter, `[1, 1+S)` per-segment
-  completed counters, then one completion flag per group in start order (`1 + S + total groups` words). It is reset every forward by a
+- At the start of each work-group the leader takes a ticket with a relaxed `fetch_add` on the ticket counter and broadcasts it
+  to the group (`StageItem::group` carries it). The ticket, not the hardware id, gives the work-group's segment and its group
+  within the segment through the segment table, in ticket order. Every earlier ticket is held by a group that has started, so
+  a group waiting only on earlier groups cannot deadlock **and no co-residency is needed**.
+- **Ticket state** is a device container owned by the group, `uint32` words: `[0]` the ticket counter, `[1, 1+S)` per-segment
+  completed counters, then one completion flag per ticket (`1 + S + total groups` words). It is reset every forward by a
   container fill ordered after the previous launch; the launch is an outside writer of it and waits on the fill. Its pointer is
   in every geometry entry. A group with neither the property nor a barrier has a null pointer and allocates nothing.
 - **Completion.** After the stage sequence the work-group does a group barrier and a device-scope release fence; the leader
@@ -567,16 +567,16 @@ the stage's segment, from 0; local ids and ranges are physical.
 
 The waits are `const` and **collective** (every work-item calls them): one work-item spins with acquire loads, then a group
 barrier and an acquire fence release the group. `wait_group(s, g)` waits for group `g` of segment `s`;
-`wait_earlier_segments()` for every group of every earlier segment. They need a group with `cs::group_waits_enabled` or a `cs::global_barrier()`: without one the pointer is null and
+`wait_earlier_segments()` for every group of every earlier segment. They need ticket mode (a group with `cs::group_waits_enabled` or a `cs::global_barrier()`): without it the pointer is null and
 the behavior is undefined, with no branches and no checks; waiting on your own segment or a later one never returns. A plain
 body gets `sycl::id<R>`.
 
 ### 6.6 Events
 
 The single launch waits on, and registers a read on: every stage's input containers, the argument arrays, the geometry array
-and the pointer array. It registers a write on every stage's output containers and on the wait state. Its dependencies are
+and the pointer array. It registers a write on every stage's output containers and on the ticket state. Its dependencies are
 those of one component (per stage: inputs' writes, outputs' reads and their variables' resize events, `depends_on` events) collected over every
-stage, plus the geometry, pointer and wait-state arrays. Internal connections work out naturally. The group's event is
+stage, plus the geometry, pointer and ticket-state arrays. Internal connections work out naturally. The group's event is
 recorded on every stage.
 
 ---
@@ -601,7 +601,7 @@ outstanding × node size), `os_allocations` (cumulative) and `os_bytes_in_use`.
 
 **The rule:** `pool_bytes_in_use` is the sum of the live containers' capacities, each rounded up to whole nodes. Counted
 containers include the launch arrays: each kernel component's argument array, the group's pointer array and geometry array,
-and the wait state of a group with group waits. Each is far below one node, so each takes one: **a bare component costs three nodes, a
+and the ticket state in ticket mode (a group with group waits). Each is far below one node, so each takes one: **a bare component costs three nodes, a
 fused group of n stages costs n + 2** (plus one with group waits), in addition to the variables. The tests assert these numbers
 exactly (`support.hpp`: `pool_node_bytes`, `pool_bytes_of`, `solo_launch_bytes`). There is no arena; frees are ordered by the
 events registered on the container.
@@ -643,14 +643,14 @@ Section 11 is the design; where the code differs, this is where and why.
    does not say when it fails.
    **Boundary set (11.6).** `cs::global_barrier()` is the only boundary item; waiting on earlier groups is the fused-group
    property `cs::group_waits_enabled` (a barrier implies it), and every other ordering pattern is the user's logic inside
-   their stages. The first implementation also had a second boundary item that only switched the launch to wait mode; that
+   their stages. The first implementation also had a second boundary item that only switched the launch to ticket mode; that
    was never the intent (Jack corrected the design) and it was removed.
 5. **Config cache (11.6).** The design keeps one dynamic-function *definition* per component type (a function-local static).
    As built that holds, and the *configuration* of each distinct stage sequence is cached process-wide and never destroyed
    (keyed by rank and the definitions' names), because a configuration must outlive every kernel and a transient group can be
    deleted before its kernel is compiled.
-6. **Wait counters (11.6).** The design allows a fill or a forward-number comparison to reset the counters; as built it is a
-   container fill before every launch, with the launch registered as an outside writer of the wait state.
+6. **Ticket counters (11.6).** The design allows a fill or a forward-number comparison to reset the counters; as built it is a
+   container fill before every launch, with the launch registered as an outside writer of the ticket state.
 7. **Merging two materialized variables (11.2).** The design defers it; as built it throws at the call.
 8. **Phase-bound calls (11.0).** `add_subsystem` and the marks are still setup-only; every other structural call is legal at
    any time. `add_subsystem` may follow the "anywhere" principle later.
@@ -666,10 +666,10 @@ Section 11 is the design; where the code differs, this is where and why.
 13. **Host-component exceptions (11.4).** The design says the original exception comes out of `wait()`. As built `wait()` is
     `wait_and_throw` on both queues and the tests assert that it throws and that `forward()` does not; the exception's type and
     text are not asserted.
-14. **Waits in a group without group waits (11.6).** As designed, undefined with no checks; no debug assert was added.
+14. **Waits on a non-ticket launch, a group without group waits (11.6).** As designed, undefined with no checks; no debug assert was added.
 15. **Local-memory request (11.6).** Requests are rounded up to 16 bytes, and the check against the device limit names the
     stages that asked for local memory.
-16. **Pool accounting.** The argument, pointer, geometry and wait-state arrays are pool containers like any other, so the exact
+16. **Pool accounting.** The argument, pointer, geometry and ticket arrays are pool containers like any other, so the exact
     pool numbers include them (section 7).
 17. **Open items (11.7).** The fork has the stage-index counter and the cross-translation-unit linking fix
     (`f815ee1e`); the empty-`single_task` question is moot (no collapse). The gemver `onepass` q bug on OpenMP is still open.

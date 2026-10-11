@@ -47,7 +47,7 @@ variant promotes the same names, so the driver is variant-agnostic.
   (relative L2 about 3e-6 against unfused). **Skipped by `--variant all` on omp**, where its `q` is
   wrong (see the open questions); an explicit `--variant onepass` still runs it there.
 * **naive**: the SAME components, fused with global barriers into **three launches for the whole chain** (the
-  barrier items make every group of the next segment wait for every group of the earlier ones, which only ever wait on groups that started earlier, so no
+  barrier items make every group of the next segment wait for every group of the earlier ones, in ticket order, so no
   co-residency is needed):
   `G1 = fuse_components(segment<whole>(r2u, gtp), global_barrier(), cred, global_barrier(), gemv)`,
   `BiCGK = fuse_components(onepass, global_barrier(), segment(rowred, cred_s))`, `G2` as `G1`. It contains `BicgkOnePass`, so on
