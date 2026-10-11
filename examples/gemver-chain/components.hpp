@@ -52,8 +52,10 @@ constexpr std::size_t kWg = 256;  // the work-group size of every kernel
 
 inline std::uint32_t u32(std::size_t v) { return static_cast<std::uint32_t>(v); }
 
-// Runtime values (the matrix order n, the strip height R, the scale) are free inputs of extent 1 (u32 / f32) that each component
-// declares and initializes from its constructor's value; a stride is read from the item (groups x group size).
+// Runtime values are free inputs of extent 1. The matrix order n and the strip height R (u32) are declared by each component
+// with an unspecified shape: the chain ties them into ONE alias each (systems.hpp) and the driver sets the aliases once. The
+// scale (f32) is per component, initialized from its constructor's value. A stride is read from the item (groups x group size).
+// The constructor's n and R remain for HOST use only: the declared shapes and the launch range.
 inline std::uint32_t first(const cs::Input<DType::u32, 1>& v) { return v[std::size_t{0}]; }
 inline float         first(const cs::Input<DType::f32, 1>& v) { return v[std::size_t{0}]; }
 
@@ -94,10 +96,8 @@ private:
 public:
     Rank2Update(int n, int R) : n_{n}, R_{R} {}
     void setup() override {
-        declare_input(inputs.n, "n", 1);
-        declare_input(inputs.R, "R", 1);
-        init_input("n", cs::init::fill(u32(n_)));
-        init_input("R", cs::init::fill(u32(R_)));
+        declare_input(inputs.n, "n", cs::unspecified_shape<1>());
+        declare_input(inputs.R, "R", cs::unspecified_shape<1>());
         declare_input(inputs.A, "A", n_, n_);
         declare_input(inputs.u1, "u1", n_);
         declare_input(inputs.v1, "v1", n_);
@@ -150,10 +150,8 @@ private:
 public:
     GemvTPartial(int n, int R, bool tied_b = false) : n_{n}, R_{R}, tied_b_{tied_b} {}
     void setup() override {
-        declare_input(inputs.n, "n", 1);
-        declare_input(inputs.R, "R", 1);
-        init_input("n", cs::init::fill(u32(n_)));
-        init_input("R", cs::init::fill(u32(R_)));
+        declare_input(inputs.n, "n", cs::unspecified_shape<1>());
+        declare_input(inputs.R, "R", cs::unspecified_shape<1>());
         if (tied_b_)
             declare_input(inputs.B, "B", cs::unspecified_shape<2>());
         else
@@ -218,11 +216,9 @@ public:
     void setup() override {
         this->declare_input(inputs.P, "P", n_ / R_, n_);
         if constexpr (Z) this->declare_input(inputs.z, "z", n_);  // only declared when Z
-        this->declare_input(inputs.n, "n", 1);
-        this->declare_input(inputs.R, "R", 1);
+        this->declare_input(inputs.n, "n", cs::unspecified_shape<1>());
+        this->declare_input(inputs.R, "R", cs::unspecified_shape<1>());
         this->declare_input(inputs.scale, "scale", 1);
-        this->init_input("n", cs::init::fill(u32(n_)));
-        this->init_input("R", cs::init::fill(u32(R_)));
         this->init_input("scale", cs::init::fill(scale_));
         this->declare_output(outputs.x, "x", n_);
     }
@@ -273,9 +269,8 @@ private:
 public:
     Gemv(int n, float scale, bool tied_b = false) : n_{n}, scale_{scale}, tied_b_{tied_b} {}
     void setup() override {
-        declare_input(inputs.n, "n", 1);
+        declare_input(inputs.n, "n", cs::unspecified_shape<1>());
         declare_input(inputs.scale, "scale", 1);
-        init_input("n", cs::init::fill(u32(n_)));
         init_input("scale", cs::init::fill(scale_));
         if (tied_b_)
             declare_input(inputs.B, "B", cs::unspecified_shape<2>());
@@ -338,10 +333,8 @@ private:
 public:
     BicgkOnePass(int n, int R) : n_{n}, R_{R} {}
     void setup() override {
-        declare_input(inputs.n, "n", 1);
-        declare_input(inputs.R, "R", 1);
-        init_input("n", cs::init::fill(u32(n_)));
-        init_input("R", cs::init::fill(u32(R_)));
+        declare_input(inputs.n, "n", cs::unspecified_shape<1>());
+        declare_input(inputs.R, "R", cs::unspecified_shape<1>());
         declare_input(inputs.B, "B", n_, n_);
         declare_input(inputs.p, "p", n_);
         declare_input(inputs.r, "r", n_);
@@ -385,8 +378,7 @@ private:
 public:
     explicit RowReduce(int n) : n_{n} {}
     void setup() override {
-        declare_input(inputs.n, "n", 1);
-        init_input("n", cs::init::fill(u32(n_)));
+        declare_input(inputs.n, "n", cs::unspecified_shape<1>());
         declare_input(inputs.Pq, "Pq", n_, n_ / static_cast<int>(kWg));
         declare_output(outputs.q, "q", n_);
     }
@@ -442,8 +434,7 @@ private:
 public:
     explicit Rank2UpdateLocal(int n) : n_{n} {}
     void setup() override {
-        declare_input(inputs.n, "n", 1);
-        init_input("n", cs::init::fill(u32(n_)));
+        declare_input(inputs.n, "n", cs::unspecified_shape<1>());
         declare_input(inputs.A, "A", n_, n_);
         declare_input(inputs.u1, "u1", n_);
         declare_input(inputs.v1, "v1", n_);
@@ -493,8 +484,7 @@ private:
 public:
     explicit GemvTPartialLocal(int n) : n_{n} {}
     void setup() override {
-        declare_input(inputs.n, "n", 1);
-        init_input("n", cs::init::fill(u32(n_)));
+        declare_input(inputs.n, "n", cs::unspecified_shape<1>());
         declare_input(inputs.y, "y", n_);
         declare_output(outputs.P, "P", n_ / static_cast<int>(kRt), n_);
     }
@@ -549,8 +539,7 @@ private:
 public:
     explicit BicgkTileLocal(int n) : n_{n} {}
     void setup() override {
-        declare_input(inputs.n, "n", 1);
-        init_input("n", cs::init::fill(u32(n_)));
+        declare_input(inputs.n, "n", cs::unspecified_shape<1>());
         declare_input(inputs.B, "B", n_, n_);
         declare_input(inputs.p, "p", n_);
         declare_input(inputs.r, "r", n_);
@@ -602,8 +591,7 @@ private:
 public:
     explicit Rank2UpdateFromLocal(int n) : n_{n} {}
     void setup() override {
-        declare_input(inputs.n, "n", 1);
-        init_input("n", cs::init::fill(u32(n_)));
+        declare_input(inputs.n, "n", cs::unspecified_shape<1>());
         declare_input(inputs.u1, "u1", n_);
         declare_input(inputs.v1, "v1", n_);
         declare_input(inputs.u2, "u2", n_);

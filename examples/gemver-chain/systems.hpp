@@ -14,6 +14,10 @@
 //   outputs  B1 x1 w1              G1
 //            q s                   BiCGK
 //            B2 x2 w2              G2
+//   constants n R                  the matrix order and the strip height: every component's own `n` / `R` input, tied into
+//                                 ONE alias each by Chain (the level that contains all the users); the driver sets them
+//                                 once. (The crafted chain's strip height is kRt, not --R.) `scale` is per component: the
+//                                 values differ (1/sqrt(n) for GEMVER's cred and gemv, 1 for BiCGK's).
 //
 // Styles (Style):
 //   unfused   every component is its own kernel
@@ -36,7 +40,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
+#include <string_view>
+#include <vector>
 
 #include <sycl/sycl.hpp>
 
@@ -228,9 +235,46 @@ public:
         promote<DType::f32, 2>("g2.B", "B2");
         promote<DType::f32, 1>("g2.x", "x2");
         promote<DType::f32, 1>("g2.w", "w2");
+
+        // n and R: the users, by the paths the styles give their components (a fused group adds its "fw." / "par." level)
+        std::vector<std::string> n_users, R_users;
+        const auto               use = [&](const std::string& path, bool with_R) {
+            n_users.push_back(path + ".n");
+            if (with_R) R_users.push_back(path + ".R");
+        };
+        for (const std::string g : {"g1", "g2"}) {  // GEMVER: r2u and gtp in a group for naive / fused / onepass; cred, gemv also for naive
+            const std::string in_group = (style_ == Style::naive || style_ == Style::fused || style_ == Style::onepass) ? g + ".fw" : g;
+            const std::string rest     = style_ == Style::naive ? g + ".fw" : g;
+            use(in_group + ".r2u", true);
+            use(in_group + ".gtp", true);
+            use(rest + ".cred", true);
+            use(rest + ".gemv", false);
+        }
+        if (style_ == Style::naive) {  // BiCGK
+            use("bicgk.fw.onepass", true);
+            use("bicgk.fw.rowred", false);
+            use("bicgk.fw.cred_s", true);
+        } else if (style_ == Style::onepass) {
+            use("bicgk.onepass", true);
+            use("bicgk.rowred", false);
+            use("bicgk.cred_s", true);
+        } else {
+            const std::string two = style_ == Style::parallel ? "bicgk.par" : style_ == Style::fused ? "bicgk.fw" : "bicgk";
+            use(two + ".gemv_q", false);
+            use(two + ".gtp_s", true);
+            use("bicgk.cred_s", true);
+        }
+        tie_scalar(n_users, "n");
+        tie_scalar(R_users, "R");
     }
 
 private:
+    /// Ties the extent-1 u32 inputs at `paths` into one alias `name` (the driver sets it with update_input).
+    void tie_scalar(const std::vector<std::string>& paths, std::string name) {
+        const std::vector<std::string_view> views(paths.begin(), paths.end());
+        tie_inputs_of<DType::u32, 1>(std::span<const std::string_view>{views}, std::move(name), cs::shape(1));
+    }
+
     /// The crafted chain: three fused launches (g1, mid, g2) over the components written for local memory. It promotes the
     /// same names as the other styles. Tiles are kRt rows by 256 columns (not --R: the strips of the reducers are n / kRt).
     void setup_crafted() {
@@ -288,6 +332,12 @@ private:
         promote<DType::f32, 2>("mid.r2u.B", "B2");
         promote<DType::f32, 1>("g2.cred.x", "x2");
         promote<DType::f32, 1>("g2.gemv.y", "w2");
+
+        // n and R (R = kRt for every user here, set by the driver)
+        tie_scalar({"g1.r2u.n", "g1.gtp.n", "g1.cred.n", "g1.gemv.n", "mid.bk.n", "mid.r2u.n", "mid.rowred.n", "mid.cred_s.n", "g2.gtp.n",
+                    "g2.cred.n", "g2.gemv.n"},
+                   "n");
+        tie_scalar({"g1.cred.R", "mid.cred_s.R", "g2.gtp.R", "g2.cred.R"}, "R");
     }
 };
 
