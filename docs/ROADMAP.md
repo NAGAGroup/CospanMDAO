@@ -47,7 +47,12 @@ Principle: fusion is always the user's explicit decision. The framework never gu
 - [ ] MLS-MPM.
 - [ ] FE heat conduction (a client demonstration, not only a test).
 - [x] GEMVER→BiCGK→GEMVER chain (examples/gemver-chain)
-- [ ] A fusion benchmark that replaces softmax and doubles as a tutorial example: it exercises the fused-group feature set (segments, shared or partitioned local memory, range modes, connects between stages, ties between stages, the global barrier, group waits, item-wrapper queries, atomics, reuse) and compares fused, unfused and hand-written. Not chosen yet (a matrix-free finite-element operator is one candidate).
+- [ ] Fusion benchmark (chosen 2026-10-11; replaces softmax; becomes a tutorial example): one compressible Navier–Stokes residual evaluation on a 2D structured grid as ONE fused group of work-group stages, one group per 16×16 tile. Compared against unfused CoSpan and one hand-written SYCL kernel.
+  - Segment 1 (shared local memory): load the tile plus halo, apply the boundary condition, convert to primitives, compute gradients, reconstruct with a limiter, then the convective (HLLC) and viscous fluxes on the owned faces. One flux component is reused for x and y.
+  - Segment 2 (partitioned): the convective and viscous divergence stages each wait (group waits) on the segment-1 tiles they read, and write the residual R as a plain tie. Diagnostic stages (min local timestep, max wave speed, residual sums of squares) reduce per tile, then both apply atomically and write per-tile partials.
+  - global_barrier.
+  - Segment 3 (partitioned, range_mode own): deterministic reductions of the partials (4 groups for the norms, 1 for the min timestep, 1 for the max wave speed).
+  - Segment 4: an error stage waits on exactly those segment-3 groups and reports atomic minus deterministic for each diagnostic.
 - [ ] Delete examples/softmax once the replacement exists.
 
 ## User documentation (tutorial-style; before cycles and optimizers)
