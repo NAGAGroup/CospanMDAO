@@ -9,7 +9,7 @@
 //                       over several design points against a host reference in double
 //   2. Marks            design variables, objective, constraints: counts, bounds, and
 //                       the tied z appearing once (one record per root)
-//   3. Lifecycle        forward / view_output before setup, setup twice, a moved-from
+//   3. Lifecycle        run / view_output before setup, setup twice, a moved-from
 //                       Model
 //   4. Host access      unknown path, view_input on an output, update_input on an output
 //   5. Memory report    a small static model computes; the pool report (there is no arena)
@@ -752,9 +752,9 @@ TEST_CASE("Marks: no scope rule; whatever is collected at setup stays", "[model]
 TEST_CASE("Lifecycle: errors before setup, setup twice, moved-from", "[model][lifecycle]") {
     using Top = tmod::SellarTop<DType::f32>;
 
-    SECTION("forward before setup throws") {
+    SECTION("run before setup throws") {
         auto m = cs::create_model<Top>(default_config());
-        tmod::expect_throws([&] { m.forward(); }, {"before setup"});
+        tmod::expect_throws([&] { m.run(); }, {"before setup"});
     }
     SECTION("view_output before setup throws") {
         auto m = cs::create_model<Top>(default_config());
@@ -765,12 +765,12 @@ TEST_CASE("Lifecycle: errors before setup, setup twice, moved-from", "[model][li
         m.setup();
         tmod::expect_throws([&] { m.setup(); }, {"runs once"});
     }
-    SECTION("forward on a moved-from Model throws; the moved-to Model runs") {
+    SECTION("run on a moved-from Model throws; the moved-to Model runs") {
         auto m = cs::create_model<Top>(default_config());
         m.setup();
         cs::Model moved = std::move(m);
-        tmod::expect_throws([&] { m.forward(); }, {"moved-from"});  // NOLINT(bugprone-use-after-move)
-        CHECK_NOTHROW(moved.forward());
+        tmod::expect_throws([&] { m.run(); }, {"moved-from"});  // NOLINT(bugprone-use-after-move)
+        CHECK_NOTHROW(moved.run());
         CHECK_NOTHROW(moved.wait());
     }
 }
@@ -786,7 +786,7 @@ TEST_CASE("Host access: errors name the path; update_input on an output throws",
 
         // A view can be obtained only after a run (design review, section 5): these cases were about what a view
         // names, so the model runs once first (the old order, a view straight after setup, now throws).
-        model.forward();
+        model.run();
 
         // Unknown path: the message carries the path it could not resolve.
         tmod::expect_throws([&] { (void)model.view_output<DType::f32, 1>("nope.y"); }, {"nope.y"});
@@ -1359,7 +1359,7 @@ TEST_CASE("async_handler_desc: a model built with a handler runs and waits norma
     SECTION("a host task that throws") {
         auto model = cs::create_model<tmod::ThrowTop>(cs::model_config_desc{cs::async_handler_desc{handler}});
         model.setup();
-        model.forward();
+        model.run();
         CHECK_THROWS_AS(model.wait(), std::runtime_error);
     }
 }

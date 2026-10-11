@@ -15,7 +15,7 @@
 // (model_config.hpp). There is no device gating: any context device may be given to add_subsystem, whether or not a pool_desc
 // names it. There is no default device (section 2): every instance takes AdaptiveCpp's default when it is declared, and a device given to add_subsystem overrides a subtree.
 //
-// The forward (section 3), host views and update_input (section 5) and the memory report are all here.
+// The run (section 3), host views and update_input (section 5) and the memory report are all here.
 //
 // STATE LIVES ON THE HEAP. The Model is one pointer to an Impl; moving a Model moves the pointer. Inside Impl the
 // members are declared so that destruction (the reverse of declaration) runs the root System first: its instances go,
@@ -181,11 +181,11 @@ public:
         s.ready = true;
     }
 
-    /// ENQUEUES one forward and returns: precompute, compute and postcompute of the root, in that order. It does not
-    /// wait: forwards stream with no artificial synchronization, so call wait() or sync a host view when you need the
+    /// ENQUEUES one run and returns: precompute, compute and postcompute of the root, in that order. It does not
+    /// wait: runs stream with no artificial synchronization, so call wait() or sync a host view when you need the
     /// results (section 5).
-    void forward() {
-        Impl& s = ready("forward");
+    void run() {
+        Impl& s = ready("run");
         ++s.rt.forward;
         s.root->run_precompute(s.rt);
         s.root->run_compute(s.rt);
@@ -218,8 +218,8 @@ public:
         return OutputHandle<DT, Rank>{&s.rt, inst};
     }
 
-    // A host view is an instance of the variable on a host placement. While it lives, every forward pushes one copy to it
-    // (each live view costs one copy per forward); a view can be made at any time (it materializes the variable like any
+    // A host view is an instance of the variable on a host placement. While it lives, every run pushes one copy to it
+    // (each live view costs one copy per run); a view can be made at any time (it materializes the variable like any
     // holder and fails only when the shape cannot be resolved yet); call sync() before reading it. See host_view.hpp.
     template <DType DT, int Rank>
     HostView<DT, Rank> view_input(std::string_view path) {

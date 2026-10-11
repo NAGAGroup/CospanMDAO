@@ -56,7 +56,7 @@ inline Capture capture_forward(cs::Model& m, const char* chunked_path, const std
         for (const cs::detail::IOEntry* e : sys.chunk_entries()) s += describe_entry(*e) + "\n";
         c.chunks.push_back(std::move(s));
     });
-    m.forward();
+    m.run();
     m.wait();
     sys.set_chunk_hooks(nullptr, nullptr);
     c.window = cs::diag::last_window();
@@ -81,7 +81,7 @@ std::vector<Capture> against_plain(const char* chunked_path, MakeChunked&& make_
             between(chunked, f);
             between(plain, f);
         }
-        plain.forward();
+        plain.run();
         plain.wait();
         const std::vector<float> want = read(plain);
         Capture                  c    = capture_forward(chunked, chunked_path, read);

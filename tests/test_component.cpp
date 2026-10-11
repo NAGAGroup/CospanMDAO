@@ -641,7 +641,7 @@ TEST_CASE("a launch's event is registered on the container of every port it touc
     CHECK(yi->data->write_deps().empty());
 
     model.update_input("aff.x", cs::init::fill(1.0f));
-    model.forward();
+    model.run();
 
     // The kernel READ x and WROTE y. Its event is the component's last event, and it is behind both containers' lists: a
     // writer of x (which waits on x's reads) and a reader of y (which waits on y's writes) both come after it. Checked
@@ -663,7 +663,7 @@ TEST_CASE("a launch's event is registered on the container of every port it touc
     model.wait();
 
     // A second forward registers again, and the result is still right.
-    model.forward();
+    model.run();
     CHECK_FALSE(yi->data->read_deps().empty());
     auto y = wait_and_view<DType::f32, 1>(model, "aff.y");
     CHECK(to_vector(y) == std::vector<float>(1000, 3.0f));

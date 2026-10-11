@@ -168,11 +168,11 @@ Result run_cospan(const char* name, bool fused, const Options& o) {
         model.update_input(p.geo, cs::init::from_host(nsr::geo_values(o.nx, o.ny)));
         model.update_input(p.U, make_init(o.nx, o.ny, 1.0f));
         for (int i = 0; i < o.warmup; ++i) {
-            model.forward();
+            model.run();
             model.wait();
         }
         const auto t0 = std::chrono::steady_clock::now();
-        for (int i = 0; i < o.iters; ++i) model.forward();
+        for (int i = 0; i < o.iters; ++i) model.run();
         model.wait();
         const auto t1 = std::chrono::steady_clock::now();
         r.ms          = ms_between(t0, t1) / o.iters;
@@ -182,7 +182,7 @@ Result run_cospan(const char* name, bool fused, const Options& o) {
             r.checked = true;
             if (o.bc == "periodic") {  // uniform flow: R is exactly zero
                 model.update_input(p.U, make_init(o.nx, o.ny, 0.0f));
-                model.forward();
+                model.run();
                 model.wait();
                 r.uniform_max = max_abs(read_output<3>(model, p.R));
             }

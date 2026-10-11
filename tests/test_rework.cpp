@@ -147,7 +147,7 @@ TEST_CASE("Model::wait after forward surfaces an exception thrown inside a host-
     // from wait(), not from forward(). Only that wait() throws is asserted, not the text.
     cs::Model m = cs::create_model<trework::TrTop<trework::TrThrow>>(default_config());
     m.setup();
-    CHECK_NOTHROW(m.forward());
+    CHECK_NOTHROW(m.run());
     CHECK_THROWS(m.wait());
     try {
         m.wait();  // drain whatever is left before the Model is destroyed

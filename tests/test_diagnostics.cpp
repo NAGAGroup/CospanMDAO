@@ -75,7 +75,7 @@ TEST_CASE("Diagnostics: Model::wait and a host launch are counted", "[diag]") {
     m.setup();
 
     const auto before = cs::diag::snapshot();
-    m.forward();
+    m.run();
     const auto after_fwd = cs::diag::snapshot() - before;
     // forward() enqueues and does not wait (design review, section 5), so no queue wait is counted by it.
     CHECK(after_fwd.queue_waits == 0);

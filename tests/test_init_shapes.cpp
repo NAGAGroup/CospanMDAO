@@ -52,7 +52,7 @@ cs::Model make(std::function<void(cs::System&)> f) { return cs::create_model<Lam
 void forward_throws(cs::Model& m, const std::vector<std::string>& needles) {
     std::string what = "<no exception>";
     try {
-        m.forward();
+        m.run();
         m.wait();
     } catch (const std::exception& e) {
         what = e.what();
@@ -279,7 +279,7 @@ TEST_CASE("shape: an init that agrees with a per-index dim runs", "[shape][init]
         s.init_input("p.x", cs::init::from_host(tis::iota(8), cs::init::ragged(3, tis::Sizes{3, 1, 4})));
     });
     m.setup();
-    m.forward();
+    m.run();
     m.wait();
     // by hand: [0 1 2] [3] [4 5 6 7]
     CHECK(tis::out1(m, "p.sums") == std::vector<float>{3.0f, 3.0f, 22.0f});
@@ -312,7 +312,7 @@ TEST_CASE("shape: bare data (from_host(vec)) carries no shape for a rank-2 root"
         s.init_input("p.x", cs::init::from_host(tis::iota(4)));
     });
     m.setup();
-    m.forward();
+    m.run();
     m.wait();
     CHECK(tis::out1(m, "p.sums") == std::vector<float>{1.0f, 5.0f});  // [0 1] [2 3]
 }
@@ -374,13 +374,13 @@ TEST_CASE("shape: ragged from_host needs the sum of the block sizes", "[shape][i
 TEST_CASE("shape: a free ragged input is shaped only by its init", "[shape][init][ragged]") {
     auto m = cs::create_model<tis::TopFree>(default_config(), tis::ragged_init());
     m.setup();
-    m.forward();
+    m.run();
     m.wait();
     CHECK(tis::out1(m, "inner.sums") == tis::kDoubled);
     auto v = m.view_ragged_input<DType::f32, 2>("inner.x");
     v.sync();
     tis::check_blocks(v);
-    m.forward();  // and again: no second init, same values
+    m.run();  // and again: no second init, same values
     m.wait();
     CHECK(tis::out1(m, "inner.sums") == tis::kDoubled);
 }
@@ -388,7 +388,7 @@ TEST_CASE("shape: a free ragged input is shaped only by its init", "[shape][init
 TEST_CASE("shape: a ragged init on a tie", "[shape][init][ragged][tie]") {
     auto m = cs::create_model<tis::TieTop>(default_config(), tis::ragged_init());
     m.setup();
-    m.forward();
+    m.run();
     m.wait();
     for (const char* p : {"a.sums", "b.sums"}) CHECK(tis::out1(m, p) == tis::kSums);
     auto v = m.view_ragged_input<DType::f32, 2>("a.x");

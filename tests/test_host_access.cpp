@@ -129,7 +129,7 @@ TEST_CASE("handles: get_input gives a view and update, get_output a view", "[hos
     auto in  = m.get_input<DType::f32, 1>("c.x");
     auto out = m.get_output<DType::f32, 1>("c.y");
 
-    m.forward();
+    m.run();
     m.wait();
     auto xv = in.view();
     auto yv = out.view();
@@ -139,13 +139,13 @@ TEST_CASE("handles: get_input gives a view and update, get_output a view", "[hos
 
     in.update(cs::init::from_host(tha::Floats{10, 20, 30, 40}));  // the same as update_input
     CHECK(tha::ha_values(xv) == tha::Floats{1, 2, 3, 4});         // nothing ran yet: the old values
-    m.forward();
+    m.run();
     m.wait();
     CHECK(tha::ha_values(xv) == tha::Floats{10, 20, 30, 40});
     CHECK(tha::ha_values(yv) == tha::Floats{20, 40, 60, 80});
 
     m.update_input("c.x", cs::init::from_host(tha::Floats{5, 5, 5, 5}));  // the shorthand still works
-    m.forward();
+    m.run();
     m.wait();
     CHECK(tha::ha_values(yv) == tha::Floats{10, 10, 10, 10});
     CHECK(tha::ha_values(m.view_output<DType::f32, 1>("c.y")) == tha::Floats{10, 10, 10, 10});  // and so does make_view's
@@ -170,7 +170,7 @@ TEST_CASE("views any time: a free initialized input shows its initial values aft
     yv.sync();
     CHECK(yv.size() == 4);
 
-    m.forward();  // the variable was materialized by the view: the run goes on from it
+    m.run();  // the variable was materialized by the view: the run goes on from it
     m.wait();
     CHECK(tha::ha_values(xv) == tha::Floats{1, 2, 3, 4});
     CHECK(tha::ha_values(yv) == tha::Floats{2, 4, 6, 8});
@@ -181,7 +181,7 @@ TEST_CASE("views any time: a view made after setup and before the first forward 
     auto m = tha::ha_make([](cs::System& s) { s.add_subsystem(cs::subsystem_desc<tha::HaScale>("c")); });
     m.setup();
     auto yv = m.get_output<DType::f32, 1>("c.y").view();
-    m.forward();
+    m.run();
     yv.sync();  // no wait(): sync waits on the host container's write list
     CHECK(tha::ha_values(yv) == tha::Floats{2, 4, 6, 8});
 }
@@ -191,7 +191,7 @@ TEST_CASE("views any time: a view whose shape cannot be resolved yet throws and 
     m.setup();
     // p.y's size is set by its producer in pre_forward: before a run it is unknown
     tha::ha_throws([&] { (void)m.get_output<DType::f32, 1>("p.y").view(); }, {"p.y"});
-    m.forward();
+    m.run();
     m.wait();
     CHECK(tha::ha_values(m.get_output<DType::f32, 1>("p.y").view()) == tha::Floats{1, 2, 3});
 }
@@ -201,7 +201,7 @@ TEST_CASE("view_input: a component sizes its output from the max of an input rea
     m.setup();
     auto y = m.get_output<DType::f32, 1>("p.y");
 
-    m.forward();  // v = {3,1,2,3,2}: max 3
+    m.run();  // v = {3,1,2,3,2}: max 3
     m.wait();
     {
         const auto yv = y.view();
@@ -210,7 +210,7 @@ TEST_CASE("view_input: a component sizes its output from the max of an input rea
     }
 
     m.update_input("p.v", cs::init::from_host(std::vector<std::uint32_t>{1, 6, 2, 5, 2}));  // max 6
-    m.forward();
+    m.run();
     m.wait();
     {
         const auto yv = y.view();
@@ -219,7 +219,7 @@ TEST_CASE("view_input: a component sizes its output from the max of an input rea
     }
 
     m.update_input("p.v", cs::init::from_host(std::vector<std::uint32_t>{2, 2, 2, 2, 2}));  // and back down: max 2
-    m.forward();
+    m.run();
     m.wait();
     const auto yv = y.view();
     CHECK(yv.shape()[0] == 2);

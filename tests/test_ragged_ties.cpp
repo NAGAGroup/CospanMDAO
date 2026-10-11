@@ -288,7 +288,7 @@ TieRef tie_ref(const Counts& counts, bool factor) {
 
 void run_tie_out(cs::Model& m, const Counts& counts, bool factor) {
     m.update_input("sz.raw", cs::init::from_host(counts));
-    m.forward();
+    m.run();
     m.wait();
     const TieRef ref  = tie_ref(counts, factor);
     auto         sums = cst::synced_output<DType::f32, 1>(m, "sum.sums");
@@ -490,7 +490,7 @@ public:
 
 /// One forward, then cons.out (synced).
 std::vector<float> forward_out(cs::Model& m) {
-    m.forward();
+    m.run();
     m.wait();
     const auto v = cst::synced_output<DType::f32, 1>(m, "cons.out");
     return std::vector<float>(v.span().begin(), v.span().end());
@@ -810,7 +810,7 @@ TEST_CASE("Ragged ties: a connected tie_inputs alias that declares cs::counts is
         const trt::Counts sizes{2, 2, 0, 3};
         cs::Model         m = cs::create_model<trt::TieInDeclTop>(default_config(), sizes, trt::Sizes{2, 2, 0, 3});
         m.setup();
-        m.forward();
+        m.run();
         m.wait();
         auto sa = cst::synced_output<DType::f32, 1>(m, "sa.sums");
         auto sb = cst::synced_output<DType::f32, 1>(m, "sb.sums");
@@ -831,7 +831,7 @@ TEST_CASE("Ragged ties: a connected tie_inputs alias that declares cs::counts is
         for (const trt::Counts& c : {trt::Counts{2, 0, 1, 1}, trt::Counts{2, 0, 3, 1}}) {
             cs::Model m = cs::create_model<trt::TieInDeclTop>(default_config(), c, trt::Sizes{2, 0, 3, 1}, 2);
             m.setup();
-            trt::expect_throws([&] { m.forward(); }, {"gen.pts", "takes a number only on an unspecified dimension"});
+            trt::expect_throws([&] { m.run(); }, {"gen.pts", "takes a number only on an unspecified dimension"});
             m.wait();
         }
     }
@@ -842,7 +842,7 @@ TEST_CASE("Ragged ties: tie_inputs of two RaggedInputs, connected from a ragged 
     m.setup();
     for (const trt::Counts& counts : {trt::Counts{2, 0, 3, 1}, trt::Counts{0, 4, 0, 2}, trt::Counts{1, 1, 1, 1}}) {
         m.update_input("sz.raw", cs::init::from_host(counts));
-        m.forward();
+        m.run();
         m.wait();
         auto sa = cst::synced_output<DType::f32, 1>(m, "sa.sums");
         auto sb = cst::synced_output<DType::f32, 1>(m, "sb.sums");
@@ -938,7 +938,7 @@ TEST_CASE("Ragged ties: an outside tie_outputs over a promotion of an inside out
     const trt::Counts counts{3, 1, 4, 0, 2, 5, 1, 3, 2, 4};
     cs::Model         m = cs::create_model<trt::OtTop>(default_config(), counts);
     m.setup();
-    m.forward();
+    m.run();
     m.wait();
     std::vector<float>         want_flat, want_cons;
     std::vector<std::uint64_t> want_offs{0};
@@ -968,7 +968,7 @@ TEST_CASE("Ragged ties: an outside tie_inputs over a promotion of an inside tied
     m.setup();
     for (const trt::Counts* counts : {&first, &second}) {
         m.update_input("sz.raw", cs::init::from_host(*counts));
-        m.forward();
+        m.run();
         m.wait();
         for (const char* out : {"c1.out", "c2.out"}) {
             const auto o = cst::to_vector(cst::synced_output<DType::f32, 1>(m, out));

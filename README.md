@@ -23,7 +23,7 @@ formalism for composing open systems along shared boundaries, and *MDAO* credits
   while some port on that device holds it. A connection costs nothing at run time.
 - **Shapes.** A component says per dimension only "specified" or `cs::unspecified`. A shape comes from a connection, an
   initializer, a producer's `pre_forward()` (`set_shape`), or a System's `shape_hook`.
-- **Forward.** `Model::forward()` enqueues one run and returns. Kernels are ordered by events, never by queue order, so
+- **Run.** `Model::run()` enqueues one run and returns. Kernels are ordered by events, never by queue order, so
   independent work overlaps. Run policy (`run_n`, `do_once`, `transient`) belongs to the parent, which deletes finished
   children and can `rearm` them.
 - **Host access.** `Model::update_input` is the only write; `view_output` gives a host view of a result after a run, and
@@ -75,7 +75,7 @@ int main() {
     model.setup();                                           // wiring and shape rules are checked here
 
     model.update_input("a.x", cs::init::from_host(std::vector<float>{1, 2, 3, 4}));  // supplies a.x and its shape
-    model.forward();                                         // enqueues and returns; the update is applied here
+    model.run();                                         // enqueues and returns; the update is applied here
 
     auto y = model.view_output<DType::f32, 1>("b.y");        // a view can be made any time, once its shape is known
     y.sync();                                                // wait for the data before reading

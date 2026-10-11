@@ -221,7 +221,7 @@ void neighbor_case(std::size_t wg, std::size_t G, int forwards) {
         for (std::size_t g = 0; g < G; ++g)
             for (std::size_t l = 0; l < wg; ++l) want[g * wg + l] = x[((g + 1) % G) * wg + l] + 1.0f;
         model.update_input("f.a.x", cs::init::from_host(x));
-        model.forward();
+        model.run();
         model.wait();
         CHECK(out_of(model, "f.b.y") == want);
     }
@@ -257,7 +257,7 @@ TEST_CASE("fused groups: two segments, each stage sees its own segment's group c
     });
     model.setup();
     for (int fwd = 0; fwd < 3; ++fwd) {
-        model.forward();
+        model.run();
         model.wait();
         CHECK(tfg::out_of(model, "f.a.y") == tfg::filled(200, 0 * 1000 + 4 * 100 + 2 * 10 + 2));
         CHECK(tfg::out_of(model, "f.b.y") == tfg::filled(100, 1 * 1000 + 4 * 100 + 2 * 10 + 2));
@@ -273,7 +273,7 @@ TEST_CASE("fused groups: a bare descriptor is a one-stage segment", "[fused_grou
         s.connect("sb.y", "f.b.x");
     });
     model.setup();
-    model.forward();
+    model.run();
     model.wait();
     CHECK(tfg::out_of(model, "f.a.y") == tfg::filled(200, 422));
     CHECK(tfg::out_of(model, "f.b.y") == tfg::filled(100, 1422));
@@ -295,7 +295,7 @@ TEST_CASE("fused groups: range mode own vs whole", "[fused_groups]") {
         s.connect("sb.y", "f.b.x");
     });
     model.setup();
-    model.forward();
+    model.run();
     model.wait();
     CHECK(tfg::out_of(model, "f.a.y") == tfg::filled(200, 4.0f));              // the block is the larger count in both modes
     CHECK(tfg::out_of(model, "f.b.y") == tfg::filled(100, whole ? 4.0f : 2.0f));  // own: its own two groups; whole: the block
@@ -312,7 +312,7 @@ TEST_CASE("fused groups: shared local memory carries a stage's values to the nex
     });
     model.setup();
     for (int fwd = 0; fwd < 2; ++fwd) {
-        model.forward();
+        model.run();
         model.wait();
         std::vector<float> want(128);
         for (std::size_t g = 0; g < want.size(); ++g) want[g] = static_cast<float>(tfg::kWg - (g % tfg::kWg));  // t[63 - l] = 64 - l
@@ -331,7 +331,7 @@ TEST_CASE("fused groups: partitioned local memory gives each stage its own slice
     });
     model.setup();
     for (int fwd = 0; fwd < 2; ++fwd) {
-        model.forward();
+        model.run();
         model.wait();
         std::vector<float> want_a(128), want_b(128);
         for (std::size_t g = 0; g < 128; ++g) {
@@ -353,7 +353,7 @@ TEST_CASE("fused groups: stages with different work-group shapes throw at forwar
         s.connect("src.y", "f.b.x");
     });
     model.setup();
-    tfg::expect_throws([&] { model.forward(); }, {"f.a", "f.b", "different work-group shapes"});
+    tfg::expect_throws([&] { model.run(); }, {"f.a", "f.b", "different work-group shapes"});
     model.wait();
 }
 
@@ -365,7 +365,7 @@ TEST_CASE("fused groups: a bare component launches as a group of one stage", "[f
     });
     model.setup();
     for (int fwd = 0; fwd < 3; ++fwd) {
-        model.forward();
+        model.run();
         model.wait();
         CHECK(tfg::out_of(model, "t.y") == tfg::filled(256, 401));  // segment 0, 4 groups, one segment
     }
@@ -386,7 +386,7 @@ TEST_CASE("fused groups: one component type in two groups", "[fused_groups]") {
     });
     model.setup();
     for (int fwd = 0; fwd < 2; ++fwd) {
-        model.forward();
+        model.run();
         model.wait();
         CHECK(tfg::out_of(model, "f1.a.y") == tfg::filled(200, 422));
         CHECK(tfg::out_of(model, "f1.b.y") == tfg::filled(100, 1422));
@@ -411,7 +411,7 @@ TEST_CASE("fused groups: a transient group rebuilt every forward (the config cac
     model.setup();
     for (int fwd = 1; fwd <= 5; ++fwd) {
         INFO("forward " << fwd);
-        model.forward();
+        model.run();
         model.wait();
         CHECK(model.get_subsystem("grp") == nullptr);  // deleted after its turn; a new group is built next forward
         CHECK(tfg::out_of(model, "sink.y") == tfg::filled(100, 1423));  // grp.b.y = 1422, plus 1
@@ -432,7 +432,7 @@ TEST_CASE("fused groups: group_waits_enabled gives the launch its wait state and
     });
     model.setup();
     for (int fwd = 0; fwd < 3; ++fwd) {
-        model.forward();
+        model.run();
         model.wait();
         CHECK(tfg::out_of(model, "f.a.y") == tfg::filled(200, 422));  // the (segment, group) indices are unchanged
         CHECK(tfg::out_of(model, "f.b.y") == tfg::filled(100, 1422));
@@ -452,7 +452,7 @@ TEST_CASE("fused groups: a group with neither group_waits_enabled nor a global_b
     });
     model.setup();
     for (int fwd = 0; fwd < 2; ++fwd) {
-        model.forward();
+        model.run();
         model.wait();
         CHECK(tfg::out_of(model, "f.a.y") == tfg::filled(200, 422));
         CHECK(tfg::out_of(model, "f.b.y") == tfg::filled(100, 1422));
@@ -726,7 +726,7 @@ TEST_CASE("ties_desc: atomic outputs of three stages tied in the group, the view
     });
     model.setup();
     for (int fwd = 0; fwd < 3; ++fwd) {  // the zeroing stage runs every forward: the sums do not pile up
-        model.forward();
+        model.run();
         model.wait();
         CHECK(tfg::out_of(model, "f.a.y") == tfg::filled(12, 3.0f));
         CHECK(tfg::out_of(model, "f.b.y") == tfg::filled(12, 3.0f));
@@ -741,7 +741,7 @@ TEST_CASE("ties_desc: plain outputs under allow_plain, each stage writes its own
             tfg::slice_stages()));
     });
     model.setup();
-    model.forward();
+    model.run();
     model.wait();
     CHECK(tfg::out_of(model, "f.a.y") == tfg::halves());
     CHECK(tfg::out_of(model, "f.b.y") == tfg::halves());
@@ -756,7 +756,7 @@ TEST_CASE("ties_desc: connects_desc and ties_desc together, connects first", "[f
                                                                               cs::subsystem_desc<tfg::TAdder>("b", 2.0f), cs::subsystem_desc<tfg::Plus1>("c"))));
     });
     model.setup();
-    model.forward();
+    model.run();
     model.wait();
     CHECK(tfg::out_of(model, "f.y") == tfg::filled(12, 3.0f));
     CHECK(tfg::out_of(model, "f.c.y") == tfg::filled(12, 4.0f));  // c reads the alias inside the group (one segment: per index z, a, b, c)
@@ -770,7 +770,7 @@ TEST_CASE("ties_desc: a shape hook on the alias, by path", "[fused_groups][ties]
         s.shape_hook("f.y", cs::dim::from_shape("src.y", 0));
     });
     model.setup();
-    model.forward();
+    model.run();
     model.wait();
     CHECK(tfg::out_of(model, "f.a.y") == tfg::filled(16, 3.0f));
     CHECK(tfg::out_of(model, "f.b.y") == tfg::filled(16, 3.0f));
@@ -790,7 +790,7 @@ TEST_CASE("ties_desc: an input tie in the group, both stages read the alias", "[
         want[i] = ramp[i] + 1.0f;
     }
     model.update_input("f.x", cs::init::from_host(ramp));
-    model.forward();
+    model.run();
     model.wait();
     CHECK(tfg::in_of(model, "f.x") == ramp);
     CHECK(tfg::in_of(model, "f.p.x") == ramp);
@@ -809,7 +809,7 @@ TEST_CASE("ties_desc: a consumer outside the group reads the alias in the same f
     });
     model.setup();
     for (int fwd = 0; fwd < 3; ++fwd) {
-        model.forward();
+        model.run();
         model.wait();
         CHECK(tfg::out_of(model, "c.y") == tfg::filled(12, 4.0f));
         CHECK(tfg::out_of(model, "f.y") == tfg::filled(12, 3.0f));
@@ -822,7 +822,7 @@ TEST_CASE("ties_desc: a tie declared by the owner with paths into the group stil
         s.tie_outputs<DType::atomic_f32, 1>({"f.z.y", "f.a.y", "f.b.y"}, "sum", cs::shape(12));
     });
     model.setup();
-    model.forward();
+    model.run();
     model.wait();
     CHECK(tfg::out_of(model, "sum") == tfg::filled(12, 3.0f));
     CHECK(tfg::out_of(model, "f.a.y") == tfg::filled(12, 3.0f));
@@ -859,7 +859,7 @@ TEST_CASE("ties_desc: errors", "[fused_groups][ties][errors]") {
                                                    cs::subsystem_desc<tfg::TSlice>("b", 6.0f, 12.0f, 2.0f))));
         });
         model.setup();
-        tfg::expect_throws([&] { model.forward(); model.wait(); }, {"is tied", "its tie"});
+        tfg::expect_throws([&] { model.run(); model.wait(); }, {"is tied", "its tie"});
     }
     SECTION("a plain dtype under require_atomic") {
         cs::Model model = tfg::make([](cs::System& s) {

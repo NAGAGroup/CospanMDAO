@@ -408,7 +408,7 @@ std::vector<float> flat_of(const View& v) {
 /// Run one forward with `counts` and check every view against the references.
 void run_counts(cs::Model& model, const std::vector<std::uint32_t>& counts) {
     if (!counts.empty()) model.update_input("counts.raw", cs::init::from_host(counts));
-    model.forward();
+    model.run();
     model.wait();
     const FillRef ref = fill_ref(counts);
 
@@ -505,7 +505,7 @@ TEST_CASE("Ragged: a hook on a ragged output hands its column's resize events to
         const std::size_t before = meta->hook_resize_notes;
 
         model.update_input("c.cnt", cs::init::from_host(counts));
-        model.forward();
+        model.run();
         model.wait();
 
         // the slot received the column's resize event exactly when the column reallocated with data
@@ -553,7 +553,7 @@ TEST_CASE("Ragged: counts_from on a rank-2 [N,k] input reads column 0", "[ragged
     cs::Model model = cs::create_model<trag::HookedTop<trag::Col0>>(default_config());
     model.setup();
     model.update_input("c.cnt", cs::init::from_host(std::vector<std::uint32_t>{2, 9, 0, 9, 3, 9, 1, 9}));
-    model.forward();
+    model.run();
     model.wait();
     auto v = model.view_ragged_output<DType::f32, 2>("c.v");
     v.sync();
@@ -568,7 +568,7 @@ TEST_CASE("Ragged: a ragged output connected to a ragged input with matching cou
     const trag::Sizes sizes{1, 0, 3, 2};
     cs::Model         model = cs::create_model<trag::PerIndexTop>(default_config(), sizes, sizes);
     model.setup();
-    model.forward();
+    model.run();
     model.wait();
     auto sums = cst::synced_output<DType::f32, 1>(model, "take.sums");
     REQUIRE(sums.size() == 4);
@@ -585,7 +585,7 @@ TEST_CASE("Ragged: a ragged output connected to a ragged input with matching cou
     // N = 0 with a counts array of length 0 is ragged-capable too
     cs::Model zero = cs::create_model<trag::PerIndexTop>(default_config(), trag::Sizes{}, trag::Sizes{});
     zero.setup();
-    zero.forward();
+    zero.run();
     zero.wait();
     auto z = zero.view_ragged_output<DType::f32, 2>("make.m");
     z.sync();
@@ -618,7 +618,7 @@ TEST_CASE("Ragged: mismatching declared counts error at connect (setup)", "[ragg
 TEST_CASE("Ragged: a RaggedInput reading a DENSE port", "[ragged]") {
     cs::Model model = cs::create_model<trag::DenseTop>(default_config());
     model.setup();
-    model.forward();
+    model.run();
     model.wait();
     auto sums = cst::synced_output<DType::f32, 1>(model, "sum.sums");
     REQUIRE(sums.size() == 3);
@@ -661,7 +661,7 @@ TEST_CASE("Ragged: declaration and binding errors", "[ragged][errors]") {
         model.setup();
         model.update_input("c.cnt", cs::init::from_host(std::vector<std::int32_t>{1, -1, 2}));
         // (the old needle was "negative extent"; the hook says "holds a negative value; a size cannot be negative")
-        trag::expect_throws([&] { model.forward(); }, {"shape hook on 'c.layout'", "holds a negative value"});
+        trag::expect_throws([&] { model.run(); }, {"shape hook on 'c.layout'", "holds a negative value"});
         model.wait();
     }
     SECTION("a ragged port in a fused component: refused at setup") {

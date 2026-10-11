@@ -69,7 +69,7 @@ inline void sh_setup_throws(const std::function<void(cs::System&)>& build, const
 inline void sh_forward_throws(cs::Model& m, const Needles& needles) {
     std::string what = "<no exception>";
     try {
-        m.forward();
+        m.run();
         m.wait();
     } catch (const std::exception& e) {
         what = e.what();
@@ -415,7 +415,7 @@ TEST_CASE("shape definitions: an unspecified dimension takes the fixed one it me
             s.connect("p.y", "c.x");
         });
         m.setup();
-        m.forward();
+        m.run();
         m.wait();
         CHECK(cst::synced_input<DType::f32, 1>(m, "c.x").shape()[0] == 4);
         CHECK(cst::to_vector(cst::synced_output<DType::f32, 1>(m, "c.y")) == tshape::sh_iota(4, 2.0f));
@@ -427,7 +427,7 @@ TEST_CASE("shape definitions: an unspecified dimension takes the fixed one it me
             s.connect("p.y", "c.x");
         });
         m.setup();
-        m.forward();
+        m.run();
         m.wait();
         CHECK(cst::to_vector(cst::synced_output<DType::f32, 1>(m, "c.y")) == tshape::sh_iota(4, 2.0f));
     }
@@ -452,7 +452,7 @@ TEST_CASE("shape definitions: tie members fixed on different dimensions merge", 
         s.init_input("t", cs::init::fill(1.0f, {4, 3}));
     });
     m.setup();
-    m.forward();
+    m.run();
     m.wait();
     const auto ax = cst::synced_input<DType::f32, 2>(m, "a.x");
     CHECK(ax.shape()[0] == 4);
@@ -487,7 +487,7 @@ TEST_CASE("shape definitions: promote carries no shape", "[shapes][definition][p
         s.connect("in.y", "c.x");
     });
     m.setup();
-    m.forward();
+    m.run();
     m.wait();
     CHECK(cst::synced_output<DType::f32, 1>(m, "in.y").shape()[0] == 5);
     CHECK(cst::to_vector(cst::synced_output<DType::f32, 1>(m, "c.y")) == tshape::sh_iota(5, 2.0f));
@@ -530,7 +530,7 @@ TEST_CASE("hook from_shape: an input takes a dimension of an upstream output's s
         s.shape_hook("c.x", cs::dim::from_shape("p.y", 0));
     });
     m.setup();
-    m.forward();
+    m.run();
     m.wait();
     CHECK(cst::synced_input<DType::f32, 1>(m, "c.x").shape()[0] == 6);
     CHECK(cst::synced_output<DType::f32, 1>(m, "c.y").shape()[0] == 6);
@@ -545,7 +545,7 @@ TEST_CASE("hook from_value: two dimensions from two different sources", "[shapes
         s.shape_hook("c.x", cs::dim::from_value("na.n", 0), cs::dim::from_value("nb.n", 0));
     });
     m.setup();
-    m.forward();
+    m.run();
     m.wait();
     const auto x = cst::synced_input<DType::f32, 2>(m, "c.x");
     CHECK(x.shape()[0] == 3);
@@ -563,7 +563,7 @@ TEST_CASE("hook custom: a function of the hook context", "[shapes][hook]") {
         s.shape_hook("c.x", cs::dim::custom([](cs::ShapeHookCtx& ctx) { return ctx.shape_of("p.y").extents[0] * ctx.value_of("k.n", 0); }));
     });
     m.setup();
-    m.forward();
+    m.run();
     m.wait();
     CHECK(cst::synced_input<DType::f32, 1>(m, "c.x").shape()[0] == 12);
 }
@@ -598,7 +598,7 @@ TEST_CASE("hook on an input tie alias", "[shapes][hook][tie]") {
         s.init_input("t", cs::init::fill(1.5f));
     });
     m.setup();
-    m.forward();
+    m.run();
     m.wait();
     CHECK(cst::synced_input<DType::f32, 1>(m, "a.x").shape()[0] == 7);
     CHECK(cst::to_vector(cst::synced_output<DType::f32, 1>(m, "a.y")) == std::vector<float>(7, 3.0f));
@@ -621,7 +621,7 @@ TEST_CASE("hook on an output tie alias whose members are atomic Adders", "[shape
     m.setup();
     for (int r = 0; r < 2; ++r) {
         INFO("forward " << r + 1);
-        m.forward();
+        m.run();
         m.wait();
         CHECK(cst::to_vector(cst::synced_output<DType::f32, 1>(m, "sum")) == std::vector<float>(6, 3.0f));  // 0 + 1 + 2
     }
@@ -641,7 +641,7 @@ TEST_CASE("hook ragged counts_from and offsets_from: n(), block_offsets() and to
                 s.shape_hook("c.r", cs::ragged::counts_from("src.out"));
         });
         m.setup();
-        m.forward();
+        m.run();
         m.wait();
         auto v = m.view_ragged_input<DType::f32, 2>("c.r");
         v.sync();
@@ -727,7 +727,7 @@ TEST_CASE("hook replay: a transient target child, rebuilt each forward, still ge
     m.setup();
     for (int r = 0; r < 3; ++r) {
         INFO("forward " << r + 1);
-        CHECK_NOTHROW(m.forward());
+        CHECK_NOTHROW(m.run());
         m.wait();
         CHECK(m.get_subsystem("tr") == nullptr);  // deleted after its turn; rebuilt for the next forward
         CHECK(cst::synced_output<DType::f32, 1>(m, "sink.y").shape()[0] == 6);
@@ -746,7 +746,7 @@ TEST_CASE("hook run point: a hook declared after the target's child still runs b
         s.shape_hook("c.x", cs::dim::from_shape("p.y", 0));              // declared last, runs before "c"
     });
     m.setup();
-    m.forward();
+    m.run();
     m.wait();
     CHECK(cst::synced_input<DType::f32, 1>(m, "c.x").shape()[0] == 5);
     CHECK(cst::synced_output<DType::f32, 1>(m, "later.y").shape()[0] == 5);
@@ -762,7 +762,7 @@ TEST_CASE("set_shape rank 3: a hooked dimension, a producer's dimension and a de
         s.shape_hook("p.y", cs::dim::from_value("nn.n", 0), cs::dim::as_is(), cs::dim::as_is());  // a hook on an untied output
     });
     m.setup();
-    m.forward();
+    m.run();
     m.wait();
     const auto y = cst::synced_output<DType::f32, 3>(m, "p.y");
     CHECK(y.shape()[0] == 5);
@@ -801,7 +801,7 @@ TEST_CASE("hook on an untied output: the hook runs before the producer, which pa
         s.shape_hook("p.y", cs::dim::from_value("nn.n", 0));
     });
     m.setup();
-    m.forward();
+    m.run();
     m.wait();
     CHECK(cst::to_vector(cst::synced_output<DType::f32, 1>(m, "c.y")) == tshape::sh_iota(6, 2.0f));
 }
@@ -829,7 +829,7 @@ TEST_CASE("shape_hook and depends_on called after setup work", "[shapes][hook][p
     m.setup();
     CHECK_NOTHROW(m.root().shape_hook("c.x", cs::dim::from_value("nn.n", 0)));
     CHECK_NOTHROW(m.root().depends_on("b", "a"));
-    m.forward();
+    m.run();
     m.wait();
     CHECK(cst::synced_input<DType::f32, 1>(m, "c.x").shape()[0] == 4);
     CHECK(cst::to_vector(cst::synced_output<DType::f32, 1>(m, "c.y")) == std::vector<float>(4, 3.0f));
@@ -841,11 +841,11 @@ TEST_CASE("a late init_input on a materialized free input re-initializes at the 
         s.init_input("c.x", cs::init::fill(1.0f, {4}));
     });
     m.setup();
-    m.forward();
+    m.run();
     m.wait();
     CHECK(cst::to_vector(cst::synced_output<DType::f32, 1>(m, "c.y")) == std::vector<float>(4, 2.0f));
     m.root().init_input("c.x", cs::init::fill(3.0f, {4}));  // after the variable was materialized
-    m.forward();
+    m.run();
     m.wait();
     CHECK(cst::to_vector(cst::synced_output<DType::f32, 1>(m, "c.y")) == std::vector<float>(4, 6.0f));
 }
@@ -857,7 +857,7 @@ TEST_CASE("ragged set_shape(out, as_is, counts): the n is owned by a hook", "[sh
         s.shape_hook("g.pts", cs::dim::from_value("nn.n", 0), cs::dim::as_is());  // n alone; the counts are the producer's
     });
     m.setup();
-    m.forward();
+    m.run();
     m.wait();
     auto v = m.view_ragged_output<DType::f32, 2>("g.pts");
     v.sync();

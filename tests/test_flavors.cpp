@@ -79,9 +79,9 @@ cs::Model make(Build b) {
 }
 
 void run_three(cs::Model& m) {
-    m.forward();
-    m.forward();
-    m.forward();
+    m.run();
+    m.run();
+    m.run();
     m.wait();
 }
 
@@ -568,7 +568,7 @@ void value_from_outside() {
     const std::uint32_t nb1 = 8, nb2 = 13;
     for (const std::uint32_t nb : {nb1, nb2}) {  // the second value grows the output
         model.update_input("f.b.n", cs::init::from_host(std::vector<std::uint32_t>{nb}));
-        model.forward();
+        model.run();
         model.wait();
         std::vector<float> want(nb);
         for (std::uint32_t i = 0; i < nb; ++i) want[i] = static_cast<float>(i + 1);
@@ -680,7 +680,7 @@ TEST_CASE("fused sequential: two group+scratch stages, B's own barrier, own loca
         s.connect("src.y", "f.a.x");
     });
     model.setup();
-    model.forward();
+    model.run();
     model.wait();
     std::vector<float> x(200);
     for (int i = 0; i < 200; ++i) x[i] = static_cast<float>(i + 1);
@@ -704,7 +704,7 @@ TEST_CASE("fused sequential: a rank-2 wave and a rank-3 wave (7x9x11), the defau
             s.connect("src.y", "f.a.x");
         });
         model.setup();
-        model.forward();
+        model.run();
         model.wait();
         std::vector<float> want_a, want_b;
         for (int i = 0; i < 40; ++i)
@@ -724,7 +724,7 @@ TEST_CASE("fused sequential: a rank-2 wave and a rank-3 wave (7x9x11), the defau
             s.connect("src.y", "f.a.x");
         });
         model.setup();
-        model.forward();
+        model.run();
         model.wait();
         std::vector<float> want_a, want_b;
         for (int i = 0; i < 7; ++i)
@@ -773,13 +773,13 @@ TEST_CASE("fused: stages asking for different work-group shapes throw at forward
     SECTION("sequential") {
         cs::Model model = build(std::integral_constant<cst::FuseMode, tfl::kSeq>{});
         model.setup();
-        tfl::expect_throws([&] { model.forward(); }, {"f.a", "f.b", "different work-group shapes"});
+        tfl::expect_throws([&] { model.run(); }, {"f.a", "f.b", "different work-group shapes"});
         model.wait();
     }
     SECTION("parallel") {
         cs::Model model = build(std::integral_constant<cst::FuseMode, tfl::kPar>{});
         model.setup();
-        tfl::expect_throws([&] { model.forward(); }, {"f.a", "f.b", "different work-group shapes"});
+        tfl::expect_throws([&] { model.run(); }, {"f.a", "f.b", "different work-group shapes"});
         model.wait();
     }
 }
@@ -839,7 +839,7 @@ TEST_CASE("fused: tied outputs follow the ordinary tie policy, in parallel and s
     SECTION("parallel, atomic: the writers accumulate") {
         cs::Model model = tfl::tied_adders<tfl::kPar>();
         model.setup();
-        model.forward();
+        model.run();
         model.wait();
         CHECK(tfl::out_of<1>(model, "sum") == std::vector<float>(12, 3.0f));  // 1 + 2
     }
@@ -853,7 +853,7 @@ TEST_CASE("fused: tied outputs follow the ordinary tie policy, in parallel and s
             s.tie_outputs<DType::f32, 1>({"f.a.y", "f.b.y"}, "t", cs::shape(12), cs::TieOutputsPolicy::allow_plain);
         });
         CHECK_NOTHROW(model.setup());
-        CHECK_NOTHROW(model.forward());
+        CHECK_NOTHROW(model.run());
         model.wait();
         std::vector<float> want(12);
         for (int i = 0; i < 12; ++i) want[i] = static_cast<float>(i + 1);
@@ -870,7 +870,7 @@ TEST_CASE("fused: tied outputs follow the ordinary tie policy, in parallel and s
     SECTION("sequential: no check, the writers accumulate") {
         cs::Model model = tfl::tied_adders<tfl::kSeq>();
         model.setup();
-        model.forward();
+        model.run();
         model.wait();
         CHECK(tfl::out_of<1>(model, "sum") == std::vector<float>(12, 3.0f));
     }
@@ -918,13 +918,13 @@ TEST_CASE("fused: a wave's local memory over the device limit throws at forward,
     SECTION("sequential: the slices add up, over the limit") {
         cs::Model model = tfl::big_wave<tfl::kSeq>(elems);
         model.setup();
-        tfl::expect_throws([&] { model.forward(); }, {"f.a", "f.b", "bytes of local memory"});
+        tfl::expect_throws([&] { model.run(); }, {"f.a", "f.b", "bytes of local memory"});
         model.wait();
     }
     SECTION("parallel: one shared slice, within the limit") {
         cs::Model model = tfl::big_wave<tfl::kPar>(elems);
         model.setup();
-        model.forward();
+        model.run();
         model.wait();
         std::vector<float> x(256);
         for (int i = 0; i < 256; ++i) x[i] = static_cast<float>(i + 1);  // Src1's default offset is 1
@@ -1001,7 +1001,7 @@ TEST_CASE("transient: a system_from group and a fused component release after th
     model.setup();
     // A fused component keeps its wave staging in member usm_vectors drawn from the pool, so the baseline is taken after the
     // FIRST forward: what the group's variables held is then gone (the group is deleted with its staging).
-    model.forward();
+    model.run();
     model.wait();
     CHECK(model.get_subsystem("grp") == nullptr);  // the group is deleted after its turn, its variables with it
     for (const char* p : {"grp.a.y", "grp.b.y"}) {
@@ -1015,8 +1015,8 @@ TEST_CASE("transient: a system_from group and a fused component release after th
     // (scale and offset: a node each).
     CHECK(base == cst::pool_bytes_of(tfl::kLen * sizeof(float)) + 2 * cst::pool_node_bytes + cst::solo_launch_bytes(1));
     CHECK(base == 3 * cst::pool_node_bytes + cst::solo_launch_bytes(1));
-    model.forward();
-    model.forward();
+    model.run();
+    model.run();
     model.wait();
     CHECK(cst::pool_in_use(model) == base);  // every later forward returns what it allocated
 }
@@ -1043,7 +1043,7 @@ TEST_CASE("replay: a transient host reader of a deleted do_once producer reads i
     }
     for (int fwd = 1; fwd <= 3; ++fwd) {
         INFO("forward " << fwd);
-        model.forward();
+        model.run();
         model.wait();
         CHECK(tfl::out_of<1>(model, "e2.y") == want);
     }

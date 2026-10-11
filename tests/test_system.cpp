@@ -1281,7 +1281,7 @@ TEST_CASE("connect: identity, producer to consumer", "[system][connect]") {
 TEST_CASE("promote: a two-level chain reads the same variable", "[system][promote]") {
     cs::Model model = cs::create_model<tsys::PromoteTop>(default_config());
     model.setup();
-    model.forward();
+    model.run();
     model.wait();
 
     const auto want = tsys::iota_plus(1.0f, tsys::kLen);
@@ -1311,7 +1311,7 @@ TEST_CASE("ties: tie_inputs gives one variable; a tie of a tie gives three membe
         CHECK(model.root().instance_at("a.x")->meta == model.root().instance_at("b.x")->meta);
         CHECK(model.root().instance_at("x")->meta == model.root().instance_at("a.x")->meta);
         model.update_input("x", cs::init::from_host(x));
-        model.forward();
+        model.run();
         model.wait();
         CHECK(to_vector(cst::synced_input<DType::f32, 1>(model, "a.x")) == x);
         CHECK(to_vector(cst::synced_input<DType::f32, 1>(model, "b.x")) == x);
@@ -1333,7 +1333,7 @@ TEST_CASE("ties: tie_inputs gives one variable; a tie of a tie gives three membe
         CHECK(sys.instance_at("in.ax")->meta == var);
         CHECK(sys.instance_at("in.bx")->meta == var);
         model.update_input("tt", cs::init::from_host(x));
-        model.forward();
+        model.run();
         model.wait();
         for (const char* path : {"in.a.x", "in.b.x", "c.x", "in.ax", "in.bx"})
             CHECK(to_vector(cst::synced_input<DType::f32, 1>(model, path)) == x);
@@ -1451,7 +1451,7 @@ TEST_CASE("init: the last declaration wins (System init_input beats the Componen
     // c1 declared 99; the owner System `inner` declared 1.5 afterwards (its setup runs after its children's) and wins.
     // The init is applied by the owner (c1) in the first forward.
     // c2.x is connected, so nothing is declared on it and it is not initialized.
-    model.forward();
+    model.run();
     model.wait();
     CHECK(to_vector(cst::synced_input<DType::f32, 1>(model, "inner.c1.x")) == std::vector<float>(tsys::kLen, tsys::kSysInit));
     CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "c3.y")) == std::vector<float>(tsys::kLen, tsys::kSysInit));
@@ -1461,15 +1461,15 @@ TEST_CASE("init: init_input on an eternal free input between forwards", "[system
     cs::Model model = cs::create_model<tsys::OneAxpb>(default_config());
     model.setup();
     // No init declared: zeros, so y = 2 * 0 + 1.
-    model.forward();
+    model.run();
     model.wait();
     CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "a.y")) == tsys::filled(1.0f));
     tsys::set_x(model, "a.x", 1.0f);
-    model.forward();
+    model.run();
     model.wait();
     CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "a.y")) == tsys::filled(3.0f));
     tsys::set_x(model, "a.x", 4.0f);
-    model.forward();
+    model.run();
     model.wait();
     CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "a.y")) == tsys::filled(9.0f));
 }
@@ -1483,9 +1483,9 @@ TEST_CASE("init: an eternal free input is initialized by its owner on the first 
     // and the view shows its values after sync.
     CHECK(to_vector(cst::synced_input<DType::f32, 1>(model, "a.x")) == tsys::filled(5.0f));
     CHECK(tsys::count_of("a") == 1);
-    model.forward();
-    model.forward();
-    model.forward();
+    model.run();
+    model.run();
+    model.run();
     model.wait();
     CHECK(tsys::count_of("a") == 1);  // allocated once, initialized once, never released
     CHECK(to_vector(cst::synced_input<DType::f32, 1>(model, "a.x")) == tsys::filled(5.0f));
@@ -1497,7 +1497,7 @@ TEST_CASE("init: Model::update_input before the first forward beats the declared
     cs::Model model = cs::create_model<tsys::OneAxpbLog>(default_config());
     model.setup();
     tsys::set_x(model, "a.x", 3.0f);  // the owner applies it at its allocation, in place of the declared init
-    model.forward();
+    model.run();
     model.wait();
     CHECK(tsys::count_of("a") == 0);  // the declared (logging) init never ran
     CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "a.y")) == tsys::filled(7.0f));  // 2 * 3 + 1
@@ -1527,7 +1527,7 @@ TEST_CASE("transient: deleted after its turn, kept outputs, back-to-back forward
     // two scalar free inputs a and b: a node each)
     constexpr std::size_t kEternal = 4 * cst::pool_node_bytes + cst::solo_launch_bytes(1);
     SECTION("host access to a deleted subsystem's variable throws") {
-        model.forward();
+        model.run();
         model.wait();
         CHECK(model.get_subsystem("tr") == nullptr);  // the transient is deleted after its turn
         tsys::expect_throws([&] { (void)cst::synced_output<DType::f32, 1>(model, "tr.mid.y"); }, "was deleted");
@@ -1535,7 +1535,7 @@ TEST_CASE("transient: deleted after its turn, kept outputs, back-to-back forward
     }
 
     SECTION("an output connected outside the subtree stays eternal") {
-        model.forward();
+        model.run();
         model.wait();
         CHECK(model.get_subsystem("tr") == nullptr);  // the intermediates went with the transient
         // tr.cons.y's variable is held by the sink's port outside: it is still readable
@@ -1545,11 +1545,11 @@ TEST_CASE("transient: deleted after its turn, kept outputs, back-to-back forward
 
     SECTION("a second forward rebuilds it and gives the same values") {
         CHECK(pool_in_use(model) == 0);  // nothing at setup
-        model.forward();
+        model.run();
         model.wait();
         const std::size_t after1 = pool_in_use(model);
         CHECK(after1 == kEternal);
-        model.forward();
+        model.run();
         model.wait();
         CHECK(to_vector(cst::synced_input<DType::f32, 1>(model, "sink.x")) == want_cons());
         CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "sink.y")) == want_sink());
@@ -1557,12 +1557,12 @@ TEST_CASE("transient: deleted after its turn, kept outputs, back-to-back forward
     }
 
     SECTION("three forwards enqueued back to back, then one wait") {
-        model.forward();
+        model.run();
         model.wait();
         const std::size_t after1 = pool_in_use(model);
-        model.forward();
-        model.forward();
-        model.forward();
+        model.run();
+        model.run();
+        model.run();
         model.wait();
         CHECK(to_vector(cst::synced_input<DType::f32, 1>(model, "sink.x")) == want_cons());
         CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "sink.y")) == want_sink());
@@ -1574,7 +1574,7 @@ TEST_CASE("transient: sequential Components A then B are deleted after their tur
     cs::Model model = cs::create_model<tsys::TransComps>(cst::pooled_config());
     model.setup();
 
-    model.forward();
+    model.run();
     model.wait();
     CHECK(model.get_subsystem("a") == nullptr);  // A and B are transient: deleted after their turns, A's output with them
     CHECK(model.get_subsystem("b") == nullptr);
@@ -1588,7 +1588,7 @@ TEST_CASE("transient: sequential Components A then B are deleted after their tur
 TEST_CASE("transient: a variable read by a transient and a non-transient Component stays readable", "[system][transient]") {
     cs::Model model = cs::create_model<tsys::SharedRead>(cst::pooled_config());
     model.setup();
-    model.forward();
+    model.run();
     model.wait();
     CHECK(model.get_subsystem("p") == nullptr);  // the transient producer is deleted; the plain reader's port holds p.y
     CHECK(to_vector(cst::synced_input<DType::f32, 1>(model, "n.x")) == tsys::iota_plus(1.0f, tsys::kLen));
@@ -1599,7 +1599,7 @@ TEST_CASE("transient: promotion inside a transient stays transient; re-promoted 
     SECTION("promoted inside the transient subsystem only") {
         cs::Model model = cs::create_model<tsys::PromoInTrans>(cst::pooled_config(), false);
         model.setup();
-        model.forward();
+        model.run();
         model.wait();
         CHECK(model.get_subsystem("tr") == nullptr);
         tsys::expect_throws([&] { (void)cst::synced_output<DType::f32, 1>(model, "tr.y"); }, "was deleted");
@@ -1607,7 +1607,7 @@ TEST_CASE("transient: promotion inside a transient stays transient; re-promoted 
     SECTION("re-promoted at a non-transient level") {
         cs::Model model = cs::create_model<tsys::PromoInTrans>(cst::pooled_config(), true);
         model.setup();
-        model.forward();
+        model.run();
         model.wait();
         // the root System's promotion holds the variable: eternal
         CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "out")) == tsys::iota_plus(1.0f, tsys::kLen));
@@ -1618,7 +1618,7 @@ TEST_CASE("transient: nested transients, the outer one is named", "[system][tran
     cs::Model model = cs::create_model<tsys::NestedTrans>(cst::pooled_config());
     model.setup();
     const std::size_t base = pool_in_use(model);
-    model.forward();
+    model.run();
     model.wait();
     CHECK(pool_in_use(model) == base);
     tsys::expect_throws([&] { (void)cst::synced_output<DType::f32, 1>(model, "outer.inner.cons.y"); }, "was deleted");
@@ -1629,9 +1629,9 @@ TEST_CASE("transient: a free input inside a transient subtree is re-initialized 
     cs::Model model = cs::create_model<tsys::TransFreeInput>(cst::pooled_config());
     model.setup();
     CHECK(tsys::count_of("tr.p") == 0);  // a transient root has no storage at setup
-    model.forward();
-    model.forward();
-    model.forward();
+    model.run();
+    model.run();
+    model.run();
     model.wait();
     CHECK(tsys::count_of("tr.p") == 3);
     CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "sink.y")) == tsys::filled(15.0f));  // 2 * 7 + 1
@@ -1646,14 +1646,14 @@ TEST_CASE("run-N: n = 1 runs once; once its child is deleted, an init_input on i
     model.setup();
 
     tsys::set_x(model, "op.a.x", 1.0f);
-    model.forward();
+    model.run();
     model.wait();
     CHECK(to_vector(cst::synced_input<DType::f32, 1>(model, "sink.x")) == tsys::filled(2.0f));  // op.a.y's variable
     CHECK(model.get_subsystem("op") == nullptr);  // run_n{1}: deleted after its turn
 
     // Nothing can apply a later init: the child is gone, and so is its free input. The output is held by the sink.
     tsys::expect_throws([&] { tsys::set_x(model, "op.a.x", 5.0f); }, "was deleted");
-    model.forward();
+    model.run();
     model.wait();
     tsys::expect_throws([&] { (void)cst::synced_input<DType::f32, 1>(model, "op.a.x"); }, "was deleted");
     CHECK(to_vector(cst::synced_input<DType::f32, 1>(model, "sink.x")) == tsys::filled(2.0f));  // op.a.y's variable, unchanged
@@ -1670,7 +1670,7 @@ TEST_CASE("run-N: n = 3 follows the input for three forwards, then holds", "[sys
             tsys::set_x(model, "op.a.x", xs[k]);
         else  // op was deleted after its third run: its input can no longer be set
             tsys::expect_throws([&] { tsys::set_x(model, "op.a.x", xs[k]); }, "was deleted");
-        model.forward();
+        model.run();
         model.wait();
         const float held = k < 3 ? xs[k] : xs[2];  // the 3rd value from then on
         CHECK(to_vector(cst::synced_input<DType::f32, 1>(model, "sink.x")) == tsys::filled(2.0f * held));  // op.a.y's variable
@@ -1691,7 +1691,7 @@ TEST_CASE("run-N subtree: its variables live for the n runs and are freed after 
     // node each). Run 1 holds five containers: prod.x (the free input), prod.y (= mid.x), mid.y (= cons.x), cons.y
     // (= sink.x) and sink.y; after the last run the subtree's three are freed and the two eternal ones stay.
     CHECK(base == 0);
-    model.forward();
+    model.run();
     model.wait();
     CHECK(tsys::count_of("op.prod") == 1);
     CHECK(model.get_subsystem("op") != nullptr);
@@ -1703,7 +1703,7 @@ TEST_CASE("run-N subtree: its variables live for the n runs and are freed after 
     CHECK(after1 == 13 * cst::pool_node_bytes + cst::solo_launch_bytes(4));
 
     // run 2 is the last: the subtree's variables are freed, the eternal one stays; the init is not applied again
-    model.forward();
+    model.run();
     model.wait();
     CHECK(tsys::count_of("op.prod") == 1);
     CHECK(model.get_subsystem("op") == nullptr);  // deleted after its last run: mid.y went with it
@@ -1712,7 +1712,7 @@ TEST_CASE("run-N subtree: its variables live for the n runs and are freed after 
     CHECK(after2 == 4 * cst::pool_node_bytes + cst::solo_launch_bytes(1));  // the sink keeps its launch arrays and its a, b
 
     // forward 3: past n, nothing runs, so nothing is allocated, initialized or released
-    model.forward();
+    model.run();
     model.wait();
     CHECK(tsys::count_of("op.prod") == 1);
     CHECK(to_vector(cst::synced_input<DType::f32, 1>(model, "sink.x")) == tsys::filled(11.0f));  // unchanged
@@ -1730,7 +1730,7 @@ TEST_CASE("run-N subtree: n = 3, the roots stay for runs 1..3 and the pool drops
     std::size_t held = 0, freed = 0;
     for (int k = 1; k <= 5; ++k) {
         INFO("forward " << k);
-        model.forward();
+        model.run();
         model.wait();
         const std::size_t now = tsys::pool_in_use_of(model);
         if (k == 1) {
@@ -1775,7 +1775,7 @@ void add_pair(cs::System& s, const cs::property_list& pp, const cs::property_lis
                                                              }}));
 }
 void forwards(cs::Model& model, int n) {
-    for (int k = 0; k < n; ++k) model.forward();
+    for (int k = 0; k < n; ++k) model.run();
     model.wait();
 }
 }  // namespace
@@ -1929,7 +1929,7 @@ TEST_CASE("structural errors", "[system][errors]") {
     SECTION("an unknown path in view_output names the path") {
         cs::Model model = cs::create_model<tsys::ThreeAxpb>(default_config());
         model.setup();
-        model.forward();  // a view can be obtained only after a run (design review, section 5)
+        model.run();  // a view can be obtained only after a run (design review, section 5)
         tsys::expect_throws([&] { (void)model.view_output<DType::f32, 1>("a.nope"); }, "a.nope");
         tsys::expect_throws([&] { (void)model.view_output<DType::f32, 1>("zz.y"); }, "zz");
         // The kind is checked too.
@@ -1975,7 +1975,7 @@ TEST_CASE("placement: a device equal to the parent's is a no-op", "[system][plac
 TEST_CASE("Sellar-shaped forward: ties of ties, promotions, marks, init last word", "[system][sellar]") {
     cs::Model model = cs::create_model<tsys::SellarTop>(default_config());
     model.setup();
-    model.forward();
+    model.run();
     model.wait();
 
     // Host reference in the same float arithmetic.
@@ -2181,7 +2181,7 @@ TEST_CASE("alias: a promoted value-driven output shows its member's current shap
     for (const std::uint32_t n : {3u, 7u, 2u}) {  // the size changes between runs
         INFO("n = " << n);
         model.update_input("n", cs::init::from_host(tsys2::one_u32(n)));
-        model.forward();
+        model.run();
         model.wait();
         auto v = cst::synced_output<DType::f32, 1>(model, "b");
         CHECK(v.shape()[0] == n);
@@ -2195,7 +2195,7 @@ TEST_CASE("alias: views of an alias before its root's owner has run work (the sh
     model.setup();
     CHECK(cst::synced_input<DType::f32, 1>(model, "x").shape()[0] == tsys::kLen);  // design review 11.4: views any time
     CHECK(cst::synced_input<DType::f32, 1>(model, "a.x").shape()[0] == tsys::kLen);
-    model.forward();
+    model.run();
     model.wait();
     CHECK(cst::synced_input<DType::f32, 1>(model, "x").shape()[0] == tsys::kLen);
     CHECK(cst::synced_input<DType::f32, 1>(model, "a.x").shape()[0] == tsys::kLen);
@@ -2256,7 +2256,7 @@ TEST_CASE("cycle warning: a correctly ordered model prints nothing", "[system][c
         s.connect("b.y", "a.x");
     });
     model.setup();
-    model.forward();
+    model.run();
     model.wait();
     CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "a.y")) == tsys::filled(6.0f));
     CHECK(cap.str().find("naga::cospan: warning") == std::string::npos);  // (the runtime's own warnings share std::cerr)
@@ -2279,7 +2279,7 @@ TEST_CASE("alias: tie errors", "[system][alias][errors]") {
         model.setup();  // no error here
         std::string what = "<no exception>";
         try {
-            model.forward();
+            model.run();
         } catch (const std::exception& e) {
             what = e.what();
         }
@@ -2394,7 +2394,7 @@ TEST_CASE("alias: tie_inputs shapes: fixed, from_output_shape, from_output_value
         });
         model.setup();
         model.update_input("x", cs::init::from_host(tsys2::one_to(5)));
-        model.forward();
+        model.run();
         model.wait();
         CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "a.y")) == tsys2::doubled(tsys2::one_to(5)));
         CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "b.y")) == tsys2::doubled(tsys2::one_to(5)));
@@ -2411,7 +2411,7 @@ TEST_CASE("alias: tie_inputs shapes: fixed, from_output_shape, from_output_value
         for (const std::uint32_t n : {3u, 6u, 4u}) {
             INFO("n = " << n);
             model.update_input("v.n", cs::init::from_host(tsys2::one_u32(n)));
-            model.forward();
+            model.run();
             model.wait();
             CHECK(cst::synced_input<DType::f32, 1>(model, "x").shape()[0] == n);
             CHECK(cst::synced_input<DType::f32, 1>(model, "a.x").shape()[0] == n);
@@ -2431,7 +2431,7 @@ TEST_CASE("alias: tie_inputs shapes: fixed, from_output_shape, from_output_value
             INFO("n = " << n);
             model.update_input("nb.v", cs::init::from_host(tsys2::one_u32(n)));
             model.update_input("x", cs::init::fill(1.5f));
-            model.forward();
+            model.run();
             model.wait();
             CHECK(cst::synced_input<DType::f32, 1>(model, "a.x").shape()[0] == n);
             CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "a.y")) == std::vector<float>(n, 3.0f));
@@ -2450,7 +2450,7 @@ TEST_CASE("alias: tie_outputs shapes: fixed and from_output_values", "[system][a
             s.connect("t", "c.x");
         });
         model.setup();
-        model.forward();
+        model.run();
         model.wait();
         CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "t")) == tsys2::one_to(6));
         CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "c.y")) == tsys2::one_to(6));
@@ -2469,7 +2469,7 @@ TEST_CASE("alias: tie_outputs shapes: fixed and from_output_values", "[system][a
         for (const std::uint32_t n : {3u, 8u, 5u}) {
             INFO("n = " << n);
             model.update_input("nb.v", cs::init::from_host(tsys2::one_u32(n)));
-            model.forward();
+            model.run();
             model.wait();
             CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "t")) == tsys2::one_to(n));
             CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "c.y")) == tsys2::one_to(n));
@@ -2497,7 +2497,7 @@ TEST_CASE("alias: a connected tie_inputs alias joins the producer's root", "[sys
         for (const std::uint32_t n : {4u, 2u}) {
             INFO("n = " << n);
             model.update_input("v.n", cs::init::from_host(tsys2::one_u32(n)));
-            model.forward();
+            model.run();
             model.wait();
             CHECK(cst::synced_input<DType::f32, 1>(model, "a.x").shape()[0] == n);
             CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "a.y")) == tsys2::doubled(tsys2::one_to(n)));
@@ -2510,24 +2510,24 @@ TEST_CASE("alias: a connected tie_inputs alias joins the producer's root", "[sys
         auto model = tsys2::make(build(cs::shape(5)));
         model.setup();
         model.update_input("v.n", cs::init::from_host(tsys2::one_u32(4)));
-        tsys::expect_throws_all([&] { model.forward(); }, {"dimension 0 is declared as 5", "takes a number only on an unspecified dimension"});
+        tsys::expect_throws_all([&] { model.run(); }, {"dimension 0 is declared as 5", "takes a number only on an unspecified dimension"});
         model.wait();
     }
     SECTION("a fixed AliasShape: a producer number throws even when it matches") {
         auto model = tsys2::make(build(cs::shape(4)));
         model.setup();
         model.update_input("v.n", cs::init::from_host(tsys2::one_u32(4)));
-        tsys::expect_throws_all([&] { model.forward(); }, {"dimension 0 is declared as 4", "takes a number only on an unspecified dimension"});
+        tsys::expect_throws_all([&] { model.run(); }, {"dimension 0 is declared as 4", "takes a number only on an unspecified dimension"});
         model.wait();
     }
     SECTION("a fixed AliasShape with a producer passing as_is keeps its size when the source's size changes") {
         auto model = tsys2::make(build(cs::shape(4), true));
         model.setup();
         model.update_input("v.n", cs::init::from_host(tsys2::one_u32(4)));
-        CHECK_NOTHROW(model.forward());
+        CHECK_NOTHROW(model.run());
         model.wait();
         model.update_input("v.n", cs::init::from_host(tsys2::one_u32(6)));
-        CHECK_NOTHROW(model.forward());
+        CHECK_NOTHROW(model.run());
         model.wait();
         CHECK(cst::synced_input<DType::f32, 1>(model, "a.x").shape()[0] == 4);
     }
@@ -2535,7 +2535,7 @@ TEST_CASE("alias: a connected tie_inputs alias joins the producer's root", "[sys
         auto model = tsys2::make(build(cs::shape(4), true));
         model.setup();
         model.update_input("v.n", cs::init::from_host(tsys2::one_u32(4)));
-        model.forward();
+        model.run();
         model.wait();
         CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "a.y")) == tsys2::doubled(tsys2::one_to(4)));
     }
@@ -2554,7 +2554,7 @@ TEST_CASE("alias: a connected tie_inputs alias joins the producer's root", "[sys
         CHECK(captured.str() ==
               "naga::cospan: warning: input 'x' is connected to an output; update_input is never applied\n");
         model.update_input("v.n", cs::init::from_host(tsys2::one_u32(3)));
-        model.forward();
+        model.run();
         model.wait();
         CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "a.y")) == tsys2::doubled(tsys2::one_to(3)));  // not 9
     }
@@ -2567,7 +2567,7 @@ TEST_CASE("alias: a tie alias inside a transient subsystem is released and the p
     const std::size_t base = tsys::pool_in_use_of(model);
     for (int round = 0; round < 2; ++round) {
         INFO("forward " << round + 1);
-        model.forward();
+        model.run();
         model.wait();
         auto& sys = model.root();
         CHECK(model.get_subsystem("tr") == nullptr);  // the transient System is deleted after its turn
@@ -2585,7 +2585,7 @@ TEST_CASE("lifetime: a bare transient producer and a transient reader are delete
     std::size_t steady = 0;  // the pool in use after the first run: t.y (= sink.x) and sink.y, a node each
     for (int run = 1; run <= 3; ++run) {
         INFO("run " << run);
-        model.forward();
+        model.run();
         model.wait();
         CHECK(model.get_subsystem("p") == nullptr);  // transient: deleted after its turn
         CHECK(model.get_subsystem("t") == nullptr);
@@ -2616,7 +2616,7 @@ TEST_CASE("lifetime: a run_n(3) parent's roots are freed after the third run unl
     auto& sys = model.root();
     for (int k = 1; k <= 4; ++k) {
         INFO("forward " << k);
-        model.forward();
+        model.run();
         model.wait();
         CHECK((model.get_subsystem("op") != nullptr) == (k < 3));  // deleted by its parent after the third run
         if (k < 3) CHECK_NOTHROW(cst::synced_output<DType::f32, 1>(model, "op.mid.y"));  // still alive: its variable is readable
@@ -2629,7 +2629,7 @@ TEST_CASE("lifetime: a do_once producer with an eternal reader is eternal; its v
     model.setup();
     for (int run = 1; run <= 3; ++run) {
         INFO("run " << run);
-        model.forward();
+        model.run();
         model.wait();
         CHECK(model.get_subsystem("p") == nullptr);  // do_once: deleted; r's port keeps the variable alive
         CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "r.y")) == tsys::iota_plus(1.0f, tsys::kLen, 2.0f, 0.0f));
@@ -2644,12 +2644,12 @@ TEST_CASE("lifetime: a do_once producer with a transient reader: the rebuilt rea
     // run 2 throws variable.hpp's shape_unknown ("its shape is not known yet").
     cs::Model model = cs::create_model<tsys::DoOnceProducer>(default_config(), true);
     model.setup();
-    model.forward();  // run 1: both run, the variable is freed after them
+    model.run();  // run 1: both run, the variable is freed after them
     model.wait();
     CHECK(model.get_subsystem("p") == nullptr);
     std::string what = "<no exception>";
     try {
-        model.forward();
+        model.run();
     } catch (const std::exception& e) {
         what = e.what();
     }
@@ -2664,7 +2664,7 @@ TEST_CASE("lifetime: a tie_outputs variable under a transient System is deleted 
     std::size_t steady = 0;  // the pool in use after the first run
     for (int run = 1; run <= 2; ++run) {
         INFO("run " << run);
-        model.forward();
+        model.run();
         model.wait();
         CHECK(model.get_subsystem("tr") == nullptr);
         CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "sink.y")) == tsys::iota_plus(1.0f, tsys::kLen));
@@ -2678,7 +2678,7 @@ TEST_CASE("lifetime: a tie_outputs variable under a transient System is deleted 
 TEST_CASE("lifetime: a tie_inputs variable is initialized by the tie; a member's own init loses to it", "[system][lifetime]") {
     cs::Model model = cs::create_model<tsys::TieInit>(default_config());
     model.setup();
-    model.forward();
+    model.run();
     model.wait();
     CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "a.y")) == tsys::filled(6.0f));  // 2 * 3, not 2 * 100
     CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "b.y")) == tsys::filled(9.0f));  // 3 * 3
@@ -2690,7 +2690,7 @@ TEST_CASE("lifetime: two tied members with inits: the tie's init wins, else the 
     SECTION("a tie-level init_input declared after the tie") {
         cs::Model model = cs::create_model<tsys::TieInitTwo>(default_config(), true);
         REQUIRE_NOTHROW(model.setup());
-        model.forward();
+        model.run();
         model.wait();
         CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "a.y")) == tsys::filled(14.0f));  // 2 * 7
         CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "b.y")) == tsys::filled(21.0f));  // 3 * 7
@@ -2698,7 +2698,7 @@ TEST_CASE("lifetime: two tied members with inits: the tie's init wins, else the 
     SECTION("no tie-level init: the later merged member (b) wins") {
         cs::Model model = cs::create_model<tsys::TieInitTwo>(default_config(), false);
         REQUIRE_NOTHROW(model.setup());
-        model.forward();
+        model.run();
         model.wait();
         CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "a.y")) == tsys::filled(400.0f));  // 2 * 200
         CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "b.y")) == tsys::filled(600.0f));  // 3 * 200
@@ -2709,7 +2709,7 @@ TEST_CASE("lifetime: a model-level promotion is eternal", "[system][lifetime]") 
     cs::Model model = cs::create_model<tsys::PromoteFromTransient>(cst::pooled_config());
     model.setup();
     for (int run = 1; run <= 2; ++run) {
-        model.forward();
+        model.run();
         model.wait();
         // the promotion's alias holds the variable, though the transient producer is gone
         CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "y")) == tsys::iota_plus(1.0f, tsys::kLen));
@@ -2723,7 +2723,7 @@ TEST_CASE("lifetime: a mark under a transient System is collected at setup and s
     REQUIRE_NOTHROW(model.setup());
     REQUIRE(model.design_vars().size() == 1);
     CHECK(model.design_vars()[0].path == "tr.a.x");
-    model.forward();
+    model.run();
     model.wait();
     CHECK(model.get_subsystem("tr") == nullptr);  // deleted after its turn
     REQUIRE(model.design_vars().size() == 1);
@@ -2805,7 +2805,7 @@ TEST_CASE("lifetime: a transient System with a finite value source for a hook is
     model.update_input("s.nb.v", cs::init::from_host(tsys2::one_u32(4)));
     for (int k = 1; k <= 2; ++k) {
         INFO("forward " << k);
-        CHECK_NOTHROW(model.forward());
+        CHECK_NOTHROW(model.run());
         model.wait();
         CHECK(model.get_subsystem("s") == nullptr);  // deleted after its turn, on schedule
     }
@@ -2826,7 +2826,7 @@ TEST_CASE("lifetime: a hook whose value source is gone keeps the last shape",
             model.update_input("s.nb.v", cs::init::from_host(tsys2::one_u32(4)));
             for (int k = 1; k <= 3; ++k) {
                 INFO("forward " << k);
-                CHECK_NOTHROW(model.forward());
+                CHECK_NOTHROW(model.run());
                 model.wait();
                 CHECK(cst::synced_input<DType::f32, 1>(model, "s.x").shape()[0] == 4);  // the last shape stands from forward 3 on
                 CHECK((model.get_subsystem("s.nb") == nullptr) == (k >= 2));  // deleted after its second turn
@@ -2904,7 +2904,7 @@ TEST_CASE("lifetime: a variable survives its producer being deleted, through an 
     model.setup();
     for (int run = 1; run <= 3; ++run) {
         INFO("run " << run);
-        model.forward();
+        model.run();
         model.wait();
         CHECK(model.get_subsystem("p") == nullptr);  // the producer is gone after its one turn
         // r holds the variable through its port
@@ -2919,7 +2919,7 @@ TEST_CASE("lifetime: a transient producer feeding a transient reader in the same
     std::size_t steady = 0;  // the pool in use after the first run
     for (int run = 1; run <= 3; ++run) {
         INFO("run " << run);
-        model.forward();
+        model.run();
         model.wait();
         // built at the start of the forward and deleted at its end: all three exist for the whole forward
         CHECK(model.get_subsystem("p") == nullptr);
@@ -3052,7 +3052,7 @@ template <class Needles>
 void forward_throws(cs::Model& model, const Needles& needles) {
     std::string what = "<no exception>";
     try {
-        model.forward();
+        model.run();
     } catch (const std::exception& e) {
         what = e.what();
     }
@@ -3078,7 +3078,7 @@ TEST_CASE("shape: unspecified dims are supplied by a connection", "[system][shap
     model.setup();
     for (const std::uint32_t n : {5u, 3u}) {  // the supplier changes between runs, the consumer follows
         model.update_input("v.n", cs::init::from_host(tsys2::one_u32(n)));
-        model.forward();
+        model.run();
         model.wait();
         CHECK(cst::synced_input<DType::f32, 1>(model, "a.x").shape()[0] == n);
         CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "a.y")) == tshape::iota_doubled(n));
@@ -3094,7 +3094,7 @@ TEST_CASE("shape: unspecified dims are supplied by a tie (an initializer on it, 
             s.init_input("x", cs::init::fill(3.0f, {5}));
         });
         model.setup();
-        model.forward();
+        model.run();
         model.wait();
         CHECK(cst::synced_input<DType::f32, 1>(model, "a.x").shape()[0] == 5);
         CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "b.y")) == std::vector<float>(5, 6.0f));
@@ -3109,7 +3109,7 @@ TEST_CASE("shape: unspecified dims are supplied by a tie (an initializer on it, 
         });
         model.setup();
         model.update_input("v.n", cs::init::from_host(tsys2::one_u32(4)));
-        model.forward();
+        model.run();
         model.wait();
         CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "a.y")) == tshape::iota_doubled(4));
     }
@@ -3122,7 +3122,7 @@ TEST_CASE("shape: every initializer kind supplies the shape of a free unspecifie
             s.init_input("a.x", init);
         });
         model.setup();
-        model.forward();
+        model.run();
         model.wait();
         CHECK(cst::synced_input<DType::f32, 1>(model, "a.x").shape()[0] == want_len);
         return to_vector(cst::synced_output<DType::f32, 1>(model, "a.y"));
@@ -3158,7 +3158,7 @@ TEST_CASE("shape: every initializer kind supplies the shape of a free unspecifie
             s.init_input("a.x", cs::init::from_host(std::vector<float>{1, 2, 3, 4, 5, 6}, {2, 3}));
         });
         model.setup();
-        model.forward();
+        model.run();
         model.wait();
         CHECK(cst::synced_input<DType::f32, 2>(model, "a.x").shape()[0] == 2);
         CHECK(cst::synced_input<DType::f32, 2>(model, "a.x").shape()[1] == 3);
@@ -3328,7 +3328,7 @@ TEST_CASE("depends_on: declaration errors", "[system][depends_on][errors]") {
             s.depends_on("b", "a");
         });
         CHECK_NOTHROW(model.setup());
-        model.forward();
+        model.run();
         model.wait();
     }
 }
@@ -3346,7 +3346,7 @@ TEST_CASE("placement: a child placed by its author on device X, added by its par
     CHECK(model.root().instance_at("in.k.y")->device == host);
 
     model.update_input("in.k.x", cs::init::fill(3.0f));
-    model.forward();
+    model.run();
     model.wait();
     CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "in.k.y")) == tsys::filled(3.0f));
 }
@@ -3356,12 +3356,12 @@ TEST_CASE("placement: a rebuilt child keeps the outer device", "[system][placeme
     if (!tsys::pick_two(first, host)) SKIP("a non-OpenMP device and the OpenMP host device are not both visible");
     cs::Model model = cs::create_model<tsys::DevTop>(default_config(), first, host);
     model.setup();
-    model.forward();
+    model.run();
     model.wait();
 
     // the root re-arms "in" at the start of the next forward: deleted and built again from its slot (the slot keeps the device)
     tsys::rearm_next(model, "in");
-    model.forward();
+    model.run();
     model.wait();
     REQUIRE(model.get_subsystem("in") != nullptr);
     CHECK(model.root().instance_at("in.k.x")->device == host);
@@ -3386,7 +3386,7 @@ inline void run_sizes(cs::Model& model, std::initializer_list<std::uint32_t> siz
     for (const std::uint32_t n : sizes) {
         INFO("n = " << n);
         model.update_input("v.n", cs::init::from_host(one_u32(n)));
-        model.forward();
+        model.run();
         model.wait();
         CHECK(cst::synced_input<DType::f32, 1>(model, "a.x").shape()[0] == n);
         CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, y_path)) == std::vector<float>(n, want));
@@ -3421,7 +3421,7 @@ TEST_CASE("init: reshaping a tie_inputs alias runs its initializer again", "[sys
         for (const std::uint32_t n : {3u, 6u, 4u, 8u}) {
             INFO("n = " << n);
             model.update_input("v.n", cs::init::from_host(tsys2::one_u32(n)));
-            model.forward();
+            model.run();
             model.wait();
             const std::vector<float> want(n, explicit_fill ? 14.0f : 0.0f);
             CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "a.y")) == want);
@@ -3440,7 +3440,7 @@ TEST_CASE("init: in a tie an explicit initializer beats an implicit one, whichev
             s.tie_inputs<DType::f32, 1>({"a.x", "b.x"}, "x", cs::shape(5));
         });
         model.setup();
-        model.forward();
+        model.run();
         model.wait();
         CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "a.y")) == std::vector<float>(5, 14.0f));
         CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "b.y")) == std::vector<float>(5, 14.0f));
@@ -3456,7 +3456,7 @@ TEST_CASE("init: in a tie with two explicit initializers the last one wins", "[s
         s.tie_inputs<DType::f32, 1>({"a.x", "b.x"}, "x", cs::shape(5));
     });
     model.setup();
-    model.forward();
+    model.run();
     model.wait();
     CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "a.y")) == std::vector<float>(5, 10.0f));
     CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "b.y")) == std::vector<float>(5, 10.0f));
@@ -3475,7 +3475,7 @@ TEST_CASE("init: a connected input and an output are never initialized, not even
     for (const std::uint32_t n : {3u, 6u, 4u}) {
         INFO("n = " << n);
         model.update_input("v.n", cs::init::from_host(tsys2::one_u32(n)));
-        model.forward();
+        model.run();
         model.wait();
         // a.y (an output) holds what a wrote, b.x (connected) is that same data, and b.y is computed from it: nothing zeroed them
         CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "a.y")) == std::vector<float>(n, 14.0f));

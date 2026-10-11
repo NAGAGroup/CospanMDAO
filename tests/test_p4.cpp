@@ -73,7 +73,7 @@ std::vector<float> iota_from_one() {
 }
 
 void run(cs::Model& m) {
-    m.forward();
+    m.run();
     m.wait();
 }
 std::vector<float> out(cs::Model& m, std::string_view path) { return to_vector(cst::synced_output<DType::f32, 1>(m, path)); }
@@ -543,7 +543,7 @@ TEST_CASE("cycle: without an initializer the first forward throws, naming the va
     tp4::CerrCapture cap;
     cs::Model        model = cs::create_model<tp4::CycleTop>(default_config(), 2);
     model.setup();  // not an error at setup: an initializer may still come
-    tp4::expect_throws_all([&] { model.forward(); }, {"closes a cycle", "'p.x' reads 'q.y', which runs after it", "has no initializer"});
+    tp4::expect_throws_all([&] { model.run(); }, {"closes a cycle", "'p.x' reads 'q.y', which runs after it", "has no initializer"});
 }
 
 TEST_CASE("cycle: an initializer set by update_input after setup counts", "[p4][cycle]") {
@@ -630,7 +630,7 @@ TEST_CASE("tie devices: a member moved by set_device after the tie errors at the
     model.setup();
     tp4::run(model);  // fine: both on the default device
     model.get_subsystem("b")->set_device(other);
-    tp4::expect_throws_all([&] { model.forward(); },
+    tp4::expect_throws_all([&] { model.run(); },
                            {"tie_outputs 't'", "member 'b.y' is on", "but the tie is on", "every member must be on the tie's device"});
 }
 
@@ -806,5 +806,5 @@ TEST_CASE("init: the implicit zero is not a declaration, so a cycle with no expl
     tp4::CerrCapture cap;
     cs::Model        model = cs::create_model<tp4::CycleTop>(default_config(), 2);
     model.setup();
-    tp4::expect_throws_all([&] { model.forward(); }, {"closes a cycle", "'p.x' reads 'q.y', which runs after it", "has no initializer"});
+    tp4::expect_throws_all([&] { model.run(); }, {"closes a cycle", "'p.x' reads 'q.y', which runs after it", "has no initializer"});
 }

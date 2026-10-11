@@ -402,7 +402,7 @@ void shapes_case() {
     });
     m.setup();
     for (int fwd = 0; fwd < 2; ++fwd) {
-        m.forward();
+        m.run();
         m.wait();
         CHECK(trs::out_of<2>(m, "f.a.y") == trs::expected_ids<2>(sycl::range<2>{3, 5}, 0));
         CHECK(trs::out_of<2>(m, "f.b.y") == trs::expected_ids<2>(sycl::range<2>{4, 2}, 1));
@@ -426,7 +426,7 @@ void own_whole_case(bool whole) {
     });
     m.setup();
     for (int fwd = 0; fwd < 2; ++fwd) {
-        m.forward();
+        m.run();
         m.wait();
         const std::vector<float> got = trs::out_of<2>(m, "g.flags");
         // flags is shaped (12, 28) items; the group (y, x) is written by its leader at item (4y, 4x)... the stage writes at the
@@ -471,7 +471,7 @@ void tickets_case() {
             want[y * gr[1] * 4 + x] = static_cast<float>((ngy * gr[1] + ngx) * 16 + (y % 4) * 4 + (x % 4));
         }
     for (int fwd = 0; fwd < 4; ++fwd) {
-        m.forward();
+        m.run();
         m.wait();
         INFO("forward " << fwd);
         CHECK(trs::out_of<2>(m, "f.r.z") == want);
@@ -492,7 +492,7 @@ TEMPLATE_TEST_CASE("range_split: 260 x 260 = 67600 groups per stage in a fused g
                                                       cs::subsystem_desc<trs::IdStage<2, 1>>("b", sycl::range<2>{260, 260})));
     });
     m.setup();
-    m.forward();
+    m.run();
     m.wait();
     CHECK(trs::out_of<2>(m, "f.a.y") == trs::expected_ids<2>(sycl::range<2>{260, 260}, 0));
     CHECK(trs::out_of<2>(m, "f.b.y") == trs::expected_ids<2>(sycl::range<2>{260, 260}, 1));
@@ -504,7 +504,7 @@ TEST_CASE("range_split: 67600 groups in a bare rank-2 group component and a bare
         s.add_subsystem(cs::subsystem_desc<trs::PlainId>("p", sycl::range<2>{2080, 2080}));  // default 8 x 8: 260 x 260 groups
     });
     m.setup();
-    m.forward();
+    m.run();
     m.wait();
     CHECK(trs::out_of<2>(m, "a.y") == trs::expected_ids<2>(sycl::range<2>{260, 260}, 0));
     const std::vector<float> p = trs::out_of<2>(m, "p.y");
@@ -521,7 +521,7 @@ TEMPLATE_TEST_CASE("range_split: rank-3 stages", "[range_split][rank3]", Flatten
         s.add_subsystem(cs::subsystem_desc<trs::IdStage<3, 2>>("c", sycl::range<3>{2, 2, 3}));  // a bare rank-3 component
     });
     m.setup();
-    m.forward();
+    m.run();
     m.wait();
     CHECK(trs::out_of<3>(m, "f.a.y") == trs::expected_ids<3>(sycl::range<3>{2, 3, 4}, 0));
     CHECK(trs::out_of<3>(m, "f.b.y") == trs::expected_ids<3>(sycl::range<3>{3, 1, 5}, 1));
@@ -534,7 +534,7 @@ TEST_CASE("range_split: rank-1 stages", "[range_split][rank1]") {
                                                  cs::subsystem_desc<trs::IdStage<1, 1>>("b", sycl::range<1>{4})));
     });
     m.setup();
-    m.forward();
+    m.run();
     m.wait();
     CHECK(trs::out_of<1>(m, "f.a.y") == trs::expected_ids<1>(sycl::range<1>{9}, 0));
     CHECK(trs::out_of<1>(m, "f.b.y") == trs::expected_ids<1>(sycl::range<1>{4}, 1));
@@ -544,7 +544,7 @@ TEST_CASE("range_split: rank-1 stages", "[range_split][rank1]") {
 TEST_CASE("range_split: a bare component's physical launch is its declared range", "[range_split][native]") {
     cs::Model m = trs::make([](cs::System& s) { s.add_subsystem(cs::subsystem_desc<trs::RawStage<3>>("a", sycl::range<2>{6, 9})); });
     m.setup();
-    m.forward();
+    m.run();
     m.wait();
     CHECK(trs::out_of<2>(m, "a.y") == std::vector<float>(24u * 36u, 1.0f));
 }
@@ -555,7 +555,7 @@ TEST_CASE("range_split: flatten_and_split puts the groups along the last dimensi
                                                      cs::subsystem_desc<trs::RawStage<0>>("b", sycl::range<2>{2, 3})));
     });
     m.setup();
-    m.forward();
+    m.run();
     m.wait();
     CHECK(trs::out_of<2>(m, "f.a.y") == std::vector<float>(24u * 36u, 1.0f));
     CHECK(trs::out_of<2>(m, "f.b.y") == std::vector<float>(8u * 12u, 1.0f));
@@ -567,7 +567,7 @@ TEST_CASE("range_split: pad_and_split keeps the leading dimensions hardware-dire
                                                  cs::subsystem_desc<trs::RawStage<1>>("b", sycl::range<2>{2, 3})));
     });
     m.setup();
-    m.forward();
+    m.run();
     m.wait();
     CHECK(trs::out_of<2>(m, "f.a.y") == std::vector<float>(24u * 36u, 1.0f));
     CHECK(trs::out_of<2>(m, "f.b.y") == std::vector<float>(8u * 12u, 1.0f));
@@ -579,7 +579,7 @@ TEST_CASE("range_split: padded makes physical dimension 0 the segment index", "[
                                                     cs::subsystem_desc<trs::RawStage<2>>("b", sycl::range<2>{2, 3})));
     });
     m.setup();
-    m.forward();
+    m.run();
     m.wait();
     CHECK(trs::out_of<2>(m, "f.a.y") == std::vector<float>(24u * 36u, 1.0f));
     CHECK(trs::out_of<2>(m, "f.b.y") == std::vector<float>(8u * 12u, 1.0f));
@@ -590,7 +590,7 @@ TEST_CASE("cs:: group functions: every family over the CoSpan group wrapper", "[
     static_assert(std::is_same_v<cs::sub_group, sycl::sub_group>);
     cs::Model m = trs::make([](cs::System& s) { s.add_subsystem(cs::subsystem_desc<trs::FamStage>("a")); });
     m.setup();
-    m.forward();
+    m.run();
     m.wait();
     const std::vector<float> r = trs::out_of<1>(m, "a.r");
     REQUIRE(r.size() == 128u);
@@ -630,7 +630,7 @@ TEST_CASE("cs:: group functions: every family over the CoSpan group wrapper", "[
 TEST_CASE("to_sycl(): the physical item and group go into raw SYCL algorithms", "[range_split][group_functions]") {
     cs::Model m = trs::make([](cs::System& s) { s.add_subsystem(cs::subsystem_desc<trs::ToSyclStage>("a")); });
     m.setup();
-    m.forward();
+    m.run();
     m.wait();
     const std::vector<float> r = trs::out_of<1>(m, "a.r");
     CHECK(r[0] == 136.0f);

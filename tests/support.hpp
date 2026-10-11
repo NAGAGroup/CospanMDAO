@@ -4,10 +4,10 @@
 // tests/support.hpp — small helpers shared by the Catch2 tests
 // =============================================================================
 //
-// Every test goes through a cospan::Model (create_model / setup / forward /
+// Every test goes through a cospan::Model (create_model / setup / run /
 // wait / view_* / update_input). Nothing here reaches past the Model's public API.
 //
-// Reading results (docs/design-review-2026-10-03.md, section 5): forward() only enqueues. A host view can be
+// Reading results (docs/design-review-2026-10-03.md, section 5): run() only enqueues. A host view can be
 // obtained only after the first forward, and it must be sync()ed before it is read. The helpers below do the
 // forward + view + sync sequence so the cases do not repeat it.
 
@@ -110,9 +110,9 @@ inline auto to_vector(const View& v) {
 }
 
 // ---- running a Model -----------------------------------------------------------
-/// One forward, then wait for everything submitted ("run it and let it finish").
+/// One run, then wait for everything submitted ("run it and let it finish").
 inline void forward_and_wait(cs::Model& m) {
-    m.forward();
+    m.run();
     m.wait();
 }
 
@@ -132,10 +132,10 @@ inline cs::HostView<DT, Rank> synced_input(cs::Model& m, std::string_view path) 
     return v;
 }
 
-/// One forward, then a synced host view of an output (forward + view + sync).
+/// One run, then a synced host view of an output (run + view + sync).
 template <DType DT, int Rank>
 inline cs::HostView<DT, Rank> wait_and_view(cs::Model& m, std::string_view path) {
-    m.forward();
+    m.run();
     return synced_output<DT, Rank>(m, path);
 }
 

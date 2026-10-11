@@ -110,7 +110,7 @@ parent was placed. **The outermost call wins**, and `set_device` covers aliases 
   and where the tie's initializer runs. Members may be elsewhere; a device no member uses costs one more allocation.
 - `tie_outputs<DT, R>(members, name, shape = {}, policy = require_atomic, device = {})`: every member must be on the tie's
   device, checked at the call; because `set_device` can later move one member, the owning System checks again at the start of
-  every forward, before any submission, and the error names the member, both devices and the tie.
+  every run, before any submission, and the error names the member, both devices and the tie.
 - `connect` takes no device.
 
 ### 2.4 Wiring and merges
@@ -145,8 +145,8 @@ After the rules pass, the losing variable's live holders are re-pointed at the w
 then reads the producer's previous value. `connect` keeps the target's initializer (it does not drop it). The first
 materialization of a cycle variable runs the initializer even though the variable is connected, takes the shape from it, and
 throws when there is none ("'<var>' closes a cycle ('<dst>' reads '<src>', which runs after it) and has no initializer").
-That is checked at the first forward, not at setup, because an initializer may be set after setup. `update_input` accepts a
-cycle variable and re-initializes it at the next forward. The warning to `std::cerr` (once per pair) stays.
+That is checked at the first run, not at setup, because an initializer may be set after setup. `update_input` accepts a
+cycle variable and re-initializes it at the next run. The warning to `std::cerr` (once per pair) stays.
 
 ### 2.6 Initial values
 
@@ -188,9 +188,9 @@ user error, so promote what must stay durable.
 
 ## 3. Execution and events
 
-### 3.1 The forward
+### 3.1 The run
 
-`Model::forward()` enqueues one forward of the root and returns: precompute, compute, postcompute, for components and Systems
+`Model::run()` enqueues one run of the root and returns: precompute, compute, postcompute, for components and Systems
 alike. Each step is framework-owned and calls an empty-by-default user hook.
 
 | Step | System | Component |
@@ -332,11 +332,11 @@ A view is a read-only holder on the host, owned by the user. **It can be made at
 any holder and throws only when the shape cannot be resolved yet ("its shape is not known yet"). Reading before anything is
 computed shows whatever is in memory.
 
-- While a view lives, **every forward pushes one copy to it** (each live view costs one copy per forward). An unwanted view
+- While a view lives, **every run pushes one copy to it** (each live view costs one copy per run). An unwanted view
   should go out of scope.
 - **`sync()`** waits on the host container's write list. Reading without syncing is the user's responsibility.
 - **A shape change resizes the host container too, so a live view follows it**; spans taken before the change are invalid.
-  After the next forward and a `sync()` the same view shows the new size and values.
+  After the next run and a `sync()` the same view shows the new size and values.
 - A view outlives the Model (it keeps the variable and the host container).
 - `HostView`: `sync()`, `size()`, `data()`, `span()`, `shape()`, `operator()(i[, j[, k]])`. `HostRagged`: `sync()`, `size()`,
   `data()`, `span()`, `n()`, `block_offsets()`, `block(i)`.
@@ -354,13 +354,13 @@ is how a component sizes its outputs from values.
 `update_input(path, init)` sets the initializer (the last call wins) and marks the variable stale; it queues no work. A
 variable that is not materialized is always stale. At the next forward the first holder to materialize it runs the initializer
 on its own device and copies to the others; a materialized stale variable is initialized in place (a write: it waits on the
-reads and is registered as a write). Several updates before a forward collapse to the last, and a variable nothing touches is
-never initialized. A host view synced before the next forward still shows the old values. On an input whose variable has a
+reads and is registered as a write). Several updates before a run collapse to the last, and a variable nothing touches is
+never initialized. A host view synced before the next run still shows the old values. On an input whose variable has a
 source it warns (`std::cerr`) and does nothing, unless the variable is part of a cycle. Naming an output throws.
 
 ### 4.5 wait
 
-`wait()` is optional (3.6). A host-body exception surfaces from `wait()`, not from `forward()`.
+`wait()` is optional (3.6). A host-body exception surfaces from `wait()`, not from `run()`.
 
 ---
 
@@ -372,7 +372,7 @@ The **definition** of a dimension is fixed once setup ends: **specified** (a val
 from outside) or **hook-owned** (one registered hook owns it). The **actual** shape changes at run time and only through
 `VarMeta::set_by_producer` / `set_dims`, which check every change against the definition. Every dimension has exactly one
 setter: a specified one the definition, a hook-owned one its hook, an unspecified one the producer (an output) or the
-initializer (a free input). A shape that is needed and not known is an error at the forward; setup checks wiring rules only.
+initializer (a free input). A shape that is needed and not known is an error at the run; setup checks wiring rules only.
 
 *Defining* a shape is: declaring a port, merging through the wiring calls, registering a hook, `fixed_at_run`. *Setting* it is:
 an output's producer in `pre_forward`, a hook when it runs, a free input from its initializer.
@@ -743,7 +743,7 @@ Section 11 is the design; where the code differs, this is where and why.
    any time. `add_subsystem` may follow the "anywhere" principle later.
 9. **`override_run_policy` (11.2).** As built it also revives a gone child that is not made transient, and is not logged for
    replay (rearming an ancestor rebuilds the slot with its declared policy).
-10. **Cycles (11.2).** `update_input` on a cycle variable after the first forward re-initializes it at the next forward; the
+10. **Cycles (11.2).** `update_input` on a cycle variable after the first run re-initializes it at the next run; the
     replay of a connect carries the cycle mark and initializer. A declaration (`init_input`) on an already-materialized free
     input marks it stale; the replay of one does not.
 11. **Tied-output pushes (11.3).** A tie whose member children are all skipped or deleted does not push that forward.
@@ -751,7 +751,7 @@ Section 11 is the design; where the code differs, this is where and why.
     `ragged_view()` (rank 2), since a dense and a ragged view cannot share one return type. The `view_*` and `update_input`
     shorthands are kept.
 13. **Host-component exceptions (11.4).** The design says the original exception comes out of `wait()`. As built `wait()` is
-    `wait_and_throw` on both queues and the tests assert that it throws and that `forward()` does not; the exception's type and
+    `wait_and_throw` on both queues and the tests assert that it throws and that `run()` does not; the exception's type and
     text are not asserted.
 14. **Waits on a non-ticket launch, a group without group waits (11.6).** As designed, undefined with no checks; no debug assert was added.
 15. **Local-memory request (11.6).** Requests are rounded up to 16 bytes, and the check against the device limit names the

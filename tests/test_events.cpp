@@ -109,7 +109,7 @@ TEST_CASE("a second holder on a new placement gets its own container, a copy of 
         s.add_subsystem(cs::subsystem_desc<tev::Fill>("p"));
     });
     model.setup();
-    model.forward();
+    model.run();
     model.wait();
 
     const auto               p_y  = model.root().instance_at("p.y");
@@ -176,7 +176,7 @@ TEST_CASE("the first materialization, asked by an input, is global and initializ
         CHECK_FALSE(inst->meta->is_materialized());
     }
 
-    model.forward();
+    model.run();
     model.wait();
     CHECK(observed == 1);
 

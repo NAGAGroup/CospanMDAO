@@ -159,11 +159,11 @@ Report run_variant(Variant v, const Options& o, const Data& d, bool need_B2) {
         model.setup();
         set_inputs(model, d);
         for (int i = 0; i < o.warmup; ++i) {
-            model.forward();
+            model.run();
             model.wait();
         }
         const auto t0 = std::chrono::steady_clock::now();
-        for (int i = 0; i < o.iters; ++i) model.forward();
+        for (int i = 0; i < o.iters; ++i) model.run();
         model.wait();  // ONE wait for the whole batch
         const auto t1 = std::chrono::steady_clock::now();
         rep.ms        = std::chrono::duration<double, std::milli>(t1 - t0).count() / o.iters;

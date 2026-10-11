@@ -123,7 +123,7 @@ int main() {
     model.setup();
 
     model.update_input("axpb.x", cs::init::from_host(std::vector<float>{1, 2, 3, 4}));
-    model.forward();
+    model.run();
 
     auto y = model.view_output<DType::f32, 1>("axpb.y");
     y.sync();
