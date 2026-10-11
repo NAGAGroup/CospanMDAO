@@ -34,9 +34,42 @@ The goals:
 ## Phases
 
 ### Phase 1: The model's lifecycle and the edit window
-States: created, set up, editable, first run (frozen), reset. What may be called in each state. Building procedurally from `main`, the root handle, and `create_model` with a plain root. Inventory: 5, 30, 31.
-- Decisions: none yet.
-- Open questions: none yet.
+First pass, 2026-10-11. Inventory: 5, 30, 31.
+
+Decisions (first pass):
+- **States:**
+  - *Created*: `create_model` has constructed the root.
+  - *Editable*: after `model.setup()`. Structure may still change from `main`, through the root handle or `get_subsystem` handles.
+  - *Frozen*: from the first run on, the structure is fixed.
+  - *Reset*: `setup()` called again.
+- **`setup()` stays a separate call.** It is not folded into `create_model`, so we can't regret removing it later.
+- **Procedural building.** `create_model` with a plain System root. Everything is added from `main` between `setup()` and the first run.
+- **`finalize()`.** The user may call it; otherwise it runs at the start of the first run.
+- **Checks come in three tiers:**
+  1. at the call (for example, the cycle warning at connect);
+  2. at finalize;
+  3. at run time (for example, shapes set by hooks, and shapes resolved lazily).
+
+  A free input has a zero initializer by default.
+- **Reverse operations.** Every operation that mutates the model metadata defines its reverse right alongside it: add_subsystem, declaring an input or output, connect, promote, tie, and so on.
+  - The subsystem object that performed an operation owns its reverse, not the global metadata.
+  - When a subsystem goes out of scope, the model calls its deconstruct, which plays its reverses. The object itself is not deleted.
+  - A reverse removes what that subsystem owns. For example, removing a component's holder metadata releases its device data through the existing last-holder rule.
+- **Outside declarations stay.** A declaration made outside a subsystem that reaches into it, such as a parent's connect, is not reversed when the subsystem goes out of scope. It stays as metadata, and replay uses it.
+- **Rearm.** Rearm reruns setup on the same object, then replays the outside declarations that name it.
+  - A rebuild reproduces the same structure by construction, so nothing checks it.
+  - Users who do unusual things in hooks are on their own: the rules decide whether a replay succeeds.
+- **Reset.** Reset plays the root's reverse operations, then calls `setup()`. Anything added procedurally from `main` is not kept.
+- **Run policies are metadata entries.** They are replayed on rearm and can also be updated at run time.
+- **Host views and update_input.** Whether a view can be made depends only on whether its variable can be materialized at that moment, not on the state. `update_input` may be called at any time; it only sets an initializer.
+
+Open questions:
+- **Run-policy override against a rearm.** Two options:
+  - (a) record the override as a later declaration, so it replays after the declared policy;
+  - (b) the override replaces the runtime policy and carries an owner, and a setter higher in the hierarchy wins.
+- **Reverse operations in detail:** where exactly they are kept, and how and when the model calls deconstruct.
+- **The full table of which calls are legal in which state.** First guess: structural calls only while Editable; rearm, policy changes, update_input, views, wait and inspection at run time.
+- **Which checks belong to which tier,** item by item.
 
 ### Phase 2: Names and the metadata object
 Fully resolved names; the maps (name → input/output metadata, subsystem → inputs/outputs, Systems, name → list index); subsystems not owning their inputs and outputs; how a declarer's resolved name is assigned; namespace views for Systems, `main` and `get_subsystem` handles. Inventory: 1, 3, 19, 32, 33.
