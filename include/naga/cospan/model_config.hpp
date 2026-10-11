@@ -15,8 +15,8 @@
 //
 // The Model's context is sk::context{}: EVERY available root device. There is no device gating: any device may be given to
 // add_subsystem, whether or not a pool_desc names it. The descriptors resolve into detail::ResolvedConfig, which only the
-// Model reads; the validation (a device covered twice, all_devices combined with another pool_desc, a device not in the
-// context) happens when the Model is created and throws std::invalid_argument naming the device.
+// Model reads; the validation (a device covered twice, all_devices combined with another pool_desc)
+// happens when the Model is created and throws std::invalid_argument naming the device.
 
 #include <cstddef>
 #include <optional>

@@ -301,32 +301,25 @@ private:
             if (!root) throw std::invalid_argument("naga::cospan: Model needs a root System");
         }
 
-        // The async handler, when given, goes to both queues; otherwise the no-handler constructors. The context covers every
-        // device, so the queues name their default device (the one an unplaced operation runs on): AdaptiveCpp's default,
-        // not the context's first device, which may be another backend's.
+        // The async handler, when given, goes to both queues; otherwise the no-handler constructors.
         static sk::queue make_queue(const sk::context& c, const detail::ResolvedConfig& d) {
-            if (d.async_handler) return sk::queue{c, detail::default_device(), *d.async_handler};
-            return sk::queue{c, detail::default_device()};
+            if (d.async_handler) return sk::queue{c, *d.async_handler};
+            return sk::queue{c};
         }
         static sk::unordered_queue make_uqueue(const sk::context& c, const detail::ResolvedConfig& d) {
-            if (d.async_handler) return sk::unordered_queue{c, detail::default_device(), *d.async_handler};
-            return sk::unordered_queue{c, detail::default_device()};
+            if (d.async_handler) return sk::unordered_queue{c, *d.async_handler};
+            return sk::unordered_queue{c};
         }
 
         static std::string name_of(const sycl::device& d) { return d.get_info<sycl::info::device::name>(); }
 
         /// The (bytes, node size) each context device gets: from the pool_desc that covers it, else 0 bytes and 1024.
         /// Throws std::invalid_argument, naming the device, for a device covered twice (by two pool_descs or twice in one
-        /// list), cs::all_devices combined with another pool_desc, or a named device that is not in the context.
+        /// list) or cs::all_devices combined with another pool_desc.
         static std::vector<std::pair<std::size_t, std::size_t>> resolve_pools(const sk::context& ctx, const detail::ResolvedConfig& c) {
             const auto devices = ctx.devices();
             std::vector<std::pair<std::size_t, std::size_t>> out(devices.size(), {std::size_t{0}, std::size_t{1024}});
             std::vector<bool>                                covered(devices.size(), false);
-            const auto index_of = [&](const sycl::device& d) -> std::size_t {
-                for (std::size_t i = 0; i < devices.size(); ++i)
-                    if (devices[i] == d) return i;
-                throw std::invalid_argument("naga::cospan: pool_desc names device '" + name_of(d) + "', which is not in the model's context");
-            };
             for (const detail::PoolEntry& e : c.pools) {
                 if (e.all && c.pools.size() > 1) {
                     // name a device the other pool_desc covers
@@ -350,7 +343,9 @@ private:
                 if (e.all) {
                     for (std::size_t i = 0; i < devices.size(); ++i) cover(i);
                 } else {
-                    for (const sycl::device& d : e.devices) cover(index_of(d));
+                    for (const sycl::device& d : e.devices)
+                        for (std::size_t i = 0; i < devices.size(); ++i)
+                            if (devices[i] == d) cover(i);
                 }
             }
             return out;
