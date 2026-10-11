@@ -1,0 +1,13 @@
+PROJECT_NAME        = CoSpan
+INPUT               = include/naga/cospan
+RECURSIVE           = YES
+FILE_PATTERNS       = *.hpp
+OUTPUT_DIRECTORY    = build/docs/doxygen
+GENERATE_XML        = YES
+GENERATE_HTML       = NO
+GENERATE_LATEX      = NO
+EXTRACT_ALL         = YES
+JAVADOC_AUTOBRIEF   = YES
+QT_AUTOBRIEF        = YES
+QUIET               = YES
+WARN_IF_UNDOCUMENTED = NO

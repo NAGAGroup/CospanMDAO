@@ -102,6 +102,24 @@ setup-git = "git config core.hooksPath .project/hooks"
 features = ["git"]
 no-default-feature = true
 
+# ---- documentation: Sphinx + Breathe over Doxygen XML ------------------------
+[feature.documentation.dependencies]
+sphinx          = "<9"  # breathe (latest 5.1) needs sphinx < 9; unpinned, the solver picked sphinx 9 with breathe 4.15, which fails to import
+myst-parser     = "*"
+breathe         = "*"
+doxygen         = "*"
+sphinx-autobuild = "*"
+
+[feature.documentation.tasks]
+# doxygen creates only the last directory of OUTPUT_DIRECTORY, so build/docs is made first.
+docs-doxygen = "mkdir -p build/docs && doxygen docs/Doxyfile"
+docs-build   = { cmd = "sphinx-build -b html docs/site build/docs/html", depends-on = ["docs-doxygen"] }
+docs-serve   = { cmd = "sphinx-autobuild docs/site build/docs/html --host 0.0.0.0 --port 8000 --watch include/naga/cospan --pre-build 'doxygen docs/Doxyfile'", depends-on = ["docs-doxygen"] }
+
+[environments.docs]
+features = ["documentation"]
+no-default-feature = true
+
 # ---- cuBLAS reference for examples/gemver-chain -----------------------------
 # A plain CUDA toolchain from conda-forge, apart from the AdaptiveCpp stack (its
 # own solve group). cuda-version is pinned to what the driver supports (nvidia-smi:
