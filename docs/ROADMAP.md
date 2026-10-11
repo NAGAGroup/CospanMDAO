@@ -11,7 +11,7 @@ Messy by design. Checkboxes, notes, strike-throughs welcome. Each item points at
   1. [ ] Documentation infrastructure, then documentation and tutorials. CoSpan gets polished along the way as rough spots show up. Tutorials target the default device.
   2. [ ] Lay of the land for the web presence. This is discussion only, with nothing built: what goes on the NAGA Labs site, whether CoSpan lives there or at cospan.dev, pointing Jack's personal site at NAGA Labs, and the LinkedIn update.
   3. [ ] SlabKit polish, plus any CoSpan polish the tutorials didn't cover.
-  4. [ ] Toolchain and OpenMP work: the fork's OpenMP dependency-ordering bug (must be fixed before anything is published), the gemver onepass OpenMP bug, and the toolchain CI failures.
+  4. [ ] Toolchain and OpenMP work: the fork's OpenMP dependency-ordering bug (must be fixed before anything is published), the gemver onepass OpenMP bug, and the toolchain CI failures. Also: exceptions thrown by host tasks never reach the queue's async handler. The AdaptiveCpp fork doesn't route them there, which is why SlabKit catches them itself (HostErrors) and rethrows from wait_and_throw; the fix spans the fork and SlabKit, specifics later (2026-10-11).
   5. [ ] CI/CD for SlabKit and CoSpan.
   6. [ ] Building the site, publishing and promoting. Not defined yet.
 
