@@ -6,7 +6,14 @@ Messy by design. Checkboxes, notes, strike-throughs welcome. Each item points at
 
 - [x] **The 2026-10-03 rework is done**: branch `rework-2026-10-03`, last commit before the docs commit `2e8e223` (default and cuda suites green; spec `docs/spec/revisions/r02-2026-10-03-the-design-as-built.md`, decision D144, migration `docs/rework-migration-2026-10-03.md`).
 - [x] **Design review section 11 implemented on main**; spec r03 (`docs/spec/revisions/r03-2026-10-06-section-11-as-built.md`).
-- [ ] **Next: the chunked-systems redesign** (Jack). Chunked systems, slices and leading ranges were not ported; the old code is dead code in `include/naga/cospan/chunked_system.hpp` and in git history (`c8553f6`).
+- [ ] **The chunked-systems redesign is deferred until after the public release** (decided with Jack, 2026-10-11). Chunked systems, slices and leading ranges were not ported; the old code is dead code in `include/naga/cospan/chunked_system.hpp` and in git history (`c8553f6`).
+- [ ] **Path to a public release (agreed 2026-10-11)**
+  1. [ ] Documentation infrastructure, then documentation and tutorials. CoSpan gets polished along the way as rough spots show up. Tutorials target the default device.
+  2. [ ] Lay of the land for the web presence. This is discussion only, with nothing built: what goes on the NAGA Labs site, whether CoSpan lives there or at cospan.dev, pointing Jack's personal site at NAGA Labs, and the LinkedIn update.
+  3. [ ] SlabKit polish, plus any CoSpan polish the tutorials didn't cover.
+  4. [ ] Toolchain and OpenMP work: the fork's OpenMP dependency-ordering bug (must be fixed before anything is published), the gemver onepass OpenMP bug, and the toolchain CI failures.
+  5. [ ] CI/CD for SlabKit and CoSpan.
+  6. [ ] Building the site, publishing and promoting. Not defined yet.
 
 Open items after the rework:
 
