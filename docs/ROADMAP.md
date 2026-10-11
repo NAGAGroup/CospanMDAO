@@ -24,7 +24,7 @@ Open items after the rework:
 
 ## Before any code (spec drafts still needed)
 
-- [ ] Chunked systems — a system flavour with a scratch budget; nesting and sub-chunking are required; the chunk axis and the sub-chunk declaration are open. Not ported in the 2026-10-03 rework: redesign next (see Status and next).
+- [ ] Chunked systems — a system flavour with a scratch budget; nesting and sub-chunking are required; the chunk axis and the sub-chunk declaration are open. Not ported in the 2026-10-03 rework: redesign deferred until after the public release (see Status and next).
 - [ ] Cycles, solvers and implicit components — cycles by registration order; an implicit component is a self-connection with its own buffer; a balance helper. (absorbed by: r02)
 - [ ] A "proven by" list per r01 section — the order-sensitive tests each contract needs. (absorbed by: r02)
 
