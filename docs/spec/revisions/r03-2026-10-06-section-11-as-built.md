@@ -496,7 +496,7 @@ add_subsystem(cs::fuse_components(
     cs::segment(cs::subsystem_desc<C>("c"))));                             // c has its own groups, in the same launch
 ```
 
-`cs::fuse_components<options...>(name, [ConnectsDesc,] items...)` returns a descriptor for `add_subsystem`. An item is a bare
+`cs::fuse_components<options...>(name, [ConnectsDesc,] [TiesDesc,] items...)` (connects first when both are given) returns a descriptor for `add_subsystem`. An item is a bare
 component descriptor (a one-stage segment), `cs::segment<opts...>(descs...)`, or `cs::global_barrier()`. The one option is
 `cs::group_waits_enabled` (6.4); any other option is a `static_assert` ("the only fuse_components option is
 cs::group_waits_enabled"), and a plain `fuse_components(...)` with no options is the common case. `cs::system_from(name,
@@ -510,7 +510,21 @@ cs::group_waits_enabled"), and a plain `fuse_components(...)` with no options is
   group, and mark the target variable internal. They are allowed in every range mode but must go **forward in stage order**: a
   connect from a stage's output to the input of the same or an earlier stage throws at setup:
   `"'<dst>' reads '<src>', which runs after it in fused group '<name>'"`.
-- Ports of the children are reached by path (`"f.a.x"`). Ties inside a group follow the ordinary tie policy.
+- **Ties inside a group** (`cs::ties_desc({cs::tie_outputs<DT, R>({"a.y", "b.y"}, "y" [, shape [, policy]]),
+  cs::tie_inputs<DT, R>({...}, "x" [, shape])})`): each entry takes the parameters of `System::tie_outputs` /
+  `System::tie_inputs` with the same defaults, minus the device (the group's own: the default device, moved with the group by
+  `set_device`). Member paths are relative to the group (stage name, then port). The group is a System, and each entry runs
+  the System tie logic itself (`System::tie_outputs_of` / `tie_inputs_of`, the bodies of the public calls), in setup after the
+  stages are added and before the connects (a tie refuses members that are already connected; a connect may name an alias).
+  **The alias lives in the group**, at `f.<name>`: through the Model, `f.a.y`, `f.b.y` and `f.y` are views of the same data.
+  Every existing tie rule applies: the output policy (`require_atomic` by default), no ties of ties (across levels too: a
+  member the group tied is refused to an owner's tie, "already tied", and so is the group's alias, "tying a tie is not
+  allowed"), tied members cannot `set_shape`, a shape hook on `f.y` by path, push suppression, and the run-time check that
+  every member is on the tie's device. **There are no ordering or pattern checks among tied stages**: ordering is the
+  designer's, through stage order, segments, `cs::global_barrier()` and group waits (stages of one plain segment run per index in
+  stage order; separate segments are unordered). Ties declared by the owner with paths into the group (`tie_outputs({"f.a.y",
+  "f.b.y"}, "y")`) work as before, the alias at the owner's level.
+- Ports of the children are reached by path (`"f.a.x"`).
 
 ### 6.3 Segments, range, local memory
 
@@ -591,6 +605,14 @@ and the pointer array. It registers a write on every stage's output containers a
 those of one component (per stage: inputs' writes, outputs' reads and their variables' resize events, `depends_on` events) collected over every
 stage, plus the geometry, pointer and ticket-state arrays. Internal connections work out naturally. The group's event is
 recorded on every stage.
+
+**Push timing of the group's own tied outputs.** A `tie_outputs` alias the group declares (`cs::ties_desc`) is pushed to the
+variable's other placements (the same copy the System loop does) **after the group's single launch**, in the group's
+`run_compute`: the System loop's "right after the last child holding a member" turn never comes inside a fused group, whose
+compute is one launch over all stages. Each copy waits on the alias container's write list, which holds the launch's write,
+so it is ordered after the launch's event; the copies' events are part of the group's events (`events()`). The member-device
+check runs at the start of the group's `run_compute`, before the launch. An owner's tie with paths into the group is pushed
+by the owner's loop, after the group, as before.
 
 ---
 

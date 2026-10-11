@@ -599,3 +599,250 @@ TEST_CASE("fused groups: a connect to the same or an earlier stage throws at set
         tfg::expect_throws([&] { model.setup(); }, {"which runs after it in fused group \'f\'"});
     }
 }
+
+// =============================================================================================
+// ties declared in fuse_components (cs::ties_desc)
+// =============================================================================================
+namespace tfg {
+
+// TAdder: y[i] += v on an ATOMIC output (a tie_outputs member); TZero stores 0 first (outputs are never initialized).
+struct TAdderBody {
+    struct Inputs {};
+    struct Outputs {
+        cs::Output<DType::atomic_f32, 1> y;
+    };
+    float v;
+    void operator()(sycl::id<1> i, Inputs, Outputs out) const { out.y[i].fetch_add(v); }
+};
+class TAdder : public cs::Component<TAdderBody> {
+    cs::Output<DType::atomic_f32, 1> y_;
+    float                            v_;
+
+public:
+    explicit TAdder(float v) : v_{v} {}
+    void setup() override { declare_output(y_, "y", cs::unspecified_shape<1>()); }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(y_.shape(), {}, {y_}, {v_}); }
+};
+struct TZeroBody {
+    struct Inputs {};
+    struct Outputs {
+        cs::Output<DType::atomic_f32, 1> y;
+    };
+    void operator()(sycl::id<1> i, Inputs, Outputs out) const { out.y[i].store(0.0f); }
+};
+class TZero : public cs::Component<TZeroBody> {
+    cs::Output<DType::atomic_f32, 1> y_;
+
+public:
+    void setup() override { declare_output(y_, "y", cs::unspecified_shape<1>()); }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(y_.shape(), {}, {y_}, {}); }
+};
+
+// TSlice: y[i] = v for lo <= i < hi and nothing else, a PLAIN output (disjoint slices of one tie). `reshape`: its
+// pre_forward calls set_shape on the output, which a tied member may not do.
+struct TSliceBody {
+    struct Inputs {};
+    struct Outputs {
+        cs::Output<DType::f32, 1> y;
+    };
+    float lo, hi, v;
+    void operator()(sycl::id<1> i, Inputs, Outputs out) const {
+        const float k = static_cast<float>(i[0]);
+        if (k >= lo && k < hi) out.y[i] = v;
+    }
+};
+class TSlice : public cs::Component<TSliceBody> {
+    cs::Output<DType::f32, 1> y_;
+    float                     lo_, hi_, v_;
+    bool                      reshape_;
+
+public:
+    TSlice(float lo, float hi, float v, bool reshape = false) : lo_{lo}, hi_{hi}, v_{v}, reshape_{reshape} {}
+    void setup() override { declare_output(y_, "y", cs::unspecified_shape<1>()); }
+    void pre_forward() override {
+        if (reshape_) set_shape(y_, 12);
+    }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+        return create_launch_config(y_.shape(), {}, {y_}, {lo_, hi_, v_});
+    }
+};
+
+std::vector<float> in_of(cs::Model& m, const char* path) { return to_vector(cst::synced_input<DType::f32, 1>(m, path)); }
+
+/// The group of the atomic cases: z zeroes, a adds 1, b adds 2, all in one segment (each index runs z, a, b in that order).
+inline auto atomic_stages() {
+    return cs::segment<cs::range_mode::whole>(cs::subsystem_desc<TZero>("z"), cs::subsystem_desc<TAdder>("a", 1.0f),
+                                              cs::subsystem_desc<TAdder>("b", 2.0f));
+}
+/// The group of the plain cases: a writes [0, 6) = 1, b writes [6, 12) = 2.
+inline auto slice_stages() {
+    return cs::segment<cs::range_mode::whole>(cs::subsystem_desc<TSlice>("a", 0.0f, 6.0f, 1.0f),
+                                              cs::subsystem_desc<TSlice>("b", 6.0f, 12.0f, 2.0f));
+}
+inline std::vector<float> halves() {
+    std::vector<float> v(12, 1.0f);
+    std::fill(v.begin() + 6, v.end(), 2.0f);
+    return v;
+}
+
+}  // namespace tfg
+
+TEST_CASE("ties_desc: atomic outputs of three stages tied in the group, the views of the members and the alias agree",
+          "[fused_groups][ties]") {
+    cs::Model model = tfg::make([](cs::System& s) {
+        s.add_subsystem(cs::fuse_components("f", cs::ties_desc({cs::tie_outputs<DType::atomic_f32, 1>({"z.y", "a.y", "b.y"}, "y", cs::shape(12))}),
+                                            tfg::atomic_stages()));
+    });
+    model.setup();
+    for (int fwd = 0; fwd < 3; ++fwd) {  // the zeroing stage runs every forward: the sums do not pile up
+        model.forward();
+        model.wait();
+        CHECK(tfg::out_of(model, "f.a.y") == tfg::filled(12, 3.0f));
+        CHECK(tfg::out_of(model, "f.b.y") == tfg::filled(12, 3.0f));
+        CHECK(tfg::out_of(model, "f.y") == tfg::filled(12, 3.0f));
+    }
+}
+
+TEST_CASE("ties_desc: plain outputs under allow_plain, each stage writes its own slice", "[fused_groups][ties]") {
+    cs::Model model = tfg::make([](cs::System& s) {
+        s.add_subsystem(cs::fuse_components(
+            "f", cs::ties_desc({cs::tie_outputs<DType::f32, 1>({"a.y", "b.y"}, "y", cs::shape(12), cs::TieOutputsPolicy::allow_plain)}),
+            tfg::slice_stages()));
+    });
+    model.setup();
+    model.forward();
+    model.wait();
+    CHECK(tfg::out_of(model, "f.a.y") == tfg::halves());
+    CHECK(tfg::out_of(model, "f.b.y") == tfg::halves());
+    CHECK(tfg::out_of(model, "f.y") == tfg::halves());
+}
+
+TEST_CASE("ties_desc: connects_desc and ties_desc together, connects first", "[fused_groups][ties]") {
+    cs::Model model = tfg::make([](cs::System& s) {
+        s.add_subsystem(cs::fuse_components("f", cs::connects_desc({{"y", "c.x"}}),
+                                            cs::ties_desc({cs::tie_outputs<DType::atomic_f32, 1>({"z.y", "a.y", "b.y"}, "y", cs::shape(12))}),
+                                            cs::segment<cs::range_mode::whole>(cs::subsystem_desc<tfg::TZero>("z"), cs::subsystem_desc<tfg::TAdder>("a", 1.0f),
+                                                                              cs::subsystem_desc<tfg::TAdder>("b", 2.0f), cs::subsystem_desc<tfg::Plus1>("c"))));
+    });
+    model.setup();
+    model.forward();
+    model.wait();
+    CHECK(tfg::out_of(model, "f.y") == tfg::filled(12, 3.0f));
+    CHECK(tfg::out_of(model, "f.c.y") == tfg::filled(12, 4.0f));  // c reads the alias inside the group (one segment: per index z, a, b, c)
+}
+
+TEST_CASE("ties_desc: a shape hook on the alias, by path", "[fused_groups][ties][shapes]") {
+    cs::Model model = tfg::make([](cs::System& s) {
+        s.add_subsystem(cs::subsystem_desc<tfg::Src>("src", 16));
+        s.add_subsystem(cs::fuse_components("f", cs::ties_desc({cs::tie_outputs<DType::atomic_f32, 1>({"z.y", "a.y", "b.y"}, "y")}),
+                                            tfg::atomic_stages()));
+        s.shape_hook("f.y", cs::dim::from_shape("src.y", 0));
+    });
+    model.setup();
+    model.forward();
+    model.wait();
+    CHECK(tfg::out_of(model, "f.a.y") == tfg::filled(16, 3.0f));
+    CHECK(tfg::out_of(model, "f.b.y") == tfg::filled(16, 3.0f));
+    CHECK(tfg::out_of(model, "f.y") == tfg::filled(16, 3.0f));
+}
+
+TEST_CASE("ties_desc: an input tie in the group, both stages read the alias", "[fused_groups][ties]") {
+    cs::Model model = tfg::make([](cs::System& s) {
+        s.add_subsystem(cs::fuse_components("f", cs::ties_desc({cs::tie_inputs<DType::f32, 1>({"p.x", "q.x"}, "x", cs::shape(12))}),
+                                            cs::segment<cs::range_mode::whole>(cs::subsystem_desc<tfg::Plus1>("p"),
+                                                                              cs::subsystem_desc<tfg::Plus1>("q"))));
+    });
+    model.setup();
+    std::vector<float> ramp(12), want(12);
+    for (std::size_t i = 0; i < 12; ++i) {
+        ramp[i] = static_cast<float>(i) * 3.0f;
+        want[i] = ramp[i] + 1.0f;
+    }
+    model.update_input("f.x", cs::init::from_host(ramp));
+    model.forward();
+    model.wait();
+    CHECK(tfg::in_of(model, "f.x") == ramp);
+    CHECK(tfg::in_of(model, "f.p.x") == ramp);
+    CHECK(tfg::in_of(model, "f.q.x") == ramp);
+    CHECK(tfg::out_of(model, "f.p.y") == want);
+    CHECK(tfg::out_of(model, "f.q.y") == want);
+}
+
+TEST_CASE("ties_desc: a consumer outside the group reads the alias in the same forward and gets the final values",
+          "[fused_groups][ties]") {
+    cs::Model model = tfg::make([](cs::System& s) {
+        s.add_subsystem(cs::fuse_components("f", cs::ties_desc({cs::tie_outputs<DType::atomic_f32, 1>({"z.y", "a.y", "b.y"}, "y", cs::shape(12))}),
+                                            tfg::atomic_stages()));
+        s.add_subsystem(cs::subsystem_desc<tfg::Plus1>("c"));
+        s.connect("f.y", "c.x");
+    });
+    model.setup();
+    for (int fwd = 0; fwd < 3; ++fwd) {
+        model.forward();
+        model.wait();
+        CHECK(tfg::out_of(model, "c.y") == tfg::filled(12, 4.0f));
+        CHECK(tfg::out_of(model, "f.y") == tfg::filled(12, 3.0f));
+    }
+}
+
+TEST_CASE("ties_desc: a tie declared by the owner with paths into the group still works", "[fused_groups][ties]") {
+    cs::Model model = tfg::make([](cs::System& s) {
+        s.add_subsystem(cs::fuse_components("f", tfg::atomic_stages()));
+        s.tie_outputs<DType::atomic_f32, 1>({"f.z.y", "f.a.y", "f.b.y"}, "sum", cs::shape(12));
+    });
+    model.setup();
+    model.forward();
+    model.wait();
+    CHECK(tfg::out_of(model, "sum") == tfg::filled(12, 3.0f));
+    CHECK(tfg::out_of(model, "f.a.y") == tfg::filled(12, 3.0f));
+    CHECK(tfg::out_of(model, "f.b.y") == tfg::filled(12, 3.0f));
+}
+
+TEST_CASE("ties_desc: errors", "[fused_groups][ties][errors]") {
+    SECTION("a tie of a tie: the owner ties a member the group tied") {
+        cs::Model model = tfg::make([](cs::System& s) {
+            s.add_subsystem(cs::fuse_components(
+                "f", cs::ties_desc({cs::tie_outputs<DType::f32, 1>({"a.y", "b.y"}, "y", cs::shape(12), cs::TieOutputsPolicy::allow_plain)}),
+                cs::segment<cs::range_mode::whole>(cs::subsystem_desc<tfg::TSlice>("a", 0.0f, 6.0f, 1.0f),
+                                                   cs::subsystem_desc<tfg::TSlice>("b", 6.0f, 12.0f, 2.0f),
+                                                   cs::subsystem_desc<tfg::TSlice>("c", 0.0f, 12.0f, 3.0f))));
+            s.tie_outputs<DType::f32, 1>({"f.a.y", "f.c.y"}, "z", cs::shape(12), cs::TieOutputsPolicy::allow_plain);
+        });
+        tfg::expect_throws([&] { model.setup(); }, {"tie_outputs", "already tied"});
+    }
+    SECTION("a tie of a tie: the owner ties the alias of the group") {
+        cs::Model model = tfg::make([](cs::System& s) {
+            s.add_subsystem(cs::fuse_components(
+                "f", cs::ties_desc({cs::tie_outputs<DType::f32, 1>({"a.y", "b.y"}, "y", cs::shape(12), cs::TieOutputsPolicy::allow_plain)}),
+                tfg::slice_stages()));
+            s.add_subsystem(cs::subsystem_desc<tfg::TSlice>("g", 0.0f, 12.0f, 3.0f));
+            s.tie_outputs<DType::f32, 1>({"f.y", "g.y"}, "z", cs::shape(12), cs::TieOutputsPolicy::allow_plain);
+        });
+        tfg::expect_throws([&] { model.setup(); }, {"tie_outputs", "tying a tie is not allowed"});
+    }
+    SECTION("set_shape on a tied member") {
+        cs::Model model = tfg::make([](cs::System& s) {
+            s.add_subsystem(cs::fuse_components(
+                "f", cs::ties_desc({cs::tie_outputs<DType::f32, 1>({"a.y", "b.y"}, "y", cs::shape(12), cs::TieOutputsPolicy::allow_plain)}),
+                cs::segment<cs::range_mode::whole>(cs::subsystem_desc<tfg::TSlice>("a", 0.0f, 6.0f, 1.0f, true),
+                                                   cs::subsystem_desc<tfg::TSlice>("b", 6.0f, 12.0f, 2.0f))));
+        });
+        model.setup();
+        tfg::expect_throws([&] { model.forward(); model.wait(); }, {"is tied", "its tie"});
+    }
+    SECTION("a plain dtype under require_atomic") {
+        cs::Model model = tfg::make([](cs::System& s) {
+            s.add_subsystem(cs::fuse_components("f", cs::ties_desc({cs::tie_outputs<DType::f32, 1>({"a.y", "b.y"}, "y", cs::shape(12))}),
+                                                tfg::slice_stages()));
+        });
+        tfg::expect_throws([&] { model.setup(); }, {"is not atomic", "require_atomic", "allow_plain"});
+    }
+    SECTION("a member path that does not exist") {
+        cs::Model model = tfg::make([](cs::System& s) {
+            s.add_subsystem(cs::fuse_components(
+                "f", cs::ties_desc({cs::tie_outputs<DType::f32, 1>({"a.y", "nope.y"}, "y", cs::shape(12), cs::TieOutputsPolicy::allow_plain)}),
+                tfg::slice_stages()));
+        });
+        tfg::expect_throws([&] { model.setup(); }, {"nope"});
+    }
+}

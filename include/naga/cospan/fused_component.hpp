@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <concepts>
+#include <functional>
 #include <initializer_list>
 #include <memory>
 #include <optional>
@@ -54,6 +55,22 @@ inline ConnectsDesc connects_desc(std::initializer_list<std::pair<std::string_vi
     return c;
 }
 
+namespace detail {
+class FusedBase;
+}  // namespace detail
+
+/// One tie declared in a group: cs::tie_outputs<DT, R>(...) or cs::tie_inputs<DT, R>(...), applied to the group in setup().
+using TieEntry = std::function<void(detail::FusedBase&)>;
+
+/// The ties of a helper-built group, in order: ties_desc({cs::tie_outputs<DType::f32, 1>({"a.y", "b.y"}, "y"), ...}). Each
+/// entry takes the parameters of System::tie_outputs / System::tie_inputs (member paths relative to the group: stage name,
+/// then port), minus the device, which is the group's own. The alias lives in the group, at `<group>.<name>`.
+struct TiesDesc {
+    std::vector<TieEntry> entries;
+};
+
+inline TiesDesc ties_desc(std::initializer_list<TieEntry> entries) { return TiesDesc{std::vector<TieEntry>{entries}}; }
+
 /// A fused-group property, given as a template option of fuse_components: cs::fuse_components<cs::group_waits_enabled>(...).
 /// With it the stages may wait on work-groups of EARLIER segments (GroupItem::wait_group, wait_earlier_segments) without
 /// any co-residency of groups; a cs::global_barrier() in the group implies it. The group's stages must all be work-group
@@ -89,14 +106,36 @@ public:
     void run_compute(Runtime& rt) override {
         const std::vector<ComponentBase*> st = stages();
         if (st.empty()) throw std::invalid_argument("naga::cospan: " + describe() + ": a fused group has no stages");
+        check_tied_output_devices();  // a member moved off its tie's device since the tie was made is an error
         (void)launcher_.launch(rt, st, segments_, describe(), group_waits_);
+        // The loop of a System never runs for a group, so its "after the last child holding a member" turn never comes: the
+        // group's own tied outputs are pushed here, after the single launch (the copies wait on the launch's writes).
+        push_events_ = push_own_tied_outputs();
     }
 
     void run_postcompute(Runtime& rt) override {
         for (ComponentBase* s : stages()) s->run_postcompute(rt);
     }
 
-    std::vector<sycl::event> events() const override { return launcher_.events(); }
+    /// The launch's events, and the events of the pushes of the group's own tied outputs (after the launch).
+    std::vector<sycl::event> events() const override {
+        std::vector<sycl::event> out = launcher_.events();
+        out.insert(out.end(), push_events_.begin(), push_events_.end());
+        return out;
+    }
+
+    /// The group's own ties (cs::ties_desc): the same logic as System::tie_inputs / tie_outputs, on the group, on the default
+    /// device that the group's set_device moves with the rest. Called by the TieEntry objects in setup().
+    template <DType DT, int Rank>
+    void group_tie_inputs(const std::vector<std::string>& members, std::string name, ShapeSpec shape) {
+        const std::vector<std::string_view> v(members.begin(), members.end());
+        this->template tie_inputs_of<DT, Rank>(std::span<const std::string_view>{v}, std::move(name), std::move(shape));
+    }
+    template <DType DT, int Rank>
+    void group_tie_outputs(const std::vector<std::string>& members, std::string name, ShapeSpec shape, TieOutputsPolicy policy) {
+        const std::vector<std::string_view> v(members.begin(), members.end());
+        this->template tie_outputs_of<DT, Rank>(std::span<const std::string_view>{v}, std::move(name), std::move(shape), policy);
+    }
 
     /// Whether the group has allocated its wait state (group_waits_enabled or a global_barrier, after a forward).
     bool has_wait_state() const { return launcher_.has_wait_state(); }
@@ -131,6 +170,7 @@ private:
     std::vector<SegmentSpec> segments_;
     bool                     group_waits_ = false;
     GroupLauncher            launcher_;
+    std::vector<sycl::event> push_events_;  ///< the pushes of the group's own tied outputs, this forward
 };
 
 /// The component type of a SubsystemDesc.
@@ -150,6 +190,12 @@ template <class... Ds>
 inline constexpr bool leads_with_connects_v = false;
 template <class D, class... Ds>
 inline constexpr bool leads_with_connects_v<D, Ds...> = std::is_same_v<std::remove_cvref_t<D>, ConnectsDesc>;
+
+/// Whether the first of `Ds` is a TiesDesc (false for none).
+template <class... Ds>
+inline constexpr bool leads_with_ties_v = false;
+template <class D, class... Ds>
+inline constexpr bool leads_with_ties_v<D, Ds...> = std::is_same_v<std::remove_cvref_t<D>, TiesDesc>;
 
 /// A segment descriptor: consecutive stages that share groups, with the segment's options.
 template <LocalMem LM, RangeMode RM, class... Descs>
@@ -294,11 +340,15 @@ class FusedGroup final : public detail::FusedBase {
                   "work-group to wait with");
 
 public:
-    FusedGroup(ConnectsDesc c, Items... items)
-        : detail::FusedBase{detail::segment_specs<Items...>(), Waits || detail::has_boundary_v<Items...>}, connects_{std::move(c)}, items_{std::move(items)...} {}
+    FusedGroup(ConnectsDesc c, TiesDesc t, Items... items)
+        : detail::FusedBase{detail::segment_specs<Items...>(), Waits || detail::has_boundary_v<Items...>}, connects_{std::move(c)}, ties_{std::move(t)}, items_{std::move(items)...} {}
 
     void setup() override {
         std::apply([this](auto&... it) { (this->add_item(it), ...); }, items_);
+        // The ties come first: a tie refuses members that are already connected, and a connect may name a tie alias. Only the
+        // System tie rules apply (no ordering or pattern checks among tied stages: that is the designer's, by stage order,
+        // segments, global_barrier and group waits).
+        for (const TieEntry& e : ties_.entries) e(*this);
         for (const auto& [a, b] : connects_.pairs) {
             check_forward(a, b);
             connect(a, b);
@@ -346,6 +396,7 @@ private:
     std::vector<std::string> names_;
 
     ConnectsDesc         connects_;
+    TiesDesc             ties_;
     std::tuple<Items...> items_;
 };
 
@@ -379,23 +430,62 @@ template <class O>
 inline constexpr bool is_fuse_option_v = std::is_same_v<O, group_waits_enabled>;
 }  // namespace detail
 
-/// A fused group of the given items (in order) with the given connections, as a descriptor for add_subsystem. Options are
-/// template arguments: cs::fuse_components<cs::group_waits_enabled>(name, connects, items...).
+/// A tie_outputs declared in a fused group (cs::ties_desc): the parameters of System::tie_outputs, minus the device.
+template <DType DT, int Rank>
+TieEntry tie_outputs(std::initializer_list<std::string_view> members, std::string name, ShapeSpec shape = {},
+                     TieOutputsPolicy policy = TieOutputsPolicy::require_atomic) {
+    std::vector<std::string> ms;
+    for (const std::string_view m : members) ms.emplace_back(m);
+    return [ms = std::move(ms), name = std::move(name), shape = std::move(shape), policy](detail::FusedBase& g) {
+        g.template group_tie_outputs<DT, Rank>(ms, name, shape, policy);
+    };
+}
+/// A tie_inputs declared in a fused group (cs::ties_desc): the parameters of System::tie_inputs, minus the device.
+template <DType DT, int Rank>
+TieEntry tie_inputs(std::initializer_list<std::string_view> members, std::string name, ShapeSpec shape = {}) {
+    std::vector<std::string> ms;
+    for (const std::string_view m : members) ms.emplace_back(m);
+    return [ms = std::move(ms), name = std::move(name), shape = std::move(shape)](detail::FusedBase& g) {
+        g.template group_tie_inputs<DT, Rank>(ms, name, shape);
+    };
+}
+
+/// A fused group of the given items (in order), as a descriptor for add_subsystem:
+/// cs::fuse_components[<options>](name, [connects_desc(...)], [ties_desc(...)], items...). Options are template arguments:
+/// cs::fuse_components<cs::group_waits_enabled>(...). Both descriptions are optional; connects comes first.
 template <class... Opts, class... Items>
+    requires(!detail::leads_with_ties_v<Items...>)
 auto fuse_components(std::string name, ConnectsDesc c, Items... items) {
     static_assert(((detail::is_fuse_option_v<Opts>) && ...),
                   "naga::cospan: the only fuse_components option is cs::group_waits_enabled");
     constexpr bool waits = detail::option_count_v<group_waits_enabled, Opts...> > 0;
-    return subsystem_desc<FusedGroup<waits, Items...>>(std::move(name), std::move(c), std::move(items)...);
+    return subsystem_desc<FusedGroup<waits, Items...>>(std::move(name), std::move(c), TiesDesc{}, std::move(items)...);
 }
-/// The same with no connections.
+/// Connections and ties.
 template <class... Opts, class... Items>
-    requires(sizeof...(Items) >= 1 && !detail::leads_with_connects_v<Items...>)
+auto fuse_components(std::string name, ConnectsDesc c, TiesDesc t, Items... items) {
+    static_assert(((detail::is_fuse_option_v<Opts>) && ...),
+                  "naga::cospan: the only fuse_components option is cs::group_waits_enabled");
+    constexpr bool waits = detail::option_count_v<group_waits_enabled, Opts...> > 0;
+    return subsystem_desc<FusedGroup<waits, Items...>>(std::move(name), std::move(c), std::move(t), std::move(items)...);
+}
+/// Ties, no connections.
+template <class... Opts, class... Items>
+    requires(!detail::leads_with_connects_v<Items...>)
+auto fuse_components(std::string name, TiesDesc t, Items... items) {
+    static_assert(((detail::is_fuse_option_v<Opts>) && ...),
+                  "naga::cospan: the only fuse_components option is cs::group_waits_enabled");
+    constexpr bool waits = detail::option_count_v<group_waits_enabled, Opts...> > 0;
+    return subsystem_desc<FusedGroup<waits, Items...>>(std::move(name), ConnectsDesc{}, std::move(t), std::move(items)...);
+}
+/// Neither.
+template <class... Opts, class... Items>
+    requires(sizeof...(Items) >= 1 && !detail::leads_with_connects_v<Items...> && !detail::leads_with_ties_v<Items...>)
 auto fuse_components(std::string name, Items... items) {
     static_assert(((detail::is_fuse_option_v<Opts>) && ...),
                   "naga::cospan: the only fuse_components option is cs::group_waits_enabled");
     constexpr bool waits = detail::option_count_v<group_waits_enabled, Opts...> > 0;
-    return subsystem_desc<FusedGroup<waits, Items...>>(std::move(name), ConnectsDesc{}, std::move(items)...);
+    return subsystem_desc<FusedGroup<waits, Items...>>(std::move(name), ConnectsDesc{}, TiesDesc{}, std::move(items)...);
 }
 
 /// A plain System of the given children (in order) with the given connections, as a descriptor for add_subsystem.

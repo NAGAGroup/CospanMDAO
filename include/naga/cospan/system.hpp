@@ -228,12 +228,8 @@ public:
     template <DType DT, int Rank>
     void tie_inputs(std::initializer_list<std::string_view> members, std::string name, ShapeSpec shape = {},
                     std::optional<sycl::device> device = {}) {
-        static_assert(Rank >= 1 && Rank <= 3, "cospan: rank is 1..3");
-        check_new_name(name, "alias");
-        const detail::TieMembers ms = resolve_members(members);
-        auto a = detail::tie_inputs<DT, Rank>(site(), ms, name, this, shape, std::optional<sycl::device>{device.value_or(detail::default_device())});
-        store_alias(a);
-        record_tie(members, name, /*is_input=*/true, a);
+        tie_inputs_of<DT, Rank>(std::span<const std::string_view>{members.begin(), members.size()}, std::move(name), std::move(shape),
+                                std::move(device));
     }
 
     /// A NEW variable (source, not target); atomic member dtypes unless allow_plain. The members are outputs of dtype
@@ -246,15 +242,8 @@ public:
     template <DType DT, int Rank>
     void tie_outputs(std::initializer_list<std::string_view> members, std::string name, ShapeSpec shape = {},
                      TieOutputsPolicy policy = TieOutputsPolicy::require_atomic, std::optional<sycl::device> device = {}) {
-        static_assert(Rank >= 1 && Rank <= 3, "cospan: rank is 1..3");
-        check_new_name(name, "alias");
-        const detail::TieMembers ms = resolve_members(members);
-        auto a = detail::tie_outputs<DT, Rank>(site(), ms, name, this, shape, policy, device.value_or(detail::default_device()));
-        store_alias(a);
-        TieOut t{a, {}};
-        for (const std::string_view m : members) t.members.emplace_back(m);
-        tie_outs_.push_back(std::move(t));
-        record_tie(members, name, /*is_input=*/false, a);
+        tie_outputs_of<DT, Rank>(std::span<const std::string_view>{members.begin(), members.size()}, std::move(name), std::move(shape),
+                                 policy, std::move(device));
     }
 
     // ---- shape hooks (legal at any time) -----------------------------------------------
@@ -565,6 +554,41 @@ public:
     void run_postcompute([[maybe_unused]] detail::Runtime& rt) override { post_forward(); }
 
 protected:
+    /// The bodies of tie_inputs and tie_outputs, over a span of member paths (a fused group's ties_desc has its members in a
+    /// vector, not in an initializer list). Everything the public calls do is done here, once.
+    template <DType DT, int Rank>
+    void tie_inputs_of(std::span<const std::string_view> members, std::string name, ShapeSpec shape = {},
+                       std::optional<sycl::device> device = {}) {
+        static_assert(Rank >= 1 && Rank <= 3, "cospan: rank is 1..3");
+        check_new_name(name, "alias");
+        const detail::TieMembers ms = resolve_members(members);
+        auto a = detail::tie_inputs<DT, Rank>(site(), ms, name, this, shape, std::optional<sycl::device>{device.value_or(detail::default_device())});
+        store_alias(a);
+        record_tie(members, name, /*is_input=*/true, a);
+    }
+    template <DType DT, int Rank>
+    void tie_outputs_of(std::span<const std::string_view> members, std::string name, ShapeSpec shape = {},
+                        TieOutputsPolicy policy = TieOutputsPolicy::require_atomic, std::optional<sycl::device> device = {}) {
+        static_assert(Rank >= 1 && Rank <= 3, "cospan: rank is 1..3");
+        check_new_name(name, "alias");
+        const detail::TieMembers ms = resolve_members(members);
+        auto a = detail::tie_outputs<DT, Rank>(site(), ms, name, this, shape, policy, device.value_or(detail::default_device()));
+        store_alias(a);
+        TieOut t{a, {}};
+        for (const std::string_view m : members) t.members.emplace_back(m);
+        tie_outs_.push_back(std::move(t));
+        record_tie(members, name, /*is_input=*/false, a);
+    }
+
+    /// The push of every tie_outputs alias this System owns, now; returns the events of the copies. A fused group calls it
+    /// after its single launch (its loop never runs, so the "after the last child holding a member" turn never comes). Each
+    /// copy waits on the alias's write list, which holds the launch's write.
+    std::vector<sycl::event> push_own_tied_outputs() {
+        forward_events_.clear();
+        for (const TieOut& t : tie_outs_) push_tied_output(t);
+        return forward_events_;
+    }
+
     /// "the root System" or "System 'path'": the prefix of every System error.
     std::string describe() const {
         return path().empty() ? std::string{"the root System"} : "System '" + path() + "'";
@@ -790,7 +814,7 @@ private:
         return detail::WiringSite{describe(), src_order, dst_order, &root_system().warned_cycles_};
     }
 
-    detail::TieMembers resolve_members(std::initializer_list<std::string_view> members) {
+    detail::TieMembers resolve_members(std::span<const std::string_view> members) {
         detail::TieMembers out;
         for (const std::string_view m : members) out.emplace_back(std::string{m}, instance_at(m));
         return out;
@@ -841,7 +865,7 @@ private:
         decls_.push_back(Decl{std::move(refs), std::move(replay), var});
     }
 
-    void record_tie(std::initializer_list<std::string_view> members, const std::string& name, bool is_input,
+    void record_tie(std::span<const std::string_view> members, const std::string& name, bool is_input,
                     const std::shared_ptr<detail::Instance>& alias) {
         std::vector<std::string> ms, refs;
         for (const std::string_view m : members) {
