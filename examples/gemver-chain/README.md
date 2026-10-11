@@ -47,7 +47,7 @@ variant promotes the same names, so the driver is variant-agnostic.
   (relative L2 about 3e-6 against unfused). **Skipped by `--variant all` on omp**, where its `q` is
   wrong (see the open questions); an explicit `--variant onepass` still runs it there.
 * **naive**: the SAME components, fused with global barriers into **three launches for the whole chain** (the
-  barrier items make every group of the next segment wait for every group of the earlier ones, in ticket order, so no
+  barrier items make every group of the next segment wait for every group of the earlier ones, which only ever wait on groups that started earlier, so no
   co-residency is needed):
   `G1 = fuse_components(segment<whole>(r2u, gtp), global_barrier(), cred, global_barrier(), gemv)`,
   `BiCGK = fuse_components(onepass, global_barrier(), segment(rowred, cred_s))`, `G2` as `G1`. It contains `BicgkOnePass`, so on
@@ -110,8 +110,9 @@ nothing else in GEMVER:
 * BiCGK's `gemv_q` and `gtp_s` are independent, so they fuse as two segments (disjoint
   groups); `cred_s` again needs all of `P`.
 
-A global dependency like these can be put inside one fused group with a boundary item
-(`cs::global_barrier()` between two segments, or `cs::ticket_order()` plus `GroupItem::wait_group`).
+A global dependency like these can be put inside one fused group with `cs::global_barrier()` between two segments, the
+only boundary item (or, in a group built with the `cs::group_waits_enabled` property, with `GroupItem::wait_group` in
+the stages).
 The `naive` and `crafted` variants use them: the global dependencies of the whole chain become barriers inside three launches.
 
 ## cuBLAS reference (`cublas/`)

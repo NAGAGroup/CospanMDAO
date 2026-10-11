@@ -241,8 +241,9 @@ struct ReadNextBody {
     }
 };
 
-/// y[g] = the neighbor group's value + 1, over `forwards` forwards with new inputs every time (so a stale ticket state or a
-/// missed wait shows). Kind: 1 = ticket_order() before segment 2, 2 = global_barrier(). Mode: see ReadNextBody.
+/// y[g] = the neighbor group's value + 1, over `forwards` forwards with new inputs every time (so a stale wait state or a
+/// missed wait shows). Kind: 1 = the group_waits_enabled property, no barrier; 2 = a global_barrier() before segment 2 (the
+/// barrier alone gives the group its waits). Mode: see ReadNextBody.
 template <int Mode, int Kind>
 void neighbor_case(std::size_t wg, std::size_t G, int forwards) {
     cs::Model model = make([wg](cs::System& s) {
@@ -251,7 +252,7 @@ void neighbor_case(std::size_t wg, std::size_t G, int forwards) {
         if constexpr (Kind == 2)
             s.add_subsystem(cs::fuse_components("f", cs::connects_desc({{"a.y", "b.x"}}), cs::segment(a), cs::global_barrier(), cs::segment(b)));
         else
-            s.add_subsystem(cs::fuse_components("f", cs::connects_desc({{"a.y", "b.x"}}), cs::segment(a), cs::ticket_order(), cs::segment(b)));
+            s.add_subsystem(cs::fuse_components<cs::group_waits_enabled>("f", cs::connects_desc({{"a.y", "b.x"}}), cs::segment(a), cs::segment(b)));
     });
     model.setup();
     const std::size_t N = G * wg;
@@ -461,14 +462,14 @@ TEST_CASE("fused groups: a transient group rebuilt every forward (the config cac
 
 
 // =============================================================================================
-// P7b: boundaries, ticket mode, waits, connect order
+// P7b: boundaries, group waits, connect order
 // =============================================================================================
-TEST_CASE("fused groups: ticket_order puts the launch in ticket mode and the segments keep their values", "[fused_groups][tickets]") {
+TEST_CASE("fused groups: group_waits_enabled gives the launch its wait state and the segments keep their values", "[fused_groups][group_waits]") {
     cs::Model model = tfg::make([](cs::System& s) {
         s.add_subsystem(cs::subsystem_desc<tfg::Src>("sa", 200));  // 4 groups
         s.add_subsystem(cs::subsystem_desc<tfg::Src>("sb", 100));  // 2 groups
-        s.add_subsystem(cs::fuse_components("f", cs::segment(cs::subsystem_desc<TagStage>("a")), cs::ticket_order(),
-                                            cs::segment(cs::subsystem_desc<TagStage>("b"))));
+        s.add_subsystem(cs::fuse_components<cs::group_waits_enabled>("f", cs::segment(cs::subsystem_desc<TagStage>("a")),
+                                                                     cs::segment(cs::subsystem_desc<TagStage>("b"))));
         s.connect("sa.y", "f.a.x");
         s.connect("sb.y", "f.b.x");
     });
@@ -476,26 +477,56 @@ TEST_CASE("fused groups: ticket_order puts the launch in ticket mode and the seg
     for (int fwd = 0; fwd < 3; ++fwd) {
         model.forward();
         model.wait();
-        CHECK(tfg::out_of(model, "f.a.y") == tfg::filled(200, 422));  // ticket -> (segment, group) gives the same indices
+        CHECK(tfg::out_of(model, "f.a.y") == tfg::filled(200, 422));  // the (segment, group) indices are unchanged
         CHECK(tfg::out_of(model, "f.b.y") == tfg::filled(100, 1422));
     }
+    auto* f = dynamic_cast<cs::detail::FusedBase*>(model.get_subsystem("f"));
+    REQUIRE(f != nullptr);
+    CHECK(f->has_wait_state());
 }
 
-TEST_CASE("fused groups: global_barrier, a group reads what a different group of the earlier segment wrote", "[fused_groups][tickets]") {
+TEST_CASE("fused groups: a group with neither group_waits_enabled nor a global_barrier allocates no wait state", "[fused_groups][group_waits]") {
+    cs::Model model = tfg::make([](cs::System& s) {
+        s.add_subsystem(cs::subsystem_desc<tfg::Src>("sa", 200));
+        s.add_subsystem(cs::subsystem_desc<tfg::Src>("sb", 100));
+        s.add_subsystem(cs::fuse_components("f", cs::segment(cs::subsystem_desc<TagStage>("a")), cs::segment(cs::subsystem_desc<TagStage>("b"))));
+        s.connect("sa.y", "f.a.x");
+        s.connect("sb.y", "f.b.x");
+    });
+    model.setup();
+    for (int fwd = 0; fwd < 2; ++fwd) {
+        model.forward();
+        model.wait();
+        CHECK(tfg::out_of(model, "f.a.y") == tfg::filled(200, 422));
+        CHECK(tfg::out_of(model, "f.b.y") == tfg::filled(100, 1422));
+    }
+    auto* f = dynamic_cast<cs::detail::FusedBase*>(model.get_subsystem("f"));
+    REQUIRE(f != nullptr);
+    CHECK_FALSE(f->has_wait_state());
+}
+
+TEST_CASE("fused groups: global_barrier, a group reads what a different group of the earlier segment wrote", "[fused_groups][group_waits]") {
     const bool big = GENERATE(false, true);
     CAPTURE(big);
     const tfg::Shape sh = big ? tfg::big_shape() : tfg::Shape{64, 5};
-    tfg::neighbor_case<0, 2>(sh.wg, sh.groups, 5);  // five forwards: the ticket state is reset every time
+    tfg::neighbor_case<0, 2>(sh.wg, sh.groups, 5);  // five forwards: the wait state is reset every time
 }
 
-TEST_CASE("fused groups: ticket_order with wait_group on a neighbor group of the earlier segment", "[fused_groups][tickets]") {
+TEST_CASE("fused groups: group_waits_enabled with wait_group on a neighbor group of the earlier segment", "[fused_groups][group_waits]") {
     const bool big = GENERATE(false, true);
     CAPTURE(big);
     const tfg::Shape sh = big ? tfg::big_shape() : tfg::Shape{64, 5};
     tfg::neighbor_case<1, 1>(sh.wg, sh.groups, 5);
 }
 
-TEST_CASE("fused groups: wait_earlier_segments gives the same result as a global_barrier", "[fused_groups][tickets]") {
+TEST_CASE("fused groups: wait_group works in a group that has only a global_barrier", "[fused_groups][group_waits]") {
+    const bool big = GENERATE(false, true);
+    CAPTURE(big);
+    const tfg::Shape sh = big ? tfg::big_shape() : tfg::Shape{64, 5};
+    tfg::neighbor_case<1, 2>(sh.wg, sh.groups, 5);  // the barrier implies the property; the stage's own wait_group is on top
+}
+
+TEST_CASE("fused groups: wait_earlier_segments gives the same result as a global_barrier", "[fused_groups][group_waits]") {
     const bool big = GENERATE(false, true);
     CAPTURE(big);
     const tfg::Shape sh = big ? tfg::big_shape() : tfg::Shape{64, 5};
@@ -504,7 +535,6 @@ TEST_CASE("fused groups: wait_earlier_segments gives the same result as a global
 
 namespace tfg {
 struct X {};  // a stand-in for a stage item in the placement traits
-using TO = decltype(cs::ticket_order());
 using GB = decltype(cs::global_barrier());
 using PlainDesc = decltype(cs::subsystem_desc<Plus1>("p"));
 using GroupDesc = decltype(cs::subsystem_desc<TagStage>("g"));
@@ -514,28 +544,33 @@ using Checks = cs::detail::stage_checks<cs::detail::all_stage_descs_t<Ds...>>;
 
 // Compile-time rules: the placement of boundaries and boundaries in plain groups are static_asserts of FusedGroup, so a
 // wrong group does not compile; the conditions they test are the traits checked here.
-static_assert(cs::detail::boundaries_placed_ok<tfg::X, tfg::TO, tfg::X>());
-static_assert(cs::detail::boundaries_placed_ok<tfg::X, tfg::GB, tfg::X, tfg::TO, tfg::X>());
-static_assert(!cs::detail::boundaries_placed_ok<tfg::TO, tfg::X>());
+static_assert(cs::detail::boundaries_placed_ok<tfg::X, tfg::GB, tfg::X>());
+static_assert(cs::detail::boundaries_placed_ok<tfg::X, tfg::GB, tfg::X, tfg::GB, tfg::X>());
+static_assert(!cs::detail::boundaries_placed_ok<tfg::GB, tfg::X>());
 static_assert(!cs::detail::boundaries_placed_ok<tfg::X, tfg::GB>());
-static_assert(!cs::detail::boundaries_placed_ok<tfg::X, tfg::TO, tfg::GB, tfg::X>());
+static_assert(!cs::detail::boundaries_placed_ok<tfg::X, tfg::GB, tfg::GB, tfg::X>());
 static_assert(!cs::detail::boundaries_placed_ok<tfg::GB>());
+static_assert(cs::detail::is_fuse_option_v<cs::group_waits_enabled>);
+static_assert(!cs::detail::is_fuse_option_v<cs::local_mem::shared>);
 
 TEST_CASE("fused groups: boundary placement and plain groups are rejected at compile time", "[fused_groups][errors]") {
     using namespace tfg;
-    CHECK(cs::detail::boundaries_placed_ok<X, TO, X>());
-    CHECK(cs::detail::boundaries_placed_ok<X, GB, X, TO, X>());
-    CHECK_FALSE(cs::detail::boundaries_placed_ok<TO, X>());              // at the start
+    CHECK(cs::detail::boundaries_placed_ok<X, GB, X>());
+    CHECK(cs::detail::boundaries_placed_ok<X, GB, X, GB, X>());
+    CHECK_FALSE(cs::detail::boundaries_placed_ok<GB, X>());              // at the start
     CHECK_FALSE(cs::detail::boundaries_placed_ok<X, GB>());              // at the end
-    CHECK_FALSE(cs::detail::boundaries_placed_ok<X, TO, GB, X>());       // two in a row
+    CHECK_FALSE(cs::detail::boundaries_placed_ok<X, GB, GB, X>());       // two in a row
     CHECK_FALSE(cs::detail::boundaries_placed_ok<GB>());                 // nothing but a boundary
-    // a boundary needs stages that are all work-group stages: a plain group has no work-group to cooperate with
+    // a global_barrier and the group_waits_enabled property need stages that are all work-group stages: a plain group has
+    // no work-group to wait with
     CHECK(Checks<GroupDesc, GroupDesc>::all_group);
     CHECK_FALSE(Checks<PlainDesc, PlainDesc>::all_group);
-    CHECK(cs::detail::has_boundary_v<GroupDesc, TO, GroupDesc>);
+    CHECK(cs::detail::has_boundary_v<GroupDesc, GB, GroupDesc>);
     CHECK_FALSE(cs::detail::has_boundary_v<GroupDesc, GroupDesc>);
-    // (fuse_components("f", segment(plain), global_barrier(), segment(plain)) fails the static_assert of FusedGroup:
-    // !has_boundary_v<Items...> || Checks::all_group)
+    // fuse_components<group_waits_enabled>("f", segment(plain), segment(plain)) fails the static_assert of FusedGroup
+    // (!Waits || Checks::all_group), as does a global_barrier() between plain segments (!has_boundary_v<Items...> ||
+    // Checks::all_group); an option other than group_waits_enabled fails the static_assert of fuse_components
+    // (is_fuse_option_v, checked above).
 }
 
 TEST_CASE("fused groups: a connect to the same or an earlier stage throws at setup", "[fused_groups][errors]") {

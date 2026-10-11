@@ -54,13 +54,20 @@ inline ConnectsDesc connects_desc(std::initializer_list<std::pair<std::string_vi
     return c;
 }
 
+/// A fused-group property, given as a template option of fuse_components: cs::fuse_components<cs::group_waits_enabled>(...).
+/// With it the stages may wait on work-groups of EARLIER segments (GroupItem::wait_group, wait_earlier_segments) without
+/// any co-residency of groups; a cs::global_barrier() in the group implies it. The group's stages must all be work-group
+/// stages. Without it (and without a global_barrier) the groups carry no wait state at all.
+struct group_waits_enabled {};
+
 namespace detail {
 
 /// A fused group's machinery: not the user path, a base for FusedGroup. `segments` says which consecutive stages share
-/// groups and how (range mode, local memory); they cover the stages in order.
+/// groups and how (range mode, local memory); they cover the stages in order. `group_waits`: the group has the
+/// group_waits_enabled property or contains a global_barrier, so its launch carries the wait state.
 class FusedBase : public System {
 public:
-    explicit FusedBase(std::vector<SegmentSpec> segments) : segments_{std::move(segments)} {}
+    FusedBase(std::vector<SegmentSpec> segments, bool group_waits) : segments_{std::move(segments)}, group_waits_{group_waits} {}
     ~FusedBase() override = default;
 
     /// Setup, then the setup-end check: no ragged ports.
@@ -82,7 +89,7 @@ public:
     void run_compute(Runtime& rt) override {
         const std::vector<ComponentBase*> st = stages();
         if (st.empty()) throw std::invalid_argument("naga::cospan: " + describe() + ": a fused group has no stages");
-        (void)launcher_.launch(rt, st, segments_, describe());
+        (void)launcher_.launch(rt, st, segments_, describe(), group_waits_);
     }
 
     void run_postcompute(Runtime& rt) override {
@@ -90,6 +97,9 @@ public:
     }
 
     std::vector<sycl::event> events() const override { return launcher_.events(); }
+
+    /// Whether the group has allocated its wait state (group_waits_enabled or a global_barrier, after a forward).
+    bool has_wait_state() const { return launcher_.has_wait_state(); }
 
     /// depends_on: every stage's submission (all of it is one launch) adds them for one forward.
     void add_dependencies(std::span<const sycl::event> deps) override {
@@ -119,6 +129,7 @@ private:
     }
 
     std::vector<SegmentSpec> segments_;
+    bool                     group_waits_ = false;
     GroupLauncher            launcher_;
 };
 
@@ -160,7 +171,7 @@ inline constexpr bool is_range_option_v = std::is_same_v<O, range_mode::own> || 
 template <class T, class... Opts>
 inline constexpr std::size_t option_count_v = (std::size_t{std::is_same_v<T, Opts>} + ... + std::size_t{0});
 
-/// A boundary item between two segments of a group (cs::ticket_order(), cs::global_barrier()).
+/// A boundary item between two segments of a group (cs::global_barrier(), the only one).
 template <Boundary K>
 struct BoundaryItem {
     static constexpr Boundary kind = K;
@@ -263,7 +274,7 @@ private:
 /// consecutive stages that share groups), added in order, run as ONE launch. Connections are made after the stages are
 /// added and their variables are marked `internal`; they are allowed in either range mode. Tied outputs of its stages
 /// follow the ordinary tie policy (section 9).
-template <class... Items>
+template <bool Waits, class... Items>
 class FusedGroup final : public detail::FusedBase {
     using Checks = detail::stage_checks<detail::all_stage_descs_t<Items...>>;
     static_assert(Checks::nonempty, "naga::cospan: a fused group needs at least one stage");
@@ -273,15 +284,18 @@ class FusedGroup final : public detail::FusedBase {
     static_assert(Checks::one_kind, "naga::cospan: a fused group's stages are all work-group components or all plain");
     static_assert(Checks::one_rank, "naga::cospan: the stages of a fused group share one kernel rank");
     static_assert(detail::boundaries_placed_ok<Items...>(),
-                  "naga::cospan: a boundary (cs::ticket_order() / cs::global_barrier()) goes between two segments: not first, not "
-                  "last, and not next to another boundary");
+                  "naga::cospan: a cs::global_barrier() goes between two segments: not first, not last, and not next to "
+                  "another barrier");
     static_assert(!detail::has_boundary_v<Items...> || Checks::all_group,
-                  "naga::cospan: boundaries are for groups of work-group stages: a plain-body group has no work-group to "
-                  "cooperate with");
+                  "naga::cospan: cs::global_barrier() is for groups of work-group stages: a plain-body group has no "
+                  "work-group to cooperate with");
+    static_assert(!Waits || Checks::all_group,
+                  "naga::cospan: cs::group_waits_enabled is for groups of work-group stages: a plain-body group has no "
+                  "work-group to wait with");
 
 public:
     FusedGroup(ConnectsDesc c, Items... items)
-        : detail::FusedBase{detail::segment_specs<Items...>()}, connects_{std::move(c)}, items_{std::move(items)...} {}
+        : detail::FusedBase{detail::segment_specs<Items...>(), Waits || detail::has_boundary_v<Items...>}, connects_{std::move(c)}, items_{std::move(items)...} {}
 
     void setup() override {
         std::apply([this](auto&... it) { (this->add_item(it), ...); }, items_);
@@ -354,23 +368,34 @@ auto segment(Descs... d) {
     return detail::SegmentDesc<lm, rm, Descs...>{std::tuple<Descs...>{std::move(d)...}};
 }
 
-/// Boundary items for fuse_components, between two segments of a group of work-group stages. Either one puts the whole
-/// launch in ticket mode (each work-group takes a ticket at its start, so a group only waits for EARLIER groups and no
-/// co-residency is needed). ticket_order(): nothing more. global_barrier(): every group of the segment after it waits for
-/// every group of the earlier segments before its first stage.
-inline detail::BoundaryItem<detail::Boundary::ticket_order> ticket_order() { return {}; }
+/// The one boundary item for fuse_components, between two segments of a group of work-group stages: every group of the
+/// segment after it waits for every group of the earlier segments before its first stage. Each work-group waits only on
+/// EARLIER groups, so no co-residency is needed. It implies the group_waits_enabled property. Any other ordering pattern
+/// is the user's logic inside their stages (GroupItem::wait_group / wait_earlier_segments).
 inline detail::BoundaryItem<detail::Boundary::global_barrier> global_barrier() { return {}; }
 
-/// A fused group of the given items (in order) with the given connections, as a descriptor for add_subsystem.
-template <class... Items>
+namespace detail {
+template <class O>
+inline constexpr bool is_fuse_option_v = std::is_same_v<O, group_waits_enabled>;
+}  // namespace detail
+
+/// A fused group of the given items (in order) with the given connections, as a descriptor for add_subsystem. Options are
+/// template arguments: cs::fuse_components<cs::group_waits_enabled>(name, connects, items...).
+template <class... Opts, class... Items>
 auto fuse_components(std::string name, ConnectsDesc c, Items... items) {
-    return subsystem_desc<FusedGroup<Items...>>(std::move(name), std::move(c), std::move(items)...);
+    static_assert(((detail::is_fuse_option_v<Opts>) && ...),
+                  "naga::cospan: the only fuse_components option is cs::group_waits_enabled");
+    constexpr bool waits = detail::option_count_v<group_waits_enabled, Opts...> > 0;
+    return subsystem_desc<FusedGroup<waits, Items...>>(std::move(name), std::move(c), std::move(items)...);
 }
 /// The same with no connections.
-template <class... Items>
+template <class... Opts, class... Items>
     requires(sizeof...(Items) >= 1 && !detail::leads_with_connects_v<Items...>)
 auto fuse_components(std::string name, Items... items) {
-    return subsystem_desc<FusedGroup<Items...>>(std::move(name), ConnectsDesc{}, std::move(items)...);
+    static_assert(((detail::is_fuse_option_v<Opts>) && ...),
+                  "naga::cospan: the only fuse_components option is cs::group_waits_enabled");
+    constexpr bool waits = detail::option_count_v<group_waits_enabled, Opts...> > 0;
+    return subsystem_desc<FusedGroup<waits, Items...>>(std::move(name), ConnectsDesc{}, std::move(items)...);
 }
 
 /// A plain System of the given children (in order) with the given connections, as a descriptor for add_subsystem.

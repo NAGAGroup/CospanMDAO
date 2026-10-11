@@ -108,9 +108,10 @@ add_subsystem(cs::fuse_components(
     cs::segment(cs::subsystem_desc<StageC>("c"))));            // c has its own groups, in the same launch
 ```
 
-Between two segments of work-group stages a boundary item (`cs::ticket_order()` or `cs::global_barrier()`) puts the launch in
-ticket mode, where a group can wait for earlier groups (`GroupItem::wait_group`, `wait_earlier_segments`) without every group
-being resident. See `examples/gemver-chain` for fused groups in a real chain.
+`cs::global_barrier()` between two segments of work-group stages makes every group of the later segment wait for every group
+of the earlier ones. The fused-group property `cs::group_waits_enabled`
+(`cs::fuse_components<cs::group_waits_enabled>(...)`) lets stages wait for earlier groups themselves
+(`GroupItem::wait_group`, `wait_earlier_segments`) without every group being resident; a barrier implies it. See `examples/gemver-chain` for fused groups in a real chain.
 
 ## Using CospanMDAO
 

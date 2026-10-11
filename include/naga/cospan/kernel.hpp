@@ -85,9 +85,10 @@ namespace detail {
 enum class LocalMem : std::uint8_t { partitioned = 0, shared = 1 };
 enum class RangeMode : std::uint8_t { own = 0, whole = 1 };
 
-/// What stands before a segment in a fused group (cs::ticket_order() / cs::global_barrier()). Any boundary in a group puts
-/// the whole launch in TICKET MODE; global_barrier also makes every group of the segment wait for every earlier segment.
-enum class Boundary : std::uint8_t { none = 0, ticket_order = 1, global_barrier = 2 };
+/// What stands before a segment in a fused group (cs::global_barrier()). A group with a global_barrier, like a group with
+/// the group_waits_enabled property, has the wait state ("ticket mode" internally); global_barrier also makes every group of
+/// the segment wait for every earlier segment.
+enum class Boundary : std::uint8_t { none = 0, global_barrier = 1 };
 
 /// One entry per stage, in a device array the group owns and refills every forward. Followed (after `stages` entries) by
 /// the segment table: one std::uint64_t per segment, that segment's block of groups.
@@ -95,7 +96,7 @@ struct StageGeometry {
     std::uint64_t group_count    = 0;  ///< this stage's own number of groups
     std::uint64_t group_base     = 0;  ///< the groups before this stage's segment
     std::uint64_t segment_groups = 0;  ///< this segment's block (the largest group count of its stages)
-    void*         ticket_state   = nullptr;  ///< the group's ticket state; null: no boundary in the group (no ticket mode)
+    void*         ticket_state   = nullptr;  ///< the group's ticket state; null: the group neither has group_waits_enabled nor a global_barrier (no ticket mode)
     std::uint32_t segment        = 0;
     std::uint32_t segments       = 0;
     std::uint32_t stages         = 0;  ///< the number of stage entries (where the segment table starts)
@@ -223,8 +224,8 @@ struct GroupItem {
     }
 
     /// COLLECTIVE (every work-item of the group calls it): wait until group `g` of segment `s` has finished all its stages.
-    /// Needs ticket mode (a group with a cs::ticket_order() or cs::global_barrier() boundary) and `s` EARLIER than this
-    /// stage's segment; with no ticket state the pointer is null and the behavior is undefined (no checks, as with
+    /// Needs a group with the cs::group_waits_enabled property or a cs::global_barrier(), and `s` EARLIER than this
+    /// stage's segment; with no wait state the pointer is null and the behavior is undefined (no checks, as with
     /// waiting on your own or a later segment, which never returns).
     void wait_group(std::size_t s, std::size_t g) const {
         detail::ticket_wait_group<R>(ticket_state_, segments_, segment_groups_, s, g, it_);

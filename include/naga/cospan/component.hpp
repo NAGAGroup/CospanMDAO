@@ -764,7 +764,7 @@ inline void GroupLauncher::prepare(Runtime& rt, const std::vector<ComponentBase*
 }
 
 inline std::vector<sycl::event> GroupLauncher::launch(Runtime& rt, const std::vector<ComponentBase*>& st,
-                                                      const std::vector<SegmentSpec>& segs, const std::string& who) {
+                                                      const std::vector<SegmentSpec>& segs, const std::string& who, bool group_waits) {
     if (st.empty()) throw std::invalid_argument("naga::cospan: " + who + ": a group has no stages");
     if (!ptrs_) throw std::logic_error("naga::cospan: " + who + ": forward before the first precompute");
     const std::size_t n = st.size();
@@ -828,7 +828,7 @@ inline std::vector<sycl::event> GroupLauncher::launch(Runtime& rt, const std::ve
     const std::size_t table = (2 * nseg * sizeof(std::uint64_t) + sizeof(StageGeometry) - 1) / sizeof(StageGeometry);
     host_geo_.assign(n + table, StageGeometry{});
     std::vector<std::uint64_t> blocks(2 * nseg, 0);
-    bool                       ticket_mode = false;
+    bool                       ticket_mode = group_waits;  // the group's property; a global_barrier below also switches it on
     std::uint64_t              base = 0;
     std::size_t                local_bytes = 0;
     for (std::size_t s = 0; s < segs.size(); ++s) {
@@ -856,7 +856,7 @@ inline std::vector<sycl::event> GroupLauncher::launch(Runtime& rt, const std::ve
         }
         blocks[s]        = block;
         blocks[nseg + s] = static_cast<std::uint64_t>(sp.boundary);
-        if (sp.boundary != Boundary::none) ticket_mode = true;
+        if (sp.boundary == Boundary::global_barrier) ticket_mode = true;
         base += block;
         local_bytes = std::max(local_bytes, seg_local);
     }
@@ -881,7 +881,7 @@ inline std::vector<sycl::event> GroupLauncher::launch(Runtime& rt, const std::ve
     }
     std::memcpy(static_cast<void*>(&host_geo_[n]), blocks.data(), blocks.size() * sizeof(std::uint64_t));
 
-    // Ticket mode: the ticket state (counter, per-segment completed counters, per-ticket flags) is sized for this launch and
+    // Group waits (ticket mode): the ticket state (counter, per-segment completed counters, per-ticket flags) is sized for this launch and
     // reset with a container fill, ordered after the previous launch (an outside writer of it). The launch then waits on
     // the fill (read_deps). Its address goes into every geometry entry.
     if (ticket_mode) {

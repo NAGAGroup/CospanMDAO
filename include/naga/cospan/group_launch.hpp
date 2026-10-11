@@ -21,8 +21,8 @@
 // largest segment size. THERE ARE NO FRAMEWORK BARRIERS: a stage that reads across work-items what an earlier stage wrote
 // calls its own group barrier; across groups nothing is ordered.
 //
-// BOUNDARIES (cs::ticket_order(), cs::global_barrier(), between two segments of a group of group-body stages): any
-// boundary puts the WHOLE launch in ticket mode. The group then owns a small device array, the TICKET STATE (kernel.hpp), reset
+// GROUP WAITS (the fuse_components option cs::group_waits_enabled, or a cs::global_barrier() between two segments, of a
+// group of group-body stages): either puts the WHOLE launch in ticket mode. The group then owns a small device array, the TICKET STATE (kernel.hpp), reset
 // with a container fill before every launch; the launch is an outside writer of it. Each work-group takes a ticket at its
 // start and the ticket, not the hardware group id, says which segment and group it is, so a group only ever waits for
 // earlier tickets and no co-residency is needed. A global_barrier makes every group of the segment after it wait for every
@@ -65,15 +65,20 @@ public:
     /// One forward: describe every stage, check the work-group shapes, upload the stages' arguments and the geometry, submit
     /// ONE launch, register its event on every container it touches and on every stage. `who` names the owner in messages.
     /// Returns the launch's events (none when every stage is empty).
+    /// `group_waits`: the group has the group_waits_enabled property (a global_barrier in `segments` also switches the wait
+    /// state on). Default false: a lone component.
     std::vector<sycl::event> launch(Runtime& rt, const std::vector<ComponentBase*>& stages, const std::vector<SegmentSpec>& segments,
-                                    const std::string& who);
+                                    const std::string& who, bool group_waits = false);
 
     const std::vector<sycl::event>& events() const { return last_; }
+
+    /// Whether the wait state exists: only after a launch of a group with group waits (property or global_barrier).
+    bool has_wait_state() const { return ticket_.has_value(); }
 
 private:
     std::optional<sk::usm_vector<const void*>>   ptrs_;
     std::optional<sk::usm_vector<StageGeometry>> geo_;
-    std::optional<sk::usm_vector<std::uint32_t>> ticket_;  ///< ticket state: only in a group with a boundary, reset every forward
+    std::optional<sk::usm_vector<std::uint32_t>> ticket_;  ///< wait state ("ticket state"): only in a group with group waits, reset every forward
     std::vector<StageGeometry>                   host_geo_;  ///< the host member the geometry array is copied from
     std::vector<sycl::event>                     last_;
 };

@@ -429,15 +429,16 @@ This section restates the design from the discussion only, not from the code. Th
 - **Segments.**
   - The descriptor lists stages and says which consecutive stages share groups. Each such run is a segment with its own block of groups.
   - Inside a segment there are two range modes, and both launch the largest range any stage asked for: each stage sees only its requested groups, or each stage sees the whole range.
-  - With no boundary primitive, segments use plain hardware group ids, with no atomics. That is the former "parallel" case.
+  - In a group without group waits (no `group_waits_enabled` property, no global barrier), segments use plain hardware group ids, with no atomics. That is the former "parallel" case.
 - **Connects inside a fused group** are allowed anywhere, as long as they go forward in stage order (that is, no cycles). What a connect means is the user's responsibility: work-group-local ownership of the data, or a wait.
-- **Boundary primitives** are descriptor entries between segments, not components.
-  - **Ticket ordering.**
-    - It switches the whole launch to tickets taken from an atomic counter.
-    - Every group of a later segment starts only after every group of the earlier segments has started.
+- **Boundary primitives.** `global_barrier()` is the ONLY boundary item: a descriptor entry between segments, not a component.
+  - **Global barrier.** Every group of the later segment waits until all groups of the earlier segments have finished. It implies the group-waits property below.
+  - **Group waits** are a property of the fused group, `cs::group_waits_enabled`, given as a template option of `fuse_components`.
+    - It switches the whole launch to start numbers taken from an atomic counter: every group of a later segment starts only after every group of the earlier segments has started, so a group may wait on earlier groups without co-residency.
     - It records per-group completion.
-  - **Global barrier.** Ticket ordering, plus every group of the later segment waits until all earlier groups have finished.
-  - **Per-tile ordering** is the user's own logic inside their components, built on the handle.
+    - With it, stages may use `wait_group` and `wait_earlier_segments`. A global barrier implies it, so a group with a barrier needs no option.
+    - It requires every stage to be a work-group stage.
+  - **Any other ordering pattern** (per-tile ordering, lookback and so on) is the user's own logic inside their stages, built on the group waits and the handle.
   - **Counters.** The fused group owns a small global buffer for its counters. It is reset each forward, either by a fill or by comparing against the forward number times the group count.
 - **Item wrapper and handle.**
   - Every group-based component, fused or not, sees our item wrapper, never raw SYCL group objects. The handle lives inside the wrapper, so the user never sees it.
@@ -449,7 +450,7 @@ This section restates the design from the discussion only, not from the code. Th
     - waiting on all earlier groups;
     - group barriers, reductions and local memory.
   - Waits are collective: one work-item spins, then a group barrier releases the rest.
-  - If there is no primitive, the ticket metadata is null and using it is UB, with no branches on the fast path. Waiting on your own segment or a later one deadlocks; that's for the user to debug.
+  - If the group has no group waits, the wait metadata is null and using it is UB, with no branches on the fast path. Waiting on your own segment or a later one deadlocks; that's for the user to debug.
   - There are two flavours, one for work-group stages and one for plain stages.
 - **Local memory.**
   - It is per work-group.
@@ -467,7 +468,7 @@ This section restates the design from the discussion only, not from the code. Th
 - **Stage data.**
   - Each component keeps a one-element USM vector holding its typed argument struct. Every forward it copies the struct in from a host member, with normal event ordering, and hands the fuser a type-erased pointer.
   - The fuser's pointer array is allocated, filled and waited on once, at its first precompute (not at setup, because devices aren't final then). It is redone only after a rearm rebuilds the group.
-  - The per-stage geometry array (segment, group base, local offset, ticket data) is the fuser's. It is filled from a host member every forward, with event ordering.
+  - The per-stage geometry array (segment, group base, local offset, wait-state pointer) is the fuser's. It is filled from a host member every forward, with event ordering.
 - **Events.**
   - The single launch's event is registered as a read on every stage's input containers, the argument containers and the geometry array.
   - It is registered as a write on every stage's output containers.
