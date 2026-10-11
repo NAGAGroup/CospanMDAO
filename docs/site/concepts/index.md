@@ -7,6 +7,7 @@ This page is a placeholder.
 
 components
 systems
+model
 connect-promote-tie
 shapes-and-initialization
 execution-and-synchronization
