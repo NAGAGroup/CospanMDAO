@@ -55,7 +55,7 @@ public:
         declare_input(x_, "x", cs::unspecified);
         declare_output(y_, "y", cs::unspecified);
     }
-    void pre_forward() override { set_shape(y_, shape_of(x_)); }   // the output follows the input
+    void pre_forward() override { set_shape(y_, shape_of(x_)[0]); }   // the output follows the input
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         return create_launch_config(x_.shape(), {x_}, {y_}, {});
     }
