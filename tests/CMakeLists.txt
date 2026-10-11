@@ -32,6 +32,7 @@ set(COSPAN_TEST_SOURCES
     test_p4.cpp
     test_ragged.cpp
     test_ragged_ties.cpp
+    test_range_split.cpp
     test_rework.cpp
     test_shapes.cpp
     test_diagnostics.cpp

@@ -77,14 +77,37 @@ inline TiesDesc ties_desc(std::initializer_list<TieEntry> entries) { return Ties
 /// stages. Without it (and without a global_barrier) the groups carry no wait state at all.
 struct group_waits_enabled {};
 
+/// How a fused group's work-groups are laid on the physical (always rank-3) launch; a fuse_components<...> option next to
+/// cs::group_waits_enabled, at most one per group. The stage rank R only exists in the wrappers: a stage's range and work-group
+/// shape live in the TRAILING physical dimensions (rank 1: {1, 1, N}, rank 2: {1, Y, X}). Raw SYCL ids (sycl::nd_item<3>,
+/// sycl::group<3>) are PHYSICAL and mean nothing to a stage; a stage uses the rank-R ids of GroupItem and cs::Group.
+///   flatten_and_split (the default)  every group along the LAST physical dimension; the rank-R group id is rebuilt row-major
+///                                    over the segment's range, last dimension fastest.
+///   pad_and_split                    the segments are stacked along the last dimension (its extent is the sum of the
+///                                    segments' extents there); the other dimensions are the maximum over all segments.
+///                                    Group ids are the hardware's, minus the segment's offset along the last dimension.
+///   padded                           physical dimension 0 is the segment index (work-group extent 1); the other dimensions
+///                                    are the maximum over all segments. Stages must be rank 2 or lower.
+namespace range_split {
+struct flatten_and_split {};
+struct pad_and_split {};
+struct padded {};
+}  // namespace range_split
+
 namespace detail {
+
+/// Whether a range_split strategy supports stages of rank `Rank`: padded needs rank 2 or lower (its first physical dimension
+/// is the segment index). FusedGroup static_asserts it; the trait is for code that wants to ask first.
+template <Split Sp, int Rank>
+inline constexpr bool split_supports_rank_v = Sp != Split::padded || Rank <= 2;
 
 /// A fused group's machinery: not the user path, a base for FusedGroup. `segments` says which consecutive stages share
 /// groups and how (range mode, local memory); they cover the stages in order. `group_waits`: the group has the
 /// group_waits_enabled property or contains a global_barrier, so its launch carries the wait state.
 class FusedBase : public System {
 public:
-    FusedBase(std::vector<SegmentSpec> segments, bool group_waits) : segments_{std::move(segments)}, group_waits_{group_waits} {}
+    FusedBase(std::vector<SegmentSpec> segments, bool group_waits, Split split)
+        : segments_{std::move(segments)}, group_waits_{group_waits}, split_{split} {}
     ~FusedBase() override = default;
 
     /// Setup, then the setup-end check: no ragged ports.
@@ -107,7 +130,7 @@ public:
         const std::vector<ComponentBase*> st = stages();
         if (st.empty()) throw std::invalid_argument("naga::cospan: " + describe() + ": a fused group has no stages");
         check_tied_output_devices();  // a member moved off its tie's device since the tie was made is an error
-        (void)launcher_.launch(rt, st, segments_, describe(), group_waits_);
+        (void)launcher_.launch(rt, st, segments_, describe(), group_waits_, split_);
         // The loop of a System never runs for a group, so its "after the last child holding a member" turn never comes: the
         // group's own tied outputs are pushed here, after the single launch (the copies wait on the launch's writes).
         push_events_ = push_own_tied_outputs();
@@ -169,6 +192,7 @@ private:
 
     std::vector<SegmentSpec> segments_;
     bool                     group_waits_ = false;
+    Split                    split_       = Split::flatten;
     GroupLauncher            launcher_;
     std::vector<sycl::event> push_events_;  ///< the pushes of the group's own tied outputs, this forward
 };
@@ -270,6 +294,7 @@ struct stage_checks<std::tuple<Ds...>> {
     static constexpr bool fusible    = ((!CustomOpBody<desc_body_t<Ds>> && !HostBody<desc_body_t<Ds>>) && ...);
     static constexpr bool one_kind   = (GroupBody<desc_body_t<Ds>> && ...) || (!GroupBody<desc_body_t<Ds>> && ...);
     static constexpr bool all_group  = (GroupBody<desc_body_t<Ds>> && ...);
+    static constexpr int  rank       = kernel_rank_v<desc_body_t<std::tuple_element_t<0, std::tuple<Ds...>>>>;
     static constexpr bool one_rank   = ((kernel_rank_v<desc_body_t<Ds>> == kernel_rank_v<desc_body_t<std::tuple_element_t<0, std::tuple<Ds...>>>>) && ...);
 };
 
@@ -320,7 +345,7 @@ private:
 /// consecutive stages that share groups), added in order, run as ONE launch. Connections are made after the stages are
 /// added and their variables are marked `internal`; they are allowed in either range mode. Tied outputs of its stages
 /// follow the ordinary tie policy (section 9).
-template <bool Waits, class... Items>
+template <bool Waits, detail::Split Sp, class... Items>
 class FusedGroup final : public detail::FusedBase {
     using Checks = detail::stage_checks<detail::all_stage_descs_t<Items...>>;
     static_assert(Checks::nonempty, "naga::cospan: a fused group needs at least one stage");
@@ -335,13 +360,16 @@ class FusedGroup final : public detail::FusedBase {
     static_assert(!detail::has_boundary_v<Items...> || Checks::all_group,
                   "naga::cospan: cs::global_barrier() is for groups of work-group stages: a plain-body group has no "
                   "work-group to cooperate with");
+    static_assert(detail::split_supports_rank_v<Sp, Checks::rank>,
+                  "naga::cospan: cs::range_split::padded needs stages of rank 2 or lower (its first physical dimension is the "
+                  "segment index); use flatten_and_split or pad_and_split for rank-3 stages");
     static_assert(!Waits || Checks::all_group,
                   "naga::cospan: cs::group_waits_enabled is for groups of work-group stages: a plain-body group has no "
                   "work-group to wait with");
 
 public:
     FusedGroup(ConnectsDesc c, TiesDesc t, Items... items)
-        : detail::FusedBase{detail::segment_specs<Items...>(), Waits || detail::has_boundary_v<Items...>}, connects_{std::move(c)}, ties_{std::move(t)}, items_{std::move(items)...} {}
+        : detail::FusedBase{detail::segment_specs<Items...>(), Waits || detail::has_boundary_v<Items...>, Sp}, connects_{std::move(c)}, ties_{std::move(t)}, items_{std::move(items)...} {}
 
     void setup() override {
         std::apply([this](auto&... it) { (this->add_item(it), ...); }, items_);
@@ -427,7 +455,23 @@ inline detail::BoundaryItem<detail::Boundary::global_barrier> global_barrier() {
 
 namespace detail {
 template <class O>
-inline constexpr bool is_fuse_option_v = std::is_same_v<O, group_waits_enabled>;
+inline constexpr bool is_fuse_option_v = std::is_same_v<O, group_waits_enabled> || std::is_same_v<O, range_split::flatten_and_split> ||
+                                         std::is_same_v<O, range_split::pad_and_split> || std::is_same_v<O, range_split::padded>;
+
+template <class... Opts>
+inline constexpr bool split_options_ok_v = (option_count_v<range_split::flatten_and_split, Opts...> + option_count_v<range_split::pad_and_split, Opts...> +
+                                            option_count_v<range_split::padded, Opts...>) <= 1;
+
+/// The strategy named among the options (flatten_and_split when none).
+template <class... Opts>
+constexpr Split split_of() {
+    if constexpr (option_count_v<range_split::pad_and_split, Opts...> > 0)
+        return Split::pad;
+    else if constexpr (option_count_v<range_split::padded, Opts...> > 0)
+        return Split::padded;
+    else
+        return Split::flatten;
+}
 }  // namespace detail
 
 /// A tie_outputs declared in a fused group (cs::ties_desc): the parameters of System::tie_outputs, minus the device.
@@ -457,35 +501,43 @@ template <class... Opts, class... Items>
     requires(!detail::leads_with_ties_v<Items...>)
 auto fuse_components(std::string name, ConnectsDesc c, Items... items) {
     static_assert(((detail::is_fuse_option_v<Opts>) && ...),
-                  "naga::cospan: the only fuse_components option is cs::group_waits_enabled");
-    constexpr bool waits = detail::option_count_v<group_waits_enabled, Opts...> > 0;
-    return subsystem_desc<FusedGroup<waits, Items...>>(std::move(name), std::move(c), TiesDesc{}, std::move(items)...);
+                  "naga::cospan: the fuse_components options are cs::group_waits_enabled and cs::range_split::*");
+    static_assert(detail::split_options_ok_v<Opts...>, "naga::cospan: a fused group takes at most one cs::range_split option");
+    constexpr bool         waits = detail::option_count_v<group_waits_enabled, Opts...> > 0;
+    constexpr detail::Split sp    = detail::split_of<Opts...>();
+    return subsystem_desc<FusedGroup<waits, sp, Items...>>(std::move(name), std::move(c), TiesDesc{}, std::move(items)...);
 }
 /// Connections and ties.
 template <class... Opts, class... Items>
 auto fuse_components(std::string name, ConnectsDesc c, TiesDesc t, Items... items) {
     static_assert(((detail::is_fuse_option_v<Opts>) && ...),
-                  "naga::cospan: the only fuse_components option is cs::group_waits_enabled");
-    constexpr bool waits = detail::option_count_v<group_waits_enabled, Opts...> > 0;
-    return subsystem_desc<FusedGroup<waits, Items...>>(std::move(name), std::move(c), std::move(t), std::move(items)...);
+                  "naga::cospan: the fuse_components options are cs::group_waits_enabled and cs::range_split::*");
+    static_assert(detail::split_options_ok_v<Opts...>, "naga::cospan: a fused group takes at most one cs::range_split option");
+    constexpr bool         waits = detail::option_count_v<group_waits_enabled, Opts...> > 0;
+    constexpr detail::Split sp    = detail::split_of<Opts...>();
+    return subsystem_desc<FusedGroup<waits, sp, Items...>>(std::move(name), std::move(c), std::move(t), std::move(items)...);
 }
 /// Ties, no connections.
 template <class... Opts, class... Items>
     requires(!detail::leads_with_connects_v<Items...>)
 auto fuse_components(std::string name, TiesDesc t, Items... items) {
     static_assert(((detail::is_fuse_option_v<Opts>) && ...),
-                  "naga::cospan: the only fuse_components option is cs::group_waits_enabled");
-    constexpr bool waits = detail::option_count_v<group_waits_enabled, Opts...> > 0;
-    return subsystem_desc<FusedGroup<waits, Items...>>(std::move(name), ConnectsDesc{}, std::move(t), std::move(items)...);
+                  "naga::cospan: the fuse_components options are cs::group_waits_enabled and cs::range_split::*");
+    static_assert(detail::split_options_ok_v<Opts...>, "naga::cospan: a fused group takes at most one cs::range_split option");
+    constexpr bool         waits = detail::option_count_v<group_waits_enabled, Opts...> > 0;
+    constexpr detail::Split sp    = detail::split_of<Opts...>();
+    return subsystem_desc<FusedGroup<waits, sp, Items...>>(std::move(name), ConnectsDesc{}, std::move(t), std::move(items)...);
 }
 /// Neither.
 template <class... Opts, class... Items>
     requires(sizeof...(Items) >= 1 && !detail::leads_with_connects_v<Items...> && !detail::leads_with_ties_v<Items...>)
 auto fuse_components(std::string name, Items... items) {
     static_assert(((detail::is_fuse_option_v<Opts>) && ...),
-                  "naga::cospan: the only fuse_components option is cs::group_waits_enabled");
-    constexpr bool waits = detail::option_count_v<group_waits_enabled, Opts...> > 0;
-    return subsystem_desc<FusedGroup<waits, Items...>>(std::move(name), ConnectsDesc{}, TiesDesc{}, std::move(items)...);
+                  "naga::cospan: the fuse_components options are cs::group_waits_enabled and cs::range_split::*");
+    static_assert(detail::split_options_ok_v<Opts...>, "naga::cospan: a fused group takes at most one cs::range_split option");
+    constexpr bool         waits = detail::option_count_v<group_waits_enabled, Opts...> > 0;
+    constexpr detail::Split sp    = detail::split_of<Opts...>();
+    return subsystem_desc<FusedGroup<waits, sp, Items...>>(std::move(name), ConnectsDesc{}, TiesDesc{}, std::move(items)...);
 }
 
 /// A plain System of the given children (in order) with the given connections, as a descriptor for add_subsystem.

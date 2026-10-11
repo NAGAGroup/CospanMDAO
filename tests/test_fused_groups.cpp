@@ -121,8 +121,8 @@ struct TagBody {
         const std::size_t g = it.get_global_id(0);
         if (g >= in.x.shape()[0]) return;
         const std::size_t segs = it.get_segment_count();
-        const std::size_t gc0  = it.get_segment_group_count(0);
-        const std::size_t gc1  = segs > 1 ? it.get_segment_group_count(1) : 0;
+        const std::size_t gc0  = it.get_segment_group_count(0)[0];
+        const std::size_t gc1  = segs > 1 ? it.get_segment_group_count(1)[0] : 0;
         out.y[g]               = static_cast<float>(it.get_segment() * 1000 + gc0 * 100 + gc1 * 10 + segs);
     }
 };
@@ -165,7 +165,7 @@ struct TakeBody {
     void operator()(cs::GroupItem<1> it, Inputs in, Outputs out) const {
         float*            t = it.local<float>(kWg);
         const std::size_t g = it.get_global_id(0);
-        sycl::group_barrier(it.get_group());
+        cs::group_barrier(it.get_group());
         if (g < in.x.shape()[0]) out.y[g] = t != nullptr ? t[kWg - 1 - it.get_local_linear_id()] : -1.0f;
     }
 };
@@ -182,7 +182,7 @@ struct OwnTileBody {
         float*            t = it.local<float>(kWg);
         const std::size_t g = it.get_global_id(0);
         if (t != nullptr) t[it.get_local_linear_id()] = static_cast<float>(Base + it.get_local_linear_id());
-        sycl::group_barrier(it.get_group());
+        cs::group_barrier(it.get_group());
         if (g < in.x.shape()[0]) out.y[g] = t != nullptr ? t[kWg - 1 - it.get_local_linear_id()] : -1.0f;
     }
 };
@@ -235,7 +235,7 @@ struct ReadNextBody {
     };
     void operator()(cs::GroupItem<1> it, Inputs in, Outputs out) const {
         const std::size_t G = it.get_group_range(0), g = it.get_group(0), wg = it.get_local_range(0), l = it.get_local_linear_id();
-        if constexpr (Mode == 1) it.wait_group(0, (g + 1) % G);  // collective: every work-item calls it
+        if constexpr (Mode == 1) it.wait_group(0, sycl::id<1>{(g + 1) % G});  // collective: every work-item calls it
         if constexpr (Mode == 2) it.wait_earlier_segments();     // collective
         out.y[g * wg + l] = in.x[((g + 1) % G) * wg + l];
     }

@@ -227,7 +227,7 @@ struct RevBody {
         const std::size_t n = it.get_local_range(0), l = it.get_local_linear_id(), g = it.get_global_id(0);
         const std::size_t total = in.x.shape()[0];
         s.tile[l]               = g < total ? in.x[g] : 0.0f;
-        sycl::group_barrier(it.get_group());
+        cs::group_barrier(it.get_group());
         if (g < total) out.y[g] = s.tile[n - 1 - l];
     }
 };
@@ -247,7 +247,7 @@ struct MirrorBody {
         s.tile[l]               = 0.0f;  // touches the local buffer: a scratch stage
         // B reads OTHER work-items' writes of stage A: nothing orders them for it, so it calls
         // its own group barrier first (every work-item reaches it, ragged lanes included).
-        sycl::group_barrier(it.get_group());
+        cs::group_barrier(it.get_group());
         const std::size_t m = g - l + (n - 1 - l);
         if (g < total) out.y[g] = m < total ? in.x[m] : 0.0f;
     }

@@ -481,8 +481,9 @@ public:
     virtual std::vector<sycl::event> stage_args_deps() const { throw_no_stage(); }
     virtual void                     stage_args_register_read(const sycl::event&) { throw_no_stage(); }
     /// Finishes this forward's description for the group's work-group shape `wg`, copies its arguments into the array
-    /// (a container write) and returns the stage's group count.
-    virtual std::size_t stage_upload(detail::Runtime&, LaunchDescription&, const sycl::range<3>&) { throw_no_stage(); }
+    /// (a container write) and returns the stage's group range: per dimension (trailing dimensions, leading 1s) the groups it
+    /// needs, all 0 when the stage is empty.
+    virtual sycl::range<3> stage_upload(detail::Runtime&, LaunchDescription&, const sycl::range<3>&) { throw_no_stage(); }
 
 protected:
     ComponentBase() = default;
@@ -764,7 +765,8 @@ inline void GroupLauncher::prepare(Runtime& rt, const std::vector<ComponentBase*
 }
 
 inline std::vector<sycl::event> GroupLauncher::launch(Runtime& rt, const std::vector<ComponentBase*>& st,
-                                                      const std::vector<SegmentSpec>& segs, const std::string& who, bool group_waits) {
+                                                      const std::vector<SegmentSpec>& segs, const std::string& who, bool group_waits,
+                                                      Split split) {
     if (st.empty()) throw std::invalid_argument("naga::cospan: " + who + ": a group has no stages");
     if (!ptrs_) throw std::logic_error("naga::cospan: " + who + ": forward before the first precompute");
     const std::size_t n = st.size();
@@ -816,32 +818,35 @@ inline std::vector<sycl::event> GroupLauncher::launch(Runtime& rt, const std::ve
         }
     }
     sycl::range<3> wg = *wg_opt;
-    for (int d = rank; d < 3; ++d) wg[d] = 1;  // dimensions past the rank do not exist
+    for (int d = 0; d < 3 - rank; ++d) wg[d] = 1;  // the leading dimensions (before the rank's trailing ones) do not exist
+    if (split == Split::padded && (rank > 2 || wg[0] != 1))
+        throw std::invalid_argument("naga::cospan: " + who + ": cs::range_split::padded needs stages of rank 2 or lower");
 
     // 3. Every stage's arguments into its own array (a container write), and its group count.
-    std::vector<std::size_t> counts(n);
+    std::vector<sycl::range<3>> counts(n, sycl::range<3>{0, 0, 0});
     for (std::size_t i = 0; i < n; ++i) counts[i] = st[i]->stage_upload(rt, *ds[i], wg);
 
     // 4. The geometry: per segment the block (the largest count), the groups before it, the local slices.
     // The segment table after the n entries: the S block sizes, then the S boundary kinds.
     const std::size_t nseg  = segs.size();
-    const std::size_t table = (2 * nseg * sizeof(std::uint64_t) + sizeof(StageGeometry) - 1) / sizeof(StageGeometry);
+    const std::size_t table = (nseg * sizeof(SegmentInfo) + sizeof(StageGeometry) - 1) / sizeof(StageGeometry);
     host_geo_.assign(n + table, StageGeometry{});
-    std::vector<std::uint64_t> blocks(2 * nseg, 0);
+    std::vector<SegmentInfo>   infos(nseg);
+    std::uint64_t              pad_offset = 0;  // pad_and_split: where the next segment starts along the last dimension
     bool                       ticket_mode = group_waits;  // the group's property; a global_barrier below also switches it on
     std::uint64_t              base = 0;
     std::size_t                local_bytes = 0;
     for (std::size_t s = 0; s < segs.size(); ++s) {
         const SegmentSpec& sp = segs[s];
-        std::uint64_t      block = 0;
-        for (std::size_t j = sp.first; j < sp.first + sp.count; ++j) block = std::max<std::uint64_t>(block, counts[j]);
+        std::array<std::uint64_t, 3> block{0, 0, 0};  // the per-dimension maximum of the stages' group ranges
+        for (std::size_t j = sp.first; j < sp.first + sp.count; ++j)
+            for (int d = 0; d < 3; ++d) block[d] = std::max<std::uint64_t>(block[d], counts[j][d]);
+        const std::uint64_t block_count = block[0] * block[1] * block[2];
         std::size_t seg_local = 0;
         for (std::size_t j = sp.first; j < sp.first + sp.count; ++j) {
             StageGeometry& g = host_geo_[j];
-            g.group_count    = counts[j];
-            g.group_base     = base;
-            g.segment_groups = block;
             g.segment        = static_cast<std::uint32_t>(s);
+            g.split          = static_cast<std::uint32_t>(split);
             g.segments       = static_cast<std::uint32_t>(segs.size());
             g.stages         = static_cast<std::uint32_t>(n);
             g.range_mode     = static_cast<std::uint32_t>(sp.range);
@@ -854,10 +859,15 @@ inline std::vector<sycl::event> GroupLauncher::launch(Runtime& rt, const std::ve
                 seg_local      = std::max(seg_local, parts[j]->local_bytes);
             }
         }
-        blocks[s]        = block;
-        blocks[nseg + s] = static_cast<std::uint64_t>(sp.boundary);
+        SegmentInfo& si = infos[s];
+        for (int d = 0; d < 3; ++d) si.range[d] = block[d];
+        si.count    = block_count;
+        si.first    = base;
+        si.offset   = pad_offset;
+        si.boundary = static_cast<std::uint64_t>(sp.boundary);
+        pad_offset += block[2];
         if (sp.boundary == Boundary::global_barrier) ticket_mode = true;
-        base += block;
+        base += block_count;
         local_bytes = std::max(local_bytes, seg_local);
     }
     const sycl::device dev         = ComponentAccess::device_of(*st.front());
@@ -879,7 +889,8 @@ inline std::vector<sycl::event> GroupLauncher::launch(Runtime& rt, const std::ve
         last_.clear();
         return {};
     }
-    std::memcpy(static_cast<void*>(&host_geo_[n]), blocks.data(), blocks.size() * sizeof(std::uint64_t));
+    for (std::size_t i = 0; i < n; ++i) host_geo_[i].total_groups = base;
+    std::memcpy(static_cast<void*>(&host_geo_[n]), infos.data(), infos.size() * sizeof(SegmentInfo));
 
     // Group waits (ticket mode): the ticket state (counter, per-segment completed counters, per-ticket flags) is sized for this launch and
     // reset with a container fill, ordered after the previous launch (an outside writer of it). The launch then waits on
@@ -910,15 +921,32 @@ inline std::vector<sycl::event> GroupLauncher::launch(Runtime& rt, const std::ve
     std::vector<JitId> defs;
     defs.reserve(n);
     for (const ComponentBase* s : st) defs.push_back(s->definition_id());
-    sycl::AdaptiveCpp_jit::dynamic_function_config& cfg = group_config(rank, defs);
+    sycl::AdaptiveCpp_jit::dynamic_function_config& cfg = group_config(defs);
     const StageGeometry*                            gp  = geo_->data();
     const void* const*                              ap  = ptrs_->data();
-    sycl::event                                     ev;
-    switch (rank) {
-        case 1: ev = launch_group<1>(rt.uq, dev, deps, cfg, group_nd_range<1>(base, wg), gp, ap, local_bytes); break;
-        case 2: ev = launch_group<2>(rt.uq, dev, deps, cfg, group_nd_range<2>(base, wg), gp, ap, local_bytes); break;
-        default: ev = launch_group<3>(rt.uq, dev, deps, cfg, group_nd_range<3>(base, wg), gp, ap, local_bytes); break;
+
+    // The physical launch: always rank 3, the groups laid out by the range_split strategy.
+    std::array<std::uint64_t, 3> phys{1, 1, 1};
+    switch (split) {
+        case Split::flatten: phys = {1, 1, base}; break;
+        case Split::pad:
+            phys = {1, 1, 0};
+            for (const SegmentInfo& si : infos) {
+                phys[0] = std::max(phys[0], si.range[0]);
+                phys[1] = std::max(phys[1], si.range[1]);
+                phys[2] += si.range[2];
+            }
+            break;
+        case Split::padded:
+            phys = {nseg, 1, 1};
+            for (const SegmentInfo& si : infos) {
+                phys[1] = std::max(phys[1], si.range[1]);
+                phys[2] = std::max(phys[2], si.range[2]);
+            }
+            break;
     }
+    const sycl::nd_range<3> nd{sycl::range<3>{phys[0] * wg[0], phys[1] * wg[1], phys[2] * wg[2]}, wg};
+    const sycl::event       ev = launch_group(rt.uq, dev, deps, cfg, nd, gp, ap, local_bytes);
 
     // 7. The launch's event: a read of the geometry, the pointer array and every argument array, and on every stage (its
     // inputs' reads and its outputs' writes), registered here, at submit.
@@ -951,7 +979,7 @@ public:
     KernelLaunch(sycl::range<R> range, std::optional<sycl::range<R>> wg,
                  typename KB::Inputs in, typename KB::Outputs out, KB body, Scratch scratch)
         : args_{in, out, body, scratch} {
-        args_.range       = pad3<R>(range);
+        args_.range       = pad3<R>(range);  // in the trailing dimensions
         args_.flat_extent = range.size();
         if constexpr (HasScratch<KB>) args_.scratch_bytes = layout_scratch(args_.scratch);
         parts_.rank        = R;
@@ -979,25 +1007,18 @@ public:
 
     /// This forward's arguments for a group of work-group shape `wg`: the stage's group grid and count.
     const StageArgs<KB>& finalize(const sycl::range<3>& wg) {
-        const std::size_t wg_size = wg[0] * wg[1] * wg[2];
-        if constexpr (GroupBody<KB>) {
-            args_.group_range = sycl::range<3>{(args_.range[0] + wg[0] - 1) / wg[0], (args_.range[1] + wg[1] - 1) / wg[1],
-                                               (args_.range[2] + wg[2] - 1) / wg[2]};
-            group_count_      = args_.group_range[0] * args_.group_range[1] * args_.group_range[2];
-        } else {
-            group_count_      = (args_.flat_extent + wg_size - 1) / wg_size;
-            args_.group_range = sycl::range<3>{group_count_, 1, 1};
-        }
-        if (args_.flat_extent == 0) group_count_ = 0;
+        // ceil(range / wg) per dimension, for plain and group bodies alike; an empty stage has no groups in any dimension
+        args_.group_range = sycl::range<3>{(args_.range[0] + wg[0] - 1) / wg[0], (args_.range[1] + wg[1] - 1) / wg[1],
+                                           (args_.range[2] + wg[2] - 1) / wg[2]};
+        if (args_.flat_extent == 0) args_.group_range = sycl::range<3>{0, 0, 0};
         return args_;
     }
-    std::size_t group_count() const { return group_count_; }
+    sycl::range<3> group_range() const { return args_.group_range; }
 
 private:
     static_assert(std::is_trivially_copyable_v<StageArgs<KB>>);
 
     StageArgs<KB> args_;
-    std::size_t   group_count_ = 0;
     KernelParts   parts_;
 };
 
@@ -1126,13 +1147,13 @@ public:
             this->throw_no_stage();
         }
     }
-    std::size_t stage_upload([[maybe_unused]] detail::Runtime& rt, [[maybe_unused]] LaunchDescription& d,
-                             [[maybe_unused]] const sycl::range<3>& wg) override {
+    sycl::range<3> stage_upload([[maybe_unused]] detail::Runtime& rt, [[maybe_unused]] LaunchDescription& d,
+                                [[maybe_unused]] const sycl::range<3>& wg) override {
         if constexpr (PlainBody<KB> || GroupBody<KB>) {
             auto&                        kl = dynamic_cast<detail::KernelLaunch<KB>&>(d);
             const detail::StageArgs<KB>& a  = kl.finalize(wg);
             args_->from_host(std::span<const detail::StageArgs<KB>>{&a, 1});  // the host member into the array: a container write
-            return kl.group_count();
+            return kl.group_range();
         } else {
             this->throw_no_stage();
         }

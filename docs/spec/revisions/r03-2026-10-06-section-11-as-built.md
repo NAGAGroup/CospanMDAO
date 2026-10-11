@@ -467,23 +467,30 @@ Every plain-body and group-body component launches through a `detail::GroupLaunc
 one for its stages, and a **bare component is a group of one stage** in one default segment. Custom-op and host components keep
 their own submission and cannot be stages.
 
+- **Every launch is physically `sycl::nd_range<3>`.** A stage's range and work-group shape live in the **trailing**
+  dimensions with leading 1s (rank 1: `{1, 1, N}`, rank 2: `{1, Y, X}`); the stage rank R exists only in the wrappers (6.5).
+  Raw SYCL ids (`sycl::nd_item<3>`, `sycl::group<3>`) are **physical** and mean nothing to a stage. The default work-group
+  shapes are `{1, 1, 128}`, `{1, 8, 8}` and `{4, 4, 4}`. A plain body gets a rank-R global index, masked per dimension
+  against its range; there is no flat-index path.
 - **Stage function.** `stage_fn<KB>` is one `SYCL_EXTERNAL` function template per body type, with the same signature for every
-  type: `(detail::StageItem<R>, const detail::StageGeometry*, const void* const*, int stage)`. It reads `geometry[k]` and
-  `args[k]`, builds the item wrapper and calls the user's body. Its dynamic-function-definition id is a function-local static
+  type and every rank: `(detail::StageItem, const detail::StageGeometry*, const void* const*, int stage)`, where `StageItem`
+  holds the rank-3 `nd_item`, the local block and the group's logical place (segment, rank-3 coordinate). It reads
+  `geometry[k]` and `args[k]`, builds the item wrapper and calls the user's body. Its dynamic-function-definition id is a function-local static
   (`stage_definition_id<KB>()`) reached through the component's virtual `definition_id()`.
-- **The kernel.** One generic kernel per rank calls the declared noinline placeholder `run_stages_r1/r2/r3(item, geometry*,
-  args**, int)`, which the JIT replaces with an **indexed call sequence** of the stage functions
-  (`define_as_indexed_call_sequence(&run_stages_rN, {ids}, index_param = 3)`, an AdaptiveCpp-fork extension: argument 3 is
+- **The kernel.** One generic rank-3 kernel calls the declared noinline placeholder `run_stages(item, geometry*, args**,
+  int)`, which the JIT replaces with an **indexed call sequence** of the stage functions
+  (`define_as_indexed_call_sequence(&run_stages, {ids}, index_param = 3)`, an AdaptiveCpp-fork extension: argument 3 is
   replaced by the position k of each definition).
 - **Config cache.** The `dynamic_function_config` of a sequence lives in a process-wide, never-destroyed cache
-  (`detail::group_config(rank, defs)`), keyed by (rank, the definitions' symbol names). A config must outlive every kernel that
+  (`detail::group_config(defs)`), keyed by the definitions' symbol names. A config must outlive every kernel that
   uses it, and a transient group can be deleted before its kernel is compiled.
 - **Stage data.** Each component keeps a one-element device array of its argument struct (`StageArgs<KB>`), copied in from a
   host member every forward as a container write. The group's **pointer array** (one pointer per stage) is allocated, filled
   and waited on once, at the group's first precompute (devices are final then); it is redone only if the group is rebuilt. The
   group's **geometry array** is refilled every forward from a host member with event ordering: one `StageGeometry` per stage
-  (`group_count`, `group_base`, `segment_groups`, `ticket_state`, `segment`, `segments`, `stages`, `local_offset`,
-  `local_bytes`, `range_mode`), followed by the segment table (6.3).
+  (`ticket_state`, `total_groups`, `segment`, `segments`, `stages`, `local_offset`, `local_bytes`, `range_mode`, `split`),
+  followed by the segment table (6.3). A **bare component** is the native launch: one segment, its range in the trailing
+  dimensions, no padding and no remapping.
 
 ### 6.2 The descriptor
 
@@ -498,9 +505,10 @@ add_subsystem(cs::fuse_components(
 
 `cs::fuse_components<options...>(name, [ConnectsDesc,] [TiesDesc,] items...)` (connects first when both are given) returns a descriptor for `add_subsystem`. An item is a bare
 component descriptor (a one-stage segment), `cs::segment<opts...>(descs...)`, or `cs::global_barrier()`. The one option is
-`cs::group_waits_enabled` (6.4); any other option is a `static_assert` ("the only fuse_components option is
-cs::group_waits_enabled"), and a plain `fuse_components(...)` with no options is the common case. `cs::system_from(name,
-[connects], descs...)` builds a plain System of the same children instead. The result type is `FusedGroup<waits, Items...>`.
+`cs::group_waits_enabled` (6.4) and one **range-split strategy** `cs::range_split::flatten_and_split` (the default) /
+`pad_and_split` / `padded` (6.3); at most one strategy (`static_assert`), any other option is a `static_assert`, and a plain
+`fuse_components(...)` with no options is the common case. `cs::system_from(name,
+[connects], descs...)` builds a plain System of the same children instead. The result type is `FusedGroup<waits, split, Items...>`.
 
 - **Segment options** (at most one of each kind, `static_assert`ed): `cs::local_mem::partitioned` (default) /
   `cs::local_mem::shared`, and `cs::range_mode::own` (default) / `cs::range_mode::whole`.
@@ -528,12 +536,22 @@ cs::group_waits_enabled"), and a plain `fuse_components(...)` with no options is
 
 ### 6.3 Segments, range, local memory
 
-A **segment** is a run of consecutive stages that share groups. Its block is the largest group count of its stages; the launch
-is the sum of the blocks. In a group without waits (no `cs::group_waits_enabled`, no `cs::global_barrier()`), segments use the
-hardware group id and no atomics.
+A **segment** is a run of consecutive stages that share groups. A stage's **group range** is ceil(range / work-group shape)
+per dimension; a segment's **block** is the per-dimension maximum of its stages' group ranges, and its logical group count is
+the product. The launch's logical groups are the sum of the segments' counts. In a group without waits (no
+`cs::group_waits_enabled`, no `cs::global_barrier()`), segments use the hardware group id and no atomics.
 
-- **Range mode `own`:** a stage runs only for its first N groups of the block. **`whole`:** every stage runs for every group of
-  the block (the `GroupItem` group range widens dimension 0 to the block).
+- **Range mode `own`:** a stage skips the groups outside its own range in ANY dimension. **`whole`:** every stage runs for
+  every group of the block (the stage's group range is the segment's block).
+- **Range-split strategies** (`cs::range_split::*`, the layout of the logical groups on the physical rank-3 launch; at most one
+  per group, a `fuse_components<...>` option next to `cs::group_waits_enabled`):
+  - `flatten_and_split` (the default): every group along the LAST physical dimension. The rank-R group id is rebuilt row-major
+    over the segment's block, last dimension fastest. (On CUDA the last dimension is the one with the large group limit.)
+  - `pad_and_split`: the segments are stacked along the last dimension (its extent is the sum of the segments' extents there);
+    the leading dimensions are the maximum over all segments; ids are the hardware's, minus the segment's offset.
+  - `padded`: physical dimension 0 is the segment index (work-group extent 1); the other dimensions are the maximum over all
+    segments. Stages must be rank 2 or lower: a rank-3 stage is a `static_assert` (`detail::split_supports_rank_v`).
+  Physical groups outside every segment's range (padding) do nothing.
 - **Work-group shape.** Every forward, before the launch, every stage that asks for a shape must ask for the same one
   ("... ask for different work-group shapes ..."); a stage that asks for none takes the group's.
 - **Local memory.** A stage requests bytes with `LaunchDescription::request_local_bytes(n)` (each request rounded up to 16)
@@ -541,8 +559,9 @@ hardware group id and no atomics.
   gets the same block, the size is the max. The launch's local block is the largest segment size, checked against the device's
   `local_mem_size` each forward ("... bytes of local memory ...", naming the stages). `GroupItem::local<T>(n)` is a typed bump
   allocator over the stage's slice after its `Scratch`; it returns null when the slice is exhausted.
-- **Segment table.** After the `stages` geometry entries: the S block sizes, then the S boundary kinds (`none`,
-  `global_barrier`), as `std::uint64_t`.
+- **Segment table.** After the `stages` geometry entries, one `detail::SegmentInfo` per segment: the block (three extents), the
+  logical count, the first ticket, the offset along the last dimension (`pad_and_split`) and the boundary kind (`none`,
+  `global_barrier`).
 
 ### 6.4 Group waits, the global barrier and ticket mode
 
@@ -563,8 +582,9 @@ has no work-group to cooperate with", "the only fuse_components option is cs::gr
 If a group has the property or a barrier, **the whole launch uses tickets**:
 
 - At the start of each work-group the leader takes a ticket with a relaxed `fetch_add` on the ticket counter and broadcasts it
-  to the group (`StageItem::group` carries it). The ticket, not the hardware id, gives the work-group's segment and its group
-  within the segment through the segment table, in ticket order. Every earlier ticket is held by a group that has started, so
+  to the group. The ticket, not the hardware id, gives the work-group's segment and its rank-R group within the segment
+  through the segment table: **segment-major, then row-major within the segment, the last dimension fastest, for every
+  strategy**. A physical group that draws a ticket at or past the logical total exits before any completion write. Every earlier ticket is held by a group that has started, so
   a group waiting only on earlier groups cannot deadlock **and no co-residency is needed**.
 - **Ticket state** is a device container owned by the group, `uint32` words: `[0]` the ticket counter, `[1, 1+S)` per-segment
   completed counters, then one completion flag per ticket (`1 + S + total groups` words). It is reset every forward by a
@@ -579,21 +599,32 @@ If a group has the property or a barrier, **the whole launch uses tickets**:
 
 ### 6.5 The item wrapper
 
-Every group body, fused or not, gets `cs::GroupItem<R>` and never raw SYCL group objects. Group-level indices are relative to
-the stage's segment, from 0; local ids and ranges are physical.
+Every group body, fused or not, gets `cs::GroupItem<R>`: the API of `sycl::nd_item<R>` over **rank-R** ids. Group-level indices
+are relative to the stage's segment, from 0; local ids and ranges are those of the trailing R physical dimensions. `GroupItem`
+wraps the physical `sycl::nd_item<3>`: `to_sycl()` (and the implicit conversion) return it for raw SYCL code, whose ids are
+physical, not the stage's.
 
 | Member | Meaning |
 |---|---|
 | `get_local_id()`, `get_local_range()`, `get_local_linear_id()` | physical, as `nd_item` |
 | `get_group_id()`, `get_group(d)`, `get_group_range()`, `get_group_range(d)`, `get_group_linear_id()` | group within the segment |
 | `get_global_id()`, `get_global_range()`, `get_global_linear_id()` | within the segment's grid |
-| `get_segment()`, `get_segment_count()`, `get_segment_group_count(s)` | the segment structure |
+| `get_segment()`, `get_segment_count()`, `get_segment_group_count(s)` | the segment structure (the count is a `sycl::range<R>`) |
 | `local<T>(n)` | a typed slice of the stage's local memory |
-| `wait_group(s, g)`, `wait_earlier_segments()` | collective waits (below) |
-| `get_group()`, `get_sub_group()` | the physical group, for barriers and reductions |
+| `wait_group(s, sycl::id<R>)`, `wait_earlier_segments()` | collective waits (below) |
+| `get_group()` | a `cs::Group<R>`: the rank-R group id and range, `to_sycl()` / implicit conversion to `sycl::group<3>` |
+| `get_sub_group()` | `cs::sub_group`, an alias of `sycl::sub_group` |
+| `to_sycl()`, implicit conversion | the physical `sycl::nd_item<3>` |
+
+The SYCL 2020 group functions are free functions in `cs::` taking the `cs::Group<R>` and translating stage-rank ids to rank 3:
+`group_barrier`, `group_broadcast` (value, local linear id, rank-R local id), `any_of_group`, `all_of_group`, `none_of_group`,
+`joint_any_of`, `joint_all_of`, `joint_none_of`, `reduce_over_group` (with and without init), `joint_reduce`,
+`exclusive_scan_over_group`, `inclusive_scan_over_group`, `joint_exclusive_scan`, `joint_inclusive_scan` (argument orders as in
+SYCL: exclusive takes `init, op`, inclusive takes `op, init`), and, over `cs::sub_group`, `shift_group_left`,
+`shift_group_right`, `permute_group_by_xor`, `select_from_group`.
 
 The waits are `const` and **collective** (every work-item calls them): one work-item spins with acquire loads, then a group
-barrier and an acquire fence release the group. `wait_group(s, g)` waits for group `g` of segment `s`;
+barrier and an acquire fence release the group. `wait_group(s, g)` waits for the group `g` (its rank-R group id) of segment `s`;
 `wait_earlier_segments()` for every group of every earlier segment. They need ticket mode (a group with `cs::group_waits_enabled` or a `cs::global_barrier()`): without it the pointer is null and
 the behavior is undefined, with no branches and no checks; waiting on your own segment or a later one never returns. A plain
 body gets `sycl::id<R>`.

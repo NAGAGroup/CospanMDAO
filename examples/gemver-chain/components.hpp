@@ -236,7 +236,7 @@ struct GemvBody {
         for (std::uint32_t i = g; i < n; i += ng) {
             float acc = 0.0f;
             for (std::uint32_t j = l; j < n; j += wg) acc += in.B[sycl::id<2>{i, j}] * in.x[sycl::id<1>{j}];
-            const float sum = sycl::reduce_over_group(it.get_group(), acc, sycl::plus<float>());
+            const float sum = cs::reduce_over_group(it.get_group(), acc, sycl::plus<float>());
             if (l == 0) out.y[sycl::id<1>{i}] = scale * sum;
         }
     }
@@ -296,7 +296,7 @@ struct BicgkOnePassBody {
                 const std::uint32_t i = c * R + k;
                 const float         b = in.B[sycl::id<2>{i, j}];
                 ps += in.r[sycl::id<1>{i}] * b;
-                const float sum = sycl::reduce_over_group(it.get_group(), b * pj, sycl::plus<float>());
+                const float sum = cs::reduce_over_group(it.get_group(), b * pj, sycl::plus<float>());
                 if (l == 0) out.Pq[sycl::id<2>{i, blk}] = sum;
             }
             out.Ps[sycl::id<2>{c, j}] = ps;
@@ -445,7 +445,7 @@ struct GemvTPartialLocalBody {
         const std::uint32_t g    = static_cast<std::uint32_t>(it.get_group(0));
         const std::uint32_t c = g / blocks, blk = g - c * blocks;
         const std::uint32_t j = blk * static_cast<std::uint32_t>(kWg) + l;
-        sycl::group_barrier(it.get_group());  // the tile is complete
+        cs::group_barrier(it.get_group());  // the tile is complete
         float acc = 0.0f;
         for (std::uint32_t k = 0; k < kRt; ++k) acc += tile[k * kWg + l] * in.y[sycl::id<1>{c * kRt + k}];
         out.P[sycl::id<2>{c, j}] = acc;
@@ -499,7 +499,7 @@ struct BicgkTileLocalBody {
             const float         b = in.B[sycl::id<2>{i, j}];  // the ONE read of this element of B1
             tile[k * kWg + l]     = b;
             ps += in.r[sycl::id<1>{i}] * b;
-            const float sum = sycl::reduce_over_group(it.get_group(), b * pj, sycl::plus<float>());
+            const float sum = cs::reduce_over_group(it.get_group(), b * pj, sycl::plus<float>());
             if (l == 0) out.Pq[sycl::id<2>{i, blk}] = sum;
         }
         out.Ps[sycl::id<2>{c, j}] = ps;
@@ -549,7 +549,7 @@ struct Rank2UpdateFromLocalBody {
         const std::uint32_t g    = static_cast<std::uint32_t>(it.get_group(0));
         const std::uint32_t c = g / blocks, blk = g - c * blocks;
         const std::uint32_t j = blk * static_cast<std::uint32_t>(kWg) + l;
-        sycl::group_barrier(it.get_group());  // the tile is complete
+        cs::group_barrier(it.get_group());  // the tile is complete
         const float v1j = in.v1[sycl::id<1>{j}], v2j = in.v2[sycl::id<1>{j}];
         for (std::uint32_t k = 0; k < kRt; ++k) {
             const std::uint32_t i = c * kRt + k;

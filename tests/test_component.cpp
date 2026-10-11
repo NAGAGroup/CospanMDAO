@@ -309,7 +309,7 @@ struct TransposeBody {
         const auto l = it.get_local_id(), g = it.get_global_id();
         const bool live = g[0] < in.in.shape()[0] && g[1] < in.in.shape()[1];
         if (live) s.tile[{l[0], l[1]}] = in.in[{g[0], g[1]}];
-        sycl::group_barrier(it.get_group());
+        cs::group_barrier(it.get_group());
         const auto gt = sycl::id<2>{it.get_group(1) * it.get_local_range(1) + l[0],
                                     it.get_group(0) * it.get_local_range(0) + l[1]};
         if (gt[0] < out.out.shape()[0] && gt[1] < out.out.shape()[1]) out.out[gt] = s.tile[{l[1], l[0]}];

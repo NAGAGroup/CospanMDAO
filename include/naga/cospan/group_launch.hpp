@@ -67,8 +67,9 @@ public:
     /// Returns the launch's events (none when every stage is empty).
     /// `group_waits`: the group has the group_waits_enabled property (a global_barrier in `segments` also switches the wait
     /// state on). Default false: a lone component.
+    /// `split`: the range_split strategy (a bare component: pad, one segment, the native launch).
     std::vector<sycl::event> launch(Runtime& rt, const std::vector<ComponentBase*>& stages, const std::vector<SegmentSpec>& segments,
-                                    const std::string& who, bool group_waits = false);
+                                    const std::string& who, bool group_waits = false, Split split = Split::pad);
 
     const std::vector<sycl::event>& events() const { return last_; }
 
