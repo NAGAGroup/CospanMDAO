@@ -37,7 +37,7 @@ cospanmdao-examples = { workspace = true }
 [tasks]
 test = "cospan-tests"
 gemver-chain = "gemver-chain"
-softmax = "softmax"
+ns-residual = "ns-residual"
 # The fusion benchmarks on CUDA (JIT warm-up, 5 timed runs, medians): examples/run_benchmarks.nu. Needs `nu` on PATH
 # (and the cublas environment built for the cuBLAS reference: pixi run -e cublas build-cublas).
 benchmarks = "nu examples/run_benchmarks.nu"

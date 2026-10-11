@@ -1,6 +1,6 @@
-# examples/run_benchmarks.nu — the two fusion benchmarks on CUDA, with the run protocol written down.
+# examples/run_benchmarks.nu — the fusion benchmarks (gemver-chain, ns-residual) on CUDA, with the run protocol written down.
 #
-#   nu examples/run_benchmarks.nu [--only all|gemver|softmax] [--timed 5] [--max-warmups 8]
+#   nu examples/run_benchmarks.nu [--only all|gemver|ns-residual] [--timed 5] [--max-warmups 8]
 #   pixi run benchmarks            # the same, through the root pixi task
 #
 # Run it from the repository root. It needs the cuda environment (pixi run -e cuda ...) and, for the cuBLAS reference, the
@@ -11,7 +11,7 @@
 #      while its runtime optimization has not settled. For every CoSpan binary and argument set the script runs the program as
 #      fresh sequential processes until stderr no longer carries that warning, at most --max-warmups (8) runs, and reports
 #      how many it needed (or that it did not converge). The cuBLAS program is ahead-of-time compiled: one discarded run.
-#      EVERY VARIANT RUNS IN ITS OWN PROCESS (--variant <v>), per size, for both benchmarks: in one process (--variant all)
+#      EVERY VARIANT RUNS IN ITS OWN PROCESS (--variant <v>), per size, for both benchmarks (ns-residual: also per range_split strategy of the fused variant): in one process (--variant all)
 #      the variants interfere (the fused ones slow down and turn bimodal), so `all` is used for the correctness run only.
 #   2. Timed runs. After the warm-up, --timed (5) runs; every number is the MEDIAN of the five, with the min-max spread.
 #      Each run times 20 iterations after 3 warm-up iterations inside the process (the program's own flags).
@@ -67,9 +67,9 @@ def parse-gemver-rows [text: string] {
     $text | lines | each {|l| $l | parse --regex '^(?<variant>[a-z]+)\s+(?<ms>\d+\.\d+)\s+\S+\s+(?<gbs>\d+\.\d+)\s*$' } | flatten
 }
 
-# Rows of the softmax table: variant (or "copy ..."), ms, GB/s.
-def parse-softmax-rows [text: string] {
-    $text | lines | each {|l| $l | parse --regex '^(?<variant>copy [a-z.]+|[a-z]+)\s+(?<ms>\d+\.\d+)\s+(?<gbs>\d+\.\d+)\s+\d+\.\d+%\s+\S+\s*$' } | flatten
+# Rows of the ns-residual table: variant (unfused, fused-flatten, ..., handwritten), ms/eval, GB/s.
+def parse-ns-rows [text: string] {
+    $text | lines | each {|l| $l | parse --regex '^(?<variant>[a-z-]+)\s+(?<ms>\d+\.\d+)\s+(?<gbs>\d+\.\d+)\s*$' } | flatten
 }
 
 # The worst relative L2 of each variant from the "check <variant> vs reference, rel L2: x1 1e-07 ..." lines.
@@ -82,10 +82,10 @@ def parse-gemver-checks [text: string] {
     }
 }
 
-# The max absolute error of each softmax variant from the "  <variant>  4.4e-10  OK" lines after "check".
-def parse-softmax-checks [text: string] {
+# Per variant, from the "  check <variant>: R_relL2=.. det_rel=.. atomic_minmax_equal=.. atomic_norm_gap_rel=.. ... OK" lines.
+def parse-ns-checks [text: string] {
     $text | lines | each {|l|
-        $l | parse --regex '^\s+(?<variant>[a-z]+)\s+(?<err>[0-9.]+e[-+][0-9]+)\s+(?<status>OK|FAIL)\s*$'
+        $l | parse --regex '^\s+check (?<variant>[a-z-]+): R_relL2=(?<l2>\S+) det_rel=(?<det>\S+) atomic_minmax_equal=(?<mm>\w+) atomic_norm_gap_rel=(?<gap>\S+).* (?<status>OK|FAIL)\s*$'
     } | flatten
 }
 
@@ -184,38 +184,42 @@ def bench-gemver [timed: int, max_warm: int] {
     {table: $table, notes: $notes}
 }
 
-# ---- softmax ----------------------------------------------------------------------------------------------------------
-# Every variant in its own process as well; each process also times the device-to-device copies, which are pooled.
+# ---- ns-residual ------------------------------------------------------------------------------------------------------
+# Every variant, and every range_split strategy of the fused variant, in its own process. Walls BC, minmod limiter.
+# GB/s = nx * ny * 32 B / time: the NOMINAL traffic, 4 state fields read + 4 R fields written per cell, f32 (not measured).
 
-def bench-softmax [timed: int, max_warm: int] {
+def bench-ns [timed: int, max_warm: int] {
     mut table = []
     mut notes = []
-    # n * m * 4 B = 1 GiB for every m
-    for shape in [{n: 262144, m: 1024} {n: 65536, m: 4096} {n: 32768, m: 8192}] {
-        let tag = $"softmax-m($shape.m)"
-        let args = ["--n" $"($shape.n)" "--m" $"($shape.m)" "--iters" "20" "--warmup" "3"]
+    for n in [1024 2048 4096] {
+        let tag = $"ns-n($n)"
+        let args = ["--nx" $"($n)" "--ny" $"($n)" "--iters" "20" "--warmup" "3" "--bc" "walls" "--limiter" "minmod"]
         mut rows = []
-        for v in [unfused fused handwritten] {
-            print $"softmax m=($shape.m) ($v): JIT warm-up ..."
-            let cmd = (["pixi" "run" "-e" "cuda" "softmax"] | append $args | append ["--variant" $v])
-            let warm = (warm-up $cmd $"($tag)-($v)" $max_warm)
-            let runs = (timed-runs $cmd $"($tag)-($v)" $timed {|t| parse-softmax-rows $t })
+        for spec in [
+            {name: "unfused", extra: ["--variant" "unfused"]}
+            {name: "fused-flatten", extra: ["--variant" "fused" "--range-split" "flatten"]}
+            {name: "fused-pad", extra: ["--variant" "fused" "--range-split" "pad"]}
+            {name: "fused-padded", extra: ["--variant" "fused" "--range-split" "padded"]}
+            {name: "handwritten", extra: ["--variant" "handwritten"]}
+        ] {
+            print $"ns-residual n=($n) ($spec.name): JIT warm-up ..."
+            let cmd = (["pixi" "run" "-e" "cuda" "ns-residual"] | append $args | append $spec.extra)
+            let warm = (warm-up $cmd $"($tag)-($spec.name)" $max_warm)
+            let runs = (timed-runs $cmd $"($tag)-($spec.name)" $timed {|t| parse-ns-rows $t })
             $rows = ($rows | append $runs.rows)
-            $notes = ($notes | append {m: $shape.m, variant: $v, warmup_runs: $warm.runs, converged: $warm.converged, timed_runs_with_jit_warning: $runs.warned})
+            $notes = ($notes | append {n: $n, variant: $spec.name, warmup_runs: $warm.runs, converged: $warm.converged, timed_runs_with_jit_warning: $runs.warned})
         }
-        let chk = (run-logged (["pixi" "run" "-e" "cuda" "softmax"] | append $args | append ["--variant" "all" "--check"]) $"($tag)-check")
-        let checks = (parse-softmax-checks $chk.stdout)
+        # correctness: every variant and strategy in one process, one iteration, against the host double reference
+        let chk = (run-logged (["pixi" "run" "-e" "cuda" "ns-residual" "--nx" $"($n)" "--ny" $"($n)" "--iters" "1" "--warmup" "1" "--bc" "walls" "--limiter" "minmod" "--variant" "all" "--range-split" "all" "--check"]) $"($tag)-check")
+        let checks = (parse-ns-checks $chk.stdout)
 
-        let ms = (summarize $rows "ms")
-        let peak = ([($ms | where variant == "copy q.memcpy" | first | get median) ($ms | where variant == "copy kernel" | first | get median)] | math min)
-        let hw = ($ms | where variant == "handwritten" | first | get median)
-        let bytes = 2.0 * ($shape.n | into float) * ($shape.m | into float) * 4.0
-        for r in $ms {
+        let bytes = ($n | into float) * ($n | into float) * 32.0
+        for r in (summarize $rows "ms") {
             let c = ($checks | where variant == $r.variant)
             $table = ($table | append {
-                m: $shape.m, n: $shape.n, variant: $r.variant, ms_median: $r.median, ms_min: $r.min, ms_max: $r.max,
-                gbs: ($bytes / ($r.median * 1e6)), pct_of_copy: (100.0 * $peak / $r.median), vs_handwritten: ($r.median / $hw),
-                max_abs_error: (if ($c | is-empty) { null } else { $c.0.err }), check: (if ($c | is-empty) { "-" } else { $c.0.status }), copy_peak_ms: $peak
+                n: $n, variant: $r.variant, ms_median: $r.median, ms_min: $r.min, ms_max: $r.max, gbs: ($bytes / ($r.median * 1e6)),
+                r_rel_l2: (if ($c | is-empty) { null } else { $c.0.l2 }), norm_gap: (if ($c | is-empty) { null } else { $c.0.gap }),
+                check: (if ($c | is-empty) { "not run" } else { $c.0.status })
             })
         }
     }
@@ -238,16 +242,16 @@ def gemver-markdown [res: record] {
     $"## gemver-chain, one process per variant\n\nMain table\n\n($head)\n(gemver-rows-md $main_rows)\n\nOther variants\n\n($head)\n(gemver-rows-md $other_rows)\n\n($notes)\n"
 }
 
-def softmax-markdown [res: record] {
+def ns-markdown [res: record] {
     let rows = ($res.table | each {|r|
-        $'| ($r.m) | ($r.variant) | (fmt $r.ms_median) | (fmt $r.ms_min)–(fmt $r.ms_max) | (fmt $r.gbs) | ($r.pct_of_copy | into string --decimals 1)% | (if ($r.variant | str starts-with "copy") { "-" } else { $r.vs_handwritten | into string --decimals 3 }) | (if $r.max_abs_error == null { "-" } else { $r.max_abs_error }) |'
+        $'| ($r.n) | ($r.variant) | (fmt $r.ms_median) | (fmt $r.ms_min)–(fmt $r.ms_max) | (fmt $r.gbs) | (if $r.r_rel_l2 == null { "-" } else { $r.r_rel_l2 }) | (if $r.norm_gap == null { "-" } else { $r.norm_gap }) | ($r.check) |'
     } | str join (char nl))
-    let notes = ($res.notes | each {|r| $'- m = ($r.m), ($r.variant): warm-up runs needed: ($r.warmup_runs), ($r.converged | if $in { "converged" } else { "DID NOT CONVERGE" }); timed runs that still printed the JIT warning: ($r.timed_runs_with_jit_warning)' } | str join (char nl))
-    $"## softmax, one process per variant\n\n| m | variant | ms median | min–max | GB/s ideal | % of copy peak | time / handwritten | max abs error |\n|---:|---|---:|---|---:|---:|---:|---:|\n($rows)\n\n($notes)\n"
+    let notes = ($res.notes | each {|r| $'- n = ($r.n), ($r.variant): warm-up runs needed: ($r.warmup_runs), ($r.converged | if $in { "converged" } else { "DID NOT CONVERGE" }); timed runs that still printed the JIT warning: ($r.timed_runs_with_jit_warning)' } | str join (char nl))
+    $"## ns-residual, one process per variant and strategy, walls BC, minmod\n\nGB/s = nx * ny * 32 B / time, the nominal traffic: 4 state fields read + 4 R fields written per cell, f32, that is nx*ny*8*4 B, not measured.\n\n| n, nx = ny | variant | ms/eval median | min–max | GB/s nominal | R rel L2 vs reference | atomic-vs-deterministic norm gap | check |\n|---:|---|---:|---|---:|---:|---:|---|\n($rows)\n\n($notes)\n"
 }
 
 def main [--only: string = 'all', --timed: int = 5, --max-warmups: int = 8] {
-    if $only not-in ['all' 'gemver' 'softmax'] { error make {msg: '--only must be all, gemver or softmax'} }
+    if $only not-in ['all' 'gemver' 'ns-residual'] { error make {msg: '--only must be all, gemver or ns-residual'} }
     mkdir $out_dir
     let env_info = (environment)
     print ($env_info | table --expand)
@@ -259,10 +263,10 @@ def main [--only: string = 'all', --timed: int = 5, --max-warmups: int = 8] {
         $md = $md + (gemver-markdown $g)
         $json = ($json | insert gemver $g)
     }
-    if $only in ['all' 'softmax'] {
-        let s = (bench-softmax $timed $max_warmups)
-        $md = $md + "\n" + (softmax-markdown $s)
-        $json = ($json | insert softmax $s)
+    if $only in ['all' 'ns-residual'] {
+        let s = (bench-ns $timed $max_warmups)
+        $md = $md + "\n" + (ns-markdown $s)
+        $json = ($json | insert ns_residual $s)
     }
     $md | save --force $'($out_dir)/results.md'
     $json | to json --indent 2 | save --force $'($out_dir)/results.json'

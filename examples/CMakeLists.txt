@@ -1,7 +1,7 @@
 # The cospanmdao examples, standalone like the tests: this finds the INSTALLED
 # library (find_package(cospanmdao)) and is not part of the root project. Built by
 # pixi-build as the package `cospanmdao-examples`; run with `pixi run gemver-chain`
-# and `pixi run softmax`.
+# and `pixi run ns-residual`.
 #
 # examples/gemver-chain/cublas is a separate, standalone CUDA project (built in
 # the `cublas` pixi environment) and is not referenced from here.
@@ -23,9 +23,9 @@ target_link_libraries(gemver-chain PRIVATE naga::cospan)
 # Header-only library: the kernels are emitted by this translation unit.
 add_sycl_to_target(TARGET gemver-chain SOURCES gemver-chain/main.cpp)
 
-add_executable(softmax softmax/main.cpp)
-target_include_directories(softmax PRIVATE softmax)
-target_link_libraries(softmax PRIVATE naga::cospan)
-add_sycl_to_target(TARGET softmax SOURCES softmax/main.cpp)
+add_executable(ns-residual ns-residual/main.cpp)
+target_include_directories(ns-residual PRIVATE ns-residual)
+target_link_libraries(ns-residual PRIVATE naga::cospan)
+add_sycl_to_target(TARGET ns-residual SOURCES ns-residual/main.cpp)
 
-install(TARGETS gemver-chain softmax RUNTIME DESTINATION bin)
+install(TARGETS gemver-chain ns-residual RUNTIME DESTINATION bin)
