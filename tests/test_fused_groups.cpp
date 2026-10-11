@@ -638,6 +638,49 @@ public:
     std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(y_.shape(), {}, {y_}, {}); }
 };
 
+// TGAdder / TGZero: the same as TAdder / TZero as WORK-GROUP stages (a global_barrier needs group-body stages), work-group kWg.
+struct TGAdderBody {
+    struct Inputs {};
+    struct Outputs {
+        cs::Output<DType::atomic_f32, 1> y;
+    };
+    float v;
+    void operator()(cs::GroupItem<1> it, Inputs, Outputs out) const {
+        const std::size_t g = it.get_global_id(0);
+        if (g < out.y.shape()[0]) out.y[g].fetch_add(v);
+    }
+};
+class TGAdder : public cs::Component<TGAdderBody> {
+    cs::Output<DType::atomic_f32, 1> y_;
+    float                            v_;
+
+public:
+    explicit TGAdder(float v) : v_{v} {}
+    void setup() override { declare_output(y_, "y", cs::unspecified_shape<1>()); }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+        return create_launch_config(y_.shape(), sycl::range<1>{kWg}, {}, {y_}, {v_});
+    }
+};
+struct TGZeroBody {
+    struct Inputs {};
+    struct Outputs {
+        cs::Output<DType::atomic_f32, 1> y;
+    };
+    void operator()(cs::GroupItem<1> it, Inputs, Outputs out) const {
+        const std::size_t g = it.get_global_id(0);
+        if (g < out.y.shape()[0]) out.y[g].store(0.0f);
+    }
+};
+class TGZero : public cs::Component<TGZeroBody> {
+    cs::Output<DType::atomic_f32, 1> y_;
+
+public:
+    void setup() override { declare_output(y_, "y", cs::unspecified_shape<1>()); }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+        return create_launch_config(y_.shape(), sycl::range<1>{kWg}, {}, {y_}, {});
+    }
+};
+
 // TSlice: y[i] = v for lo <= i < hi and nothing else, a PLAIN output (disjoint slices of one tie). `reshape`: its
 // pre_forward calls set_shape on the output, which a tied member may not do.
 struct TSliceBody {
@@ -689,9 +732,13 @@ inline std::vector<float> halves() {
 
 TEST_CASE("ties_desc: atomic outputs of three stages tied in the group, the views of the members and the alias agree",
           "[fused_groups][ties]") {
+    // The standard initialization pattern: the zeroing stage in its own first segment, a global_barrier, then the segment of
+    // the accumulating stages. All stages are work-group stages (the barrier needs them).
     cs::Model model = tfg::make([](cs::System& s) {
-        s.add_subsystem(cs::fuse_components("f", cs::ties_desc({cs::tie_outputs<DType::atomic_f32, 1>({"z.y", "a.y", "b.y"}, "y", cs::shape(12))}),
-                                            tfg::atomic_stages()));
+        s.add_subsystem(cs::fuse_components(
+            "f", cs::ties_desc({cs::tie_outputs<DType::atomic_f32, 1>({"z.y", "a.y", "b.y"}, "y", cs::shape(12))}),
+            cs::segment(cs::subsystem_desc<tfg::TGZero>("z")), cs::global_barrier(),
+            cs::segment(cs::subsystem_desc<tfg::TGAdder>("a", 1.0f), cs::subsystem_desc<tfg::TGAdder>("b", 2.0f))));
     });
     model.setup();
     for (int fwd = 0; fwd < 3; ++fwd) {  // the zeroing stage runs every forward: the sums do not pile up

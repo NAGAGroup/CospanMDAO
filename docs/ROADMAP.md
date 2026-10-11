@@ -55,7 +55,7 @@ Principle: fusion is always the user's explicit decision. The framework never gu
 Topics learned while building the light-transport forcing case (2026-09-30). Each becomes a tutorial section with a worked example.
 
 - [ ] The functional model: outputs are computed fresh and are never initialized; no global scratch; multi-step work is several components, producer to consumer.
-- [ ] Accumulation patterns: group work with local memory inside one kernel; or a zeroing producer component plus the accumulators, joined with tie_outputs (atomic by default, allow_plain when writes are disjoint).
+- [ ] Accumulation patterns: group work with local memory inside one kernel; or a zeroing producer component plus the accumulators, joined with tie_outputs (atomic by default, allow_plain when writes are disjoint). Standard practice: an output that has to be initialized by computation (for example zeroed before accumulation) gets that initialization in its own first segment of the fused group, a `cs::global_barrier()` follows that segment, and every segment that writes into the output comes after. The framework does not check this; it needs work-group stages.
 - [ ] Atomics are relaxed; use sycl::atomic_fence(acq_rel, device) where ordering matters (e.g. bottom-up tree builds).
 - [ ] Namespaces, promotions and ties: subsystems get their own namespaces; Systems declare no I/O of their own; promote exposes one entry as a public alias (optional, only for what matters outside); ties are how inputs or outputs share a root; connect makes data links; names at one level are unique.
 - [ ] ~~Registration order is execution order: add children in dataflow order.~~ Execution order is data dependencies plus `depends_on` (section 11).
