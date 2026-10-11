@@ -187,10 +187,13 @@ inline void merge_definitions(const WiringSite& site, const char* verb, VarMeta&
 // THE LAST DECLARATION WINS (docs/design-review-2026-10-03.md, section 2). A parent's setup runs after its children's,
 // so a tie's, a promotion's or a System's initializer replaces the members'; tied members and promotions may carry their
 // own initializers. There is no level comparison and no conflict error: the incoming declaration always replaces what is
-// held.
+// held. Only DECLARED initializers take part (VarMeta::init is empty for an input that declared none, which gets the
+// implicit zero at initialization time): every merge below copies an initializer only when the source one is set, so an
+// implicit or empty one never replaces an explicit one, in either declaration order.
 
 /// Folds the initializer of `from` (a tie member) into `into` (the tie's alias): the member's replaces what is held, so
-/// later members replace earlier ones. Its device comes along when `into` has none.
+/// later members replace earlier ones; a member with none declared leaves what is held. Its device comes along when
+/// `into` has none.
 inline void fold_init(VarMeta& into, const VarMeta& from) {
     if (!from.init) return;
     into.init = from.init;

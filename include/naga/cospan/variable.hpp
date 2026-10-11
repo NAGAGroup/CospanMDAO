@@ -387,7 +387,10 @@ public:
     /// definition.
     ResolvedShape shape;
 
-    /// The initializer: the last declaration wins (section 2), so it is simply replaced by each declaration.
+    /// The DECLARED initializer: the last declaration wins (section 2), so it is simply replaced by each declaration.
+    /// Empty means none was declared; an input with no producer then gets the implicit zero when it initializes, but the
+    /// implicit zero is not a declaration: it is never stored here, so no merge can let it replace an explicit one, and a
+    /// cycle variable with nothing here still fails its first materialization.
     std::optional<InitSpec> init;
     /// Where the initialization runs (set by tie_inputs): else the device with the most instances.
     std::optional<sycl::device> init_device;
@@ -936,9 +939,13 @@ public:
 
     /// The shape changed and is known (set_dims): every live, bound container is resized in place (the prefix is kept)
     /// and a ragged variable's index arrays follow. Nothing before the first materialization, which sizes everything.
+    /// A reshaped variable with no producer (a free input, a tie_inputs alias) is marked stale: its initializer, the
+    /// declared one or the implicit zero, runs again on the new shape at the next materialize. Data that was still valid
+    /// is initialized again all the same.
     void apply_shape(Runtime& rt) override {
         if (!materialized) return;
         for (const auto& d : live_containers(/*bound_only=*/true)) size_container(rt, *d);
+        if (!has_producer()) stale_ = true;
     }
 
 protected:
@@ -970,17 +977,19 @@ private:
         for (const auto& d : live) size_container(rt, *d);
 
         // Unless the holder that asked is an output (its producer writes the data), initialize and copy to the others.
-        // A variable with no initializer is UNINITIALIZED (nothing fills a new container): a producer writes it, or the
-        // user gave it an initializer.
-        // A cycle variable always initializes: whichever holder asks first, the consumer reads it before the producer writes.
+        // An input with no producer and no declared initializer gets the IMPLICIT ZERO initializer: it behaves as if
+        // cs::init::zero() had been declared (the allocation itself is uninitialized; the zero is an initializer, run by
+        // initialize()). A connected input never initializes, and an output never does: its producer writes it.
+        // A cycle variable always initializes, with its declared initializer (checked above): whichever holder asks first,
+        // the consumer reads it before the producer writes.
         const bool output_asked = trigger != nullptr && kind_of(*trigger) == IOKind::output;
-        if ((!output_asked || cycle) && init) initialize(rt, live, trigger);
+        if ((!output_asked || cycle) && (init || !has_producer())) initialize(rt, live, trigger);
         materialized = true;
         stale_       = false;
     }
 
-    /// A stale, materialized variable with no producer (update_input): the (possibly new) shape, then the initializer
-    /// again, in place, on the live containers that hold data.
+    /// A stale, materialized variable with no producer (update_input, or a reshape): the (possibly new) shape, then the
+    /// initializer (the implicit zero when none was declared) again, in place, on the live containers that hold data.
     void reinitialize(Runtime& rt, const Instance* trigger) {
         resolve_free_shape(rt);  // update_input may have supplied a new shape (set_dims resizes the live containers)
         const std::vector<std::shared_ptr<Data>> live = live_containers(/*bound_only=*/true);
@@ -988,7 +997,7 @@ private:
         stale_ = false;
     }
 
-    /// Runs the initializer (or zero-fills) on one of `live`, then copies the result to the others. The initializer is a
+    /// Runs the initializer (or the implicit zero: a fill with T{}) on one of `live`, then copies the result to the others. The initializer is a
     /// WRITER of its container: it waits on both its lists, and what it enqueued is registered as a write and, so that a
     /// later kernel writer waits for it too, as a read.
     void initialize(Runtime& rt, const std::vector<std::shared_ptr<Data>>& live, const Instance* trigger) {

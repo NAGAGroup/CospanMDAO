@@ -1050,7 +1050,6 @@ TEST_CASE("init: update_input on a connected input warns and is not applied; on 
           "[model][init]") {
     auto model = cs::create_model<tmod::ChainTop>(default_config());
     model.setup();
-    model.update_input("p.x", cs::init::zero());  // p's free input is uninitialized otherwise
 
     std::ostringstream captured;
     std::streambuf*    old = std::cerr.rdbuf(captured.rdbuf());

@@ -403,7 +403,6 @@ TEST_CASE("wiring: merging two materialized variables is an error at the call", 
         s.add_subsystem(cs::subsystem_desc<tp4::Axpb>("c", 2.0f, 1.0f));
     });
     model.setup();
-    model.update_input("c.x", cs::init::zero());  // an input with no initializer is uninitialized
     tp4::run(model);  // p.y and c.x are both materialized now
     tp4::expect_throws_all([&] { model.root().connect("p.y", "c.x"); },
                            {"connect", "merging two materialized variables is not defined (yet)"});
@@ -765,8 +764,7 @@ TEST_CASE("replay skips a logged connection whose other side was deleted: the re
     CHECK(tp4::out(model, "c.y") == tp4::filled(11.0f));
     CHECK(model.get_subsystem("p") == nullptr);
     CHECK_NOTHROW(tp4::run(model));  // pre_forward rearms c: the connect to the deleted p is skipped
-    // c.x is a fresh variable with no initializer: its values are undefined, so only the shape of c.y is checked.
-    CHECK(tp4::out(model, "c.y").size() == tp4::filled(1.0f).size());
+    CHECK(tp4::out(model, "c.y") == tp4::filled(1.0f));  // c.x is a fresh variable (zeros): 2 * 0 + 1
 }
 
 // =============================================================================================
@@ -788,4 +786,14 @@ TEST_CASE("a connect after setup moves the host holder's container into the devi
     CHECK(p_y->data != h_x->data);   // two placements of one variable: device and host
     tp4::run(model);
     CHECK(tp4::out(model, "h.y") == tp4::filled(2.0f));
+}
+
+// =============================================================================================
+// implicit zero initializer
+// =============================================================================================
+TEST_CASE("init: the implicit zero is not a declaration, so a cycle with no explicit initializer still throws", "[p4][init][cycle][errors]") {
+    tp4::CerrCapture cap;
+    cs::Model        model = cs::create_model<tp4::CycleTop>(default_config(), 2);
+    model.setup();
+    tp4::expect_throws_all([&] { model.forward(); }, {"closes a cycle", "'p.x' reads 'q.y', which runs after it", "has no initializer"});
 }

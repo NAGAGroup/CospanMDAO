@@ -562,7 +562,7 @@ const cs::property_list kTransient{cs::property::transient{}};
 
 class OneAxpb : public cs::System {
 public:
-    void setup() override { add_subsystem(cs::subsystem_desc<Axpb>("a", 2.0f, 1.0f)); }  // free x, no init: uninitialized
+    void setup() override { add_subsystem(cs::subsystem_desc<Axpb>("a", 2.0f, 1.0f)); }  // free x, no init: zeros
 };
 
 /// An eternal free input with a logged init (x = 5): the init is applied by the owner on its first run.
@@ -1458,8 +1458,7 @@ TEST_CASE("init: the last declaration wins (System init_input beats the Componen
 TEST_CASE("init: init_input on an eternal free input between forwards", "[system][init]") {
     cs::Model model = cs::create_model<tsys::OneAxpb>(default_config());
     model.setup();
-    // No init declared, and an unset input is uninitialized: give it an explicit zero, so y = 2 * 0 + 1.
-    tsys::set_x(model, "a.x", 0.0f);
+    // No init declared: zeros, so y = 2 * 0 + 1.
     model.forward();
     model.wait();
     CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "a.y")) == tsys::filled(1.0f));
@@ -2405,7 +2404,6 @@ TEST_CASE("alias: tie_inputs shapes: fixed, from_output_shape, from_output_value
         for (const std::uint32_t n : {3u, 6u, 4u}) {
             INFO("n = " << n);
             model.update_input("v.n", cs::init::from_host(tsys2::one_u32(n)));
-            model.update_input("x", cs::init::zero());  // a resized variable is uninitialized: zero it explicitly
             model.forward();
             model.wait();
             CHECK(cst::synced_input<DType::f32, 1>(model, "x").shape()[0] == n);
@@ -3361,7 +3359,120 @@ TEST_CASE("placement: a rebuilt child keeps the outer device", "[system][placeme
     REQUIRE(model.get_subsystem("in") != nullptr);
     CHECK(model.root().instance_at("in.k.x")->device == host);
     CHECK(model.root().instance_at("in.k.y")->device == host);
-    // the rebuilt child's free input is a fresh variable with no initializer (undefined values): it runs on the outer
-    // device, and only the shape of its output is defined
-    CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "in.k.y")).size() == tsys::filled(0.0f).size());
+    // the rebuilt child's free input is a fresh variable (zeros), and it runs on the outer device
+    CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "in.k.y")) == tsys::filled(0.0f));
+}
+
+// =============================================================================================
+// implicit zero initializer, and re-initialization on reshape
+// =============================================================================================
+namespace tsys2 {
+/// A TScale "a" whose free input x follows the shape of v.b (a hook on a free input), v.n giving the size.
+inline void hooked_free_input(cs::System& s, std::optional<float> fill) {
+    add_bins(s);
+    s.add_subsystem(cs::subsystem_desc<TScale>("a"));
+    s.shape_hook("a.x", cs::dim::from_shape("v.b", 0));
+    if (fill) s.init_input("a.x", cs::init::fill(*fill));
+}
+/// Resizes v.n to each of `sizes`, runs, and checks a.x has that size and every element of a.y is `scale * value`.
+inline void run_sizes(cs::Model& model, std::initializer_list<std::uint32_t> sizes, const char* y_path, float want) {
+    for (const std::uint32_t n : sizes) {
+        INFO("n = " << n);
+        model.update_input("v.n", cs::init::from_host(one_u32(n)));
+        model.forward();
+        model.wait();
+        CHECK(cst::synced_input<DType::f32, 1>(model, "a.x").shape()[0] == n);
+        CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, y_path)) == std::vector<float>(n, want));
+    }
+}
+}  // namespace tsys2
+
+TEST_CASE("init: reshaping a materialized free input runs the implicit zero again", "[system][init][reshape]") {
+    auto model = tsys2::make([](cs::System& s) { tsys2::hooked_free_input(s, std::nullopt); });
+    model.setup();
+    tsys2::run_sizes(model, {3u, 6u, 4u, 8u}, "a.y", 0.0f);  // x grew and shrank: all zeros each time
+}
+
+TEST_CASE("init: reshaping a materialized free input runs its declared fill again", "[system][init][reshape]") {
+    auto model = tsys2::make([](cs::System& s) { tsys2::hooked_free_input(s, 7.0f); });
+    model.setup();
+    tsys2::run_sizes(model, {3u, 6u, 4u, 8u}, "a.y", 14.0f);  // the new elements are the fill too, not leftovers
+}
+
+TEST_CASE("init: reshaping a tie_inputs alias runs its initializer again", "[system][init][reshape]") {
+    for (const bool explicit_fill : {false, true}) {
+        INFO((explicit_fill ? "explicit fill(7)" : "implicit zero"));
+        auto model = tsys2::make([explicit_fill](cs::System& s) {
+            tsys2::add_bins(s);
+            s.add_subsystem(cs::subsystem_desc<tsys2::TScale>("a"));
+            s.add_subsystem(cs::subsystem_desc<tsys2::TScale>("b"));
+            s.tie_inputs<DType::f32, 1>({"a.x", "b.x"}, "x");
+            s.shape_hook("x", cs::dim::from_shape("v.b", 0));
+            if (explicit_fill) s.init_input("x", cs::init::fill(7.0f));
+        });
+        model.setup();
+        for (const std::uint32_t n : {3u, 6u, 4u, 8u}) {
+            INFO("n = " << n);
+            model.update_input("v.n", cs::init::from_host(tsys2::one_u32(n)));
+            model.forward();
+            model.wait();
+            const std::vector<float> want(n, explicit_fill ? 14.0f : 0.0f);
+            CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "a.y")) == want);
+            CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "b.y")) == want);
+        }
+    }
+}
+
+TEST_CASE("init: in a tie an explicit initializer beats an implicit one, whichever member declares it", "[system][init][tie]") {
+    for (const bool a_declares : {true, false}) {
+        INFO((a_declares ? "a.x declares the fill, b.x nothing" : "b.x declares the fill, a.x nothing"));
+        auto model = tsys2::make([a_declares](cs::System& s) {
+            s.add_subsystem(cs::subsystem_desc<tsys2::TScale>("a"));
+            s.add_subsystem(cs::subsystem_desc<tsys2::TScale>("b"));
+            s.init_input(a_declares ? "a.x" : "b.x", cs::init::fill(7.0f));
+            s.tie_inputs<DType::f32, 1>({"a.x", "b.x"}, "x", cs::shape(5));
+        });
+        model.setup();
+        model.forward();
+        model.wait();
+        CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "a.y")) == std::vector<float>(5, 14.0f));
+        CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "b.y")) == std::vector<float>(5, 14.0f));
+    }
+}
+
+TEST_CASE("init: in a tie with two explicit initializers the last one wins", "[system][init][tie]") {
+    auto model = tsys2::make([](cs::System& s) {
+        s.add_subsystem(cs::subsystem_desc<tsys2::TScale>("a"));
+        s.add_subsystem(cs::subsystem_desc<tsys2::TScale>("b"));
+        s.init_input("a.x", cs::init::fill(3.0f));
+        s.init_input("b.x", cs::init::fill(5.0f));
+        s.tie_inputs<DType::f32, 1>({"a.x", "b.x"}, "x", cs::shape(5));
+    });
+    model.setup();
+    model.forward();
+    model.wait();
+    CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "a.y")) == std::vector<float>(5, 10.0f));
+    CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "b.y")) == std::vector<float>(5, 10.0f));
+}
+
+TEST_CASE("init: a connected input and an output are never initialized, not even when the chain is reshaped", "[system][init][reshape]") {
+    auto model = tsys2::make([](cs::System& s) {
+        tsys2::add_bins(s);
+        s.add_subsystem(cs::subsystem_desc<tsys2::TScale>("a"));
+        s.add_subsystem(cs::subsystem_desc<tsys2::TScale>("b"));
+        s.shape_hook("a.x", cs::dim::from_shape("v.b", 0));
+        s.init_input("a.x", cs::init::fill(7.0f));
+        s.connect("a.y", "b.x");
+    });
+    model.setup();
+    for (const std::uint32_t n : {3u, 6u, 4u}) {
+        INFO("n = " << n);
+        model.update_input("v.n", cs::init::from_host(tsys2::one_u32(n)));
+        model.forward();
+        model.wait();
+        // a.y (an output) holds what a wrote, b.x (connected) is that same data, and b.y is computed from it: nothing zeroed them
+        CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "a.y")) == std::vector<float>(n, 14.0f));
+        CHECK(to_vector(cst::synced_input<DType::f32, 1>(model, "b.x")) == std::vector<float>(n, 14.0f));
+        CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "b.y")) == std::vector<float>(n, 28.0f));
+    }
 }

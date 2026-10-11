@@ -243,7 +243,20 @@ Every container (`sk::usm_vector`) keeps a **read list** and a **write list**. V
 - **Allocations are uninitialized.** `resize(n)` and `reserve(n)` never fill and a size-only constructor does not fill; a call
   given a value does. A reallocation with elements to keep copies them over (a write, in the write list) and returns the
   copy's event as `std::optional<sycl::event>`; every other case returns an empty optional. Nothing in CoSpan may rely on
-  zeroed memory: a variable with no initializer holds undefined values until a producer writes it.
+  zeroed memory: a variable is zero because an INITIALIZER made it so, never because of the allocation (below).
+- **Initializers, implicit and explicit.**
+  - (a) An input declared without an initializer gets an **implicit zero initializer**, and is stale until it runs: it
+    behaves as if `cs::init::zero()` had been declared. The implicit zero is an initializer (a fill with `T{}` run by
+    `Var::initialize`), not an allocation fill, and it is not stored as a declaration (`VarMeta::init` stays empty).
+  - (b) It is not a declaration for the existing rules. A cycle variable still needs an explicitly declared initializer (the
+    first-materialization error "... closes a cycle (...) and has no initializer" fires when none was declared). In a tie,
+    any explicit initializer (member, alias, `System::init_input`, `update_input`) beats an implicit one, whatever the order;
+    among explicit ones the last declaration wins. Every merge site (`fold_init`, `merge_connected`, `apply_tie_merge`,
+    the replay connect, `declare_init`) copies an initializer only when the source one is declared.
+  - (c) A connected input never initializes, except a cycle with an explicit initializer. Outputs never initialize.
+  - (d) A reshape of a materialized variable with no producer (a free input, or a `tie_inputs` alias) marks it stale
+    (`Var::apply_shape`, reached from `set_dims`): its initializer, explicit or the implicit zero, runs again on the new
+    shape at the next materialization. Data that was still valid is initialized again; that is accepted.
 - **The resize-event slot.** `VarMeta` keeps a list of pending resize events. Every container resize made for the variable
   (materialization sizing, `set_shape`, shape hooks, initializer shapes, the ragged index arrays) appends the event it returned.
   EVERY resize of a variable's containers, by any path, feeds its slot: a shape hook's device column (extents, offsets) resizes

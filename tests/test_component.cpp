@@ -15,7 +15,7 @@
 //   TiledTranspose                group body, Local scratch, wg override; 37x53
 //   host component chain          producer -> host prefix sum -> consumer
 //   custom-op plumbing            device_ptr recorded at submission
-//   initial values                fill/zero/from_host/custom/custom_host (no initializer: undefined),
+//   initial values                fill/zero/from_host/custom/custom_host, zeros by default,
 //                                 metadata rules; phase guards (init_input / pre_forward / setup)
 
 #include <atomic>
@@ -486,7 +486,7 @@ std::atomic<int>         g_custom_calls{0};
 std::atomic<std::size_t> g_custom_size{0};
 
 // y = 10 x + w + v + d. x fill, w from_host, u zero, v custom_host, m custom (a device kernel
-// writes 10 + i; the body ignores it), d an explicit fill(0) (a variable with no initializer is uninitialized).
+// writes 10 + i; the body ignores it), d declares nothing (zeros by default: the implicit zero initializer).
 struct InitDemoBody {
     struct Inputs {
         cs::Input<DType::f32, 1> x, w, u, v, d, m;
@@ -523,7 +523,6 @@ public:
                             }}));
         // The custom function gets the unordered queue, the device, the events its work must follow, and the
         // Initializer; it enqueues its own kernel with those events and RETURNS that kernel's event (init.hpp).
-        init_input("d", cs::init::fill(0.0f));
         init_input("m", cs::init::custom<DType::f32, 1>(cs::init::CustomFn<DType::f32, 1>{
                             [](sk::unordered_queue& q, const sycl::device& dev, const std::vector<sycl::event>& deps,
                                cs::Initializer<DType::f32, 1> out) {
@@ -729,7 +728,7 @@ TEST_CASE("host component chain: producer -> host prefix sum -> consumer", "[com
 TEST_CASE("custom op: device_ptr at submission is the storage the consumer reads", "[component][customop]") {
     auto model = cs::create_model<tc::TopCustomOp>(default_config());
     model.setup();
-    auto w = wait_and_view<DType::f32, 1>(model, "plus1.w");
+    (void)wait_and_view<DType::f32, 1>(model, "plus1.w");  // runs the model; only the recorded pointers are checked
 
     // The device data of the variables, read off the instances (the old per-root storage_on(placement) is gone).
     auto&       rec      = dynamic_cast<tc::Recorder&>((*model.get_subsystem("rec")));
@@ -739,16 +738,13 @@ TEST_CASE("custom op: device_ptr at submission is the storage the consumer reads
     CHECK(rec.in_rec.load() == want_in);
     CHECK(rec.out_rec.load() != nullptr);
     CHECK(rec.out_rec.load() == want_out);
-
-    // The recorder wrote nothing, so its output holds whatever the allocation held (allocations are uninitialized): only
-    // the shape of what the consumer produced is defined.
-    REQUIRE(w.size() == tc::kN);
+    // (The recorder writes nothing and an output is never initialized, so its values are not checked.)
 }
 
 // =============================================================================================
 // Initializers and phase guards
 // =============================================================================================
-TEST_CASE("initial values: fill / zero / from_host / custom / custom_host / fill(0)", "[component][init]") {
+TEST_CASE("initial values: fill / zero / from_host / custom / custom_host, and zeros by default", "[component][init]") {
     tc::g_host_calls   = 0;
     tc::g_custom_calls = 0;
     tc::g_custom_size  = 0;
@@ -763,7 +759,7 @@ TEST_CASE("initial values: fill / zero / from_host / custom / custom_host / fill
         CHECK(to_vector(cst::synced_input<DType::f32, 1>(model, "ini.u")) == std::vector<float>(4, 0.0f));  // zero
         CHECK(to_vector(cst::synced_input<DType::f32, 1>(model, "ini.v")) ==
               std::vector<float>({100.0f, 200.0f, 300.0f, 400.0f}));  // custom_host
-        CHECK(to_vector(cst::synced_input<DType::f32, 1>(model, "ini.d")) == std::vector<float>(4, 0.0f));  // fill(0)
+        CHECK(to_vector(cst::synced_input<DType::f32, 1>(model, "ini.d")) == std::vector<float>(4, 0.0f));  // default
     }
     SECTION("custom ran once, with the root's shape, and its device kernel wrote the values") {
         CHECK(tc::g_custom_calls.load() == 1);
