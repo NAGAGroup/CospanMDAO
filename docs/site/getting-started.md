@@ -119,7 +119,7 @@ public:
 };
 
 int main() {
-    cs::Model model = cs::create_model<App>(cs::ModelConfig{});
+    cs::Model model = cs::create_model<App>();
     model.setup();
 
     model.update_input("axpb.x", cs::init::from_host(std::vector<float>{1, 2, 3, 4}));

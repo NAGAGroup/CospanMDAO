@@ -4,15 +4,16 @@
 // naga/cospan/model.hpp — the Model
 // =============================================================================
 //
-// The Model owns one sk::context, one sk::queue (containers), one sk::unordered_queue (kernels and host tasks, ordered
-// by events only), one pool per device (sized by the user up front), the root System, and the marks. It drives the
+// The Model owns one sk::context (EVERY available root device: sk::context{}), one sk::queue (containers), one sk::unordered_queue (kernels and host tasks, ordered
+// by events only), one pool per context device (sized by the pool_desc that covers it, else 0 bytes), the root System, and the marks. It drives the
 // two setup passes of docs/design-review-2026-10-03.md, section 2, and never touches a Subsystem except through the
 // Subsystem verbs:
 //   setup:    the root's run_setup, recursive through add_subsystem.
 //   finalize: collects the marks (design variables, constraints, objectives) by absolute path, as weak pointers to
 //             their instances. Nothing else.
-// Setup never allocates, never submits and never compiles. There is no default device (section 2): every instance
-// takes AdaptiveCpp's default when it is declared, and a device given to add_subsystem overrides a subtree.
+// Setup never allocates, never submits and never compiles. The Model is configured by descriptors
+// (model_config.hpp). There is no device gating: any context device may be given to add_subsystem, whether or not a pool_desc
+// names it. There is no default device (section 2): every instance takes AdaptiveCpp's default when it is declared, and a device given to add_subsystem overrides a subtree.
 //
 // The forward (section 3), host views and update_input (section 5) and the memory report are all here.
 //
@@ -32,6 +33,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -42,34 +44,13 @@
 #include "naga/cospan/host_view.hpp"
 #include "naga/cospan/instance.hpp"
 #include "naga/cospan/metadata.hpp"
+#include "naga/cospan/model_config.hpp"
 #include "naga/cospan/runtime.hpp"
 #include "naga/cospan/subsystem.hpp"
 #include "naga/cospan/system.hpp"
 #include "naga/cospan/wiring.hpp"
 
 namespace naga::cospan {
-
-struct ModelConfig {
-    /// The platform context every device of the model lives in.
-    sk::context ctx;
-
-    /// The runtime's default-selector device only.
-    ModelConfig() : ctx(sycl::device{sycl::default_selector_v}) {}
-    explicit ModelConfig(sk::context c) : ctx(std::move(c)) {}
-    /// A context over exactly these devices.
-    explicit ModelConfig(std::span<const sycl::device> devices)
-        : ctx(std::vector<sycl::device>(devices.begin(), devices.end())) {}
-
-    /// Per-device pool sizes in bytes; a device not listed gets `default_pool_bytes`. EVERY context device gets a pool:
-    /// 0 is a pool of zero bytes, which serves nothing, so every allocation takes the OS route and is counted
-    /// (design review, section 9). `pool_node_size` is the page granularity (section 2).
-    std::unordered_map<sycl::device, std::size_t> pool_bytes;
-    std::size_t                                   default_pool_bytes = 0;
-    std::size_t                                   pool_node_size     = 1024;
-
-    /// Handed to both queues at construction; reached by wait().
-    std::optional<sycl::async_handler> async_handler;
-};
 
 /// One mark, by absolute path, collected at the end of setup. The instance is held weakly: a mark on a deleted
 /// subsystem's instance expires.
@@ -144,15 +125,29 @@ private:
     std::shared_ptr<detail::Instance> inst_;
 };
 
-/// THE factory: constructs the root System with `args...` and the Model around it.
+namespace detail {
+/// Whether the first of `Args` decays to model_config_desc (false for no arguments).
+template <class... Args>
+inline constexpr bool first_is_config_v = false;
+template <class A, class... Rest>
+inline constexpr bool first_is_config_v<A, Rest...> = std::is_same_v<std::remove_cvref_t<A>, model_config_desc>;
+}  // namespace detail
+
+/// THE factory: constructs the root System with `args...` and the Model around it. The second form takes a
+/// model_config_desc first (selected when the first argument's decayed type is model_config_desc).
 template <class Sys, class... Args>
-    requires std::derived_from<Sys, System>
-Model create_model(ModelConfig cfg, Args&&... args);
+    requires(std::derived_from<Sys, System> && !detail::first_is_config_v<Args...>)
+Model create_model(Args&&... args);
+
+template <class Sys, class Cfg, class... Args>
+    requires(std::derived_from<Sys, System> && std::is_same_v<std::remove_cvref_t<Cfg>, model_config_desc>)
+Model create_model(Cfg&& cfg, Args&&... args);
 
 class Model {
 public:
     /// Use create_model. Throws std::invalid_argument for a null root.
-    Model(ModelConfig cfg, std::unique_ptr<System> root) : s_{std::make_unique<Impl>(std::move(cfg), std::move(root))} {}
+    Model(model_config_desc cfg, std::unique_ptr<System> root)
+        : s_{std::make_unique<Impl>(std::move(cfg.data_), std::move(root))} {}
 
     Model(Model&&) noexcept = default;
     Model& operator=(Model&& o) noexcept {
@@ -270,8 +265,9 @@ public:
             std::size_t pool_bytes = 0, pool_bytes_in_use = 0;    ///< slots x node size
             std::size_t os_allocations = 0, os_bytes_in_use = 0;  ///< allocations the pool sent to the OS (cumulative) and the bytes of those still live
         };
-        /// Every context device has an entry: a device without a configured size is a pool of 0 bytes, whose allocations
-        /// all count as OS allocations.
+        /// The devices whose pool has bytes, or that recorded any allocation (pool or OS route), and no others: a device
+        /// without a configured size is a pool of 0 bytes, whose allocations all count as OS allocations, so it appears once
+        /// it has had one.
         std::unordered_map<sycl::device, PerDevice> devices;
     };
     MemoryReport memory_report() const {
@@ -283,7 +279,7 @@ public:
             p.pool_bytes_in_use = pool.outstanding() * pool.node_size();
             p.os_allocations    = pool.fallback_allocations();
             p.os_bytes_in_use   = pool.fallback_bytes_in_use();
-            r.devices.emplace(d, p);
+            if (p.pool_bytes > 0 || p.os_allocations > 0) r.devices.emplace(d, p);
         }
         return r;
     }
@@ -295,26 +291,79 @@ public:
 
 private:
     struct Impl {
-        Impl(ModelConfig cfg_in, std::unique_ptr<System> r)
-            : ctx(cfg_in.ctx)
-            , queue{ctx, cfg_in.async_handler.value_or(sycl::async_handler{})}
-            , uqueue{ctx, cfg_in.async_handler.value_or(sycl::async_handler{})}
+        Impl(detail::ResolvedConfig cfg_in, std::unique_ptr<System> r)
+            : ctx{}  // every available root device
+            , queue{make_queue(ctx, cfg_in)}
+            , uqueue{make_uqueue(ctx, cfg_in)}
             , rt{queue, uqueue, build_pools(ctx, queue, cfg_in)}
             , root{std::move(r)}
             , cfg{std::move(cfg_in)} {
             if (!root) throw std::invalid_argument("naga::cospan: Model needs a root System");
         }
 
-        /// One pool per context device, sized by its own entry, else the default (possibly 0: a zero-byte pool serves
+        // The async handler, when given, goes to both queues; otherwise the no-handler constructors. The context covers every
+        // device, so the queues name their default device (the one an unplaced operation runs on): AdaptiveCpp's default,
+        // not the context's first device, which may be another backend's.
+        static sk::queue make_queue(const sk::context& c, const detail::ResolvedConfig& d) {
+            if (d.async_handler) return sk::queue{c, detail::default_device(), *d.async_handler};
+            return sk::queue{c, detail::default_device()};
+        }
+        static sk::unordered_queue make_uqueue(const sk::context& c, const detail::ResolvedConfig& d) {
+            if (d.async_handler) return sk::unordered_queue{c, detail::default_device(), *d.async_handler};
+            return sk::unordered_queue{c, detail::default_device()};
+        }
+
+        static std::string name_of(const sycl::device& d) { return d.get_info<sycl::info::device::name>(); }
+
+        /// The (bytes, node size) each context device gets: from the pool_desc that covers it, else 0 bytes and 1024.
+        /// Throws std::invalid_argument, naming the device, for a device covered twice (by two pool_descs or twice in one
+        /// list), cs::all_devices combined with another pool_desc, or a named device that is not in the context.
+        static std::vector<std::pair<std::size_t, std::size_t>> resolve_pools(const sk::context& ctx, const detail::ResolvedConfig& c) {
+            const auto devices = ctx.devices();
+            std::vector<std::pair<std::size_t, std::size_t>> out(devices.size(), {std::size_t{0}, std::size_t{1024}});
+            std::vector<bool>                                covered(devices.size(), false);
+            const auto index_of = [&](const sycl::device& d) -> std::size_t {
+                for (std::size_t i = 0; i < devices.size(); ++i)
+                    if (devices[i] == d) return i;
+                throw std::invalid_argument("naga::cospan: pool_desc names device '" + name_of(d) + "', which is not in the model's context");
+            };
+            for (const detail::PoolEntry& e : c.pools) {
+                if (e.all && c.pools.size() > 1) {
+                    // name a device the other pool_desc covers
+                    const detail::PoolEntry* other = nullptr;
+                    for (const detail::PoolEntry& o : c.pools)
+                        if (&o != &e) {
+                            other = &o;
+                            break;
+                        }
+                    const sycl::device d = (other != nullptr && !other->all && !other->devices.empty()) ? other->devices.front() : devices.front();
+                    throw std::invalid_argument("naga::cospan: cs::all_devices cannot be combined with another pool_desc: device '" + name_of(d) +
+                                                "' would be covered twice");
+                }
+                const auto cover = [&](std::size_t i) {
+                    if (covered[i])
+                        throw std::invalid_argument("naga::cospan: device '" + name_of(devices[i]) +
+                                                    "' is covered by more than one pool_desc (or twice in one list)");
+                    covered[i] = true;
+                    out[i]     = {e.bytes, e.node_size};
+                };
+                if (e.all) {
+                    for (std::size_t i = 0; i < devices.size(); ++i) cover(i);
+                } else {
+                    for (const sycl::device& d : e.devices) cover(index_of(d));
+                }
+            }
+            return out;
+        }
+
+        /// One pool per context device, sized by the pool_desc that covers it, else 0 bytes (a zero-byte pool serves
         /// nothing and every allocation falls back and is counted). Built in place: a pool is not copied.
         static std::unordered_map<sycl::device, sk::DevicePool> build_pools(const sk::context& ctx, const sk::queue& q,
-                                                                           const ModelConfig& c) {
+                                                                           const detail::ResolvedConfig& c) {
+            const auto                                       sizes = resolve_pools(ctx, c);
             std::unordered_map<sycl::device, sk::DevicePool> pools;
-            for (const sycl::device& d : ctx.devices()) {
-                const auto        it    = c.pool_bytes.find(d);
-                const std::size_t bytes = it != c.pool_bytes.end() ? it->second : c.default_pool_bytes;
-                pools.try_emplace(d, q, d, sk::kind::device, bytes, c.pool_node_size);
-            }
+            for (std::size_t i = 0; i < ctx.devices().size(); ++i)
+                pools.try_emplace(ctx.devices()[i], q, ctx.devices()[i], sk::kind::device, sizes[i].first, sizes[i].second);
             return pools;
         }
 
@@ -326,7 +375,7 @@ private:
         detail::Runtime         rt;  ///< holds the pools by value
         std::unique_ptr<System> root;
         std::vector<Mark>       design_vars, constraints, objectives;
-        ModelConfig             cfg;
+        detail::ResolvedConfig cfg;
         bool                    setup_started = false;
         bool                    ready         = false;
     };
@@ -391,9 +440,15 @@ private:
 };
 
 template <class Sys, class... Args>
-    requires std::derived_from<Sys, System>
-Model create_model(ModelConfig cfg, Args&&... args) {
-    return Model{std::move(cfg), std::make_unique<Sys>(std::forward<Args>(args)...)};
+    requires(std::derived_from<Sys, System> && !detail::first_is_config_v<Args...>)
+Model create_model(Args&&... args) {
+    return Model{model_config_desc{}, std::make_unique<Sys>(std::forward<Args>(args)...)};
+}
+
+template <class Sys, class Cfg, class... Args>
+    requires(std::derived_from<Sys, System> && std::is_same_v<std::remove_cvref_t<Cfg>, model_config_desc>)
+Model create_model(Cfg&& cfg, Args&&... args) {
+    return Model{std::forward<Cfg>(cfg), std::make_unique<Sys>(std::forward<Args>(args)...)};
 }
 
 }  // namespace naga::cospan

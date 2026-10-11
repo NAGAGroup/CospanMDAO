@@ -31,15 +31,13 @@ namespace cs = naga::cospan;
 namespace sk = naga::slabkit;
 using cs::DType;
 
-/// The configuration every test uses: the runtime's default device, one context, no pool.
-inline cs::ModelConfig default_config() { return cs::ModelConfig{}; }
+/// The configuration every test uses: no descriptors, so no pool on any device (every allocation takes the OS route).
+inline cs::model_config_desc default_config() { return cs::model_config_desc{}; }
 
 /// default_config() plus a 1 MiB pool on every device: transient roots draw from it, so
 /// pool_in_use() measures what they hold.
-inline cs::ModelConfig pooled_config() {
-    cs::ModelConfig cfg = cs::ModelConfig{};
-    cfg.default_pool_bytes = std::size_t{1} << 20;
-    return cfg;
+inline cs::model_config_desc pooled_config() {
+    return cs::model_config_desc{cs::pool_desc{cs::all_devices, std::size_t{1} << 20}};
 }
 
 /// Pool bytes handed out right now, summed over the model's devices (between runs).
@@ -49,7 +47,7 @@ inline std::size_t pool_in_use(const cs::Model& m) {
     return total;
 }
 
-/// The pool's node size (ModelConfig::pool_node_size, 1024 by default).
+/// The pool's node size (cs::node_size_desc, 1024 by default).
 inline constexpr std::size_t pool_node_bytes = 1024;
 
 /// What a container of `bytes` takes from a pool: its capacity rounded up to whole nodes (0 for no storage). The pool's

@@ -132,12 +132,12 @@ constexpr bool same_order_as_unfused(Variant v) {
 /// n and R live in the root system's constructor arguments only. The crafted chain's strips are kRt rows, not --R.
 cs::Model make_model(Variant v, const Options& o) {
     switch (v) {
-        case Variant::unfused: return cs::create_model<gc::Chain>(cs::ModelConfig{}, gc::Style::unfused, o.n, o.R);
-        case Variant::parallel: return cs::create_model<gc::Chain>(cs::ModelConfig{}, gc::Style::parallel, o.n, o.R);
-        case Variant::fused: return cs::create_model<gc::Chain>(cs::ModelConfig{}, gc::Style::fused, o.n, o.R);
-        case Variant::onepass: return cs::create_model<gc::Chain>(cs::ModelConfig{}, gc::Style::onepass, o.n, o.R);
-        case Variant::naive: return cs::create_model<gc::Chain>(cs::ModelConfig{}, gc::Style::naive, o.n, o.R);
-        case Variant::crafted: return cs::create_model<gc::Chain>(cs::ModelConfig{}, gc::Style::crafted, o.n, static_cast<int>(gc::kRt));
+        case Variant::unfused: return cs::create_model<gc::Chain>(gc::Style::unfused, o.n, o.R);
+        case Variant::parallel: return cs::create_model<gc::Chain>(gc::Style::parallel, o.n, o.R);
+        case Variant::fused: return cs::create_model<gc::Chain>(gc::Style::fused, o.n, o.R);
+        case Variant::onepass: return cs::create_model<gc::Chain>(gc::Style::onepass, o.n, o.R);
+        case Variant::naive: return cs::create_model<gc::Chain>(gc::Style::naive, o.n, o.R);
+        case Variant::crafted: return cs::create_model<gc::Chain>(gc::Style::crafted, o.n, static_cast<int>(gc::kRt));
     }
     throw std::logic_error("unknown variant");
 }
@@ -243,7 +243,7 @@ int main(int argc, char** argv) {
             o.variant != "onepass" && o.variant != "naive" && o.variant != "crafted")
             throw std::invalid_argument("--variant must be all|unfused|parallel|fused|onepass|naive|crafted");
 
-        // ModelConfig has no default device (design review, section 2): the systems add no device, so every instance runs on
+        // There is no model-wide default device (design review, section 2): the systems add no device, so every instance runs on
         // AdaptiveCpp's default device. This default_selector_v device is the same one; it is used only to print its name
         // and to detect the omp backend.
         const sycl::device dev{sycl::default_selector_v};

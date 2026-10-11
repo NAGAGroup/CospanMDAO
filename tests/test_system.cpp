@@ -2138,7 +2138,7 @@ public:
     void setup() override { build_(*this); }
 };
 
-inline cs::Model make(std::function<void(cs::System&)> build, cs::ModelConfig cfg = default_config()) {
+inline cs::Model make(std::function<void(cs::System&)> build, cs::model_config_desc cfg = default_config()) {
     return cs::create_model<FnSys>(std::move(cfg), std::move(build));
 }
 
@@ -3339,10 +3339,8 @@ TEST_CASE("depends_on: declaration errors", "[system][depends_on][errors]") {
 TEST_CASE("placement: a child placed by its author on device X, added by its parent on device Y, ends up on Y", "[system][placement]") {
     sycl::device first, host;
     if (!tsys::pick_two(first, host)) SKIP("a non-OpenMP device and the OpenMP host device are not both visible");
-    const std::array<sycl::device, 2> devs{first, host};
-    cs::ModelConfig                   cfg{std::span<const sycl::device>{devs}};
     // the author (PlacedInner) says `first`; the parent (DevTop) adds it on `host`
-    cs::Model model = cs::create_model<tsys::DevTop>(std::move(cfg), first, host);
+    cs::Model model = cs::create_model<tsys::DevTop>(default_config(), first, host);
     model.setup();
     CHECK(model.root().instance_at("in.k.x")->device == host);
     CHECK(model.root().instance_at("in.k.y")->device == host);
@@ -3356,9 +3354,7 @@ TEST_CASE("placement: a child placed by its author on device X, added by its par
 TEST_CASE("placement: a rebuilt child keeps the outer device", "[system][placement][rearm]") {
     sycl::device first, host;
     if (!tsys::pick_two(first, host)) SKIP("a non-OpenMP device and the OpenMP host device are not both visible");
-    const std::array<sycl::device, 2> devs{first, host};
-    cs::ModelConfig                   cfg{std::span<const sycl::device>{devs}};
-    cs::Model model = cs::create_model<tsys::DevTop>(std::move(cfg), first, host);
+    cs::Model model = cs::create_model<tsys::DevTop>(default_config(), first, host);
     model.setup();
     model.forward();
     model.wait();

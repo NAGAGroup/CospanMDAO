@@ -350,12 +350,6 @@ bool two_devices(sycl::device& def, sycl::device& other) {
     return false;
 }
 
-cs::ModelConfig config_on(const sycl::device& a, const sycl::device& b) {
-    static std::array<sycl::device, 2> devs;  // the span must outlive the config's construction only; kept static for clarity
-    devs = {a, b};
-    return cs::ModelConfig{std::span<const sycl::device>{devs}};
-}
-
 }  // namespace tp4
 
 // =============================================================================================
@@ -597,7 +591,7 @@ TEST_CASE("tie devices: tie_outputs refuses a member on another device at the ca
     sycl::device def, other;
     if (!tp4::two_devices(def, other)) SKIP("a non-OpenMP device and the OpenMP host device are not both visible");
     SECTION("the tie is on the default device; the member is elsewhere") {
-        cs::Model model = cs::create_model<tp4::TopFn>(tp4::config_on(def, other), [&](cs::System& s) {
+        cs::Model model = cs::create_model<tp4::TopFn>(default_config(), [&](cs::System& s) {
             s.add_subsystem(cs::subsystem_desc<tp4::Gen>("a", 1.0f));
             s.add_subsystem(other, cs::subsystem_desc<tp4::Gen>("b", 1.0f));
             s.tie_outputs<DType::f32, 1>({"a.y", "b.y"}, "t", cs::shape(tp4::kN), cs::TieOutputsPolicy::allow_plain);
@@ -605,7 +599,7 @@ TEST_CASE("tie devices: tie_outputs refuses a member on another device at the ca
         tp4::expect_throws_all([&] { model.setup(); }, {"tie_outputs", "every member on the tie's device", "'b.y' is on"});
     }
     SECTION("the tie is on the given device; a member is on the default one") {
-        cs::Model model = cs::create_model<tp4::TopFn>(tp4::config_on(def, other), [&](cs::System& s) {
+        cs::Model model = cs::create_model<tp4::TopFn>(default_config(), [&](cs::System& s) {
             s.add_subsystem(cs::subsystem_desc<tp4::Gen>("a", 1.0f));
             s.add_subsystem(other, cs::subsystem_desc<tp4::Gen>("b", 1.0f));
             s.tie_outputs<DType::f32, 1>({"a.y", "b.y"}, "t", cs::shape(tp4::kN), cs::TieOutputsPolicy::allow_plain, other);
@@ -613,7 +607,7 @@ TEST_CASE("tie devices: tie_outputs refuses a member on another device at the ca
         tp4::expect_throws_all([&] { model.setup(); }, {"tie_outputs", "every member on the tie's device", "'a.y' is on"});
     }
     SECTION("every member on the given device: fine") {
-        cs::Model model = cs::create_model<tp4::TopFn>(tp4::config_on(def, other), [&](cs::System& s) {
+        cs::Model model = cs::create_model<tp4::TopFn>(default_config(), [&](cs::System& s) {
             s.add_subsystem(other, cs::subsystem_desc<tp4::Half>("a", 0u, 4u));
             s.add_subsystem(other, cs::subsystem_desc<tp4::Half>("b", 4u, 8u));
             s.tie_outputs<DType::f32, 1>({"a.y", "b.y"}, "t", cs::shape(tp4::kN), cs::TieOutputsPolicy::allow_plain, other);
@@ -628,7 +622,7 @@ TEST_CASE("tie devices: tie_outputs refuses a member on another device at the ca
 TEST_CASE("tie devices: a member moved by set_device after the tie errors at the next forward", "[p4][tie][devices][errors]") {
     sycl::device def, other;
     if (!tp4::two_devices(def, other)) SKIP("a non-OpenMP device and the OpenMP host device are not both visible");
-    cs::Model model = cs::create_model<tp4::TopFn>(tp4::config_on(def, other), [](cs::System& s) {
+    cs::Model model = cs::create_model<tp4::TopFn>(default_config(), [](cs::System& s) {
         s.add_subsystem(cs::subsystem_desc<tp4::Gen>("a", 1.0f));
         s.add_subsystem(cs::subsystem_desc<tp4::Gen>("b", 1.0f));
         s.tie_outputs<DType::f32, 1>({"a.y", "b.y"}, "t", cs::shape(tp4::kN), cs::TieOutputsPolicy::allow_plain);
@@ -644,7 +638,7 @@ TEST_CASE("tie devices: a device given to add_subsystem moves the whole subtree,
     sycl::device def, other;
     if (!tp4::two_devices(def, other)) SKIP("a non-OpenMP device and the OpenMP host device are not both visible");
     // TieInner ties on the default device in its own setup; the outer call moves members and alias together.
-    cs::Model model = cs::create_model<tp4::TopFn>(tp4::config_on(def, other), [&](cs::System& s) {
+    cs::Model model = cs::create_model<tp4::TopFn>(default_config(), [&](cs::System& s) {
         s.add_subsystem(other, cs::subsystem_desc<tp4::TieInner>("in", true, false));
     });
     model.setup();
@@ -658,7 +652,7 @@ TEST_CASE("tie devices: tie_inputs on a given device, and a moved subtree moves 
     sycl::device def, other;
     if (!tp4::two_devices(def, other)) SKIP("a non-OpenMP device and the OpenMP host device are not both visible");
     SECTION("an explicit device") {
-        cs::Model model = cs::create_model<tp4::TopFn>(tp4::config_on(def, other), [&](cs::System& s) {
+        cs::Model model = cs::create_model<tp4::TopFn>(default_config(), [&](cs::System& s) {
             s.add_subsystem(cs::subsystem_desc<tp4::Axpb>("a", 2.0f, 0.0f));
             s.add_subsystem(cs::subsystem_desc<tp4::Axpb>("b", 3.0f, 0.0f));
             s.tie_inputs<DType::f32, 1>({"a.x", "b.x"}, "x", cs::shape(tp4::kN), other);
@@ -673,7 +667,7 @@ TEST_CASE("tie devices: tie_inputs on a given device, and a moved subtree moves 
         CHECK(tp4::out(model, "b.y") == tp4::filled(6.0f));
     }
     SECTION("the subtree moved") {
-        cs::Model model = cs::create_model<tp4::TopFn>(tp4::config_on(def, other), [&](cs::System& s) {
+        cs::Model model = cs::create_model<tp4::TopFn>(default_config(), [&](cs::System& s) {
             s.add_subsystem(other, cs::subsystem_desc<tp4::TieInner>("in", false, false));
         });
         model.setup();
@@ -744,7 +738,7 @@ TEST_CASE("tied outputs: a consumer on another device right after the members re
           "[p4][tie][devices][push]") {
     sycl::device def, other;
     if (!tp4::two_devices(def, other)) SKIP("a non-OpenMP device and the OpenMP host device are not both visible");
-    cs::Model model = cs::create_model<tp4::TopFn>(tp4::config_on(def, other), [&](cs::System& s) {
+    cs::Model model = cs::create_model<tp4::TopFn>(default_config(), [&](cs::System& s) {
         s.add_subsystem(cs::subsystem_desc<tp4::Half>("a", 0u, 4u));  // each member writes half of the tie
         s.add_subsystem(cs::subsystem_desc<tp4::Half>("b", 4u, 8u));
         s.add_subsystem(other, cs::subsystem_desc<tp4::Axpb>("c", 1.0f, 0.0f));  // reads the tie on the other device

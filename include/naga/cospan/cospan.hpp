@@ -19,4 +19,5 @@
 #include "naga/cospan/shape_hook.hpp"
 #include "naga/cospan/system.hpp"
 #include "naga/cospan/fused_component.hpp"
+#include "naga/cospan/model_config.hpp"
 #include "naga/cospan/model.hpp"

@@ -160,7 +160,7 @@ template <class Top>
 Result run_cospan(const char* name, bool fused, const Options& o) {
     Result r;
     r.name = name;
-    cs::Model   model = cs::create_model<Top>(cs::ModelConfig{}, o.nx, o.ny);
+    cs::Model   model = cs::create_model<Top>(o.nx, o.ny);
     const Paths p     = paths(fused);
     try {
         model.setup();

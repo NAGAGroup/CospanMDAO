@@ -70,9 +70,8 @@ public:
 };
 
 int main() {
-    cs::ModelConfig cfg;                                     // the default device
-    cfg.default_pool_bytes = 64u << 20;                      // a 64 MiB pool per device
-    cs::Model model = cs::create_model<Chain>(cfg);
+    cs::Model model = cs::create_model<Chain>(
+        cs::model_config_desc{cs::pool_desc{cs::all_devices, 64u << 20}});  // a 64 MiB pool on every device
     model.setup();                                           // wiring and shape rules are checked here
 
     model.update_input("a.x", cs::init::from_host(std::vector<float>{1, 2, 3, 4}));  // supplies a.x and its shape

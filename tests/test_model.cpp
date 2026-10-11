@@ -15,6 +15,8 @@
 //   5. Memory report    a small static model computes; the pool report (there is no arena)
 //   6. Pool             a pool on the device and a value-driven (shape hook) output root
 //   7. Two devices      producer and consumer on different devices of one context
+//   9. Descriptors      create_model forms, model_config_desc, pool_desc / node_size_desc / async_handler_desc, the overlap errors,
+//                       uncovered devices, memory_report contents
 //
 // The components live in namespace tmod.
 
@@ -848,13 +850,12 @@ TEST_CASE("Memory report: a static model computes; the pool report after setup a
 
 TEST_CASE("Memory report: a device without a configured pool is a zero-byte pool, and its allocations count as OS ones",
           "[model][memory]") {
-    // Design review, section 9: every context device gets a pool, possibly of 0 bytes (default_config() sets no size).
+    // Every context device gets a pool, possibly of 0 bytes (default_config() sets no size); the report lists a device only
+    // once it has bytes or has recorded an allocation.
     const sycl::device dev{sycl::default_selector_v};
     auto               model = cs::create_model<tmod::MemTop>(default_config());
     model.setup();
-    const auto before = tmod::report_on(model, dev);  // an entry exists before anything ran
-    CHECK(before.pool_bytes == 0);
-    CHECK(before.os_allocations == 0);
+    CHECK(model.memory_report().devices.empty());  // nothing has allocated yet, and no device has pool bytes
     std::array<float, 8> bc{};
     model.update_input("bc", cs::init::from_host(std::vector<float>{bc.begin(), bc.end()}));
     cst::forward_and_wait(model);
@@ -870,9 +871,8 @@ TEST_CASE("Memory report: a device without a configured pool is a zero-byte pool
 // =============================================================================================
 TEST_CASE("Pool: a value-driven root allocates from the pool and follows update_input", "[model][pool]") {
     const sycl::device dev{sycl::default_selector_v};
-    cs::ModelConfig    cfg = default_config();
-    cfg.default_pool_bytes = std::size_t{1} << 20;  // 1 MiB, in nodes of the default 1024 B
-    auto model             = cs::create_model<tmod::PoolTop>(std::move(cfg));
+    // 1 MiB on the default device, in nodes of the default 1024 B
+    auto model = cs::create_model<tmod::PoolTop>(cs::model_config_desc{cs::pool_desc{dev, std::size_t{1} << 20}});
     model.setup();
     // A pool is sized up front (section 2): its whole capacity is reported before the first allocation, with nothing in use.
     CHECK(tmod::report_on(model, dev).pool_bytes == (std::size_t{1} << 20));
@@ -917,17 +917,16 @@ TEST_CASE("Two devices: a producer on one, its consumer on the other", "[model][
     sycl::device first, host;
     if (!tmod::pick_two(first, host)) SKIP("a non-OpenMP device and the OpenMP host device are not both visible");
 
-    // ModelConfig has no default_device (design review, section 2): every instance takes AdaptiveCpp's default and a device
+    // There is no model-wide default device (design review, section 2): every instance takes AdaptiveCpp's default and a device
     // given to add_subsystem overrides a subtree. So the default-selector device must be one of the two, and `mid` goes to
     // the other one; the case skips otherwise.
     const sycl::device dflt = cs::detail::default_device();
     if (dflt != first && dflt != host) SKIP("the default device is neither of the two devices picked");
     const sycl::device other = (dflt == first) ? host : first;
 
-    const std::array<sycl::device, 2> devs{first, host};
-    cs::ModelConfig                   cfg{std::span<const sycl::device>{devs}};
-    cfg.default_pool_bytes = std::size_t{1} << 20;  // a real pool on each device, so both report pool bytes in use
-    auto model             = cs::create_model<tmod::TwoDevTop>(std::move(cfg), other);
+    // a real pool on each of the two devices, so both report pool bytes in use
+    auto model = cs::create_model<tmod::TwoDevTop>(
+        cs::model_config_desc{cs::pool_desc{std::vector<sycl::device>{first, host}, std::size_t{1} << 20}}, other);
     model.setup();
 
     CHECK(model.root().instance_at("src.y")->device == dflt);
@@ -948,8 +947,8 @@ TEST_CASE("Two devices: a producer on one, its consumer on the other", "[model][
         CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "out.y")) == want_out);
     }
 
-    // Every context device has a pool (ModelConfig::default_pool_bytes) and a device-kind container draws from its device's
-    // pool, so bytes are in use on both after a forward.
+    // Both devices have a pool (the pool_desc) and a device-kind container draws from its device's pool, so bytes are in
+    // use on both after a forward.
     const auto rep = model.memory_report();
     CHECK(rep.devices.size() == 2);
     CHECK(rep.devices.at(first).pool_bytes_in_use > 0);
@@ -1061,4 +1060,306 @@ TEST_CASE("init: update_input on a connected input warns and is not applied; on 
           std::vector<float>(tmod::kLen, 1.0f));  // p.y = 1, not 9
 
     CHECK_THROWS_AS(model.update_input("p.y", cs::init::fill(1.0f)), std::invalid_argument);
+}
+
+
+// =============================================================================================
+// 9. Configuration by descriptors (model_config_desc, pool_desc, node_size_desc, async_handler_desc)
+// =============================================================================================
+namespace tmod {
+
+/// One Axpb p (y = 1 * x + b, x zero): every element of p.y is b.
+class ArgTop : public cs::System {
+    float b_;
+
+public:
+    explicit ArgTop(float b) : b_{b} {}
+    void setup() override { add_subsystem(cs::subsystem_desc<Axpb>("p", 1.0f, b_)); }
+};
+
+/// The same, with p placed on `dev` (add_subsystem is given the device).
+class PlacedTop : public cs::System {
+    sycl::device dev_;
+    float        b_;
+
+public:
+    PlacedTop(const sycl::device& dev, float b) : dev_{dev}, b_{b} {}
+    void setup() override { add_subsystem(dev_, cs::subsystem_desc<Axpb>("p", 1.0f, b_)); }
+};
+
+/// A host component that throws; the exception reaches the queue asynchronously.
+class Thrower : public cs::Component<Thrower> {
+public:
+    struct Inputs {
+        cs::Input<DType::f32, 1> x;
+    };
+    struct Outputs {
+        cs::Output<DType::f32, 1> y;
+    };
+    static void compute_impl(cs::Host, const Inputs&, const Outputs&) { throw std::runtime_error("tmod: asynchronous boom"); }
+    Inputs  inputs;
+    Outputs outputs;
+    void setup() override {
+        declare_input(inputs.x, "x", 4);
+        declare_output(outputs.y, "y", 4);
+    }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(); }
+};
+class ThrowTop : public cs::System {
+public:
+    void setup() override { add_subsystem(cs::subsystem_desc<Thrower>("t")); }
+};
+
+inline int         g_async_errors = 0;   // what the async_handler_desc handler saw
+inline std::string g_async_message;
+
+/// Every root device SYCL reports (what the Model's context covers).
+inline std::vector<sycl::device> all_root_devices() {
+    const sk::context ctx{};
+    return std::vector<sycl::device>(ctx.devices().begin(), ctx.devices().end());
+}
+
+/// forward, wait, and p.y read back: true when every element is `want`.
+inline bool p_is(cs::Model& m, float want) {
+    cst::forward_and_wait(m);
+    return to_vector(cst::synced_output<DType::f32, 1>(m, "p.y")) == std::vector<float>(kLen, want);
+}
+
+}  // namespace tmod
+
+TEST_CASE("create_model: no arguments, root arguments only, and a model_config_desc with root arguments", "[model][config]") {
+    SECTION("no arguments") {
+        auto model = cs::create_model<tmod::ChainTop>();
+        model.setup();
+        cst::forward_and_wait(model);
+        CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "q.y")) == std::vector<float>(tmod::kLen, 1.0f));
+    }
+    SECTION("root arguments only") {
+        auto model = cs::create_model<tmod::ArgTop>(3.0f);
+        model.setup();
+        CHECK(tmod::p_is(model, 3.0f));
+    }
+    SECTION("a model_config_desc, then root arguments") {
+        auto model = cs::create_model<tmod::ArgTop>(cs::model_config_desc{cs::pool_desc{cs::all_devices, std::size_t{1} << 20}}, 4.0f);
+        model.setup();
+        CHECK(tmod::p_is(model, 4.0f));
+    }
+    SECTION("a model_config_desc lvalue, then no root arguments") {
+        const cs::model_config_desc cfg{};
+        auto                        model = cs::create_model<tmod::ChainTop>(cfg);
+        model.setup();
+        cst::forward_and_wait(model);
+        CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "q.y")) == std::vector<float>(tmod::kLen, 1.0f));
+    }
+}
+
+TEST_CASE("model_config_desc: descriptors in either order", "[model][config]") {
+    const sycl::device dev{sycl::default_selector_v};
+    const auto         handler = [](sycl::exception_list) {};
+    SECTION("pool_desc, then async_handler_desc") {
+        auto model = cs::create_model<tmod::ArgTop>(
+            cs::model_config_desc{cs::pool_desc{dev, std::size_t{1} << 20}, cs::async_handler_desc{handler}}, 2.0f);
+        model.setup();
+        CHECK(tmod::p_is(model, 2.0f));
+        CHECK(tmod::report_on(model, dev).pool_bytes == (std::size_t{1} << 20));
+    }
+    SECTION("async_handler_desc, then pool_desc") {
+        auto model = cs::create_model<tmod::ArgTop>(
+            cs::model_config_desc{cs::async_handler_desc{handler}, cs::pool_desc{dev, std::size_t{1} << 20}}, 2.0f);
+        model.setup();
+        CHECK(tmod::p_is(model, 2.0f));
+        CHECK(tmod::report_on(model, dev).pool_bytes == (std::size_t{1} << 20));
+    }
+    SECTION("two pool_descs on different devices, with a handler between them") {
+        const auto devs = tmod::all_root_devices();
+        if (devs.size() < 2) SKIP("only one device is visible");
+        auto model = cs::create_model<tmod::ArgTop>(
+            cs::model_config_desc{cs::pool_desc{devs[0], std::size_t{1} << 20}, cs::async_handler_desc{handler},
+                                  cs::pool_desc{devs[1], std::size_t{1} << 21}},
+            2.0f);
+        model.setup();
+        CHECK(tmod::p_is(model, 2.0f));
+        CHECK(tmod::report_on(model, devs[0]).pool_bytes == (std::size_t{1} << 20));
+        CHECK(tmod::report_on(model, devs[1]).pool_bytes == (std::size_t{1} << 21));
+    }
+}
+
+TEST_CASE("pool_desc: a device, a list of devices and cs::all_devices", "[model][config][pool]") {
+    const auto         devs = tmod::all_root_devices();
+    const sycl::device dev{sycl::default_selector_v};
+    constexpr std::size_t kBytes = std::size_t{1} << 20;
+    SECTION("one device: only that device has a pool") {
+        auto model = cs::create_model<tmod::ArgTop>(cs::model_config_desc{cs::pool_desc{dev, kBytes}}, 1.0f);
+        model.setup();
+        const auto rep = model.memory_report();
+        CHECK(rep.devices.size() == 1);
+        CHECK(tmod::report_on(model, dev).pool_bytes == kBytes);
+    }
+    SECTION("a list of devices: each has a pool of the given size") {
+        auto model = cs::create_model<tmod::ArgTop>(cs::model_config_desc{cs::pool_desc{devs, kBytes}}, 1.0f);
+        model.setup();
+        const auto rep = model.memory_report();
+        CHECK(rep.devices.size() == devs.size());
+        for (const sycl::device& d : devs) CHECK(tmod::report_on(model, d).pool_bytes == kBytes);
+    }
+    SECTION("cs::all_devices: every device has a pool") {
+        auto model = cs::create_model<tmod::ArgTop>(cs::model_config_desc{cs::pool_desc{cs::all_devices, kBytes}}, 1.0f);
+        model.setup();
+        const auto rep = model.memory_report();
+        CHECK(rep.devices.size() == devs.size());
+        for (const sycl::device& d : devs) CHECK(tmod::report_on(model, d).pool_bytes == kBytes);
+        CHECK(tmod::p_is(model, 1.0f));
+    }
+}
+
+TEST_CASE("pool_desc: a per-pool node size, and the default node size of 1024", "[model][config][pool]") {
+    const sycl::device dev{sycl::default_selector_v};
+    std::size_t        in_use_default = 0, in_use_4096 = 0;
+    {
+        auto model = cs::create_model<tmod::ArgTop>(cs::model_config_desc{cs::pool_desc{dev, std::size_t{1} << 20}}, 1.0f);
+        model.setup();
+        REQUIRE(tmod::p_is(model, 1.0f));
+        in_use_default = tmod::report_on(model, dev).pool_bytes_in_use;
+        CHECK(tmod::report_on(model, dev).pool_bytes == (std::size_t{1} << 20));
+    }
+    {
+        auto model = cs::create_model<tmod::ArgTop>(
+            cs::model_config_desc{cs::pool_desc{dev, std::size_t{1} << 20, cs::node_size_desc{4096}}}, 1.0f);
+        model.setup();
+        REQUIRE(tmod::p_is(model, 1.0f));
+        in_use_4096 = tmod::report_on(model, dev).pool_bytes_in_use;
+        CHECK(tmod::report_on(model, dev).pool_bytes == (std::size_t{1} << 20));
+    }
+    // Every container takes whole nodes: multiples of 1024 by default, of 4096 with the larger node.
+    CHECK(in_use_default > 0);
+    CHECK(in_use_default % 1024 == 0);
+    CHECK(in_use_4096 % 4096 == 0);
+    CHECK(in_use_4096 >= in_use_default);
+}
+
+TEST_CASE("pool_desc: overlapping coverage is rejected, naming the device", "[model][config][pool]") {
+    const sycl::device dev{sycl::default_selector_v};
+    const std::string  name = dev.get_info<sycl::info::device::name>();
+    constexpr std::size_t kBytes = 4096;
+    SECTION("a device covered by two pool_descs") {
+        tmod::expect_throws([&] { (void)cs::create_model<tmod::ArgTop>(cs::model_config_desc{cs::pool_desc{dev, kBytes}, cs::pool_desc{dev, kBytes}}, 1.0f); },
+                            {name});
+        CHECK_THROWS_AS(cs::create_model<tmod::ArgTop>(cs::model_config_desc{cs::pool_desc{dev, kBytes}, cs::pool_desc{dev, kBytes}}, 1.0f),
+                        std::invalid_argument);
+    }
+    SECTION("a device twice in one list") {
+        const std::vector<sycl::device> twice{dev, dev};
+        tmod::expect_throws([&] { (void)cs::create_model<tmod::ArgTop>(cs::model_config_desc{cs::pool_desc{twice, kBytes}}, 1.0f); }, {name});
+        CHECK_THROWS_AS(cs::create_model<tmod::ArgTop>(cs::model_config_desc{cs::pool_desc{twice, kBytes}}, 1.0f), std::invalid_argument);
+    }
+    SECTION("cs::all_devices combined with a device pool_desc, in either order") {
+        CHECK_THROWS_AS(cs::create_model<tmod::ArgTop>(cs::model_config_desc{cs::pool_desc{cs::all_devices, kBytes}, cs::pool_desc{dev, kBytes}}, 1.0f),
+                        std::invalid_argument);
+        tmod::expect_throws([&] { (void)cs::create_model<tmod::ArgTop>(cs::model_config_desc{cs::pool_desc{dev, kBytes}, cs::pool_desc{cs::all_devices, kBytes}}, 1.0f); },
+                            {name});
+    }
+    SECTION("cs::all_devices combined with another cs::all_devices") {
+        CHECK_THROWS_AS(cs::create_model<tmod::ArgTop>(cs::model_config_desc{cs::pool_desc{cs::all_devices, kBytes}, cs::pool_desc{cs::all_devices, kBytes}}, 1.0f),
+                        std::invalid_argument);
+    }
+}
+
+TEST_CASE("an uncovered device is a pool of 0 bytes: its allocations take the OS route and are counted", "[model][config][memory]") {
+    const sycl::device dev{sycl::default_selector_v};
+    const auto         devs = tmod::all_root_devices();
+    // Cover a device other than the default one when there is one; otherwise no pool_desc at all.
+    cs::model_config_desc cfg{};
+    for (const sycl::device& d : devs)
+        if (d != dev) {
+            cfg = cs::model_config_desc{cs::pool_desc{d, std::size_t{1} << 20}};
+            break;
+        }
+    auto model = cs::create_model<tmod::ArgTop>(std::move(cfg), 5.0f);
+    model.setup();
+    CHECK(tmod::p_is(model, 5.0f));
+    const auto rep = tmod::report_on(model, dev);
+    CHECK(rep.pool_bytes == 0);
+    CHECK(rep.pool_bytes_in_use == 0);
+    CHECK(rep.os_allocations > 0);
+    CHECK(rep.os_bytes_in_use > 0);
+}
+
+TEST_CASE("a subsystem placed on a device no pool_desc names runs correctly", "[model][config][devices]") {
+    const sycl::device dflt{sycl::default_selector_v};
+    const auto         devs = tmod::all_root_devices();
+    if (devs.size() < 2) SKIP("only one device is visible");
+    sycl::device other = devs[0];
+    for (const sycl::device& d : devs)
+        if (d != dflt) {
+            other = d;
+            break;
+        }
+    // The only pool is on the default device; p goes to the other one, which no pool_desc names.
+    auto model = cs::create_model<tmod::PlacedTop>(cs::model_config_desc{cs::pool_desc{dflt, std::size_t{1} << 20}}, other, 6.0f);
+    model.setup();
+    CHECK(model.root().instance_at("p.y")->device == other);
+    CHECK(tmod::p_is(model, 6.0f));
+    CHECK(tmod::report_on(model, other).os_allocations > 0);
+}
+
+TEST_CASE("memory_report lists devices whose pool has bytes or that recorded an allocation, and no others", "[model][config][memory]") {
+    const auto         devs = tmod::all_root_devices();
+    const sycl::device dflt{sycl::default_selector_v};
+    SECTION("no pool and nothing run: empty") {
+        auto model = cs::create_model<tmod::ArgTop>(1.0f);
+        model.setup();
+        CHECK(model.memory_report().devices.empty());
+    }
+    SECTION("a pool on the default device only: that device, before and after a run") {
+        auto model = cs::create_model<tmod::ArgTop>(cs::model_config_desc{cs::pool_desc{dflt, std::size_t{1} << 20}}, 1.0f);
+        model.setup();
+        CHECK(model.memory_report().devices.size() == 1);
+        CHECK(tmod::p_is(model, 1.0f));
+        const auto rep = model.memory_report();
+        CHECK(rep.devices.size() == 1);
+        for (const sycl::device& d : devs) CHECK(rep.devices.count(d) == (d == dflt ? 1u : 0u));
+    }
+    SECTION("an uncovered device appears once it has allocated") {
+        if (devs.size() < 2) SKIP("only one device is visible");
+        sycl::device other = devs[0];
+        for (const sycl::device& d : devs)
+            if (d != dflt) {
+                other = d;
+                break;
+            }
+        auto model = cs::create_model<tmod::PlacedTop>(other, 1.0f);
+        model.setup();
+        CHECK(model.memory_report().devices.empty());
+        CHECK(tmod::p_is(model, 1.0f));
+        const auto rep = model.memory_report();
+        CHECK(rep.devices.count(other) == 1);
+        CHECK(rep.devices.at(other).pool_bytes == 0);
+        CHECK(rep.devices.at(other).os_allocations > 0);
+    }
+}
+
+TEST_CASE("async_handler_desc: a model built with a handler runs and waits normally; a host task's exception still surfaces from wait()", "[model][config][async]") {
+    // SlabKit keeps a host callable's exception itself (queue.cpp, state_throw_asynchronous: "the runtime has no way to be
+    // told about it"), so it never reaches the sycl::async_handler; wait() rethrows it. The handler is exercised by the runtime's
+    // own asynchronous errors, which no portable cospan model can provoke; here it is checked to be installed without disturbing
+    // either path.
+    tmod::g_async_errors = 0;
+    auto handler = [](sycl::exception_list list) {
+        for (const std::exception_ptr& e : list) {
+            (void)e;
+            ++tmod::g_async_errors;
+        }
+    };
+    SECTION("a normal model") {
+        auto model = cs::create_model<tmod::ArgTop>(cs::model_config_desc{cs::async_handler_desc{handler}}, 7.0f);
+        model.setup();
+        CHECK(tmod::p_is(model, 7.0f));
+        CHECK(tmod::g_async_errors == 0);
+    }
+    SECTION("a host task that throws") {
+        auto model = cs::create_model<tmod::ThrowTop>(cs::model_config_desc{cs::async_handler_desc{handler}});
+        model.setup();
+        model.forward();
+        CHECK_THROWS_AS(model.wait(), std::runtime_error);
+    }
 }
