@@ -52,20 +52,28 @@ constexpr std::size_t kWg = 256;  // the work-group size of every kernel
 
 inline std::uint32_t u32(std::size_t v) { return static_cast<std::uint32_t>(v); }
 
+// Runtime values (the matrix order n, the strip height R, the scale) are free inputs of extent 1 (u32 / f32) that each component
+// declares and initializes from its constructor's value; a stride is read from the item (groups x group size).
+inline std::uint32_t first(const cs::Input<DType::u32, 1>& v) { return v[std::size_t{0}]; }
+inline float         first(const cs::Input<DType::f32, 1>& v) { return v[std::size_t{0}]; }
+
 // =============================================================================
 // Rank2Update: t = (c = t / n, j = t % n) over (n / R) * n items
 // =============================================================================
-struct Rank2UpdateBody {
+
+class Rank2Update : public cs::Component<Rank2Update> {
+public:
     struct Inputs {
         cs::Input<DType::f32, 2> A;
         cs::Input<DType::f32, 1> u1, v1, u2, v2;
+        cs::Input<DType::u32, 1> n, R;
     };
     struct Outputs {
         cs::Output<DType::f32, 2> B;
     };
-    std::uint32_t n, R, total, stride;
-
-    void operator()(cs::GroupItem<1> it, Inputs in, Outputs out) const {
+    static void compute_impl(cs::GroupItem<1> it, const Inputs& in, const Outputs& out) {
+        const std::uint32_t n = first(in.n), R = first(in.R), total = (n / R) * n;
+        const std::uint32_t stride = static_cast<std::uint32_t>(it.get_group_range(0) * it.get_local_range(0));
         for (std::uint32_t t = static_cast<std::uint32_t>(it.get_global_id(0)); t < total; t += stride) {
             const std::uint32_t c = t / n, j = t - c * n;
             const float         v1j = in.v1[sycl::id<1>{j}], v2j = in.v2[sycl::id<1>{j}];
@@ -76,47 +84,51 @@ struct Rank2UpdateBody {
             }
         }
     }
-};
 
-class Rank2Update : public cs::Component<Rank2UpdateBody> {
-    cs::Input<DType::f32, 2>  A_;
-    cs::Input<DType::f32, 1>  u1_, v1_, u2_, v2_;
-    cs::Output<DType::f32, 2> B_;
+    Inputs  inputs;
+    Outputs outputs;
+
+private:
     int                       n_, R_;
 
 public:
     Rank2Update(int n, int R) : n_{n}, R_{R} {}
     void setup() override {
-        declare_input(A_, "A", n_, n_);
-        declare_input(u1_, "u1", n_);
-        declare_input(v1_, "v1", n_);
-        declare_input(u2_, "u2", n_);
-        declare_input(v2_, "v2", n_);
-        declare_output(B_, "B", n_, n_);
+        declare_input(inputs.n, "n", 1);
+        declare_input(inputs.R, "R", 1);
+        init_input("n", cs::init::fill(u32(n_)));
+        init_input("R", cs::init::fill(u32(R_)));
+        declare_input(inputs.A, "A", n_, n_);
+        declare_input(inputs.u1, "u1", n_);
+        declare_input(inputs.v1, "v1", n_);
+        declare_input(inputs.u2, "u2", n_);
+        declare_input(inputs.v2, "v2", n_);
+        declare_output(outputs.B, "B", n_, n_);
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         const std::size_t work  = static_cast<std::size_t>(n_ / R_) * n_;
         const std::size_t range = work;
-        return create_launch_config(sycl::range<1>{range}, sycl::range<1>{kWg},
-                                    Rank2UpdateBody::Inputs{A_, u1_, v1_, u2_, v2_}, Rank2UpdateBody::Outputs{B_},
-                                    Rank2UpdateBody{u32(n_), u32(R_), u32(work), u32(range)});
+        return create_launch_config(cs::range_desc(sycl::range<1>{range}), cs::wg_desc(sycl::range<1>{kWg}));
     }
 };
 
 // =============================================================================
 // GemvTPartial: the same item mapping as Rank2Update; one partial column sum per strip
 // =============================================================================
-struct GemvTPartialBody {
+
+class GemvTPartial : public cs::Component<GemvTPartial> {
+public:
     struct Inputs {
         cs::Input<DType::f32, 2> B;
         cs::Input<DType::f32, 1> y;
+        cs::Input<DType::u32, 1> n, R;
     };
     struct Outputs {
         cs::Output<DType::f32, 2> P;
     };
-    std::uint32_t n, R, total, stride;
-
-    void operator()(cs::GroupItem<1> it, Inputs in, Outputs out) const {
+    static void compute_impl(cs::GroupItem<1> it, const Inputs& in, const Outputs& out) {
+        const std::uint32_t n = first(in.n), R = first(in.R), total = (n / R) * n;
+        const std::uint32_t stride = static_cast<std::uint32_t>(it.get_group_range(0) * it.get_local_range(0));
         for (std::uint32_t t = static_cast<std::uint32_t>(it.get_global_id(0)); t < total; t += stride) {
             const std::uint32_t c = t / n, j = t - c * n;
             float               acc = 0.0f;
@@ -127,31 +139,32 @@ struct GemvTPartialBody {
             out.P[sycl::id<2>{c, j}] = acc;
         }
     }
-};
 
-class GemvTPartial : public cs::Component<GemvTPartialBody> {
-    cs::Input<DType::f32, 2>  B_;
-    cs::Input<DType::f32, 1>  y_;
-    cs::Output<DType::f32, 2> P_;
+    Inputs  inputs;
+    Outputs outputs;
+
+private:
     int                       n_, R_;
     bool                      tied_b_;  // B is rank-only: a tie_inputs member (the tie alias owns its shape, D139)
 
 public:
     GemvTPartial(int n, int R, bool tied_b = false) : n_{n}, R_{R}, tied_b_{tied_b} {}
     void setup() override {
+        declare_input(inputs.n, "n", 1);
+        declare_input(inputs.R, "R", 1);
+        init_input("n", cs::init::fill(u32(n_)));
+        init_input("R", cs::init::fill(u32(R_)));
         if (tied_b_)
-            declare_input(B_, "B", cs::unspecified_shape<2>());
+            declare_input(inputs.B, "B", cs::unspecified_shape<2>());
         else
-            declare_input(B_, "B", n_, n_);
-        declare_input(y_, "y", n_);
-        declare_output(P_, "P", n_ / R_, n_);
+            declare_input(inputs.B, "B", n_, n_);
+        declare_input(inputs.y, "y", n_);
+        declare_output(outputs.P, "P", n_ / R_, n_);
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         const std::size_t work  = static_cast<std::size_t>(n_ / R_) * n_;
         const std::size_t range = work;
-        return create_launch_config(sycl::range<1>{range}, sycl::range<1>{kWg}, GemvTPartialBody::Inputs{B_, y_},
-                                    GemvTPartialBody::Outputs{P_},
-                                    GemvTPartialBody{u32(n_), u32(R_), u32(work), u32(range)});
+        return create_launch_config(cs::range_desc(sycl::range<1>{range}), cs::wg_desc(sycl::range<1>{kWg}));
     }
 };
 
@@ -160,23 +173,29 @@ public:
 // =============================================================================
 // Z = true is GEMVER's x (scale beta, with z); Z = false is BiCGK's s (scale 1, no z
 // input at all, not a dummy one).
+
 template <bool Z>
-struct ColReduceBody {
+class ColReduce : public cs::Component<ColReduce<Z>> {
+public:
     struct InputsZ {
         cs::Input<DType::f32, 2> P;
         cs::Input<DType::f32, 1> z;
+        cs::Input<DType::u32, 1> n, R;
+        cs::Input<DType::f32, 1> scale;
     };
     struct InputsNoZ {
         cs::Input<DType::f32, 2> P;
+        cs::Input<DType::u32, 1> n, R;
+        cs::Input<DType::f32, 1> scale;
     };
     using Inputs = std::conditional_t<Z, InputsZ, InputsNoZ>;
     struct Outputs {
         cs::Output<DType::f32, 1> x;
     };
-    std::uint32_t n, strips, stride;
-    float         scale;
-
-    void operator()(cs::GroupItem<1> it, Inputs in, Outputs out) const {
+    static void compute_impl(cs::GroupItem<1> it, const Inputs& in, const Outputs& out) {
+        const std::uint32_t n = first(in.n), strips = n / first(in.R);
+        const float         scale  = first(in.scale);
+        const std::uint32_t stride = static_cast<std::uint32_t>(it.get_group_range(0) * it.get_local_range(0));
         for (std::uint32_t j = static_cast<std::uint32_t>(it.get_global_id(0)); j < n; j += stride) {
             float acc = 0.0f;
             for (std::uint32_t c = 0; c < strips; ++c) acc += in.P[sycl::id<2>{c, j}];
@@ -186,49 +205,51 @@ struct ColReduceBody {
                 out.x[sycl::id<1>{j}] = scale * acc;
         }
     }
-};
 
-template <bool Z>
-class ColReduce : public cs::Component<ColReduceBody<Z>> {
-    using Body = ColReduceBody<Z>;
-    cs::Input<DType::f32, 2>  P_;
-    cs::Input<DType::f32, 1>  z_;  // only declared when Z
-    cs::Output<DType::f32, 1> x_;
-    int                       n_, R_;
-    float                     scale_;
+    Inputs  inputs;
+    Outputs outputs;
+
+private:
+    int   n_, R_;
+    float scale_;
 
 public:
     ColReduce(int n, int R, float scale) : n_{n}, R_{R}, scale_{scale} {}
     void setup() override {
-        this->declare_input(P_, "P", n_ / R_, n_);
-        if constexpr (Z) this->declare_input(z_, "z", n_);
-        this->declare_output(x_, "x", n_);
+        this->declare_input(inputs.P, "P", n_ / R_, n_);
+        if constexpr (Z) this->declare_input(inputs.z, "z", n_);  // only declared when Z
+        this->declare_input(inputs.n, "n", 1);
+        this->declare_input(inputs.R, "R", 1);
+        this->declare_input(inputs.scale, "scale", 1);
+        this->init_input("n", cs::init::fill(u32(n_)));
+        this->init_input("R", cs::init::fill(u32(R_)));
+        this->init_input("scale", cs::init::fill(scale_));
+        this->declare_output(outputs.x, "x", n_);
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         const std::size_t range = static_cast<std::size_t>(n_);
-        typename Body::Inputs in{};
-        in.P = P_;
-        if constexpr (Z) in.z = z_;
-        return this->create_launch_config(sycl::range<1>{range}, sycl::range<1>{kWg}, in, typename Body::Outputs{x_},
-                                          Body{u32(n_), u32(n_ / R_), u32(range), scale_});
+        return this->create_launch_config(cs::range_desc(sycl::range<1>{range}), cs::wg_desc(sycl::range<1>{kWg}));
     }
 };
 
 // =============================================================================
 // Gemv: out[i] = scale * (B[i][:] . x). A GROUP body: group g takes rows g, g + ngroups, ...
 // =============================================================================
-struct GemvBody {
+
+class Gemv : public cs::Component<Gemv> {
+public:
     struct Inputs {
         cs::Input<DType::f32, 2> B;
         cs::Input<DType::f32, 1> x;
+        cs::Input<DType::u32, 1> n;
+        cs::Input<DType::f32, 1> scale;
     };
     struct Outputs {
         cs::Output<DType::f32, 1> y;
     };
-    std::uint32_t n;
-    float         scale;
-
-    void operator()(cs::GroupItem<1> it, Inputs in, Outputs out) const {
+    static void compute_impl(cs::GroupItem<1> it, const Inputs& in, const Outputs& out) {
+        const std::uint32_t n = first(in.n);
+        const float         scale = first(in.scale);
         const std::uint32_t l = static_cast<std::uint32_t>(it.get_local_id(0));
         const std::uint32_t wg = static_cast<std::uint32_t>(it.get_local_range(0));
         const std::uint32_t g = static_cast<std::uint32_t>(it.get_group(0));
@@ -240,12 +261,11 @@ struct GemvBody {
             if (l == 0) out.y[sycl::id<1>{i}] = scale * sum;
         }
     }
-};
 
-class Gemv : public cs::Component<GemvBody> {
-    cs::Input<DType::f32, 2>  B_;
-    cs::Input<DType::f32, 1>  x_;
-    cs::Output<DType::f32, 1> y_;
+    Inputs  inputs;
+    Outputs outputs;
+
+private:
     int                       n_;
     float                     scale_;
     bool                      tied_b_;  // B is rank-only: a tie_inputs member (the tie alias owns its shape, D139)
@@ -253,17 +273,20 @@ class Gemv : public cs::Component<GemvBody> {
 public:
     Gemv(int n, float scale, bool tied_b = false) : n_{n}, scale_{scale}, tied_b_{tied_b} {}
     void setup() override {
+        declare_input(inputs.n, "n", 1);
+        declare_input(inputs.scale, "scale", 1);
+        init_input("n", cs::init::fill(u32(n_)));
+        init_input("scale", cs::init::fill(scale_));
         if (tied_b_)
-            declare_input(B_, "B", cs::unspecified_shape<2>());
+            declare_input(inputs.B, "B", cs::unspecified_shape<2>());
         else
-            declare_input(B_, "B", n_, n_);
-        declare_input(x_, "x", n_);
-        declare_output(y_, "y", n_);
+            declare_input(inputs.B, "B", n_, n_);
+        declare_input(inputs.x, "x", n_);
+        declare_output(outputs.y, "y", n_);
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         const std::size_t range = static_cast<std::size_t>(n_) * kWg;  // a group per row
-        return create_launch_config(sycl::range<1>{range}, sycl::range<1>{kWg}, GemvBody::Inputs{B_, x_},
-                                    GemvBody::Outputs{y_}, GemvBody{u32(n_), scale_});
+        return create_launch_config(cs::range_desc(sycl::range<1>{range}), cs::wg_desc(sycl::range<1>{kWg}));
     }
 };
 
@@ -274,17 +297,20 @@ public:
 //   Ps[c][j]   = sum_{k<R} r[i] * B[i][j]                     (i = c*R + k)
 //   Pq[i][blk] = reduce_over_group(B[i][j] * p[j])            (per row i of the strip)
 // RowReduce then sums Pq over the blocks (q), and the scale-1 ColReduce sums Ps (s).
-struct BicgkOnePassBody {
+
+class BicgkOnePass : public cs::Component<BicgkOnePass> {
+public:
     struct Inputs {
         cs::Input<DType::f32, 2> B;
         cs::Input<DType::f32, 1> p, r;
+        cs::Input<DType::u32, 1> n, R;
     };
     struct Outputs {
         cs::Output<DType::f32, 2> Ps, Pq;
     };
-    std::uint32_t n, R, blocks, total_groups;
-
-    void operator()(cs::GroupItem<1> it, Inputs in, Outputs out) const {
+    static void compute_impl(cs::GroupItem<1> it, const Inputs& in, const Outputs& out) {
+        const std::uint32_t n = first(in.n), R = first(in.R);
+        const std::uint32_t blocks = n / static_cast<std::uint32_t>(it.get_local_range(0)), total_groups = (n / R) * blocks;
         const std::uint32_t l  = static_cast<std::uint32_t>(it.get_local_id(0));
         const std::uint32_t ng = static_cast<std::uint32_t>(it.get_group_range(0));
         for (std::uint32_t g = static_cast<std::uint32_t>(it.get_group(0)); g < total_groups; g += ng) {
@@ -302,67 +328,71 @@ struct BicgkOnePassBody {
             out.Ps[sycl::id<2>{c, j}] = ps;
         }
     }
-};
 
-class BicgkOnePass : public cs::Component<BicgkOnePassBody> {
-    cs::Input<DType::f32, 2>  B_;
-    cs::Input<DType::f32, 1>  p_, r_;
-    cs::Output<DType::f32, 2> Ps_, Pq_;
+    Inputs  inputs;
+    Outputs outputs;
+
+private:
     int                       n_, R_;
 
 public:
     BicgkOnePass(int n, int R) : n_{n}, R_{R} {}
     void setup() override {
-        declare_input(B_, "B", n_, n_);
-        declare_input(p_, "p", n_);
-        declare_input(r_, "r", n_);
-        declare_output(Ps_, "Ps", n_ / R_, n_);
-        declare_output(Pq_, "Pq", n_, n_ / static_cast<int>(kWg));
+        declare_input(inputs.n, "n", 1);
+        declare_input(inputs.R, "R", 1);
+        init_input("n", cs::init::fill(u32(n_)));
+        init_input("R", cs::init::fill(u32(R_)));
+        declare_input(inputs.B, "B", n_, n_);
+        declare_input(inputs.p, "p", n_);
+        declare_input(inputs.r, "r", n_);
+        declare_output(outputs.Ps, "Ps", n_ / R_, n_);
+        declare_output(outputs.Pq, "Pq", n_, n_ / static_cast<int>(kWg));
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         const std::size_t blocks = static_cast<std::size_t>(n_) / kWg;
         const std::size_t groups = static_cast<std::size_t>(n_ / R_) * blocks;
-        return create_launch_config(sycl::range<1>{groups * kWg}, sycl::range<1>{kWg},
-                                    BicgkOnePassBody::Inputs{B_, p_, r_}, BicgkOnePassBody::Outputs{Ps_, Pq_},
-                                    BicgkOnePassBody{u32(n_), u32(R_), u32(blocks), u32(groups)});
+        return create_launch_config(cs::range_desc(sycl::range<1>{groups * kWg}), cs::wg_desc(sycl::range<1>{kWg}));
     }
 };
 
 // RowReduce: q[i] = sum_blk Pq[i][blk]
-struct RowReduceBody {
+
+class RowReduce : public cs::Component<RowReduce> {
+public:
     struct Inputs {
         cs::Input<DType::f32, 2> Pq;
+        cs::Input<DType::u32, 1> n;
     };
     struct Outputs {
         cs::Output<DType::f32, 1> q;
     };
-    std::uint32_t n, blocks, stride;
-
-    void operator()(cs::GroupItem<1> it, Inputs in, Outputs out) const {
+    static void compute_impl(cs::GroupItem<1> it, const Inputs& in, const Outputs& out) {
+        const std::uint32_t n = first(in.n), blocks = n / static_cast<std::uint32_t>(kWg);
+        const std::uint32_t stride = static_cast<std::uint32_t>(it.get_group_range(0) * it.get_local_range(0));
         for (std::uint32_t i = static_cast<std::uint32_t>(it.get_global_id(0)); i < n; i += stride) {
             float acc = 0.0f;
             for (std::uint32_t b = 0; b < blocks; ++b) acc += in.Pq[sycl::id<2>{i, b}];
             out.q[sycl::id<1>{i}] = acc;
         }
     }
-};
 
-class RowReduce : public cs::Component<RowReduceBody> {
-    cs::Input<DType::f32, 2>  Pq_;
-    cs::Output<DType::f32, 1> q_;
+    Inputs  inputs;
+    Outputs outputs;
+
+private:
     int                       n_;
 
 public:
     explicit RowReduce(int n) : n_{n} {}
     void setup() override {
-        declare_input(Pq_, "Pq", n_, n_ / static_cast<int>(kWg));
-        declare_output(q_, "q", n_);
+        declare_input(inputs.n, "n", 1);
+        init_input("n", cs::init::fill(u32(n_)));
+        declare_input(inputs.Pq, "Pq", n_, n_ / static_cast<int>(kWg));
+        declare_output(outputs.q, "q", n_);
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         const std::size_t range = static_cast<std::size_t>(n_);
-        return create_launch_config(sycl::range<1>{range}, sycl::range<1>{kWg}, RowReduceBody::Inputs{Pq_},
-                                    RowReduceBody::Outputs{q_},
-                                    RowReduceBody{u32(n_), u32(n_ / static_cast<int>(kWg)), u32(range)});
+        return create_launch_config(cs::range_desc(sycl::range<1>{range}), cs::wg_desc(sycl::range<1>{kWg}));
     }
 };
 
@@ -376,20 +406,22 @@ constexpr std::uint32_t kRt        = 32;
 constexpr std::size_t   kTileBytes = static_cast<std::size_t>(kRt) * kWg * sizeof(float);
 
 /// Rank2UpdateLocal: B = A + u1 v1^T + u2 v2^T for the tile; B goes to global memory (B1 is an output) and stays in the tile.
-struct Rank2UpdateLocalBody {
+
+class Rank2UpdateLocal : public cs::Component<Rank2UpdateLocal> {
+public:
     struct Inputs {
         cs::Input<DType::f32, 2> A;
         cs::Input<DType::f32, 1> u1, v1, u2, v2;
+        cs::Input<DType::u32, 1> n;
     };
     struct Outputs {
         cs::Output<DType::f32, 2> B;
     };
-    std::uint32_t blocks;  // n / 256 column blocks
-
-    void operator()(cs::GroupItem<1> it, Inputs in, Outputs out) const {
+    static void compute_impl(cs::GroupItem<1> it, const Inputs& in, const Outputs& out) {
         float*              tile = it.local<float>(static_cast<std::size_t>(kRt) * kWg);
         const std::uint32_t l    = static_cast<std::uint32_t>(it.get_local_id(0));
         const std::uint32_t g    = static_cast<std::uint32_t>(it.get_group(0));
+        const std::uint32_t blocks = first(in.n) / static_cast<std::uint32_t>(kWg);
         const std::uint32_t c = g / blocks, blk = g - c * blocks;
         const std::uint32_t j = blk * static_cast<std::uint32_t>(kWg) + l;
         const float         v1j = in.v1[sycl::id<1>{j}], v2j = in.v2[sycl::id<1>{j}];
@@ -400,49 +432,50 @@ struct Rank2UpdateLocalBody {
             tile[k * kWg + l]        = val;
         }
     }
-};
 
-class Rank2UpdateLocal : public cs::Component<Rank2UpdateLocalBody> {
-    cs::Input<DType::f32, 2>  A_;
-    cs::Input<DType::f32, 1>  u1_, v1_, u2_, v2_;
-    cs::Output<DType::f32, 2> B_;
+    Inputs  inputs;
+    Outputs outputs;
+
+private:
     int                       n_;
 
 public:
     explicit Rank2UpdateLocal(int n) : n_{n} {}
     void setup() override {
-        declare_input(A_, "A", n_, n_);
-        declare_input(u1_, "u1", n_);
-        declare_input(v1_, "v1", n_);
-        declare_input(u2_, "u2", n_);
-        declare_input(v2_, "v2", n_);
-        declare_output(B_, "B", n_, n_);
+        declare_input(inputs.n, "n", 1);
+        init_input("n", cs::init::fill(u32(n_)));
+        declare_input(inputs.A, "A", n_, n_);
+        declare_input(inputs.u1, "u1", n_);
+        declare_input(inputs.v1, "v1", n_);
+        declare_input(inputs.u2, "u2", n_);
+        declare_input(inputs.v2, "v2", n_);
+        declare_output(outputs.B, "B", n_, n_);
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         const std::size_t blocks = static_cast<std::size_t>(n_) / kWg;
         const std::size_t groups = static_cast<std::size_t>(n_ / static_cast<int>(kRt)) * blocks;
-        auto              d      = create_launch_config(sycl::range<1>{groups * kWg}, sycl::range<1>{kWg},
-                                                        Rank2UpdateLocalBody::Inputs{A_, u1_, v1_, u2_, v2_},
-                                                        Rank2UpdateLocalBody::Outputs{B_}, Rank2UpdateLocalBody{u32(blocks)});
+        auto              d      = create_launch_config(cs::range_desc(sycl::range<1>{groups * kWg}), cs::wg_desc(sycl::range<1>{kWg}));
         d->request_local_bytes(kTileBytes);
         return d;
     }
 };
 
 /// GemvTPartialLocal: P[c][j] = sum_k tile[k][j] * y[c kRt + k]. No global B input: the tile comes from Rank2UpdateLocal.
-struct GemvTPartialLocalBody {
+
+class GemvTPartialLocal : public cs::Component<GemvTPartialLocal> {
+public:
     struct Inputs {
         cs::Input<DType::f32, 1> y;
+        cs::Input<DType::u32, 1> n;
     };
     struct Outputs {
         cs::Output<DType::f32, 2> P;
     };
-    std::uint32_t blocks;
-
-    void operator()(cs::GroupItem<1> it, Inputs in, Outputs out) const {
+    static void compute_impl(cs::GroupItem<1> it, const Inputs& in, const Outputs& out) {
         float*              tile = it.local<float>(static_cast<std::size_t>(kRt) * kWg);  // the same block as Rank2UpdateLocal's
         const std::uint32_t l    = static_cast<std::uint32_t>(it.get_local_id(0));
         const std::uint32_t g    = static_cast<std::uint32_t>(it.get_group(0));
+        const std::uint32_t blocks = first(in.n) / static_cast<std::uint32_t>(kWg);
         const std::uint32_t c = g / blocks, blk = g - c * blocks;
         const std::uint32_t j = blk * static_cast<std::uint32_t>(kWg) + l;
         cs::group_barrier(it.get_group());  // the tile is complete
@@ -450,25 +483,25 @@ struct GemvTPartialLocalBody {
         for (std::uint32_t k = 0; k < kRt; ++k) acc += tile[k * kWg + l] * in.y[sycl::id<1>{c * kRt + k}];
         out.P[sycl::id<2>{c, j}] = acc;
     }
-};
 
-class GemvTPartialLocal : public cs::Component<GemvTPartialLocalBody> {
-    cs::Input<DType::f32, 1>  y_;
-    cs::Output<DType::f32, 2> P_;
+    Inputs  inputs;
+    Outputs outputs;
+
+private:
     int                       n_;
 
 public:
     explicit GemvTPartialLocal(int n) : n_{n} {}
     void setup() override {
-        declare_input(y_, "y", n_);
-        declare_output(P_, "P", n_ / static_cast<int>(kRt), n_);
+        declare_input(inputs.n, "n", 1);
+        init_input("n", cs::init::fill(u32(n_)));
+        declare_input(inputs.y, "y", n_);
+        declare_output(outputs.P, "P", n_ / static_cast<int>(kRt), n_);
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         const std::size_t blocks = static_cast<std::size_t>(n_) / kWg;
         const std::size_t groups = static_cast<std::size_t>(n_ / static_cast<int>(kRt)) * blocks;
-        auto              d      = create_launch_config(sycl::range<1>{groups * kWg}, sycl::range<1>{kWg},
-                                                        GemvTPartialLocalBody::Inputs{y_}, GemvTPartialLocalBody::Outputs{P_},
-                                                        GemvTPartialLocalBody{u32(blocks)});
+        auto              d      = create_launch_config(cs::range_desc(sycl::range<1>{groups * kWg}), cs::wg_desc(sycl::range<1>{kWg}));
         d->request_local_bytes(kTileBytes);
         return d;
     }
@@ -476,20 +509,22 @@ public:
 
 /// BicgkTileLocal: loads the B tile into local memory and produces BicgkOnePass's partials from it:
 ///   Ps[c][j]   = sum_k r[i] B[i][j]                  Pq[i][blk] = reduce_over_group(B[i][j] p[j])   (i = c kRt + k)
-struct BicgkTileLocalBody {
+
+class BicgkTileLocal : public cs::Component<BicgkTileLocal> {
+public:
     struct Inputs {
         cs::Input<DType::f32, 2> B;
         cs::Input<DType::f32, 1> p, r;
+        cs::Input<DType::u32, 1> n;
     };
     struct Outputs {
         cs::Output<DType::f32, 2> Ps, Pq;
     };
-    std::uint32_t blocks;
-
-    void operator()(cs::GroupItem<1> it, Inputs in, Outputs out) const {
+    static void compute_impl(cs::GroupItem<1> it, const Inputs& in, const Outputs& out) {
         float*              tile = it.local<float>(static_cast<std::size_t>(kRt) * kWg);
         const std::uint32_t l    = static_cast<std::uint32_t>(it.get_local_id(0));
         const std::uint32_t g    = static_cast<std::uint32_t>(it.get_group(0));
+        const std::uint32_t blocks = first(in.n) / static_cast<std::uint32_t>(kWg);
         const std::uint32_t c = g / blocks, blk = g - c * blocks;
         const std::uint32_t j  = blk * static_cast<std::uint32_t>(kWg) + l;
         const float         pj = in.p[sycl::id<1>{j}];
@@ -504,29 +539,28 @@ struct BicgkTileLocalBody {
         }
         out.Ps[sycl::id<2>{c, j}] = ps;
     }
-};
 
-class BicgkTileLocal : public cs::Component<BicgkTileLocalBody> {
-    cs::Input<DType::f32, 2>  B_;
-    cs::Input<DType::f32, 1>  p_, r_;
-    cs::Output<DType::f32, 2> Ps_, Pq_;
+    Inputs  inputs;
+    Outputs outputs;
+
+private:
     int                       n_;
 
 public:
     explicit BicgkTileLocal(int n) : n_{n} {}
     void setup() override {
-        declare_input(B_, "B", n_, n_);
-        declare_input(p_, "p", n_);
-        declare_input(r_, "r", n_);
-        declare_output(Ps_, "Ps", n_ / static_cast<int>(kRt), n_);
-        declare_output(Pq_, "Pq", n_, n_ / static_cast<int>(kWg));
+        declare_input(inputs.n, "n", 1);
+        init_input("n", cs::init::fill(u32(n_)));
+        declare_input(inputs.B, "B", n_, n_);
+        declare_input(inputs.p, "p", n_);
+        declare_input(inputs.r, "r", n_);
+        declare_output(outputs.Ps, "Ps", n_ / static_cast<int>(kRt), n_);
+        declare_output(outputs.Pq, "Pq", n_, n_ / static_cast<int>(kWg));
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         const std::size_t blocks = static_cast<std::size_t>(n_) / kWg;
         const std::size_t groups = static_cast<std::size_t>(n_ / static_cast<int>(kRt)) * blocks;
-        auto              d      = create_launch_config(sycl::range<1>{groups * kWg}, sycl::range<1>{kWg},
-                                                        BicgkTileLocalBody::Inputs{B_, p_, r_},
-                                                        BicgkTileLocalBody::Outputs{Ps_, Pq_}, BicgkTileLocalBody{u32(blocks)});
+        auto              d      = create_launch_config(cs::range_desc(sycl::range<1>{groups * kWg}), cs::wg_desc(sycl::range<1>{kWg}));
         d->request_local_bytes(kTileBytes);
         return d;
     }
@@ -534,19 +568,21 @@ public:
 
 /// Rank2UpdateFromLocal: G2's B2 = B1 + u1b v1b^T + u2b v2b^T, with B1 taken from the tile BicgkTileLocal loaded (no global
 /// read of B1 here, and no dependency on q or s, which is why it can share BiCGK's read of B1).
-struct Rank2UpdateFromLocalBody {
+
+class Rank2UpdateFromLocal : public cs::Component<Rank2UpdateFromLocal> {
+public:
     struct Inputs {
         cs::Input<DType::f32, 1> u1, v1, u2, v2;
+        cs::Input<DType::u32, 1> n;
     };
     struct Outputs {
         cs::Output<DType::f32, 2> B;
     };
-    std::uint32_t blocks;
-
-    void operator()(cs::GroupItem<1> it, Inputs in, Outputs out) const {
+    static void compute_impl(cs::GroupItem<1> it, const Inputs& in, const Outputs& out) {
         float*              tile = it.local<float>(static_cast<std::size_t>(kRt) * kWg);
         const std::uint32_t l    = static_cast<std::uint32_t>(it.get_local_id(0));
         const std::uint32_t g    = static_cast<std::uint32_t>(it.get_group(0));
+        const std::uint32_t blocks = first(in.n) / static_cast<std::uint32_t>(kWg);
         const std::uint32_t c = g / blocks, blk = g - c * blocks;
         const std::uint32_t j = blk * static_cast<std::uint32_t>(kWg) + l;
         cs::group_barrier(it.get_group());  // the tile is complete
@@ -556,28 +592,28 @@ struct Rank2UpdateFromLocalBody {
             out.B[sycl::id<2>{i, j}] = tile[k * kWg + l] + in.u1[sycl::id<1>{i}] * v1j + in.u2[sycl::id<1>{i}] * v2j;
         }
     }
-};
 
-class Rank2UpdateFromLocal : public cs::Component<Rank2UpdateFromLocalBody> {
-    cs::Input<DType::f32, 1>  u1_, v1_, u2_, v2_;
-    cs::Output<DType::f32, 2> B_;
+    Inputs  inputs;
+    Outputs outputs;
+
+private:
     int                       n_;
 
 public:
     explicit Rank2UpdateFromLocal(int n) : n_{n} {}
     void setup() override {
-        declare_input(u1_, "u1", n_);
-        declare_input(v1_, "v1", n_);
-        declare_input(u2_, "u2", n_);
-        declare_input(v2_, "v2", n_);
-        declare_output(B_, "B", n_, n_);
+        declare_input(inputs.n, "n", 1);
+        init_input("n", cs::init::fill(u32(n_)));
+        declare_input(inputs.u1, "u1", n_);
+        declare_input(inputs.v1, "v1", n_);
+        declare_input(inputs.u2, "u2", n_);
+        declare_input(inputs.v2, "v2", n_);
+        declare_output(outputs.B, "B", n_, n_);
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         const std::size_t blocks = static_cast<std::size_t>(n_) / kWg;
         const std::size_t groups = static_cast<std::size_t>(n_ / static_cast<int>(kRt)) * blocks;
-        auto              d      = create_launch_config(sycl::range<1>{groups * kWg}, sycl::range<1>{kWg},
-                                                        Rank2UpdateFromLocalBody::Inputs{u1_, v1_, u2_, v2_},
-                                                        Rank2UpdateFromLocalBody::Outputs{B_}, Rank2UpdateFromLocalBody{u32(blocks)});
+        auto              d      = create_launch_config(cs::range_desc(sycl::range<1>{groups * kWg}), cs::wg_desc(sycl::range<1>{kWg}));
         d->request_local_bytes(kTileBytes);
         return d;
     }

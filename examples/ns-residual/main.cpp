@@ -113,11 +113,11 @@ auto make_init(int nx, int ny, float amp) {
 
 // ---- a CoSpan variant -------------------------------------------------------------------------------------------------
 struct Paths {
-    std::string U, R, Dt, Ws, Sq, DetSq, DetDt, DetWs, Err;
+    std::string geo, U, R, Dt, Ws, Sq, DetSq, DetDt, DetWs, Err;
 };
 Paths paths(bool fused) {
     const std::string p = fused ? "ns." : "";
-    return Paths{p + "U", p + "R", p + "Dt", p + "Ws", p + "Sq", p + "detn.Det", p + "detd.Det", p + "detw.Det", p + "err.Err"};
+    return Paths{p + "geo", p + "U", p + "R", p + "Dt", p + "Ws", p + "Sq", p + "detn.Det", p + "detd.Det", p + "detw.Det", p + "err.Err"};
 }
 
 template <int Rk>
@@ -164,6 +164,8 @@ Result run_cospan(const char* name, bool fused, const Options& o) {
     const Paths p     = paths(fused);
     try {
         model.setup();
+        // the grid (nx, ny, tx, ty) is a free input of the stages that need it, tied into one alias by the system
+        model.update_input(p.geo, cs::init::from_host(nsr::geo_values(o.nx, o.ny)));
         model.update_input(p.U, make_init(o.nx, o.ny, 1.0f));
         for (int i = 0; i < o.warmup; ++i) {
             model.forward();

@@ -25,21 +25,22 @@ using cst::default_config;
 namespace tdiag {
 
 // A host-body producer: y[i] = i, run as a host task.
-struct HostIotaBody {
+
+class HostIota : public cs::Component<HostIota> {
+public:
     struct Inputs {};
     struct Outputs {
         cs::Output<DType::f32, 1> y;
     };
-    void operator()(cs::Host, Inputs, Outputs out) const {
+    static void compute_impl(cs::Host, const Inputs&, const Outputs& out) {
         for (std::size_t i = 0; i < out.y.size(); ++i) out.y[i] = static_cast<float>(i);
     }
-};
-class HostIota : public cs::Component<HostIotaBody> {
-    cs::Output<DType::f32, 1> y_;
 
-public:
-    void setup() override { declare_output(y_, "y", 8); }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config({}, {y_}, {}); }
+    Inputs  inputs;
+    Outputs outputs;
+
+    void setup() override { declare_output(outputs.y, "y", 8); }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(); }
 };
 
 class HostTop : public cs::System {

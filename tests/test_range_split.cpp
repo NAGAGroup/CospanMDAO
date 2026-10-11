@@ -86,19 +86,22 @@ std::vector<float> expected_ids(sycl::range<R> groups, int seg) {
 }
 
 // ---- IdStage<R, Seg>: every item writes seg * 1e6 + its group's linear id (the rank-R group id, segment-relative) ----------
+
 template <int R, int Seg>
-struct IdBody {
+class IdStage : public cs::Component<IdStage<R, Seg>> {
+public:
     struct Inputs {};
     struct Outputs {
         cs::Output<DType::f32, R> y;
     };
-    void operator()(cs::GroupItem<R> it, Inputs, Outputs out) const {
+    static void compute_impl(cs::GroupItem<R> it, const Inputs&, const Outputs& out) {
         out.y[it.get_global_id()] = static_cast<float>(Seg * 1000000 + static_cast<int>(it.get_group_linear_id()));
     }
-};
-template <int R, int Seg>
-class IdStage : public cs::Component<IdBody<R, Seg>> {
-    cs::Output<DType::f32, R> y_;
+
+    Inputs  inputs;
+    Outputs outputs;
+
+private:
     sycl::range<R>            groups_;
 
 public:
@@ -106,79 +109,88 @@ public:
     void setup() override {
         const sycl::range<R> wg = wg_of<R>();
         if constexpr (R == 1)
-            this->declare_output(y_, "y", static_cast<int>(groups_[0] * wg[0]));
+            this->declare_output(outputs.y, "y", static_cast<int>(groups_[0] * wg[0]));
         else if constexpr (R == 2)
-            this->declare_output(y_, "y", static_cast<int>(groups_[0] * wg[0]), static_cast<int>(groups_[1] * wg[1]));
+            this->declare_output(outputs.y, "y", static_cast<int>(groups_[0] * wg[0]), static_cast<int>(groups_[1] * wg[1]));
         else
-            this->declare_output(y_, "y", static_cast<int>(groups_[0] * wg[0]), static_cast<int>(groups_[1] * wg[1]),
+            this->declare_output(outputs.y, "y", static_cast<int>(groups_[0] * wg[0]), static_cast<int>(groups_[1] * wg[1]),
                                  static_cast<int>(groups_[2] * wg[2]));
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
         sycl::range<R> r = groups_;
         for (int d = 0; d < R; ++d) r[d] *= wg_of<R>()[d];
-        return this->create_launch_config(r, wg_of<R>(), {}, {y_}, {});
+        return this->create_launch_config(cs::range_desc(r), cs::wg_desc(wg_of<R>()));
     }
 };
 
 // ---- flags: how many stages ran for each group of a (3, 7) block ----------------------------------------------------------
+
 template <bool Fill>
-struct FlagBody {
+class FlagStage : public cs::Component<FlagStage<Fill>> {
+public:
     struct Inputs {};
     struct Outputs {
         cs::Output<DType::f32, 2> f;
     };
-    void operator()(cs::GroupItem<2> it, Inputs, Outputs out) const {
+    static void compute_impl(cs::GroupItem<2> it, const Inputs&, const Outputs& out) {
         if (it.get_local_linear_id() != 0) return;
         if constexpr (Fill)
             out.f[it.get_group_id()] = 0.0f;
         else
             out.f[it.get_group_id()] += 1.0f;
     }
-};
-template <bool Fill>
-class FlagStage : public cs::Component<FlagBody<Fill>> {
-    cs::Output<DType::f32, 2> f_;
+
+    Inputs  inputs;
+    Outputs outputs;
+
+private:
     sycl::range<2>            groups_;
 
 public:
     explicit FlagStage(sycl::range<2> groups) : groups_{groups} {}
-    void setup() override { this->declare_output(f_, "f", cs::unspecified_shape<2>()); }
+    void setup() override { this->declare_output(outputs.f, "f", cs::unspecified_shape<2>()); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return this->create_launch_config(sycl::range<2>{groups_[0] * 4, groups_[1] * 4}, wg_of<2>(), {}, {f_}, {});
+        return this->create_launch_config(cs::range_desc(sycl::range<2>{groups_[0] * 4, groups_[1] * 4}), cs::wg_desc(wg_of<2>()));
     }
 };
 
 // ---- WriteStage2 -> ReadNb<W>: group g of the second segment copies the values of group (g + 1) wrapped, of the first ------
-struct Write2Body {
+
+class WriteStage2 : public cs::Component<WriteStage2> {
+public:
     struct Inputs {};
     struct Outputs {
         cs::Output<DType::f32, 2> y;
     };
-    void operator()(cs::GroupItem<2> it, Inputs, Outputs out) const {
+    static void compute_impl(cs::GroupItem<2> it, const Inputs&, const Outputs& out) {
         out.y[it.get_global_id()] = static_cast<float>(it.get_group_linear_id() * 16 + it.get_local_linear_id());
     }
-};
-class WriteStage2 : public cs::Component<Write2Body> {
-    cs::Output<DType::f32, 2> y_;
+
+    Inputs  inputs;
+    Outputs outputs;
+
+private:
     sycl::range<2>            groups_;
 
 public:
     explicit WriteStage2(sycl::range<2> groups) : groups_{groups} {}
-    void setup() override { declare_output(y_, "y", static_cast<int>(groups_[0] * 4), static_cast<int>(groups_[1] * 4)); }
+    void setup() override { declare_output(outputs.y, "y", static_cast<int>(groups_[0] * 4), static_cast<int>(groups_[1] * 4)); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(sycl::range<2>{groups_[0] * 4, groups_[1] * 4}, wg_of<2>(), {}, {y_}, {});
+        return create_launch_config(cs::range_desc(sycl::range<2>{groups_[0] * 4, groups_[1] * 4}), cs::wg_desc(wg_of<2>()));
     }
 };
 /// W: wait_group on the neighbour inside the body (needs group_waits_enabled); not W: a global_barrier before the segment.
+
 template <bool W>
-struct ReadNbBody {
+class ReadNb : public cs::Component<ReadNb<W>> {
+public:
     struct Inputs {
         cs::Input<DType::f32, 2> x;
     };
     struct Outputs {
         cs::Output<DType::f32, 2> z;
     };
-    void operator()(cs::GroupItem<2> it, Inputs in, Outputs out) const {
+    static void compute_impl(cs::GroupItem<2> it, const Inputs& in, const Outputs& out) {
         const sycl::range<2> gr = it.get_group_range();
         const sycl::id<2>    g  = it.get_group_id();
         const sycl::id<2>    ng{(g[0] + 1) % gr[0], (g[1] + 1) % gr[1]};
@@ -187,40 +199,44 @@ struct ReadNbBody {
         const sycl::range<2> wg = it.get_local_range();
         out.z[it.get_global_id()] = in.x[sycl::id<2>{ng[0] * wg[0] + l[0], ng[1] * wg[1] + l[1]}];
     }
-};
-template <bool W>
-class ReadNb : public cs::Component<ReadNbBody<W>> {
-    cs::Input<DType::f32, 2>  x_;
-    cs::Output<DType::f32, 2> z_;
+
+    Inputs  inputs;
+    Outputs outputs;
+
+private:
     sycl::range<2>            groups_;
 
 public:
     explicit ReadNb(sycl::range<2> groups) : groups_{groups} {}
     void setup() override {
-        this->declare_input(x_, "x", static_cast<int>(groups_[0] * 4), static_cast<int>(groups_[1] * 4));
-        this->declare_output(z_, "z", static_cast<int>(groups_[0] * 4), static_cast<int>(groups_[1] * 4));
+        this->declare_input(inputs.x, "x", static_cast<int>(groups_[0] * 4), static_cast<int>(groups_[1] * 4));
+        this->declare_output(outputs.z, "z", static_cast<int>(groups_[0] * 4), static_cast<int>(groups_[1] * 4));
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return this->create_launch_config(sycl::range<2>{groups_[0] * 4, groups_[1] * 4}, wg_of<2>(), {x_}, {z_}, {});
+        return this->create_launch_config(cs::range_desc(sycl::range<2>{groups_[0] * 4, groups_[1] * 4}), cs::wg_desc(wg_of<2>()));
     }
 };
 
 // ---- a plain rank-2 stage: y[i][j] = i * width + j ------------------------------------------------------------------------
-struct PlainIdBody {
+
+class PlainId : public cs::Component<PlainId> {
+public:
     struct Inputs {};
     struct Outputs {
         cs::Output<DType::f32, 2> y;
     };
-    void operator()(sycl::id<2> i, Inputs, Outputs out) const { out.y[i] = static_cast<float>(i[0] * out.y.shape()[1] + i[1]); }
-};
-class PlainId : public cs::Component<PlainIdBody> {
-    cs::Output<DType::f32, 2> y_;
+    static void compute_impl(sycl::id<2> i, const Inputs&, const Outputs& out) { out.y[i] = static_cast<float>(i[0] * out.y.shape()[1] + i[1]); }
+
+    Inputs  inputs;
+    Outputs outputs;
+
+private:
     sycl::range<2>            r_;
 
 public:
     explicit PlainId(sycl::range<2> r) : r_{r} {}
-    void setup() override { declare_output(y_, "y", static_cast<int>(r_[0]), static_cast<int>(r_[1])); }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(r_, {}, {y_}, {}); }
+    void setup() override { declare_output(outputs.y, "y", static_cast<int>(r_[0]), static_cast<int>(r_[1])); }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(cs::range_desc(r_)); }
 };
 
 // ---- RawStage<K>: 1 when the PHYSICAL group coordinates of the item are the ones kind K promises --------------------------------
@@ -228,13 +244,15 @@ public:
 //   K = 1 pad_and_split    : (0, gy, *)
 //   K = 2 padded           : (segment, gy, gx)
 //   K = 3 a bare component : (0, gy, gx), the native launch
+
 template <int K>
-struct RawBody {
+class RawStage : public cs::Component<RawStage<K>> {
+public:
     struct Inputs {};
     struct Outputs {
         cs::Output<DType::f32, 2> y;
     };
-    void operator()(cs::GroupItem<2> it, Inputs, Outputs out) const {
+    static void compute_impl(cs::GroupItem<2> it, const Inputs&, const Outputs& out) {
         const sycl::nd_item<3> raw = it;  // the implicit conversion
         const sycl::id<2>      g   = it.get_group_id();
         bool                   ok  = false;
@@ -248,28 +266,31 @@ struct RawBody {
             ok = raw.get_group(0) == 0 && raw.get_group(1) == g[0] && raw.get_group(2) == g[1];
         out.y[it.get_global_id()] = ok ? 1.0f : 0.0f;
     }
-};
-template <int K>
-class RawStage : public cs::Component<RawBody<K>> {
-    cs::Output<DType::f32, 2> y_;
+
+    Inputs  inputs;
+    Outputs outputs;
+
+private:
     sycl::range<2>            groups_;
 
 public:
     explicit RawStage(sycl::range<2> groups) : groups_{groups} {}
-    void setup() override { this->declare_output(y_, "y", static_cast<int>(groups_[0] * 4), static_cast<int>(groups_[1] * 4)); }
+    void setup() override { this->declare_output(outputs.y, "y", static_cast<int>(groups_[0] * 4), static_cast<int>(groups_[1] * 4)); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return this->create_launch_config(sycl::range<2>{groups_[0] * 4, groups_[1] * 4}, wg_of<2>(), {}, {y_}, {});
+        return this->create_launch_config(cs::range_desc(sycl::range<2>{groups_[0] * 4, groups_[1] * 4}), cs::wg_desc(wg_of<2>()));
     }
 };
 
 // ---- the group functions, one group of 4 x 4 = 16 work-items ------------------------------------------------------------------
 // r[0..31]: the group-wide results (written by the leader); r[32 + 6 * t + k]: item t's scan results.
-struct FamBody {
+
+class FamStage : public cs::Component<FamStage> {
+public:
     struct Inputs {};
     struct Outputs {
         cs::Output<DType::f32, 1> r;
     };
-    void operator()(cs::GroupItem<2> it, Inputs, Outputs out) const {
+    static void compute_impl(cs::GroupItem<2> it, const Inputs&, const Outputs& out) {
         auto              g   = it.get_group();
         float*            L   = it.local<float>(32);
         const std::size_t t   = it.get_local_linear_id();
@@ -323,26 +344,27 @@ struct FamBody {
             for (std::size_t k = 0; k < 19; ++k) out.r[k] = v[k];
         }
     }
-};
-class FamStage : public cs::Component<FamBody> {
-    cs::Output<DType::f32, 1> r_;
 
-public:
-    void setup() override { declare_output(r_, "r", 128); }
+    Inputs  inputs;
+    Outputs outputs;
+
+    void setup() override { declare_output(outputs.r, "r", 128); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        auto d = create_launch_config(sycl::range<2>{4, 4}, wg_of<2>(), {}, {r_}, {});
+        auto d = create_launch_config(cs::range_desc(sycl::range<2>{4, 4}), cs::wg_desc(wg_of<2>()));
         d->request_local_bytes(32 * sizeof(float));
         return d;
     }
 };
 
 // ---- to_sycl(): the physical objects, into raw SYCL algorithms -------------------------------------------------------------
-struct ToSyclBody {
+
+class ToSyclStage : public cs::Component<ToSyclStage> {
+public:
     struct Inputs {};
     struct Outputs {
         cs::Output<DType::f32, 1> r;
     };
-    void operator()(cs::GroupItem<2> it, Inputs, Outputs out) const {
+    static void compute_impl(cs::GroupItem<2> it, const Inputs&, const Outputs& out) {
         const float x = static_cast<float>(it.get_local_linear_id() + 1);
         sycl::group<3> g3 = it.get_group();          // the implicit conversion
         sycl::group_barrier(g3);                       // raw SYCL on the physical group
@@ -353,14 +375,13 @@ struct ToSyclBody {
             out.r[std::size_t{1}] = s2;
         }
     }
-};
-class ToSyclStage : public cs::Component<ToSyclBody> {
-    cs::Output<DType::f32, 1> r_;
 
-public:
-    void setup() override { declare_output(r_, "r", 2); }
+    Inputs  inputs;
+    Outputs outputs;
+
+    void setup() override { declare_output(outputs.r, "r", 2); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(sycl::range<2>{4, 4}, wg_of<2>(), {}, {r_}, {});
+        return create_launch_config(cs::range_desc(sycl::range<2>{4, 4}), cs::wg_desc(wg_of<2>()));
     }
 };
 

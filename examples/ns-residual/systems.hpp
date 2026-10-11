@@ -40,19 +40,19 @@ public:
         add_subsystem(cs::subsystem_desc<ToPrimitiveG>("prim", nx_, ny_));
         add_subsystem(cs::subsystem_desc<GradientsG>("grad", nx_, ny_));
         add_subsystem(cs::subsystem_desc<ReconstructG<Lim>>("rec", nx_, ny_));
-        add_subsystem(cs::subsystem_desc<ConvFluxG>("cfx", nx_, ny_, 0));
-        add_subsystem(cs::subsystem_desc<ConvFluxG>("cfy", nx_, ny_, 1));
-        add_subsystem(cs::subsystem_desc<ViscFluxG>("vfx", nx_, ny_, 0));
-        add_subsystem(cs::subsystem_desc<ViscFluxG>("vfy", nx_, ny_, 1));
-        add_subsystem(cs::subsystem_desc<ConvDivergence>("cdiv", nx_, ny_, false, false));
+        add_subsystem(cs::subsystem_desc<ConvFluxG<0>>("cfx", nx_, ny_));
+        add_subsystem(cs::subsystem_desc<ConvFluxG<1>>("cfy", nx_, ny_));
+        add_subsystem(cs::subsystem_desc<ViscFluxG<0>>("vfx", nx_, ny_));
+        add_subsystem(cs::subsystem_desc<ViscFluxG<1>>("vfy", nx_, ny_));
+        add_subsystem(cs::subsystem_desc<ConvDivergence<false>>("cdiv", nx_, ny_));
         add_subsystem(cs::subsystem_desc<ViscDivergenceChained>("vdiv", nx_, ny_));
-        add_subsystem(cs::subsystem_desc<LocalTimestep>("dtk", nx_, ny_, false));
-        add_subsystem(cs::subsystem_desc<WaveSpeed>("wsk", nx_, ny_, false));
-        add_subsystem(cs::subsystem_desc<ResidualSquares>("rsq", nx_, ny_, false));
+        add_subsystem(cs::subsystem_desc<LocalTimestep<false>>("dtk", nx_, ny_));
+        add_subsystem(cs::subsystem_desc<WaveSpeed<false>>("wsk", nx_, ny_));
+        add_subsystem(cs::subsystem_desc<ResidualSquares<false>>("rsq", nx_, ny_));
         add_subsystem(cs::subsystem_desc<DetNorm>("detn", nx_, ny_));
         add_subsystem(cs::subsystem_desc<DetMin>("detd", nx_, ny_));
         add_subsystem(cs::subsystem_desc<DetMax>("detw", nx_, ny_));
-        add_subsystem(cs::subsystem_desc<ErrorStage>("err", false));
+        add_subsystem(cs::subsystem_desc<ErrorStage<false>>("err"));
 
         connect("pad.P", "prim.P");
         for (const char* c : {"grad", "rec", "cfx", "cfy", "vfx", "vfy"}) connect("prim.W", std::string{c} + ".W");
@@ -75,6 +75,8 @@ public:
 
         // the state is read by the boundary kernel and the two per-cell diagnostics
         tie_inputs<DType::f32, 3>({"pad.U", "dtk.U", "wsk.U"}, "U", cs::shape(4, ny_, nx_));
+        // the grid (nx, ny, tx, ty): read by the boundary kernel and the deterministic reductions; the driver sets it
+        tie_inputs<DType::i32, 1>({"pad.geo", "detn.geo", "detd.geo", "detw.geo"}, "geo", cs::shape(4));
         // the atomic accumulators: zeroed by init, accumulated by the diagnostics, read by err
         tie_outputs<DType::atomic_f32, 1>({"init.Dt", "dtk.Dt", "err.Dt"}, "Dt", cs::shape(1));
         tie_outputs<DType::atomic_f32, 1>({"init.Ws", "wsk.Ws", "err.Ws"}, "Ws", cs::shape(1));
@@ -104,6 +106,9 @@ public:
                                {"detd.Det", "err.DetDt"},
                                {"detw.Det", "err.DetWs"}}),
             cs::ties_desc({cs::tie_inputs<DType::f32, 3>({"load.U", "bc.U", "dtk.U", "wsk.U"}, "U", cs::shape(4, ny_, nx_)),
+                           cs::tie_inputs<DType::i32, 1>({"load.geo", "bc.geo", "cfx.geo", "cfy.geo", "vfx.geo", "vfy.geo", "cdiv.geo", "vdiv.geo",
+                                                          "detn.geo", "detd.geo", "detw.geo"},
+                                                         "geo", cs::shape(4)),
                            cs::tie_outputs<DType::f32, 3>({"cdiv.R", "vdiv.R"}, "R", cs::shape(4, ny_, nx_), cs::TieOutputsPolicy::allow_plain),
                            cs::tie_outputs<DType::atomic_f32, 1>({"init.Dt", "dtk.Dt", "err.Dt"}, "Dt", cs::shape(1)),
                            cs::tie_outputs<DType::atomic_f32, 1>({"init.Ws", "wsk.Ws", "err.Ws"}, "Ws", cs::shape(1)),
@@ -114,23 +119,23 @@ public:
             cs::segment<cs::local_mem::shared>(cs::subsystem_desc<LoadTile>("load", nx_, ny_), cs::subsystem_desc<ApplyBoundary<Bc>>("bc", nx_, ny_),
                                                cs::subsystem_desc<ToPrimitive>("prim", nx_, ny_), cs::subsystem_desc<Gradients>("grad", nx_, ny_),
                                                cs::subsystem_desc<Reconstruct<Lim>>("rec", nx_, ny_),
-                                               cs::subsystem_desc<FaceFlux<ConvFluxBody>>("cfx", nx_, ny_, 0),
-                                               cs::subsystem_desc<FaceFlux<ConvFluxBody>>("cfy", nx_, ny_, 1),
-                                               cs::subsystem_desc<FaceFlux<ViscFluxBody>>("vfx", nx_, ny_, 0),
-                                               cs::subsystem_desc<FaceFlux<ViscFluxBody>>("vfy", nx_, ny_, 1)),
+                                               cs::subsystem_desc<ConvFlux<0>>("cfx", nx_, ny_),
+                                               cs::subsystem_desc<ConvFlux<1>>("cfy", nx_, ny_),
+                                               cs::subsystem_desc<ViscFlux<0>>("vfx", nx_, ny_),
+                                               cs::subsystem_desc<ViscFlux<1>>("vfy", nx_, ny_)),
             // segment 2: divergences (wait on the tile-pipeline groups they read) and the diagnostics (wait on init)
-            cs::segment<cs::local_mem::partitioned>(cs::subsystem_desc<ConvDivergence>("cdiv", nx_, ny_, true, true),
-                                                    cs::subsystem_desc<ViscDivergence>("vdiv", nx_, ny_, true),
-                                                    cs::subsystem_desc<LocalTimestep>("dtk", nx_, ny_, true),
-                                                    cs::subsystem_desc<WaveSpeed>("wsk", nx_, ny_, true),
-                                                    cs::subsystem_desc<ResidualSquares>("rsq", nx_, ny_, true)),
+            cs::segment<cs::local_mem::partitioned>(cs::subsystem_desc<ConvDivergence<true>>("cdiv", nx_, ny_),
+                                                    cs::subsystem_desc<ViscDivergence>("vdiv", nx_, ny_),
+                                                    cs::subsystem_desc<LocalTimestep<true>>("dtk", nx_, ny_),
+                                                    cs::subsystem_desc<WaveSpeed<true>>("wsk", nx_, ny_),
+                                                    cs::subsystem_desc<ResidualSquares<true>>("rsq", nx_, ny_)),
             cs::global_barrier(),
             // segment 3: the deterministic reductions of the per-tile partials, fixed order
             cs::segment<cs::local_mem::partitioned, cs::range_mode::own>(cs::subsystem_desc<DetNorm>("detn", nx_, ny_),
                                                                          cs::subsystem_desc<DetMin>("detd", nx_, ny_),
                                                                          cs::subsystem_desc<DetMax>("detw", nx_, ny_)),
             // segment 4: atomic - deterministic, after waiting on exactly the segment-3 groups it compares
-            cs::segment(cs::subsystem_desc<ErrorStage>("err", true))));
+            cs::segment(cs::subsystem_desc<ErrorStage<true>>("err"))));
     }
 };
 

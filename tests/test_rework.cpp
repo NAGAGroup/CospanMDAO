@@ -36,48 +36,48 @@ namespace trework {
 constexpr std::size_t kN = 8;
 
 // ---- TrCopy: y = x, x a free input of kN ----------------------------------------------------------------------------------
-struct TrCopyBody {
+
+class TrCopy : public cs::Component<TrCopy> {
+public:
     struct Inputs {
         cs::Input<DType::f32, 1> x;
     };
     struct Outputs {
         cs::Output<DType::f32, 1> y;
     };
-    void operator()(sycl::id<1> i, Inputs in, Outputs out) const { out.y[i] = in.x[i]; }
-};
-class TrCopy : public cs::Component<TrCopyBody> {
-    cs::Input<DType::f32, 1>  x_;
-    cs::Output<DType::f32, 1> y_;
+    static void compute_impl(sycl::id<1> i, const Inputs& in, const Outputs& out) { out.y[i] = in.x[i]; }
 
-public:
+    Inputs  inputs;
+    Outputs outputs;
+
     void setup() override {
-        declare_input(x_, "x", static_cast<int>(kN));
-        declare_output(y_, "y", static_cast<int>(kN));
+        declare_input(inputs.x, "x", static_cast<int>(kN));
+        declare_output(outputs.y, "y", static_cast<int>(kN));
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(y_.shape(), {x_}, {y_}, {}); }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(cs::range_desc(outputs.y.shape())); }
 };
 
 // ---- TrThrow: a HOST body that throws -------------------------------------------------------------------------------------
-struct TrThrowBody {
+
+class TrThrow : public cs::Component<TrThrow> {
+public:
     struct Inputs {
         cs::Input<DType::f32, 1> x;
     };
     struct Outputs {
         cs::Output<DType::f32, 1> y;
     };
-    void operator()(cs::Host, Inputs, Outputs) const { throw std::runtime_error("trework: thrown inside a host body"); }
-};
-class TrThrow : public cs::Component<TrThrowBody> {
-    cs::Input<DType::f32, 1>  x_;
-    cs::Output<DType::f32, 1> y_;
+    static void compute_impl(cs::Host, const Inputs&, const Outputs&) { throw std::runtime_error("trework: thrown inside a host body"); }
 
-public:
+    Inputs  inputs;
+    Outputs outputs;
+
     void setup() override {
-        declare_input(x_, "x", static_cast<int>(kN));
-        declare_output(y_, "y", static_cast<int>(kN));
+        declare_input(inputs.x, "x", static_cast<int>(kN));
+        declare_output(outputs.y, "y", static_cast<int>(kN));
         init_input("x", cs::init::fill(1.0f));
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config({x_}, {y_}, {}); }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(); }
 };
 
 template <class C>

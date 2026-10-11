@@ -80,65 +80,79 @@ std::vector<float> out(cs::Model& m, std::string_view path) { return to_vector(c
 std::vector<float> in(cs::Model& m, std::string_view path) { return to_vector(cst::synced_input<DType::f32, 1>(m, path)); }
 
 // ---- components ----------------------------------------------------------------------------------
-struct GenBody {
-    struct Inputs {};
+
+/// y[i] = v, kN elements.
+class Gen : public cs::Component<Gen> {
+public:
+    struct Inputs {
+        cs::Input<DType::f32, 1> v;  // a free input of extent 1, initialized from the constructor's value
+    };
     struct Outputs {
         cs::Output<DType::f32, 1> y;
     };
-    float v;
-    void operator()(sycl::id<1> i, Inputs, Outputs o) const { o.y[i] = v; }
-};
+    static void compute_impl(sycl::id<1> i, const Inputs& in, const Outputs& o) { o.y[i] = in.v[std::size_t{0}]; }
 
-/// y[i] = v, kN elements.
-class Gen : public cs::Component<GenBody> {
-    cs::Output<DType::f32, 1> y_;
+    Inputs  inputs;
+    Outputs outputs;
+
+private:
     float                     v_;
 
 public:
     explicit Gen(float v) : v_{v} {}
-    void setup() override { declare_output(y_, "y", static_cast<int>(kN)); }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(y_.shape(), {}, {y_}, {v_}); }
-};
-
-struct HalfBody {
-    struct Inputs {};
-    struct Outputs {
-        cs::Output<DType::f32, 1> y;
-    };
-    unsigned lo, hi;
-    void operator()(sycl::id<1> i, Inputs, Outputs o) const {
-        if (i[0] >= lo && i[0] < hi) o.y[i] = static_cast<float>(i[0] + 1);
-    }
+    void setup() override {
+        declare_input(inputs.v, "v", 1);
+        init_input("v", cs::init::fill(v_)); declare_output(outputs.y, "y", static_cast<int>(kN)); }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(cs::range_desc(outputs.y.shape())); }
 };
 
 /// Writes y[i] = i + 1 for i in [lo, hi) and nothing else: two of them tied together make the whole 1..kN.
-class Half : public cs::Component<HalfBody> {
-    cs::Output<DType::f32, 1> y_;
+class Half : public cs::Component<Half> {
+public:
+    struct Inputs {
+        cs::Input<DType::u32, 1> lo, hi;  // a free input of extent 1, initialized from the constructor's value
+    };
+    struct Outputs {
+        cs::Output<DType::f32, 1> y;
+    };
+    static void compute_impl(sycl::id<1> i, const Inputs& in, const Outputs& o) {
+        if (i[0] >= in.lo[std::size_t{0}] && i[0] < in.hi[std::size_t{0}]) o.y[i] = static_cast<float>(i[0] + 1);
+    }
+
+    Inputs  inputs;
+    Outputs outputs;
+
+private:
     unsigned                  lo_, hi_;
 
 public:
     Half(unsigned lo, unsigned hi) : lo_{lo}, hi_{hi} {}
-    void setup() override { declare_output(y_, "y", static_cast<int>(kN)); }
+    void setup() override {
+        declare_input(inputs.lo, "lo", 1);
+        init_input("lo", cs::init::fill(lo_));
+        declare_input(inputs.hi, "hi", 1);
+        init_input("hi", cs::init::fill(hi_)); declare_output(outputs.y, "y", static_cast<int>(kN)); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(y_.shape(), {}, {y_}, {lo_, hi_});
+        return create_launch_config(cs::range_desc(outputs.y.shape()));
     }
 };
 
-struct AxpbBody {
+/// y = a * x + b, kN elements; `x0` is the initial value of x (a component's own init_input); `pre` counts pre_forward calls.
+class Axpb : public cs::Component<Axpb> {
+public:
     struct Inputs {
         cs::Input<DType::f32, 1> x;
+        cs::Input<DType::f32, 1> a, b;  // a free input of extent 1, initialized from the constructor's value
     };
     struct Outputs {
         cs::Output<DType::f32, 1> y;
     };
-    float a, b;
-    void operator()(sycl::id<1> i, Inputs in, Outputs o) const { o.y[i] = a * in.x[i] + b; }
-};
+    static void compute_impl(sycl::id<1> i, const Inputs& in, const Outputs& o) { o.y[i] = in.a[std::size_t{0}] * in.x[i] + in.b[std::size_t{0}]; }
 
-/// y = a * x + b, kN elements; `x0` is the initial value of x (a component's own init_input); `pre` counts pre_forward calls.
-class Axpb : public cs::Component<AxpbBody> {
-    cs::Input<DType::f32, 1>  x_;
-    cs::Output<DType::f32, 1> y_;
+    Inputs  inputs;
+    Outputs outputs;
+
+private:
     float                     a_, b_;
     std::optional<float>      x0_;
     int*                      pre_;
@@ -146,39 +160,42 @@ class Axpb : public cs::Component<AxpbBody> {
 public:
     Axpb(float a, float b, std::optional<float> x0 = std::nullopt, int* pre = nullptr) : a_{a}, b_{b}, x0_{x0}, pre_{pre} {}
     void setup() override {
-        declare_input(x_, "x", static_cast<int>(kN));
-        declare_output(y_, "y", static_cast<int>(kN));
+        declare_input(inputs.a, "a", 1);
+        init_input("a", cs::init::fill(a_));
+        declare_input(inputs.b, "b", 1);
+        init_input("b", cs::init::fill(b_));
+        declare_input(inputs.x, "x", static_cast<int>(kN));
+        declare_output(outputs.y, "y", static_cast<int>(kN));
         if (x0_) init_input("x", cs::init::fill(*x0_));
     }
     void pre_forward() override {
         if (pre_ != nullptr) ++*pre_;
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(x_.shape(), {x_}, {y_}, {a_, b_}); }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(cs::range_desc(inputs.x.shape())); }
 };
 
 /// A host body: y = x + 1 on the host.
-struct HostIncBody {
+
+class HostInc : public cs::Component<HostInc> {
+public:
     struct Inputs {
         cs::Input<DType::f32, 1> x;
     };
     struct Outputs {
         cs::Output<DType::f32, 1> y;
     };
-    void operator()(cs::Host, Inputs in, Outputs o) const {
+    static void compute_impl(cs::Host, const Inputs& in, const Outputs& o) {
         for (std::size_t i = 0; i < in.x.size(); ++i) o.y[i] = in.x[i] + 1.0f;
     }
-};
 
-class HostInc : public cs::Component<HostIncBody> {
-    cs::Input<DType::f32, 1>  x_;
-    cs::Output<DType::f32, 1> y_;
+    Inputs  inputs;
+    Outputs outputs;
 
-public:
     void setup() override {
-        declare_input(x_, "x", static_cast<int>(kN));
-        declare_output(y_, "y", static_cast<int>(kN));
+        declare_input(inputs.x, "x", static_cast<int>(kN));
+        declare_output(outputs.y, "y", static_cast<int>(kN));
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config({x_}, {y_}, {}); }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(); }
 };
 
 // ---- systems --------------------------------------------------------------------------------------

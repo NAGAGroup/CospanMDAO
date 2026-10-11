@@ -40,24 +40,23 @@ Two copies of a component that doubles its input, connected in a chain:
 namespace cs = naga::cospan;
 using cs::DType;
 
-struct DoubleBody {
+class Double : public cs::Component<Double> {
+public:
     struct Inputs  { cs::Input<DType::f32, 1> x; };
     struct Outputs { cs::Output<DType::f32, 1> y; };
-    void operator()(sycl::id<1> i, Inputs in, Outputs out) const { out.y[i] = 2.0f * in.x[i]; }
-};
+    // the kernel: one work-item per element (its first parameter makes this a plain, rank-1 body)
+    static void compute_impl(sycl::id<1> i, const Inputs& in, const Outputs& out) { out.y[i] = 2.0f * in.x[i]; }
 
-class Double : public cs::Component<DoubleBody> {
-    cs::Input<DType::f32, 1>  x_;
-    cs::Output<DType::f32, 1> y_;
+    Inputs  inputs;
+    Outputs outputs;
 
-public:
     void setup() override {                                  // declare I/O; allocates nothing
-        declare_input(x_, "x", cs::unspecified);
-        declare_output(y_, "y", cs::unspecified);
+        declare_input(inputs.x, "x", cs::unspecified);
+        declare_output(outputs.y, "y", cs::unspecified);
     }
-    void pre_forward() override { set_shape(y_, shape_of(x_)[0]); }   // the output follows the input
+    void pre_forward() override { set_shape(outputs.y, shape_of(inputs.x)[0]); }   // the output follows the input
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(x_.shape(), {x_}, {y_}, {});
+        return create_launch_config(cs::range_desc(inputs.x.shape()));
     }
 };
 

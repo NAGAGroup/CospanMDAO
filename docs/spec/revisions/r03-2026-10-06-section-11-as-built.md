@@ -219,13 +219,34 @@ A `shape_hook` step (section 5) runs in the loop immediately before the first ch
 shape-not-known error); each wrapper is pointed at its data.
 
 **Compute.** `compute_forward()` returns a `std::unique_ptr<cs::LaunchDescription>`:
-`create_launch_config(range, in, out, body)` (plain, group), `(range, wg, in, out, body)` (group, explicit work-group),
-`(range, wg, in, out, scratch, body)` (group with `Scratch`), `(in, out, body)` (custom-op, host). A plain or group body
+`create_launch_config(descriptors...)` (3.3a): `cs::range_desc`, `cs::wg_desc`, `cs::scratch_desc` for a plain or group
+component, none for a custom-op or host component. A plain or group body
 launches through the group launcher (section 6); a custom-op or host body submits itself on the unordered queue. The launch is
 ordered by its dependencies only (3.4) and **its events are registered at submit** (`record_launch`): a read on every input
 container and a write on every output container.
 
 **Postcompute.** The pushes (3.5), then `post_forward()`.
+
+### 3.3a The component form
+
+A component is `class X : public cs::Component<X>` (there is no `Component<KB>` and no body argument). It declares:
+
+- nested `struct Inputs` and `struct Outputs` of ports, and PUBLIC members `Inputs inputs; Outputs outputs;` (a CRTP base cannot
+  read a protected or private member of the derived class). `setup()` declares `inputs.x` and `outputs.y`;
+- a static `compute_impl(first, const Inputs&, const Outputs&[, Scratch])`. The first parameter fixes the kind and rank:
+  `sycl::id<R>` plain, `cs::GroupItem<R>` group, `cs::CustomOp&` custom-op, `cs::Host` host. A nested `struct Scratch` is the
+  4th parameter of a group body.
+
+The library builds ONE kernel body type per component (`detail::SynthBody<X>`, trivially copyable, holding copies of `inputs`
+and `outputs`), so two components with the same ports and signature still have distinct bodies. `create_launch_config` takes
+descriptors in any order: `cs::range_desc(sycl::range<R>)` (required for plain and group, of the body's rank),
+`cs::wg_desc(sycl::range<R>)` (optional), `cs::scratch_desc(s)` (optional, only with a `Scratch`, of that type). Custom-op and
+host components take none: `create_launch_config()`. A repeated descriptor, a missing range, a range of the wrong rank, a
+`scratch_desc` without a `Scratch` and any descriptor on a custom-op or host component do not compile.
+
+A value a kernel needs that the item does not provide is a port: a free input of the matching dtype, rank 1, extent 1 for a
+scalar, set with `init_input` or, when several components share it, a `tie_inputs` alias set by `update_input`. A kernel has no
+other state, and a variant is a different component type (a template parameter), not a runtime flag.
 
 ### 3.4 Containers are the only source of event truth
 

@@ -66,7 +66,11 @@ void forward_throws(cs::Model& m, const std::vector<std::string>& needles) {
 }
 
 // ---- Probe: y = x + w; x, w dense rank 1, n a one-element u32 -------------------------------------------------------
-struct ProbeBody {
+
+/// mode 0: x, w fixed 5.  mode 1: x, w unspecified (shaped by their initializers).  mode 2: x fixed 3, w unspecified
+/// (a System shape hook sets it from the value of n). The output takes x's shape in pre_forward.
+class Probe : public cs::Component<Probe> {
+public:
     struct Inputs {
         cs::Input<DType::f32, 1> x;
         cs::Input<DType::f32, 1> w;
@@ -75,97 +79,98 @@ struct ProbeBody {
     struct Outputs {
         cs::Output<DType::f32, 1> y;
     };
-    void operator()(sycl::id<1> i, Inputs a, Outputs o) const { o.y[i] = a.x[i] + a.w[i]; }
-};
-/// mode 0: x, w fixed 5.  mode 1: x, w unspecified (shaped by their initializers).  mode 2: x fixed 3, w unspecified
-/// (a System shape hook sets it from the value of n). The output takes x's shape in pre_forward.
-class Probe : public cs::Component<ProbeBody> {
+    static void compute_impl(sycl::id<1> i, const Inputs& a, const Outputs& o) { o.y[i] = a.x[i] + a.w[i]; }
+
+    Inputs  inputs;
+    Outputs outputs;
+
+private:
     int                       mode_;
-    cs::Input<DType::f32, 1>  x_, w_;
-    cs::Input<DType::u32, 1>  n_;
-    cs::Output<DType::f32, 1> y_;
 
 public:
     explicit Probe(int mode) : mode_{mode} {}
     void setup() override {
-        declare_input(n_, "n", std::size_t{1});
+        declare_input(inputs.n, "n", std::size_t{1});
         if (mode_ == 0) {
-            declare_input(x_, "x", std::size_t{5});
-            declare_input(w_, "w", std::size_t{5});
+            declare_input(inputs.x, "x", std::size_t{5});
+            declare_input(inputs.w, "w", std::size_t{5});
         } else if (mode_ == 1) {
-            declare_input(x_, "x", cs::unspecified);
-            declare_input(w_, "w", cs::unspecified);
+            declare_input(inputs.x, "x", cs::unspecified);
+            declare_input(inputs.w, "w", cs::unspecified);
         } else {
-            declare_input(x_, "x", std::size_t{3});
-            declare_input(w_, "w", cs::unspecified);
+            declare_input(inputs.x, "x", std::size_t{3});
+            declare_input(inputs.w, "w", cs::unspecified);
         }
-        declare_output(y_, "y", cs::unspecified);
+        declare_output(outputs.y, "y", cs::unspecified);
     }
-    void pre_forward() override { set_shape(y_, shape_of(x_)[0]); }
+    void pre_forward() override { set_shape(outputs.y, shape_of(inputs.x)[0]); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(y_.shape(), {x_, w_, n_}, {y_}, {});
+        return create_launch_config(cs::range_desc(outputs.y.shape()));
     }
 };
 
 // ---- RagSum: sums[i] = the sum of block i of a ragged [N, c_i] input ----------------------------------------------
-struct RagSumBody {
+
+/// mode 0: x unspecified in both dims (a connection or an init shapes it).  mode 1: the same, for a tie.
+/// mode 2: x declared with cs::counts(sizes) (N = sizes.size()). The output has one sum per index.
+class RagSum : public cs::Component<RagSum> {
+public:
     struct Inputs {
         cs::RaggedInput<DType::f32, 2> x;
     };
     struct Outputs {
         cs::Output<DType::f32, 1> sums;
     };
-    void operator()(sycl::id<1> id, Inputs i, Outputs o) const {
+    static void compute_impl(sycl::id<1> id, const Inputs& i, const Outputs& o) {
         auto  b = i.x.block(id[0]);
         float s = 0.0f;
         for (std::size_t q = 0; q < b.size(); ++q) s += b[q];
         o.sums[id] = s;
     }
-};
-/// mode 0: x unspecified in both dims (a connection or an init shapes it).  mode 1: the same, for a tie.
-/// mode 2: x declared with cs::counts(sizes) (N = sizes.size()). The output has one sum per index.
-class RagSum : public cs::Component<RagSumBody> {
+
+    Inputs  inputs;
+    Outputs outputs;
+
+private:
     int                            mode_;
     Sizes                          sizes_;
-    cs::RaggedInput<DType::f32, 2> x_;
-    cs::Output<DType::f32, 1>      sums_;
 
 public:
     RagSum(int mode, Sizes sizes) : mode_{mode}, sizes_{std::move(sizes)} {}
     void setup() override {
         if (mode_ == 0 || mode_ == 1)
-            declare_input(x_, "x");
+            declare_input(inputs.x, "x");
         else
-            declare_input(x_, "x", cs::counts(sizes_));
-        declare_output(sums_, "sums", cs::unspecified);
+            declare_input(inputs.x, "x", cs::counts(sizes_));
+        declare_output(outputs.sums, "sums", cs::unspecified);
     }
-    void pre_forward() override { set_shape(sums_, shape_of(x_).n); }
+    void pre_forward() override { set_shape(outputs.sums, shape_of(inputs.x).n); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(sums_.shape(), {x_}, {sums_}, {});
+        return create_launch_config(cs::range_desc(outputs.sums.shape()));
     }
 };
 
 // ---- Dbl: out = 2 in ---------------------------------------------------------------------------------------------------
-struct DblBody {
+
+class Dbl : public cs::Component<Dbl> {
+public:
     struct Inputs {
         cs::Input<DType::f32, 1> in;
     };
     struct Outputs {
         cs::Output<DType::f32, 1> out;
     };
-    void operator()(sycl::id<1> i, Inputs a, Outputs o) const { o.out[i] = 2.0f * a.in[i]; }
-};
-class Dbl : public cs::Component<DblBody> {
-    cs::Input<DType::f32, 1>  in_;
-    cs::Output<DType::f32, 1> out_;
+    static void compute_impl(sycl::id<1> i, const Inputs& a, const Outputs& o) { o.out[i] = 2.0f * a.in[i]; }
 
-public:
+    Inputs  inputs;
+    Outputs outputs;
+
     void setup() override {
-        declare_input(in_, "in", cs::unspecified);
-        declare_output(out_, "out", cs::unspecified);
+        declare_input(inputs.in, "in", cs::unspecified);
+        declare_output(outputs.out, "out", cs::unspecified);
     }
-    void pre_forward() override { set_shape(out_, shape_of(in_)[0]); }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(out_.shape(), {in_}, {out_}, {}); }
+    void pre_forward() override { set_shape(outputs.out, shape_of(inputs.in)[0]); }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(cs::range_desc(outputs.out.shape())); }
 };
 
 // ---- the subtree under test, a plain System ----------------------------------------------------------------------------

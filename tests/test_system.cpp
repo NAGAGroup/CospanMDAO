@@ -141,16 +141,19 @@ std::vector<float> iota_plus(float first, std::size_t n, float scale = 1.0f, flo
 }
 
 // ---- Src: y[i] = i + 1 ------------------------------------------------------
-struct SrcBody {
+
+class Src : public cs::Component<Src> {
+public:
     struct Inputs {};
     struct Outputs {
         cs::Output<DType::f32, 1> y;
     };
-    void operator()(sycl::id<1> i, Inputs, Outputs out) const { out.y[i] = static_cast<float>(i[0] + 1); }
-};
+    static void compute_impl(sycl::id<1> i, const Inputs&, const Outputs& out) { out.y[i] = static_cast<float>(i[0] + 1); }
 
-class Src : public cs::Component<SrcBody> {
-    cs::Output<DType::f32, 1> y_;
+    Inputs  inputs;
+    Outputs outputs;
+
+private:
     bool                      tied_;
 
 public:
@@ -158,34 +161,36 @@ public:
     explicit Src(bool tied = false) : tied_{tied} {}
     void setup() override {
         if (tied_)
-            declare_output(y_, "y", cs::unspecified_shape<1>());
+            declare_output(outputs.y, "y", cs::unspecified_shape<1>());
         else
-            declare_output(y_, "y", static_cast<int>(kLen));
+            declare_output(outputs.y, "y", static_cast<int>(kLen));
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(y_.shape(), {}, {y_}, {});
+        return create_launch_config(cs::range_desc(outputs.y.shape()));
     }
 };
 
 // ---- Axpb: y = a * x + b, x of kLen (x0: a fill init on x; log: a logging init instead) ------------
-struct AxpbBody {
-    struct Inputs {
-        cs::Input<DType::f32, 1> x;
-    };
-    struct Outputs {
-        cs::Output<DType::f32, 1> y;
-    };
-    float a, b;
-    void operator()(sycl::id<1> i, Inputs in, Outputs out) const { out.y[i] = a * in.x[i] + b; }
-};
 
 /// Selects the Axpb whose input x has all dims unspecified (a tie_inputs member).
 struct TiedX {};
 inline constexpr TiedX tied_x{};
 
-class Axpb : public cs::Component<AxpbBody> {
-    cs::Input<DType::f32, 1>  x_;
-    cs::Output<DType::f32, 1> y_;
+class Axpb : public cs::Component<Axpb> {
+public:
+    struct Inputs {
+        cs::Input<DType::f32, 1> x;
+        cs::Input<DType::f32, 1> a, b;  // a free input of extent 1, initialized from the constructor's value
+    };
+    struct Outputs {
+        cs::Output<DType::f32, 1> y;
+    };
+    static void compute_impl(sycl::id<1> i, const Inputs& in, const Outputs& out) { out.y[i] = in.a[std::size_t{0}] * in.x[i] + in.b[std::size_t{0}]; }
+
+    Inputs  inputs;
+    Outputs outputs;
+
+private:
     float                     a_, b_;
     std::optional<float>      x0_;
     std::string               log_;
@@ -196,156 +201,165 @@ public:
         : a_{a}, b_{b}, x0_{x0}, log_{std::move(log)} {}
     Axpb(TiedX, float a, float b, std::optional<float> x0 = std::nullopt) : a_{a}, b_{b}, x0_{x0}, tied_{true} {}
     void setup() override {
+        declare_input(inputs.a, "a", 1);
+        init_input("a", cs::init::fill(a_));
+        declare_input(inputs.b, "b", 1);
+        init_input("b", cs::init::fill(b_));
         if (tied_)
-            declare_input(x_, "x", cs::unspecified_shape<1>());
+            declare_input(inputs.x, "x", cs::unspecified_shape<1>());
         else
-            declare_input(x_, "x", static_cast<int>(kLen));
-        declare_output(y_, "y", static_cast<int>(kLen));
+            declare_input(inputs.x, "x", static_cast<int>(kLen));
+        declare_output(outputs.y, "y", static_cast<int>(kLen));
         if (!log_.empty())
             init_input("x", logging_fill(log_, x0_.value_or(0.0f)));
         else if (x0_)
             init_input("x", cs::init::fill(*x0_));
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(x_.shape(), {x_}, {y_}, {a_, b_});
+        return create_launch_config(cs::range_desc(inputs.x.shape()));
     }
 };
 
 // ---- Copy1 / Copy2: y = x, the input takes the shape of what it is connected to --------------
-struct Copy1Body {
+
+class Copy1 : public cs::Component<Copy1> {
+public:
     struct Inputs {
         cs::Input<DType::f32, 1> x;
     };
     struct Outputs {
         cs::Output<DType::f32, 1> y;
     };
-    void operator()(sycl::id<1> i, Inputs in, Outputs out) const { out.y[i] = in.x[i]; }
-};
+    static void compute_impl(sycl::id<1> i, const Inputs& in, const Outputs& out) { out.y[i] = in.x[i]; }
 
-class Copy1 : public cs::Component<Copy1Body> {
-    cs::Input<DType::f32, 1>  x_;
-    cs::Output<DType::f32, 1> y_;
+    Inputs  inputs;
+    Outputs outputs;
 
-public:
     void setup() override {
-        declare_input(x_, "x", cs::unspecified_shape<1>());
-        declare_output(y_, "y", cs::unspecified_shape<1>());
+        declare_input(inputs.x, "x", cs::unspecified_shape<1>());
+        declare_output(outputs.y, "y", cs::unspecified_shape<1>());
     }
-    void pre_forward() override { set_shape(y_, shape_of(x_)[0]); }  // the output follows the input (section 10: no derived dims)
+    void pre_forward() override { set_shape(outputs.y, shape_of(inputs.x)[0]); }  // the output follows the input (section 10: no derived dims)
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(x_.shape(), {x_}, {y_}, {});
+        return create_launch_config(cs::range_desc(inputs.x.shape()));
     }
 };
 
-struct Copy2Body {
+class Copy2 : public cs::Component<Copy2> {
+public:
     struct Inputs {
         cs::Input<DType::f32, 2> x;
     };
     struct Outputs {
         cs::Output<DType::f32, 2> y;
     };
-    void operator()(sycl::id<2> ij, Inputs in, Outputs out) const { out.y[ij] = in.x[ij]; }
-};
+    static void compute_impl(sycl::id<2> ij, const Inputs& in, const Outputs& out) { out.y[ij] = in.x[ij]; }
 
-class Copy2 : public cs::Component<Copy2Body> {
-    cs::Input<DType::f32, 2>  x_;
-    cs::Output<DType::f32, 2> y_;
+    Inputs  inputs;
+    Outputs outputs;
 
-public:
     void setup() override {
-        declare_input(x_, "x", cs::unspecified_shape<2>());
-        declare_output(y_, "y", cs::unspecified_shape<2>());
+        declare_input(inputs.x, "x", cs::unspecified_shape<2>());
+        declare_output(outputs.y, "y", cs::unspecified_shape<2>());
     }
-    void pre_forward() override { set_shape(y_, shape_of(x_)[0], shape_of(x_)[1]); }  // the output follows the input (section 10: no derived dims)
+    void pre_forward() override { set_shape(outputs.y, shape_of(inputs.x)[0], shape_of(inputs.x)[1]); }  // the output follows the input (section 10: no derived dims)
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(x_.shape(), {x_}, {y_}, {});
+        return create_launch_config(cs::range_desc(inputs.x.shape()));
     }
 };
 
 // ---- Iota2D: out[i][j] = 1000 i + j ----------------------------------------------------------
-struct Iota2DBody {
+
+class Iota2D : public cs::Component<Iota2D> {
+public:
     struct Inputs {};
     struct Outputs {
         cs::Output<DType::f32, 2> out;
     };
-    void operator()(sycl::id<2> ij, Inputs, Outputs o) const { o.out[ij] = static_cast<float>(ij[0] * 1000 + ij[1]); }
-};
+    static void compute_impl(sycl::id<2> ij, const Inputs&, const Outputs& o) { o.out[ij] = static_cast<float>(ij[0] * 1000 + ij[1]); }
 
-class Iota2D : public cs::Component<Iota2DBody> {
-    cs::Output<DType::f32, 2> out_;
+    Inputs  inputs;
+    Outputs outputs;
+
+private:
     int                       rows_, cols_;
 
 public:
     Iota2D(int rows, int cols) : rows_{rows}, cols_{cols} {}
-    void setup() override { declare_output(out_, "out", rows_, cols_); }
+    void setup() override { declare_output(outputs.out, "out", rows_, cols_); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(out_.shape(), {}, {out_}, {});
+        return create_launch_config(cs::range_desc(outputs.out.shape()));
     }
 };
 
 // ---- Adder: acc[i] += v, an ATOMIC output (zeroed by a ZeroAcc producer) ------------------------------------
-struct AdderBody {
-    struct Inputs {};
+
+class Adder : public cs::Component<Adder> {
+public:
+    struct Inputs {
+        cs::Input<DType::f32, 1> v;  // a free input of extent 1, initialized from the constructor's value
+    };
     struct Outputs {
         cs::Output<DType::atomic_f32, 1> acc;
     };
-    float v;
-    void operator()(sycl::id<1> i, Inputs, Outputs out) const { out.acc[i].fetch_add(v); }
-};
+    static void compute_impl(sycl::id<1> i, const Inputs& in, const Outputs& out) { out.acc[i].fetch_add(in.v[std::size_t{0}]); }
 
-class Adder : public cs::Component<AdderBody> {
-    cs::Output<DType::atomic_f32, 1> acc_;
+    Inputs  inputs;
+    Outputs outputs;
+
+private:
     float                            v_;
 
 public:
     explicit Adder(float v) : v_{v} {}
-    void setup() override { declare_output(acc_, "acc", cs::unspecified_shape<1>()); }  // a tie_outputs member
+    void setup() override {
+        declare_input(inputs.v, "v", 1);
+        init_input("v", cs::init::fill(v_)); declare_output(outputs.acc, "acc", cs::unspecified_shape<1>()); }  // a tie_outputs member
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(acc_.shape(), {}, {acc_}, {v_});
+        return create_launch_config(cs::range_desc(outputs.acc.shape()));
     }
 };
 
 // ---- ZeroAcc: the zeroing producer (outputs are never initialized, r01 §6.0) ---
-struct ZeroAccBody {
+
+class ZeroAcc : public cs::Component<ZeroAcc> {
+public:
     struct Inputs {};
     struct Outputs {
         cs::Output<DType::atomic_f32, 1> acc;
     };
-    void operator()(sycl::id<1> i, Inputs, Outputs out) const { out.acc[i].store(0.0f); }
-};
+    static void compute_impl(sycl::id<1> i, const Inputs&, const Outputs& out) { out.acc[i].store(0.0f); }
 
-class ZeroAcc : public cs::Component<ZeroAccBody> {
-    cs::Output<DType::atomic_f32, 1> acc_;
+    Inputs  inputs;
+    Outputs outputs;
 
-public:
-    void setup() override { declare_output(acc_, "acc", cs::unspecified_shape<1>()); }
+    void setup() override { declare_output(outputs.acc, "acc", cs::unspecified_shape<1>()); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(acc_.shape(), {}, {acc_}, {});
+        return create_launch_config(cs::range_desc(outputs.acc.shape()));
     }
 };
 
 // ---- Pick: f[0] = 2 * x[0], a scalar output (one value, so it may be an objective) ------------
-struct PickBody {
+
+class Pick : public cs::Component<Pick> {
+public:
     struct Inputs {
         cs::Input<DType::f32, 1> x;
     };
     struct Outputs {
         cs::Output<DType::f32, 1> f;
     };
-    void operator()(sycl::id<1> i, Inputs in, Outputs out) const { out.f[i] = 2.0f * in.x[std::size_t{0}]; }
-};
+    static void compute_impl(sycl::id<1> i, const Inputs& in, const Outputs& out) { out.f[i] = 2.0f * in.x[std::size_t{0}]; }
 
-class Pick : public cs::Component<PickBody> {
-    cs::Input<DType::f32, 1>  x_;
-    cs::Output<DType::f32, 1> f_;
+    Inputs  inputs;
+    Outputs outputs;
 
-public:
     void setup() override {
-        declare_input(x_, "x", static_cast<int>(kLen));
-        declare_output(f_, "f", 1);
+        declare_input(inputs.x, "x", static_cast<int>(kLen));
+        declare_output(outputs.f, "f", 1);
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(sycl::range<1>{1}, {x_}, {f_}, {});
+        return create_launch_config(cs::range_desc(sycl::range<1>{1}));
     }
 };
 
@@ -358,10 +372,6 @@ public:
         connect("prod.y", "cons.x");
     }
 };
-
-
-
-
 
 // ---- promote --------------------------------------------------------------------------------
 class PromoteMid : public cs::System {
@@ -967,39 +977,41 @@ public:
 std::atomic<float> g_side{0.0f};  // the side channel: A writes it, B reads it; no variable joins them
 
 /// A: a host task that sleeps, then writes the side channel. Its own output only says it ran.
-struct SlowWriteBody {
+
+class SlowWriter : public cs::Component<SlowWriter> {
+public:
     struct Inputs {};
     struct Outputs {
         cs::Output<DType::f32, 1> done;
     };
-    void operator()(cs::Host, Inputs, Outputs out) const {
+    static void compute_impl(cs::Host, const Inputs&, const Outputs& out) {
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
         g_side.store(42.0f);
         out.done[std::size_t{0}] = 1.0f;
     }
-};
-class SlowWriter : public cs::Component<SlowWriteBody> {
-    cs::Output<DType::f32, 1> done_;
 
-public:
-    void setup() override { declare_output(done_, "done", 1); }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config({}, {done_}, {}); }
+    Inputs  inputs;
+    Outputs outputs;
+
+    void setup() override { declare_output(outputs.done, "done", 1); }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(); }
 };
 
 /// B: a host task that copies the side channel into its output.
-struct ReadSideBody {
+
+class SideReader : public cs::Component<SideReader> {
+public:
     struct Inputs {};
     struct Outputs {
         cs::Output<DType::f32, 1> got;
     };
-    void operator()(cs::Host, Inputs, Outputs out) const { out.got[std::size_t{0}] = g_side.load(); }
-};
-class SideReader : public cs::Component<ReadSideBody> {
-    cs::Output<DType::f32, 1> got_;
+    static void compute_impl(cs::Host, const Inputs&, const Outputs& out) { out.got[std::size_t{0}] = g_side.load(); }
 
-public:
-    void setup() override { declare_output(got_, "got", 1); }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config({}, {got_}, {}); }
+    Inputs  inputs;
+    Outputs outputs;
+
+    void setup() override { declare_output(outputs.got, "got", 1); }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(); }
 };
 
 /// a (SlowWriter) then b (SideReader); `dep`: b depends_on a.
@@ -1053,7 +1065,8 @@ public:
 constexpr float kSellarD1Y2 = 99.0f;  // d1's own init: overridden
 constexpr float kSellarY2   = 1.5f;   // the MDA System's init_input (depth 1): the last word
 
-struct D1Body {
+class D1 : public cs::Component<D1> {
+public:
     struct Inputs {
         cs::Input<DType::f32, 1> z;
         cs::Input<DType::f32, 1> x;
@@ -1062,30 +1075,28 @@ struct D1Body {
     struct Outputs {
         cs::Output<DType::f32, 1> y1;
     };
-    void operator()(sycl::id<1> i, Inputs in, Outputs out) const {
+    static void compute_impl(sycl::id<1> i, const Inputs& in, const Outputs& out) {
         out.y1[i] = in.z[std::size_t{0}] * in.z[std::size_t{0}] + in.z[std::size_t{1}] + in.x[std::size_t{0}] -
                     0.2f * in.y2[std::size_t{0}];
     }
-};
 
-class D1 : public cs::Component<D1Body> {
-    cs::Input<DType::f32, 1>  z_, x_, y2_;
-    cs::Output<DType::f32, 1> y1_;
+    Inputs  inputs;
+    Outputs outputs;
 
-public:
     void setup() override {
-        declare_input(z_, "z", cs::unspecified_shape<1>());  // z and x are tie members: the tie alias owns their shape
-        declare_input(x_, "x", cs::unspecified_shape<1>());
-        declare_input(y2_, "y2", 1);
-        declare_output(y1_, "y1", 1);
+        declare_input(inputs.z, "z", cs::unspecified_shape<1>());  // z and x are tie members: the tie alias owns their shape
+        declare_input(inputs.x, "x", cs::unspecified_shape<1>());
+        declare_input(inputs.y2, "y2", 1);
+        declare_output(outputs.y1, "y1", 1);
         init_input("y2", cs::init::fill(kSellarD1Y2));
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(y1_.shape(), {z_, x_, y2_}, {y1_}, {});
+        return create_launch_config(cs::range_desc(outputs.y1.shape()));
     }
 };
 
-struct D2Body {
+class D2 : public cs::Component<D2> {
+public:
     struct Inputs {
         cs::Input<DType::f32, 1> z;
         cs::Input<DType::f32, 1> y1_in;
@@ -1094,32 +1105,30 @@ struct D2Body {
         cs::Output<DType::f32, 1> y2;
         cs::Output<DType::f32, 1> yy;
     };
-    void operator()(sycl::id<1> i, Inputs in, Outputs out) const {
+    static void compute_impl(sycl::id<1> i, const Inputs& in, const Outputs& out) {
         const float y1 = in.y1_in[std::size_t{0}];
         const float y2 = sycl::sqrt(y1) + in.z[std::size_t{0}] + in.z[std::size_t{1}];
         out.y2[i]              = y2;
         out.yy[std::size_t{0}] = y1;
         out.yy[std::size_t{1}] = y2;
     }
-};
 
-class D2 : public cs::Component<D2Body> {
-    cs::Input<DType::f32, 1>  z_, y1_in_;
-    cs::Output<DType::f32, 1> y2_, yy_;
+    Inputs  inputs;
+    Outputs outputs;
 
-public:
     void setup() override {
-        declare_input(z_, "z", cs::unspecified_shape<1>());
-        declare_input(y1_in_, "y1_in", cs::unspecified_shape<1>());
-        declare_output(y2_, "y2", 1);
-        declare_output(yy_, "yy", 2);
+        declare_input(inputs.z, "z", cs::unspecified_shape<1>());
+        declare_input(inputs.y1_in, "y1_in", cs::unspecified_shape<1>());
+        declare_output(outputs.y2, "y2", 1);
+        declare_output(outputs.yy, "yy", 2);
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(y2_.shape(), {z_, y1_in_}, {y2_, yy_}, {});
+        return create_launch_config(cs::range_desc(outputs.y2.shape()));
     }
 };
 
-struct ObjBody {
+class Obj : public cs::Component<Obj> {
+public:
     struct Inputs {
         cs::Input<DType::f32, 1> x;
         cs::Input<DType::f32, 1> z;
@@ -1129,74 +1138,67 @@ struct ObjBody {
     struct Outputs {
         cs::Output<DType::f32, 1> f;
     };
-    void operator()(sycl::id<1> i, Inputs in, Outputs out) const {
+    static void compute_impl(sycl::id<1> i, const Inputs& in, const Outputs& out) {
         const float x = in.x[std::size_t{0}];
         out.f[i]      = x * x + in.z[std::size_t{1}] + in.y1[std::size_t{0}] + sycl::exp(-in.y2[std::size_t{0}]);
     }
-};
 
-class Obj : public cs::Component<ObjBody> {
-    cs::Input<DType::f32, 1>  x_, z_, y1_, y2_;
-    cs::Output<DType::f32, 1> f_;
+    Inputs  inputs;
+    Outputs outputs;
 
-public:
     void setup() override {
-        declare_input(x_, "x", cs::unspecified_shape<1>());
-        declare_input(z_, "z", cs::unspecified_shape<1>());
-        declare_input(y1_, "y1", cs::unspecified_shape<1>());
-        declare_input(y2_, "y2", cs::unspecified_shape<1>());
-        declare_output(f_, "f", 1);
+        declare_input(inputs.x, "x", cs::unspecified_shape<1>());
+        declare_input(inputs.z, "z", cs::unspecified_shape<1>());
+        declare_input(inputs.y1, "y1", cs::unspecified_shape<1>());
+        declare_input(inputs.y2, "y2", cs::unspecified_shape<1>());
+        declare_output(outputs.f, "f", 1);
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(f_.shape(), {x_, z_, y1_, y2_}, {f_}, {});
+        return create_launch_config(cs::range_desc(outputs.f.shape()));
     }
 };
 
-struct G1Body {
+class G1 : public cs::Component<G1> {
+public:
     struct Inputs {
         cs::Input<DType::f32, 1> y1;
     };
     struct Outputs {
         cs::Output<DType::f32, 1> g;
     };
-    void operator()(sycl::id<1> i, Inputs in, Outputs out) const { out.g[i] = 3.16f - in.y1[std::size_t{0}]; }
-};
+    static void compute_impl(sycl::id<1> i, const Inputs& in, const Outputs& out) { out.g[i] = 3.16f - in.y1[std::size_t{0}]; }
 
-class G1 : public cs::Component<G1Body> {
-    cs::Input<DType::f32, 1>  y1_;
-    cs::Output<DType::f32, 1> g_;
+    Inputs  inputs;
+    Outputs outputs;
 
-public:
     void setup() override {
-        declare_input(y1_, "y1", cs::unspecified_shape<1>());
-        declare_output(g_, "g", 1);
+        declare_input(inputs.y1, "y1", cs::unspecified_shape<1>());
+        declare_output(outputs.g, "g", 1);
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(g_.shape(), {y1_}, {g_}, {});
+        return create_launch_config(cs::range_desc(outputs.g.shape()));
     }
 };
 
-struct G2Body {
+class G2 : public cs::Component<G2> {
+public:
     struct Inputs {
         cs::Input<DType::f32, 1> y2;
     };
     struct Outputs {
         cs::Output<DType::f32, 1> g;
     };
-    void operator()(sycl::id<1> i, Inputs in, Outputs out) const { out.g[i] = in.y2[std::size_t{0}] - 24.0f; }
-};
+    static void compute_impl(sycl::id<1> i, const Inputs& in, const Outputs& out) { out.g[i] = in.y2[std::size_t{0}] - 24.0f; }
 
-class G2 : public cs::Component<G2Body> {
-    cs::Input<DType::f32, 1>  y2_;
-    cs::Output<DType::f32, 1> g_;
+    Inputs  inputs;
+    Outputs outputs;
 
-public:
     void setup() override {
-        declare_input(y2_, "y2", cs::unspecified_shape<1>());
-        declare_output(g_, "g", 1);
+        declare_input(inputs.y2, "y2", cs::unspecified_shape<1>());
+        declare_output(outputs.g, "g", 1);
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(g_.shape(), {y2_}, {g_}, {});
+        return create_launch_config(cs::range_desc(outputs.g.shape()));
     }
 };
 
@@ -1521,8 +1523,9 @@ TEST_CASE("transient: deleted after its turn, kept outputs, back-to-back forward
 
     // The pool's bytes in use are the sum of the live containers' capacities rounded up to whole nodes. After the first
     // forward the transient's prod.y and mid.y are gone; the eternal cons.y (= sink.x) and sink.y stay: two nodes of 8 floats.
-    // (plus the launch arrays of the one eternal kernel component, the sink: argument, pointer and geometry arrays)
-    constexpr std::size_t kEternal = 2 * cst::pool_node_bytes + cst::solo_launch_bytes(1);
+    // (plus the launch arrays of the one eternal kernel component, the sink: argument, pointer and geometry arrays, and its
+    // two scalar free inputs a and b: a node each)
+    constexpr std::size_t kEternal = 4 * cst::pool_node_bytes + cst::solo_launch_bytes(1);
     SECTION("host access to a deleted subsystem's variable throws") {
         model.forward();
         model.wait();
@@ -1696,7 +1699,8 @@ TEST_CASE("run-N subtree: its variables live for the n runs and are freed after 
     CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "op.cons.y")) == tsys::filled(11.0f));  // 2 * 4 + 3
     CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "sink.y")) == tsys::filled(11.5f));
     const std::size_t after1 = tsys::pool_in_use_of(model);
-    CHECK(after1 == 5 * cst::pool_node_bytes + cst::solo_launch_bytes(4));  // plus the launch arrays of prod, mid, cons and sink
+    // plus the launch arrays of prod, mid, cons and sink, and the scalar inputs a and b of each of the four (a node each)
+    CHECK(after1 == 13 * cst::pool_node_bytes + cst::solo_launch_bytes(4));
 
     // run 2 is the last: the subtree's variables are freed, the eternal one stays; the init is not applied again
     model.forward();
@@ -1705,7 +1709,7 @@ TEST_CASE("run-N subtree: its variables live for the n runs and are freed after 
     CHECK(model.get_subsystem("op") == nullptr);  // deleted after its last run: mid.y went with it
     CHECK(to_vector(cst::synced_input<DType::f32, 1>(model, "sink.x")) == tsys::filled(11.0f));  // op.cons.y's variable, held by the sink
     const std::size_t after2 = tsys::pool_in_use_of(model);
-    CHECK(after2 == 2 * cst::pool_node_bytes + cst::solo_launch_bytes(1));  // the sink keeps its launch arrays
+    CHECK(after2 == 4 * cst::pool_node_bytes + cst::solo_launch_bytes(1));  // the sink keeps its launch arrays and its a, b
 
     // forward 3: past n, nothing runs, so nothing is allocated, initialized or released
     model.forward();
@@ -1731,13 +1735,14 @@ TEST_CASE("run-N subtree: n = 3, the roots stay for runs 1..3 and the pool drops
         const std::size_t now = tsys::pool_in_use_of(model);
         if (k == 1) {
             held = now;
-            CHECK(held == 5 * cst::pool_node_bytes + cst::solo_launch_bytes(4));  // prod.x, prod.y, mid.y, cons.y, sink.y: a node each, plus four launch-array sets
+            // prod.x, prod.y, mid.y, cons.y, sink.y: a node each, plus four launch-array sets and the scalars a, b of the four
+            CHECK(held == 13 * cst::pool_node_bytes + cst::solo_launch_bytes(4));
         }
         if (k <= 3 && k >= 1 && k < 3) CHECK(now == held);  // runs 1 and 2: everything stays allocated
         if (k == 3) {
             freed = now;
             CHECK(freed < held);
-            CHECK(freed == 2 * cst::pool_node_bytes + cst::solo_launch_bytes(1));  // cons.y (= sink.x) and sink.y, and the sink's launch arrays
+            CHECK(freed == 4 * cst::pool_node_bytes + cst::solo_launch_bytes(1));  // cons.y (= sink.x), sink.y, the sink's a, b and launch arrays
         }
         if (k > 3) CHECK(now == freed);
         CHECK(tsys::count_of("op.prod") == 1);  // allocated and initialized once, with the first run
@@ -2006,14 +2011,15 @@ TEST_CASE("Sellar-shaped forward: ties of ties, promotions, marks, init last wor
     CHECK(tsys::mark_on(model.constraints(), sys.instance_at("g2.g")->meta) != nullptr);
 }
 
-
 // =============================================================================================
 // 7. ties own the shape; promotions mirror live; rank-templated aliases
 // =============================================================================================
 namespace tsys2 {
 
 // bins (VBins): a free u32 input n and an output b of n floats (b[i] = i + 1); a VALUE-driven output.
-struct VBinsBody {
+
+class VBins : public cs::Component<VBins> {
+public:
     struct Inputs {
         cs::Input<DType::u32, 1> n;
         cs::Input<DType::f32, 1> ref;
@@ -2021,12 +2027,12 @@ struct VBinsBody {
     struct Outputs {
         cs::Output<DType::f32, 1> b;
     };
-    void operator()(sycl::id<1> i, Inputs, Outputs out) const { out.b[i] = static_cast<float>(i[0]) + 1.0f; }
-};
-class VBins : public cs::Component<VBinsBody> {
-    cs::Input<DType::u32, 1>  n_;
-    cs::Input<DType::f32, 1>  ref_;
-    cs::Output<DType::f32, 1> b_;
+    static void compute_impl(sycl::id<1> i, const Inputs&, const Outputs& out) { out.b[i] = static_cast<float>(i[0]) + 1.0f; }
+
+    Inputs  inputs;
+    Outputs outputs;
+
+private:
     bool                      as_is_;  // true: b's size comes from a definition (an alias), so the producer passes cs::as_is
 
 public:
@@ -2034,18 +2040,18 @@ public:
     // This fixture tests a hook on an INPUT: the size by value goes through the free input `ref`, which the System hooks
     // (add_bins: from_value of `n`), and b copies its shape in pre_forward. Hooks on outputs are tested in test_shapes.cpp.
     void setup() override {
-        declare_input(n_, "n", 1);
-        declare_input(ref_, "ref", cs::unspecified);
-        declare_output(b_, "b", cs::unspecified);
+        declare_input(inputs.n, "n", 1);
+        declare_input(inputs.ref, "ref", cs::unspecified);
+        declare_output(outputs.b, "b", cs::unspecified);
     }
     void pre_forward() override {
         if (as_is_)
-            set_shape(b_, cs::as_is);
+            set_shape(outputs.b, cs::as_is);
         else
-            set_shape(b_, shape_of(ref_)[0]);
+            set_shape(outputs.b, shape_of(inputs.ref)[0]);
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(b_.shape(), {n_, ref_}, {b_}, {});
+        return create_launch_config(cs::range_desc(outputs.b.shape()));
     }
 };
 
@@ -2056,69 +2062,70 @@ inline void add_bins(cs::System& s, const char* name = "v", bool as_is = false) 
 }
 
 // NCopy: n[0] = v[0], the bin count as an OUTPUT (an alias shape reads an upstream output).
-struct NCopyBody {
+
+class NCopy : public cs::Component<NCopy> {
+public:
     struct Inputs {
         cs::Input<DType::u32, 1> v;
     };
     struct Outputs {
         cs::Output<DType::u32, 1> n;
     };
-    void operator()(sycl::id<1> i, Inputs in, Outputs out) const { out.n[i] = in.v[i]; }
-};
-class NCopy : public cs::Component<NCopyBody> {
-    cs::Input<DType::u32, 1>  v_;
-    cs::Output<DType::u32, 1> n_;
+    static void compute_impl(sycl::id<1> i, const Inputs& in, const Outputs& out) { out.n[i] = in.v[i]; }
 
-public:
+    Inputs  inputs;
+    Outputs outputs;
+
     void setup() override {
-        declare_input(v_, "v", 1);
-        declare_output(n_, "n", 1);
+        declare_input(inputs.v, "v", 1);
+        declare_output(outputs.n, "n", 1);
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(n_.shape(), {v_}, {n_}, {});
+        return create_launch_config(cs::range_desc(outputs.n.shape()));
     }
 };
 
 // TScale: y = 2 x; x has all dims unspecified (a tie member), y follows x's shape.
-struct TScaleBody {
+
+class TScale : public cs::Component<TScale> {
+public:
     struct Inputs {
         cs::Input<DType::f32, 1> x;
     };
     struct Outputs {
         cs::Output<DType::f32, 1> y;
     };
-    void operator()(sycl::id<1> i, Inputs in, Outputs out) const { out.y[i] = 2.0f * in.x[i]; }
-};
-class TScale : public cs::Component<TScaleBody> {
-    cs::Input<DType::f32, 1>  x_;
-    cs::Output<DType::f32, 1> y_;
+    static void compute_impl(sycl::id<1> i, const Inputs& in, const Outputs& out) { out.y[i] = 2.0f * in.x[i]; }
 
-public:
+    Inputs  inputs;
+    Outputs outputs;
+
     void setup() override {
-        declare_input(x_, "x", cs::unspecified_shape<1>());
-        declare_output(y_, "y", cs::unspecified_shape<1>());
+        declare_input(inputs.x, "x", cs::unspecified_shape<1>());
+        declare_output(outputs.y, "y", cs::unspecified_shape<1>());
     }
-    void pre_forward() override { set_shape(y_, shape_of(x_)[0]); }  // the output follows the input (section 10: no derived dims)
+    void pre_forward() override { set_shape(outputs.y, shape_of(inputs.x)[0]); }  // the output follows the input (section 10: no derived dims)
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(y_.shape(), {x_}, {y_}, {});
+        return create_launch_config(cs::range_desc(outputs.y.shape()));
     }
 };
 
 // TIota: o[i] = i + 1; o has all dims unspecified (a tie_outputs member).
-struct TIotaBody {
+
+class TIota : public cs::Component<TIota> {
+public:
     struct Inputs {};
     struct Outputs {
         cs::Output<DType::f32, 1> o;
     };
-    void operator()(sycl::id<1> i, Inputs, Outputs out) const { out.o[i] = static_cast<float>(i[0]) + 1.0f; }
-};
-class TIota : public cs::Component<TIotaBody> {
-    cs::Output<DType::f32, 1> o_;
+    static void compute_impl(sycl::id<1> i, const Inputs&, const Outputs& out) { out.o[i] = static_cast<float>(i[0]) + 1.0f; }
 
-public:
-    void setup() override { declare_output(o_, "o", cs::unspecified_shape<1>()); }
+    Inputs  inputs;
+    Outputs outputs;
+
+    void setup() override { declare_output(outputs.o, "o", cs::unspecified_shape<1>()); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(o_.shape(), {}, {o_}, {});
+        return create_launch_config(cs::range_desc(outputs.o.shape()));
     }
 };
 
@@ -2585,7 +2592,7 @@ TEST_CASE("lifetime: a bare transient producer and a transient reader are delete
         CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "sink.y")) == tsys::iota_plus(1.0f, tsys::kLen, 2.0f, 1.0f));
         if (run == 1) {
             steady = pool_in_use(model);
-            CHECK(steady == 2 * cst::pool_node_bytes + cst::solo_launch_bytes(1));  // and the sink's launch arrays
+            CHECK(steady == 4 * cst::pool_node_bytes + cst::solo_launch_bytes(1));  // and the sink's a, b and launch arrays
         } else {
             CHECK(pool_in_use(model) == steady);
         }
@@ -2976,60 +2983,65 @@ namespace tshape {
 
 // ---- fixtures -------------------------------------------------------------------------------
 /// Scale2: y = 2 x, rank 2; x is wholly unspecified, y follows it.
-struct S2Body {
+
+class Scale2 : public cs::Component<Scale2> {
+public:
     struct Inputs {
         cs::Input<DType::f32, 2> x;
     };
     struct Outputs {
         cs::Output<DType::f32, 2> y;
     };
-    void operator()(sycl::id<2> i, Inputs in, Outputs out) const { out.y[i] = 2.0f * in.x[i]; }
-};
-class Scale2 : public cs::Component<S2Body> {
-    cs::Input<DType::f32, 2>  x_;
-    cs::Output<DType::f32, 2> y_;
+    static void compute_impl(sycl::id<2> i, const Inputs& in, const Outputs& out) { out.y[i] = 2.0f * in.x[i]; }
 
-public:
+    Inputs  inputs;
+    Outputs outputs;
+
     void setup() override {
-        declare_input(x_, "x", cs::unspecified_shape<2>());
-        declare_output(y_, "y", cs::unspecified_shape<2>());
+        declare_input(inputs.x, "x", cs::unspecified_shape<2>());
+        declare_output(outputs.y, "y", cs::unspecified_shape<2>());
     }
-    void pre_forward() override { set_shape(y_, shape_of(x_)[0], shape_of(x_)[1]); }  // the output follows the input (section 10: no derived dims)
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(y_.shape(), {x_}, {y_}, {}); }
+    void pre_forward() override { set_shape(outputs.y, shape_of(inputs.x)[0], shape_of(inputs.x)[1]); }  // the output follows the input (section 10: no derived dims)
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(cs::range_desc(outputs.y.shape())); }
 };
 
 /// An output whose dimension is unspecified and that no tie owns (a setup error).
-struct OutBody {
+
+class OutUnspec : public cs::Component<OutUnspec> {
+public:
     struct Inputs {};
     struct Outputs {
         cs::Output<DType::f32, 1> y;
     };
-    void operator()(sycl::id<1> i, Inputs, Outputs out) const { out.y[i] = 1.0f; }
-};
-class OutUnspec : public cs::Component<OutBody> {
-    cs::Output<DType::f32, 1> y_;
+    static void compute_impl(sycl::id<1> i, const Inputs&, const Outputs& out) { out.y[i] = 1.0f; }
 
-public:
-    void setup() override { declare_output(y_, "y", cs::unspecified); }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(y_.shape(), {}, {y_}, {}); }
+    Inputs  inputs;
+    Outputs outputs;
+
+    void setup() override { declare_output(outputs.y, "y", cs::unspecified); }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(cs::range_desc(outputs.y.shape())); }
 };
 
 /// FixedOut(n): y[i] = i + 1, y fixed n.
-struct FixedOutBody {
+
+class FixedOut : public cs::Component<FixedOut> {
+public:
     struct Inputs {};
     struct Outputs {
         cs::Output<DType::f32, 1> y;
     };
-    void operator()(sycl::id<1> i, Inputs, Outputs out) const { out.y[i] = static_cast<float>(i[0] + 1); }
-};
-class FixedOut : public cs::Component<FixedOutBody> {
+    static void compute_impl(sycl::id<1> i, const Inputs&, const Outputs& out) { out.y[i] = static_cast<float>(i[0] + 1); }
+
+    Inputs  inputs;
+    Outputs outputs;
+
+private:
     std::size_t               n_;
-    cs::Output<DType::f32, 1> y_;
 
 public:
     explicit FixedOut(std::size_t n) : n_{n} {}
-    void setup() override { declare_output(y_, "y", static_cast<int>(n_)); }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(y_.shape(), {}, {y_}, {}); }
+    void setup() override { declare_output(outputs.y, "y", static_cast<int>(n_)); }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(cs::range_desc(outputs.y.shape())); }
 };
 
 // DELETED fixtures: Pair (an input declared INHERITED from another: FromInputDim) and ByVal (an input declared VALUE-DRIVEN:
@@ -3072,7 +3084,6 @@ TEST_CASE("shape: unspecified dims are supplied by a connection", "[system][shap
         CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "a.y")) == tshape::iota_doubled(n));
     }
 }
-
 
 TEST_CASE("shape: unspecified dims are supplied by a tie (an initializer on it, or a connection into it)", "[system][shape]") {
     SECTION("an initializer on the tie") {

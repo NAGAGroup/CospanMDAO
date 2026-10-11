@@ -71,7 +71,8 @@ template <DType DT>
 using T_ = cs::cpp_type_t<DT>;
 
 template <DType DT>
-struct D1Body {
+class D1 : public cs::Component<D1<DT>> {
+public:
     struct Inputs {
         cs::Input<DT, 1> z;
         cs::Input<DT, 1> x;
@@ -80,30 +81,28 @@ struct D1Body {
     struct Outputs {
         cs::Output<DT, 1> y1;
     };
-    void operator()(sycl::id<1> i, Inputs in, Outputs out) const {
+    static void compute_impl(sycl::id<1> i, const Inputs& in, const Outputs& out) {
         out.y1[i] = in.z[std::size_t{0}] * in.z[std::size_t{0}] + in.z[std::size_t{1}] + in.x[std::size_t{0}] -
                     static_cast<T_<DT>>(0.2) * in.y2[std::size_t{0}];
     }
-};
-template <DType DT>
-class D1 : public cs::Component<D1Body<DT>> {
-    cs::Input<DT, 1>  z_, x_, y2_;
-    cs::Output<DT, 1> y1_;
 
-public:
+    Inputs  inputs;
+    Outputs outputs;
+
     void setup() override {
-        this->declare_input(z_, "z", cs::unspecified_shape<1>());  // z and x are tie members: the tie alias owns their shape
-        this->declare_input(x_, "x", cs::unspecified_shape<1>());
-        this->declare_input(y2_, "y2", 1);
-        this->declare_output(y1_, "y1", 1);
+        this->declare_input(inputs.z, "z", cs::unspecified_shape<1>());  // z and x are tie members: the tie alias owns their shape
+        this->declare_input(inputs.x, "x", cs::unspecified_shape<1>());
+        this->declare_input(inputs.y2, "y2", 1);
+        this->declare_output(outputs.y1, "y1", 1);
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return this->create_launch_config(y1_.shape(), {z_, x_, y2_}, {y1_}, {});
+        return this->create_launch_config(cs::range_desc(outputs.y1.shape()));
     }
 };
 
 template <DType DT>
-struct D2Body {
+class D2 : public cs::Component<D2<DT>> {
+public:
     struct Inputs {
         cs::Input<DT, 1> z;
         cs::Input<DT, 1> y1;
@@ -111,28 +110,26 @@ struct D2Body {
     struct Outputs {
         cs::Output<DT, 1> y2;
     };
-    void operator()(sycl::id<1> i, Inputs in, Outputs out) const {
+    static void compute_impl(sycl::id<1> i, const Inputs& in, const Outputs& out) {
         out.y2[i] = sycl::sqrt(in.y1[std::size_t{0}]) + in.z[std::size_t{0}] + in.z[std::size_t{1}];
     }
-};
-template <DType DT>
-class D2 : public cs::Component<D2Body<DT>> {
-    cs::Input<DT, 1>  z_, y1_;
-    cs::Output<DT, 1> y2_;
 
-public:
+    Inputs  inputs;
+    Outputs outputs;
+
     void setup() override {
-        this->declare_input(z_, "z", cs::unspecified_shape<1>());
-        this->declare_input(y1_, "y1", cs::unspecified_shape<1>());
-        this->declare_output(y2_, "y2", 1);
+        this->declare_input(inputs.z, "z", cs::unspecified_shape<1>());
+        this->declare_input(inputs.y1, "y1", cs::unspecified_shape<1>());
+        this->declare_output(outputs.y2, "y2", 1);
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return this->create_launch_config(y2_.shape(), {z_, y1_}, {y2_}, {});
+        return this->create_launch_config(cs::range_desc(outputs.y2.shape()));
     }
 };
 
 template <DType DT>
-struct ObjBody {
+class Obj : public cs::Component<Obj<DT>> {
+public:
     struct Inputs {
         cs::Input<DT, 1> x;
         cs::Input<DT, 1> z;
@@ -142,80 +139,73 @@ struct ObjBody {
     struct Outputs {
         cs::Output<DT, 1> f;
     };
-    void operator()(sycl::id<1> i, Inputs in, Outputs out) const {
+    static void compute_impl(sycl::id<1> i, const Inputs& in, const Outputs& out) {
         const T_<DT> x = in.x[std::size_t{0}];
         out.f[i]       = x * x + in.z[std::size_t{1}] + in.y1[std::size_t{0}] + sycl::exp(-in.y2[std::size_t{0}]);
     }
-};
-template <DType DT>
-class Obj : public cs::Component<ObjBody<DT>> {
-    cs::Input<DT, 1>  x_, z_, y1_, y2_;
-    cs::Output<DT, 1> f_;
 
-public:
+    Inputs  inputs;
+    Outputs outputs;
+
     void setup() override {
-        this->declare_input(x_, "x", cs::unspecified_shape<1>());
-        this->declare_input(z_, "z", cs::unspecified_shape<1>());
-        this->declare_input(y1_, "y1", cs::unspecified_shape<1>());
-        this->declare_input(y2_, "y2", cs::unspecified_shape<1>());
-        this->declare_output(f_, "f", 1);
+        this->declare_input(inputs.x, "x", cs::unspecified_shape<1>());
+        this->declare_input(inputs.z, "z", cs::unspecified_shape<1>());
+        this->declare_input(inputs.y1, "y1", cs::unspecified_shape<1>());
+        this->declare_input(inputs.y2, "y2", cs::unspecified_shape<1>());
+        this->declare_output(outputs.f, "f", 1);
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return this->create_launch_config(f_.shape(), {x_, z_, y1_, y2_}, {f_}, {});
+        return this->create_launch_config(cs::range_desc(outputs.f.shape()));
     }
 };
 
 template <DType DT>
-struct G1Body {
+class G1 : public cs::Component<G1<DT>> {
+public:
     struct Inputs {
         cs::Input<DT, 1> y1;
     };
     struct Outputs {
         cs::Output<DT, 1> g;
     };
-    void operator()(sycl::id<1> i, Inputs in, Outputs out) const {
+    static void compute_impl(sycl::id<1> i, const Inputs& in, const Outputs& out) {
         out.g[i] = static_cast<T_<DT>>(3.16) - in.y1[std::size_t{0}];
     }
-};
-template <DType DT>
-class G1 : public cs::Component<G1Body<DT>> {
-    cs::Input<DT, 1>  y1_;
-    cs::Output<DT, 1> g_;
 
-public:
+    Inputs  inputs;
+    Outputs outputs;
+
     void setup() override {
-        this->declare_input(y1_, "y1", cs::unspecified_shape<1>());
-        this->declare_output(g_, "g", 1);
+        this->declare_input(inputs.y1, "y1", cs::unspecified_shape<1>());
+        this->declare_output(outputs.g, "g", 1);
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return this->create_launch_config(g_.shape(), {y1_}, {g_}, {});
+        return this->create_launch_config(cs::range_desc(outputs.g.shape()));
     }
 };
 
 template <DType DT>
-struct G2Body {
+class G2 : public cs::Component<G2<DT>> {
+public:
     struct Inputs {
         cs::Input<DT, 1> y2;
     };
     struct Outputs {
         cs::Output<DT, 1> g;
     };
-    void operator()(sycl::id<1> i, Inputs in, Outputs out) const {
+    static void compute_impl(sycl::id<1> i, const Inputs& in, const Outputs& out) {
         out.g[i] = in.y2[std::size_t{0}] - static_cast<T_<DT>>(24.0);
     }
-};
-template <DType DT>
-class G2 : public cs::Component<G2Body<DT>> {
-    cs::Input<DT, 1>  y2_;
-    cs::Output<DT, 1> g_;
 
-public:
+    Inputs  inputs;
+    Outputs outputs;
+
     void setup() override {
-        this->declare_input(y2_, "y2", cs::unspecified_shape<1>());
-        this->declare_output(g_, "g", 1);
+        this->declare_input(inputs.y2, "y2", cs::unspecified_shape<1>());
+        this->declare_output(outputs.g, "g", 1);
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return this->create_launch_config(g_.shape(), {y2_}, {g_}, {});
+        return this->create_launch_config(cs::range_desc(outputs.g.shape()));
     }
 };
 
@@ -340,47 +330,47 @@ constexpr std::size_t kBcBytes  = 8 * sizeof(float);
 constexpr std::size_t kOutBytes = 16 * sizeof(float);
 constexpr std::size_t kExpectedStatic = kGenBytes + kCvtBytes + kBcBytes + kOutBytes;  // 1008
 
-struct GenBody {
+class Gen : public cs::Component<Gen> {
+public:
     struct Inputs {};
     struct Outputs {
         cs::Output<DType::f32, 1> y;
     };
-    void operator()(sycl::id<1> i, Inputs, Outputs out) const { out.y[i] = static_cast<float>(i[0]); }
-};
-class Gen : public cs::Component<GenBody> {
-    cs::Output<DType::f32, 1> y_;
+    static void compute_impl(sycl::id<1> i, const Inputs&, const Outputs& out) { out.y[i] = static_cast<float>(i[0]); }
 
-public:
-    void setup() override { declare_output(y_, "y", 100); }
+    Inputs  inputs;
+    Outputs outputs;
+
+    void setup() override { declare_output(outputs.y, "y", 100); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(y_.shape(), {}, {y_}, {});
+        return create_launch_config(cs::range_desc(outputs.y.shape()));
     }
 };
 
-struct CvtBody {
+class Cvt : public cs::Component<Cvt> {
+public:
     struct Inputs {
         cs::Input<DType::f32, 1> a;
     };
     struct Outputs {
         cs::Output<DType::f64, 1> d;
     };
-    void operator()(sycl::id<1> i, Inputs in, Outputs out) const { out.d[i] = 2.0 * static_cast<double>(in.a[i]); }
-};
-class Cvt : public cs::Component<CvtBody> {
-    cs::Input<DType::f32, 1>  a_;
-    cs::Output<DType::f64, 1> d_;
+    static void compute_impl(sycl::id<1> i, const Inputs& in, const Outputs& out) { out.d[i] = 2.0 * static_cast<double>(in.a[i]); }
 
-public:
+    Inputs  inputs;
+    Outputs outputs;
+
     void setup() override {
-        declare_input(a_, "a", cs::unspecified_shape<1>());
-        declare_output(d_, "d", 64);
+        declare_input(inputs.a, "a", cs::unspecified_shape<1>());
+        declare_output(outputs.d, "d", 64);
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(d_.shape(), {a_}, {d_}, {});
+        return create_launch_config(cs::range_desc(outputs.d.shape()));
     }
 };
 
-struct CombBody {
+class Comb : public cs::Component<Comb> {
+public:
     struct Inputs {
         cs::Input<DType::f32, 1> b;
         cs::Input<DType::f32, 1> c;
@@ -389,25 +379,22 @@ struct CombBody {
     struct Outputs {
         cs::Output<DType::f32, 1> o;
     };
-    void operator()(sycl::id<1> i, Inputs in, Outputs out) const {
+    static void compute_impl(sycl::id<1> i, const Inputs& in, const Outputs& out) {
         const std::size_t k = i[0] % 8;
         out.o[i]            = in.b[k] + in.c[k] + static_cast<float>(in.e[std::size_t{0}]);
     }
-};
-class Comb : public cs::Component<CombBody> {
-    cs::Input<DType::f32, 1>  b_, c_;
-    cs::Input<DType::f64, 1>  e_;
-    cs::Output<DType::f32, 1> o_;
 
-public:
+    Inputs  inputs;
+    Outputs outputs;
+
     void setup() override {
-        declare_input(b_, "b", cs::unspecified_shape<1>());  // tied into the top alias "bc" (fixed 8)
-        declare_input(c_, "c", cs::unspecified_shape<1>());
-        declare_input(e_, "e", cs::unspecified_shape<1>());
-        declare_output(o_, "o", 16);
+        declare_input(inputs.b, "b", cs::unspecified_shape<1>());  // tied into the top alias "bc" (fixed 8)
+        declare_input(inputs.c, "c", cs::unspecified_shape<1>());
+        declare_input(inputs.e, "e", cs::unspecified_shape<1>());
+        declare_output(outputs.o, "o", 16);
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(o_.shape(), {b_, c_, e_}, {o_}, {});
+        return create_launch_config(cs::range_desc(outputs.o.shape()));
     }
 };
 
@@ -428,7 +415,9 @@ public:
 // Bins: a free u32 input n and an output of n floats (bins[i] = i + 1).
 // Bins tests a hook on an INPUT: it takes a free input `ref` that its System hooks with from_value(n) (hook_bins) and
 // copies its shape in pre_forward. (Hooks on outputs are tested in test_shapes.cpp.)
-struct BinsBody {
+
+class Bins : public cs::Component<Bins> {
+public:
     struct Inputs {
         cs::Input<DType::u32, 1> n;
         cs::Input<DType::f32, 1> ref;
@@ -436,22 +425,19 @@ struct BinsBody {
     struct Outputs {
         cs::Output<DType::f32, 1> bins;
     };
-    void operator()(sycl::id<1> i, Inputs, Outputs out) const { out.bins[i] = static_cast<float>(i[0]) + 1.0f; }
-};
-class Bins : public cs::Component<BinsBody> {
-    cs::Input<DType::u32, 1>  n_;
-    cs::Input<DType::f32, 1>  ref_;
-    cs::Output<DType::f32, 1> bins_;
+    static void compute_impl(sycl::id<1> i, const Inputs&, const Outputs& out) { out.bins[i] = static_cast<float>(i[0]) + 1.0f; }
 
-public:
+    Inputs  inputs;
+    Outputs outputs;
+
     void setup() override {
-        declare_input(n_, "n", 1);
-        declare_input(ref_, "ref", cs::unspecified);
-        declare_output(bins_, "bins", cs::unspecified);
+        declare_input(inputs.n, "n", 1);
+        declare_input(inputs.ref, "ref", cs::unspecified);
+        declare_output(outputs.bins, "bins", cs::unspecified);
     }
-    void pre_forward() override { set_shape(bins_, shape_of(ref_)[0]); }
+    void pre_forward() override { set_shape(outputs.bins, shape_of(inputs.ref)[0]); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(bins_.shape(), {n_, ref_}, {bins_}, {});
+        return create_launch_config(cs::range_desc(outputs.bins.shape()));
     }
 };
 class PoolTop : public cs::System {
@@ -465,55 +451,61 @@ public:
 // ---- Two devices (case 7) ---------------------------------------------------------------------------
 constexpr std::size_t kLen = 8;
 
-struct AxpbBody {
+class Axpb : public cs::Component<Axpb> {
+public:
     struct Inputs {
         cs::Input<DType::f32, 1> x;
+        cs::Input<DType::f32, 1> a, b;  // a free input of extent 1, initialized from the constructor's value
     };
     struct Outputs {
         cs::Output<DType::f32, 1> y;
     };
-    float a, b;
-    void operator()(sycl::id<1> i, Inputs in, Outputs out) const { out.y[i] = a * in.x[i] + b; }
-};
-class Axpb : public cs::Component<AxpbBody> {
-    cs::Input<DType::f32, 1>  x_;
-    cs::Output<DType::f32, 1> y_;
+    static void compute_impl(sycl::id<1> i, const Inputs& in, const Outputs& out) { out.y[i] = in.a[std::size_t{0}] * in.x[i] + in.b[std::size_t{0}]; }
+
+    Inputs  inputs;
+    Outputs outputs;
+
+private:
     float                     a_, b_;
 
 public:
     Axpb(float a, float b) : a_{a}, b_{b} {}
     void setup() override {
-        declare_input(x_, "x", static_cast<int>(kLen));
-        declare_output(y_, "y", static_cast<int>(kLen));
+        declare_input(inputs.a, "a", 1);
+        init_input("a", cs::init::fill(a_));
+        declare_input(inputs.b, "b", 1);
+        init_input("b", cs::init::fill(b_));
+        declare_input(inputs.x, "x", static_cast<int>(kLen));
+        declare_output(outputs.y, "y", static_cast<int>(kLen));
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(x_.shape(), {x_}, {y_}, {a_, b_});
+        return create_launch_config(cs::range_desc(inputs.x.shape()));
     }
 };
 
 // ---- Initializer-only inputs and empty roots -------------------------------------------------
 // Scale: y = 2 x, x shaped by its source, y by x.
-struct ScaleBody {
+
+class Scale : public cs::Component<Scale> {
+public:
     struct Inputs {
         cs::Input<DType::f32, 1> x;
     };
     struct Outputs {
         cs::Output<DType::f32, 1> y;
     };
-    void operator()(sycl::id<1> i, Inputs in, Outputs out) const { out.y[i] = 2.0f * in.x[i]; }
-};
-class Scale : public cs::Component<ScaleBody> {
-    cs::Input<DType::f32, 1>  x_;
-    cs::Output<DType::f32, 1> y_;
+    static void compute_impl(sycl::id<1> i, const Inputs& in, const Outputs& out) { out.y[i] = 2.0f * in.x[i]; }
 
-public:
+    Inputs  inputs;
+    Outputs outputs;
+
     void setup() override {
-        declare_input(x_, "x", cs::unspecified_shape<1>());
-        declare_output(y_, "y", cs::unspecified_shape<1>());
+        declare_input(inputs.x, "x", cs::unspecified_shape<1>());
+        declare_output(outputs.y, "y", cs::unspecified_shape<1>());
     }
-    void pre_forward() override { set_shape(y_, shape_of(x_)[0]); }  // the output follows the input (section 10: no derived dims)
+    void pre_forward() override { set_shape(outputs.y, shape_of(inputs.x)[0]); }  // the output follows the input (section 10: no derived dims)
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(y_.shape(), {x_}, {y_}, {});
+        return create_launch_config(cs::range_desc(outputs.y.shape()));
     }
 };
 // bins.n drives bins.bins (n floats); sc doubles them. With n = 0 the root is present and empty.

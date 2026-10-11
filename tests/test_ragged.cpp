@@ -59,124 +59,125 @@ void expect_throws(F&& f, const std::vector<std::string>& needles) {
 }
 
 // ---- Counts: counts[i] = raw[i] ---------------------------------------------------------------
-struct CountsBody {
+
+// N is fixed by the declaration of the free input `raw` (the old free input `n` that sized it by value is gone: a size
+// from a value is a shape hook now, covered in test_shapes.cpp).
+class Counts : public cs::Component<Counts> {
+public:
     struct Inputs {
         cs::Input<DType::u32, 1> raw;
     };
     struct Outputs {
         cs::Output<DType::u32, 1> counts;
     };
-    void operator()(sycl::id<1> i, Inputs in, Outputs out) const { out.counts[i] = in.raw[i]; }
-};
-// N is fixed by the declaration of the free input `raw` (the old free input `n` that sized it by value is gone: a size
-// from a value is a shape hook now, covered in test_shapes.cpp).
-class Counts : public cs::Component<CountsBody> {
+    static void compute_impl(sycl::id<1> i, const Inputs& in, const Outputs& out) { out.counts[i] = in.raw[i]; }
+
+    Inputs  inputs;
+    Outputs outputs;
+
+private:
     std::size_t               n_;
-    cs::Input<DType::u32, 1>  raw_;
-    cs::Output<DType::u32, 1> counts_;
 
 public:
     explicit Counts(std::size_t n) : n_{n} {}
     void setup() override {
-        declare_input(raw_, "raw", n_);
-        declare_output(counts_, "counts", cs::unspecified);
+        declare_input(inputs.raw, "raw", n_);
+        declare_output(outputs.counts, "counts", cs::unspecified);
     }
-    void pre_forward() override { set_shape(counts_, shape_of(raw_)[0]); }
+    void pre_forward() override { set_shape(outputs.counts, shape_of(inputs.raw)[0]); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(counts_.shape(), {raw_}, {counts_}, {});
+        return create_launch_config(cs::range_desc(outputs.counts.shape()));
     }
 };
 
 // ---- Fill: pts.block(i)[j] = i*1000 + j ----------------------------------------------------------
-struct FillBody {
+
+// Fill tests a hook on a ragged INPUT: a component reads no values, so the size comes in through a free ragged input
+// `layout` that the System hooks with counts_from, and Fill copies its shape. (Hooks on ragged outputs are tested in
+// test_shapes.cpp.)
+class Fill : public cs::Component<Fill> {
+public:
     struct Inputs {
         cs::RaggedInput<DType::f32, 2> layout;
     };
     struct Outputs {
         cs::RaggedOutput<DType::f32, 2> pts;
     };
-    void operator()(sycl::id<1> id, Inputs, Outputs out) const {
+    static void compute_impl(sycl::id<1> id, const Inputs&, const Outputs& out) {
         const std::size_t i = id[0];
         auto              b = out.pts.block(i);
         for (std::size_t j = 0; j < b.shape()[0]; ++j) b[j] = static_cast<float>(i * 1000 + j);
     }
-};
-// Fill tests a hook on a ragged INPUT: a component reads no values, so the size comes in through a free ragged input
-// `layout` that the System hooks with counts_from, and Fill copies its shape. (Hooks on ragged outputs are tested in
-// test_shapes.cpp.)
-class Fill : public cs::Component<FillBody> {
-    cs::RaggedInput<DType::f32, 2>  layout_;
-    cs::RaggedOutput<DType::f32, 2> pts_;
 
-public:
+    Inputs  inputs;
+    Outputs outputs;
+
     void setup() override {
-        declare_input(layout_, "layout");
-        declare_output(pts_, "pts");
+        declare_input(inputs.layout, "layout");
+        declare_output(outputs.pts, "pts");
     }
-    void pre_forward() override { set_shape(pts_, shape_of(layout_)); }
+    void pre_forward() override { set_shape(outputs.pts, shape_of(inputs.layout)); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(sycl::range<1>{layout_.size()}, {layout_}, {pts_}, {});
+        return create_launch_config(cs::range_desc(sycl::range<1>{inputs.layout.size()}));
     }
 };
 
 // ---- Scale: out = 2 * in, the output takes the input's ragged shape ---------------------------------------
-struct ScaleBody {
+
+class Scale : public cs::Component<Scale> {
+public:
     struct Inputs {
         cs::RaggedInput<DType::f32, 2> in;
     };
     struct Outputs {
         cs::RaggedOutput<DType::f32, 2> out;
     };
-    void operator()(sycl::id<1> id, Inputs in, Outputs out) const {
+    static void compute_impl(sycl::id<1> id, const Inputs& in, const Outputs& out) {
         auto bi = in.in.block(id[0]);
         auto bo = out.out.block(id[0]);
         for (std::size_t q = 0; q < bi.size(); ++q) bo[q] = 2.0f * bi[q];
     }
-};
-class Scale : public cs::Component<ScaleBody> {
-    cs::RaggedInput<DType::f32, 2>  in_;
-    cs::RaggedOutput<DType::f32, 2> out_;
 
-public:
+    Inputs  inputs;
+    Outputs outputs;
+
     void setup() override {
-        declare_input(in_, "in");
-        declare_output(out_, "out");
+        declare_input(inputs.in, "in");
+        declare_output(outputs.out, "out");
     }
-    void pre_forward() override { set_shape(out_, shape_of(in_)); }
+    void pre_forward() override { set_shape(outputs.out, shape_of(inputs.in)); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(sycl::range<1>{in_.size()}, {in_}, {out_}, {});
+        return create_launch_config(cs::range_desc(sycl::range<1>{inputs.in.size()}));
     }
 };
 
 // ---- Sum: sums[i] = the sum of every element of block i ---------------------------------------------------
 template <int R>
-struct SumBody {
+class Sum : public cs::Component<Sum<R>> {
+public:
     struct Inputs {
         cs::RaggedInput<DType::f32, R> pts;
     };
     struct Outputs {
         cs::Output<DType::f32, 1> sums;
     };
-    void operator()(sycl::id<1> id, Inputs in, Outputs out) const {
+    static void compute_impl(sycl::id<1> id, const Inputs& in, const Outputs& out) {
         auto  b = in.pts.block(id[0]);
         float s = 0.0f;
         for (std::size_t q = 0; q < b.size(); ++q) s += b[q];
         out.sums[id] = s;
     }
-};
-template <int R>
-class Sum : public cs::Component<SumBody<R>> {
-    cs::RaggedInput<DType::f32, R> pts_;
-    cs::Output<DType::f32, 1>      sums_;
 
-public:
+    Inputs  inputs;
+    Outputs outputs;
+
     void setup() override {
-        this->declare_input(pts_, "pts");
-        this->declare_output(sums_, "sums", cs::unspecified);
+        this->declare_input(inputs.pts, "pts");
+        this->declare_output(outputs.sums, "sums", cs::unspecified);
     }
-    void pre_forward() override { this->set_shape(sums_, this->shape_of(pts_).n); }
+    void pre_forward() override { this->set_shape(outputs.sums, this->shape_of(inputs.pts).n); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return this->create_launch_config(sums_.shape(), {pts_}, {sums_}, {});
+        return this->create_launch_config(cs::range_desc(outputs.sums.shape()));
     }
 };
 
@@ -198,7 +199,9 @@ public:
 };
 
 // ---- Col0: [N,2] input; the counts are COLUMN 0 (counts_from reads column 0 of a rank-2 source) --------------
-struct Col0Body {
+
+class Col0 : public cs::Component<Col0> {
+public:
     struct Inputs {
         cs::Input<DType::u32, 2>       cnt;
         cs::RaggedInput<DType::f32, 2> layout;
@@ -206,31 +209,30 @@ struct Col0Body {
     struct Outputs {
         cs::RaggedOutput<DType::f32, 2> v;
     };
-    void operator()(sycl::id<1> id, Inputs, Outputs out) const {
+    static void compute_impl(sycl::id<1> id, const Inputs&, const Outputs& out) {
         const std::size_t i = id[0];
         auto              b = out.v.block(i);
         for (std::size_t j = 0; j < b.shape()[0]; ++j) b[j] = static_cast<float>(i * 100 + j);
     }
-};
-class Col0 : public cs::Component<Col0Body> {
-    cs::Input<DType::u32, 2>        cnt_;
-    cs::RaggedInput<DType::f32, 2>  layout_;
-    cs::RaggedOutput<DType::f32, 2> v_;
 
-public:
+    Inputs  inputs;
+    Outputs outputs;
+
     void setup() override {
-        declare_input(cnt_, "cnt", 4, 2);
-        declare_input(layout_, "layout");
-        declare_output(v_, "v");
+        declare_input(inputs.cnt, "cnt", 4, 2);
+        declare_input(inputs.layout, "layout");
+        declare_output(outputs.v, "v");
     }
-    void pre_forward() override { set_shape(v_, shape_of(layout_)); }
+    void pre_forward() override { set_shape(outputs.v, shape_of(inputs.layout)); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(sycl::range<1>{cnt_.shape()[0]}, {cnt_, layout_}, {v_}, {});
+        return create_launch_config(cs::range_desc(sycl::range<1>{inputs.cnt.shape()[0]}));
     }
 };
 
 // ---- Neg: an i32 input of extents; a negative one is an error ---------------------------------------------------
-struct NegBody {
+
+class Neg : public cs::Component<Neg> {
+public:
     struct Inputs {
         cs::Input<DType::i32, 1>       cnt;
         cs::RaggedInput<DType::f32, 2> layout;
@@ -238,22 +240,19 @@ struct NegBody {
     struct Outputs {
         cs::RaggedOutput<DType::f32, 2> v;
     };
-    void operator()(sycl::id<1>, Inputs, Outputs) const {}
-};
-class Neg : public cs::Component<NegBody> {
-    cs::Input<DType::i32, 1>        cnt_;
-    cs::RaggedInput<DType::f32, 2>  layout_;
-    cs::RaggedOutput<DType::f32, 2> v_;
+    static void compute_impl(sycl::id<1>, const Inputs&, const Outputs&) {}
 
-public:
+    Inputs  inputs;
+    Outputs outputs;
+
     void setup() override {
-        declare_input(cnt_, "cnt", 3);
-        declare_input(layout_, "layout");
-        declare_output(v_, "v");
+        declare_input(inputs.cnt, "cnt", 3);
+        declare_input(inputs.layout, "layout");
+        declare_output(outputs.v, "v");
     }
-    void pre_forward() override { set_shape(v_, shape_of(layout_)); }
+    void pre_forward() override { set_shape(outputs.v, shape_of(inputs.layout)); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(cnt_.shape(), {cnt_, layout_}, {v_}, {});
+        return create_launch_config(cs::range_desc(inputs.cnt.shape()));
     }
 };
 
@@ -268,44 +267,42 @@ public:
 };
 
 // ---- Make: a cs::counts host-array port of n blocks; m.block(i)[j] = i*100 + j -----------------------------------
-struct MakeBody {
+
+class Make : public cs::Component<Make> {
+public:
     struct Inputs {};
     struct Outputs {
         cs::RaggedOutput<DType::f32, 2> m;
     };
-    void operator()(sycl::id<1> id, Inputs, Outputs out) const {
+    static void compute_impl(sycl::id<1> id, const Inputs&, const Outputs& out) {
         const std::size_t i = id[0];
         auto              b = out.m.block(i);
         for (std::size_t j = 0; j < b.shape()[0]; ++j) b[j] = static_cast<float>(i * 100 + j);
     }
-};
-class Make : public cs::Component<MakeBody> {
+
+    Inputs  inputs;
+    Outputs outputs;
+
+private:
     Sizes                           sizes_;
-    cs::RaggedOutput<DType::f32, 2> m_;
 
 public:
     explicit Make(Sizes sizes) : sizes_{std::move(sizes)} {}
-    void setup() override { declare_output(m_, "m", cs::counts(sizes_)); }
+    void setup() override { declare_output(outputs.m, "m", cs::counts(sizes_)); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(sycl::range<1>{sizes_.size()}, {}, {m_}, {});
+        return create_launch_config(cs::range_desc(sycl::range<1>{sizes_.size()}));
     }
 };
 
 /// Sums a rank-2 ragged input that DECLARES its own counts (merged with the source's at connect).
-class TakeSum : public cs::Component<SumBody<2>> {
-    Sizes                          sizes_;
-    cs::RaggedInput<DType::f32, 2> pts_;
-    cs::Output<DType::f32, 1>      sums_;
+class TakeSum : public Sum<2> {
+    Sizes sizes_;
 
 public:
     explicit TakeSum(Sizes sizes) : sizes_{std::move(sizes)} {}
     void setup() override {
-        declare_input(pts_, "pts", cs::counts(sizes_));
-        declare_output(sums_, "sums", cs::unspecified);
-    }
-    void pre_forward() override { set_shape(sums_, shape_of(pts_).n); }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(sums_.shape(), {pts_}, {sums_}, {});
+        declare_input(inputs.pts, "pts", cs::counts(sizes_));
+        declare_output(outputs.sums, "sums", cs::unspecified);
     }
 };
 
@@ -323,20 +320,21 @@ public:
 };
 
 // ---- a RaggedInput reading a DENSE port ----------------------------------------------------------------------------
-struct DenseGenBody {
+
+class DenseGen : public cs::Component<DenseGen> {
+public:
     struct Inputs {};
     struct Outputs {
         cs::Output<DType::f32, 2> d;
     };
-    void operator()(sycl::id<2> i, Inputs, Outputs out) const { out.d[i] = static_cast<float>(i[0] * 10 + i[1]); }
-};
-class DenseGen : public cs::Component<DenseGenBody> {
-    cs::Output<DType::f32, 2> d_;
+    static void compute_impl(sycl::id<2> i, const Inputs&, const Outputs& out) { out.d[i] = static_cast<float>(i[0] * 10 + i[1]); }
 
-public:
-    void setup() override { declare_output(d_, "d", 3, 4); }
+    Inputs  inputs;
+    Outputs outputs;
+
+    void setup() override { declare_output(outputs.d, "d", 3, 4); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(d_.shape(), {}, {d_}, {});
+        return create_launch_config(cs::range_desc(outputs.d.shape()));
     }
 };
 class DenseTop : public cs::System {
@@ -350,20 +348,21 @@ public:
 
 // ---- errors ----------------------------------------------------------------------------------------------------------
 /// A dense INPUT that would take a ragged source (through unspecified dims).
-struct DenseInBody {
+
+class DenseIn : public cs::Component<DenseIn> {
+public:
     struct Inputs {
         cs::Input<DType::f32, 2> in;
     };
     struct Outputs {};
-    void operator()(sycl::id<1>, Inputs, Outputs) const {}
-};
-class DenseIn : public cs::Component<DenseInBody> {
-    cs::Input<DType::f32, 2> in_;
+    static void compute_impl(sycl::id<1>, const Inputs&, const Outputs&) {}
 
-public:
-    void setup() override { declare_input(in_, "in", cs::unspecified, cs::unspecified); }
+    Inputs  inputs;
+    Outputs outputs;
+
+    void setup() override { declare_input(inputs.in, "in", cs::unspecified, cs::unspecified); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(sycl::range<1>{4}, {in_}, {}, {});
+        return create_launch_config(cs::range_desc(sycl::range<1>{4}));
     }
 };
 template <class C>
@@ -448,30 +447,30 @@ void run_counts(cs::Model& model, const std::vector<std::uint32_t>& counts) {
 // ---- HookedOut: a ragged OUTPUT whose shape is owned by a hook (counts_from its own free input) -----------------------
 // No set_shape: the hook gives the output its n, its counts and its offsets (a device column built on the source's device).
 // v.block(i)[j] = i*100 + j.
-struct HookedOutBody {
+
+class HookedOut : public cs::Component<HookedOut> {
+public:
     struct Inputs {
         cs::Input<DType::u32, 1> cnt;
     };
     struct Outputs {
         cs::RaggedOutput<DType::f32, 2> v;
     };
-    void operator()(sycl::id<1> id, Inputs, Outputs out) const {
+    static void compute_impl(sycl::id<1> id, const Inputs&, const Outputs& out) {
         const std::size_t i = id[0];
         auto              b = out.v.block(i);
         for (std::size_t j = 0; j < b.shape()[0]; ++j) b[j] = static_cast<float>(i * 100 + j);
     }
-};
-class HookedOut : public cs::Component<HookedOutBody> {
-    cs::Input<DType::u32, 1>        cnt_;
-    cs::RaggedOutput<DType::f32, 2> v_;
 
-public:
+    Inputs  inputs;
+    Outputs outputs;
+
     void setup() override {
-        declare_input(cnt_, "cnt", cs::unspecified);
-        declare_output(v_, "v");
+        declare_input(inputs.cnt, "cnt", cs::unspecified);
+        declare_output(outputs.v, "v");
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(sycl::range<1>{cnt_.shape()[0]}, {cnt_}, {v_}, {});
+        return create_launch_config(cs::range_desc(sycl::range<1>{inputs.cnt.shape()[0]}));
     }
 };
 class HookedOutTop : public cs::System {

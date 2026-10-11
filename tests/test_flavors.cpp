@@ -101,34 +101,41 @@ std::vector<float> reverse_in_groups(const std::vector<float>& in, std::size_t w
 }
 
 // ---- Src: y = scale * v + offset, v = the index read as base-100 digits ---------------------------
+
 template <int R>
-struct SrcBody {
-    struct Inputs {};
+class SrcND : public cs::Component<SrcND<R>> {
+public:
+    struct Inputs {
+        cs::Input<DType::f32, 1> scale, offset;  // free inputs of extent 1, initialized from the constructor's values
+    };
     struct Outputs {
         cs::Output<DType::f32, R> y;
     };
-    float scale, offset;
-    void operator()(sycl::id<R> i, Inputs, Outputs out) const {
+    static void compute_impl(sycl::id<R> i, const Inputs& in, const Outputs& out) {
         float v = 0.0f;
         for (int d = 0; d < R; ++d) v = v * 100.0f + static_cast<float>(i[d]);
-        out.y[i] = scale * v + offset;
+        out.y[i] = in.scale[std::size_t{0}] * v + in.offset[std::size_t{0}];
     }
-};
 
-template <int R>
-class SrcND : public cs::Component<SrcBody<R>> {
-    cs::Output<DType::f32, R> y_;
-    std::array<int, R>        dims_;
-    float                     scale_, offset_;
+    Inputs  inputs;
+    Outputs outputs;
+
+private:
+    std::array<int, R> dims_;
+    float              scale_, offset_;
 
 public:
     explicit SrcND(std::array<int, R> dims, float scale = 1.0f, float offset = 1.0f)
         : dims_{dims}, scale_{scale}, offset_{offset} {}
     void setup() override {
-        std::apply([&](auto... n) { this->declare_output(y_, "y", n...); }, dims_);
+        std::apply([&](auto... n) { this->declare_output(outputs.y, "y", n...); }, dims_);
+        this->declare_input(inputs.scale, "scale", 1);
+        this->declare_input(inputs.offset, "offset", 1);
+        this->init_input("scale", cs::init::fill(scale_));
+        this->init_input("offset", cs::init::fill(offset_));
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return this->create_launch_config(y_.shape(), {}, {y_}, {scale_, offset_});
+        return this->create_launch_config(cs::range_desc(outputs.y.shape()));
     }
 };
 using Src1 = SrcND<1>;
@@ -136,15 +143,17 @@ using Src2 = SrcND<2>;
 using Src3 = SrcND<3>;
 
 // ---- Elem: y = f(x), the shape follows the source; Op picks f --------------------------------------
+
 template <int R, int Op>
-struct ElemBody {
+class ElemND : public cs::Component<ElemND<R, Op>> {
+public:
     struct Inputs {
         cs::Input<DType::f32, R> x;
     };
     struct Outputs {
         cs::Output<DType::f32, R> y;
     };
-    void operator()(sycl::id<R> i, Inputs in, Outputs out) const {
+    static void compute_impl(sycl::id<R> i, const Inputs& in, const Outputs& out) {
         const float x = in.x[i];
         float       y = 0.0f;
         if constexpr (Op == 0) y = 2.0f * x + 1.0f;
@@ -154,24 +163,20 @@ struct ElemBody {
         if constexpr (Op == 4) y = 3.0f * x;
         out.y[i] = y;
     }
-};
 
-template <int R, int Op>
-class ElemND : public cs::Component<ElemBody<R, Op>> {
-    cs::Input<DType::f32, R>  x_;
-    cs::Output<DType::f32, R> y_;
+    Inputs  inputs;
+    Outputs outputs;
 
-public:
     void setup() override {
-        this->declare_input(x_, "x", cs::unspecified_shape<R>());
-        this->declare_output(y_, "y", cs::unspecified_shape<R>());
+        this->declare_input(inputs.x, "x", cs::unspecified_shape<R>());
+        this->declare_output(outputs.y, "y", cs::unspecified_shape<R>());
     }
     void pre_forward() override {  // the output follows the input (section 10: no derived dims), one entry per dimension
-        const sycl::range<R> s = this->shape_of(x_);
-        [&]<std::size_t... I>(std::index_sequence<I...>) { this->set_shape(y_, s[I]...); }(std::make_index_sequence<R>{});
+        const sycl::range<R> s = this->shape_of(inputs.x);
+        [&]<std::size_t... I>(std::index_sequence<I...>) { this->set_shape(outputs.y, s[I]...); }(std::make_index_sequence<R>{});
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return this->create_launch_config(x_.shape(), {x_}, {y_}, {});
+        return this->create_launch_config(cs::range_desc(inputs.x.shape()));
     }
 };
 template <int Op>
@@ -188,212 +193,229 @@ float ref(int op, float x) {
 }
 
 // ---- Half: a plain body that launches over half of its input (unequal range) ------------------------
-struct HalfBody {
+
+class Half : public cs::Component<Half> {
+public:
     struct Inputs {
         cs::Input<DType::f32, 1> x;
     };
     struct Outputs {
         cs::Output<DType::f32, 1> y;
     };
-    void operator()(sycl::id<1> i, Inputs in, Outputs out) const { out.y[i] = in.x[i] + 1.0f; }
-};
-class Half : public cs::Component<HalfBody> {
-    cs::Input<DType::f32, 1>  x_;
-    cs::Output<DType::f32, 1> y_;
+    static void compute_impl(sycl::id<1> i, const Inputs& in, const Outputs& out) { out.y[i] = in.x[i] + 1.0f; }
 
-public:
+    Inputs  inputs;
+    Outputs outputs;
+
     void setup() override {
-        declare_input(x_, "x", cs::unspecified_shape<1>());
-        declare_output(y_, "y", cs::unspecified_shape<1>());
+        declare_input(inputs.x, "x", cs::unspecified_shape<1>());
+        declare_output(outputs.y, "y", cs::unspecified_shape<1>());
     }
-    void pre_forward() override { set_shape(y_, shape_of(x_)[0]); }  // the output follows the input (section 10: no derived dims)
+    void pre_forward() override { set_shape(outputs.y, shape_of(inputs.x)[0]); }  // the output follows the input (section 10: no derived dims)
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(sycl::range<1>{x_.shape()[0] / 2}, {x_}, {y_}, {});
+        return create_launch_config(cs::range_desc(sycl::range<1>{inputs.x.shape()[0] / 2}));
     }
 };
 
 // ---- group bodies with Scratch: Rev (reverse within the group), Mirror (reads the mirrored element) ---
-struct RevBody {
-    struct Inputs {
-        cs::Input<DType::f32, 1> x;
-    };
-    struct Outputs {
-        cs::Output<DType::f32, 1> y;
-    };
-    struct Scratch {
-        cs::Local<DType::f32, 1> tile;
-    };
-    void operator()(cs::GroupItem<1> it, Inputs in, Outputs out, Scratch s) const {
-        const std::size_t n = it.get_local_range(0), l = it.get_local_linear_id(), g = it.get_global_id(0);
-        const std::size_t total = in.x.shape()[0];
-        s.tile[l]               = g < total ? in.x[g] : 0.0f;
-        cs::group_barrier(it.get_group());
-        if (g < total) out.y[g] = s.tile[n - 1 - l];
-    }
-};
-struct MirrorBody {
-    struct Inputs {
-        cs::Input<DType::f32, 1> x;
-    };
-    struct Outputs {
-        cs::Output<DType::f32, 1> y;
-    };
-    struct Scratch {
-        cs::Local<DType::f32, 1> tile;
-    };
-    void operator()(cs::GroupItem<1> it, Inputs in, Outputs out, Scratch s) const {
-        const std::size_t n = it.get_local_range(0), l = it.get_local_linear_id(), g = it.get_global_id(0);
-        const std::size_t total = in.x.shape()[0];
-        s.tile[l]               = 0.0f;  // touches the local buffer: a scratch stage
-        // B reads OTHER work-items' writes of stage A: nothing orders them for it, so it calls
-        // its own group barrier first (every work-item reaches it, ragged lanes included).
-        cs::group_barrier(it.get_group());
-        const std::size_t m = g - l + (n - 1 - l);
-        if (g < total) out.y[g] = m < total ? in.x[m] : 0.0f;
-    }
-};
+constexpr int kRev    = 0;
+constexpr int kMirror = 1;
 
-template <class Body>
-class GroupStage : public cs::Component<Body> {
-    cs::Input<DType::f32, 1>  x_;
-    cs::Output<DType::f32, 1> y_;
-    std::size_t               wg_;
+/// One component type per variant (a compile-time template parameter, no run-time branch): Kind picks Rev or Mirror.
+template <int Kind>
+class GroupStage : public cs::Component<GroupStage<Kind>> {
+public:
+    struct Inputs {
+        cs::Input<DType::f32, 1> x;
+    };
+    struct Outputs {
+        cs::Output<DType::f32, 1> y;
+    };
+    struct Scratch {
+        cs::Local<DType::f32, 1> tile;
+    };
+    static void compute_impl(cs::GroupItem<1> it, const Inputs& in, const Outputs& out, Scratch s) {
+        const std::size_t n = it.get_local_range(0), l = it.get_local_linear_id(), g = it.get_global_id(0);
+        const std::size_t total = in.x.shape()[0];
+        if constexpr (Kind == kRev) {
+            s.tile[l] = g < total ? in.x[g] : 0.0f;
+            cs::group_barrier(it.get_group());
+            if (g < total) out.y[g] = s.tile[n - 1 - l];
+        } else {
+            s.tile[l] = 0.0f;  // touches the local buffer: a scratch stage
+            // B reads OTHER work-items' writes of stage A: nothing orders them for it, so it calls
+            // its own group barrier first (every work-item reaches it, ragged lanes included).
+            cs::group_barrier(it.get_group());
+            const std::size_t m = g - l + (n - 1 - l);
+            if (g < total) out.y[g] = m < total ? in.x[m] : 0.0f;
+        }
+    }
+
+    Inputs  inputs;
+    Outputs outputs;
+
+private:
+    std::size_t wg_;
 
 public:
     explicit GroupStage(std::size_t wg = 64) : wg_{wg} {}
     void setup() override {
-        this->declare_input(x_, "x", cs::unspecified_shape<1>());
-        this->declare_output(y_, "y", cs::unspecified_shape<1>());
+        this->declare_input(inputs.x, "x", cs::unspecified_shape<1>());
+        this->declare_output(outputs.y, "y", cs::unspecified_shape<1>());
     }
-    void pre_forward() override { this->set_shape(y_, this->shape_of(x_)[0]); }  // the output follows the input (section 10: no derived dims)
+    void pre_forward() override { this->set_shape(outputs.y, this->shape_of(inputs.x)[0]); }  // the output follows the input (section 10: no derived dims)
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        typename Body::Scratch s;
+        Scratch s;
         s.tile.reshape(sycl::range<1>{wg_});
-        return this->create_launch_config(x_.shape(), sycl::range<1>{wg_}, {x_}, {y_}, s, {});
+        return this->create_launch_config(cs::range_desc(inputs.x.shape()), cs::wg_desc(sycl::range<1>{wg_}), cs::scratch_desc(s));
     }
 };
 
 // ---- Prefix (host body): z[i] = z[i-1] + x[i] ---------------------------------------------------------
-struct PrefixBody {
+
+class Prefix : public cs::Component<Prefix> {
+public:
     struct Inputs {
         cs::Input<DType::f32, 1> x;
     };
     struct Outputs {
         cs::Output<DType::f32, 1> z;
     };
-    void operator()(cs::Host, Inputs in, Outputs out) const {
+    static void compute_impl(cs::Host, const Inputs& in, const Outputs& out) {
         float acc = 0.0f;
         for (std::size_t i = 0; i < in.x.size(); ++i) {
             acc += in.x[i];
             out.z[i] = acc;
         }
     }
-};
-class Prefix : public cs::Component<PrefixBody> {
-    cs::Input<DType::f32, 1>  x_;
-    cs::Output<DType::f32, 1> z_;
 
-public:
+    Inputs  inputs;
+    Outputs outputs;
+
     void setup() override {
-        declare_input(x_, "x", cs::unspecified_shape<1>());
-        declare_output(z_, "z", cs::unspecified_shape<1>());
+        declare_input(inputs.x, "x", cs::unspecified_shape<1>());
+        declare_output(outputs.z, "z", cs::unspecified_shape<1>());
     }
-    void pre_forward() override { set_shape(z_, shape_of(x_)[0]); }  // the output follows the input (section 10: no derived dims)
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config({x_}, {z_}, {}); }
+    void pre_forward() override { set_shape(outputs.z, shape_of(inputs.x)[0]); }  // the output follows the input (section 10: no derived dims)
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(); }
 };
 
 // ---- Sum3 (fixed size n): s = p + g + h --------------------------------------------------------------
-struct Sum3Body {
+
+class Sum3 : public cs::Component<Sum3> {
+public:
     struct Inputs {
         cs::Input<DType::f32, 1> p, g, h;
     };
     struct Outputs {
         cs::Output<DType::f32, 1> s;
     };
-    void operator()(sycl::id<1> i, Inputs in, Outputs out) const { out.s[i] = in.p[i] + in.g[i] + in.h[i]; }
-};
-class Sum3 : public cs::Component<Sum3Body> {
-    cs::Input<DType::f32, 1>  p_, g_, h_;
-    cs::Output<DType::f32, 1> s_;
+    static void compute_impl(sycl::id<1> i, const Inputs& in, const Outputs& out) { out.s[i] = in.p[i] + in.g[i] + in.h[i]; }
+
+    Inputs  inputs;
+    Outputs outputs;
+
+private:
     int                       n_;
 
 public:
     explicit Sum3(int n) : n_{n} {}
     void setup() override {
         // unspecified: the producers set the sizes (a fixed input would make a connected producer's number an error, P5)
-        declare_input(p_, "p", cs::unspecified_shape<1>());
-        declare_input(g_, "g", cs::unspecified_shape<1>());
-        declare_input(h_, "h", cs::unspecified_shape<1>());
-        declare_output(s_, "s", n_);
+        declare_input(inputs.p, "p", cs::unspecified_shape<1>());
+        declare_input(inputs.g, "g", cs::unspecified_shape<1>());
+        declare_input(inputs.h, "h", cs::unspecified_shape<1>());
+        declare_output(outputs.s, "s", n_);
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(s_.shape(), {p_, g_, h_}, {s_}, {});
+        return create_launch_config(cs::range_desc(outputs.s.shape()));
     }
 };
 
 // ---- Adder: acc[i] += v, an ATOMIC output (zeroed in init); two of them tie into one root ---------------
-struct AdderBody {
-    struct Inputs {};
+
+class Adder : public cs::Component<Adder> {
+public:
+    struct Inputs {
+        cs::Input<DType::f32, 1> v;  // a free input of extent 1, initialized from the constructor's value
+    };
     struct Outputs {
         cs::Output<DType::atomic_f32, 1> acc;
     };
-    float v;
-    void operator()(sycl::id<1> i, Inputs, Outputs out) const { out.acc[i].fetch_add(v); }
-};
-class Adder : public cs::Component<AdderBody> {
-    cs::Output<DType::atomic_f32, 1> acc_;
-    float                            v_;
+    static void compute_impl(sycl::id<1> i, const Inputs& in, const Outputs& out) { out.acc[i].fetch_add(in.v[std::size_t{0}]); }
+
+    Inputs  inputs;
+    Outputs outputs;
+
+private:
+    float v_;
 
 public:
     explicit Adder(float v) : v_{v} {}
-    void setup() override { declare_output(acc_, "acc", cs::unspecified_shape<1>()); }  // a tie_outputs member: the alias owns the shape
+    void setup() override {
+        declare_input(inputs.v, "v", 1);
+        init_input("v", cs::init::fill(v_));
+        declare_output(outputs.acc, "acc", cs::unspecified_shape<1>());  // a tie_outputs member: the alias owns the shape
+    }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(acc_.shape(), {}, {acc_}, {v_});
+        return create_launch_config(cs::range_desc(outputs.acc.shape()));
     }
 };
 
 // ---- ZeroAcc: the zeroing producer (outputs are never initialized, r01 §6.0); it runs first and the
 // Adders accumulate onto the tied root --------------------------------------------------------------
-struct ZeroAccBody {
+
+class ZeroAcc : public cs::Component<ZeroAcc> {
+public:
     struct Inputs {};
     struct Outputs {
         cs::Output<DType::atomic_f32, 1> acc;
     };
-    void operator()(sycl::id<1> i, Inputs, Outputs out) const { out.acc[i].store(0.0f); }
-};
-class ZeroAcc : public cs::Component<ZeroAccBody> {
-    cs::Output<DType::atomic_f32, 1> acc_;
+    static void compute_impl(sycl::id<1> i, const Inputs&, const Outputs& out) { out.acc[i].store(0.0f); }
 
-public:
-    void setup() override { declare_output(acc_, "acc", cs::unspecified_shape<1>()); }
+    Inputs  inputs;
+    Outputs outputs;
+
+    void setup() override { declare_output(outputs.acc, "acc", cs::unspecified_shape<1>()); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(acc_.shape(), {}, {acc_}, {});
+        return create_launch_config(cs::range_desc(outputs.acc.shape()));
     }
 };
 
 // ---- NSrc / Bins: a value-driven size. NSrc writes the value n; Bins' output has n elements -----
 // Bins tests a hook on an INPUT: it takes a free input `ref` that its System hooks with from_value(n) (hook_bins), and
 // copies its shape in pre_forward. (Hooks on outputs are tested in test_shapes.cpp.)
-struct NSrcBody {
-    struct Inputs {};
+
+class NSrc : public cs::Component<NSrc> {
+public:
+    struct Inputs {
+        cs::Input<DType::f32, 1> v;  // a free input of extent 1, initialized from the constructor's value
+    };
     struct Outputs {
         cs::Output<DType::u32, 1> n;
     };
-    float v;
-    void operator()(sycl::id<1> i, Inputs, Outputs out) const { out.n[i] = static_cast<std::uint32_t>(v); }
-};
-class NSrc : public cs::Component<NSrcBody> {
-    cs::Output<DType::u32, 1> n_;
-    float                     v_;
+    static void compute_impl(sycl::id<1> i, const Inputs& in, const Outputs& out) { out.n[i] = static_cast<std::uint32_t>(in.v[std::size_t{0}]); }
+
+    Inputs  inputs;
+    Outputs outputs;
+
+private:
+    float v_;
 
 public:
     explicit NSrc(float v) : v_{v} {}
-    void setup() override { declare_output(n_, "n", 1); }
+    void setup() override {
+        declare_input(inputs.v, "v", 1);
+        init_input("v", cs::init::fill(v_));
+        declare_output(outputs.n, "n", 1);
+    }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(n_.shape(), {}, {n_}, {v_});
+        return create_launch_config(cs::range_desc(outputs.n.shape()));
     }
 };
-struct BinsBody {
+
+class Bins : public cs::Component<Bins> {
+public:
     struct Inputs {
         cs::Input<DType::u32, 1> n;
         cs::Input<DType::f32, 1> ref;
@@ -401,22 +423,19 @@ struct BinsBody {
     struct Outputs {
         cs::Output<DType::f32, 1> bins;
     };
-    void operator()(sycl::id<1> i, Inputs, Outputs out) const { out.bins[i] = static_cast<float>(i[0]) + 1.0f; }
-};
-class Bins : public cs::Component<BinsBody> {
-    cs::Input<DType::u32, 1>  n_;
-    cs::Input<DType::f32, 1>  ref_;
-    cs::Output<DType::f32, 1> bins_;
+    static void compute_impl(sycl::id<1> i, const Inputs&, const Outputs& out) { out.bins[i] = static_cast<float>(i[0]) + 1.0f; }
 
-public:
+    Inputs  inputs;
+    Outputs outputs;
+
     void setup() override {
-        declare_input(n_, "n", 1);
-        declare_input(ref_, "ref", cs::unspecified);
-        declare_output(bins_, "bins", cs::unspecified);
+        declare_input(inputs.n, "n", 1);
+        declare_input(inputs.ref, "ref", cs::unspecified);
+        declare_output(outputs.bins, "bins", cs::unspecified);
     }
-    void pre_forward() override { set_shape(bins_, shape_of(ref_)[0]); }
+    void pre_forward() override { set_shape(outputs.bins, shape_of(inputs.ref)[0]); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(bins_.shape(), {n_, ref_}, {bins_}, {});
+        return create_launch_config(cs::range_desc(outputs.bins.shape()));
     }
 };
 /// Hooks the `ref` of the Bins at `path` (e.g. "f.b") with the value of its `n`.
@@ -425,7 +444,9 @@ inline void hook_bins(cs::System& s, const std::string& path) {
 }
 
 // ---- BigStage: a group stage whose scratch tile has `elems` floats (the work-group is 64) -----------------
-struct BigBody {
+
+class BigStage : public cs::Component<BigStage> {
+public:
     struct Inputs {
         cs::Input<DType::f32, 1> x;
     };
@@ -435,74 +456,75 @@ struct BigBody {
     struct Scratch {
         cs::Local<DType::f32, 1> tile;
     };
-    void operator()(cs::GroupItem<1> it, Inputs in, Outputs out, Scratch s) const {
+    static void compute_impl(cs::GroupItem<1> it, const Inputs& in, const Outputs& out, Scratch s) {
         const std::size_t l = it.get_local_linear_id(), g = it.get_global_id(0);
         const bool        ok = g < in.x.shape()[0];
         s.tile[l]            = ok ? in.x[g] : 0.0f;  // touches the local buffer (own slot): a scratch stage
         if (ok) out.y[g] = s.tile[l];
     }
-};
-class BigStage : public cs::Component<BigBody> {
-    cs::Input<DType::f32, 1>  x_;
-    cs::Output<DType::f32, 1> y_;
+
+    Inputs  inputs;
+    Outputs outputs;
+
+private:
     std::size_t               elems_;
 
 public:
     explicit BigStage(std::size_t elems) : elems_{elems} {}
     void setup() override {
-        declare_input(x_, "x", cs::unspecified_shape<1>());
-        declare_output(y_, "y", cs::unspecified_shape<1>());
+        declare_input(inputs.x, "x", cs::unspecified_shape<1>());
+        declare_output(outputs.y, "y", cs::unspecified_shape<1>());
     }
-    void pre_forward() override { set_shape(y_, shape_of(x_)[0]); }  // the output follows the input (section 10: no derived dims)
+    void pre_forward() override { set_shape(outputs.y, shape_of(inputs.x)[0]); }  // the output follows the input (section 10: no derived dims)
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        BigBody::Scratch s;
+        Scratch s;
         s.tile.reshape(sycl::range<1>{elems_});
-        return create_launch_config(x_.shape(), sycl::range<1>{64}, {x_}, {y_}, s, {});
+        return create_launch_config(cs::range_desc(inputs.x.shape()), cs::wg_desc(sycl::range<1>{64}), cs::scratch_desc(s));
     }
 };
 
 // ---- custom-op and host children that a wave must refuse ------------------------------------------------
-struct NopCustomBody {
+
+class NopCustom : public cs::Component<NopCustom> {
+public:
     struct Inputs {
         cs::Input<DType::f32, 1> x;
     };
     struct Outputs {
         cs::Output<DType::f32, 1> y;
     };
-    void operator()(cs::CustomOp&, Inputs, Outputs) const {}
-};
-class NopCustom : public cs::Component<NopCustomBody> {
-    cs::Input<DType::f32, 1>  x_;
-    cs::Output<DType::f32, 1> y_;
+    static void compute_impl(cs::CustomOp&, const Inputs&, const Outputs&) {}
 
-public:
+    Inputs  inputs;
+    Outputs outputs;
+
     void setup() override {
-        declare_input(x_, "x", cs::unspecified_shape<1>());
-        declare_output(y_, "y", cs::unspecified_shape<1>());
+        declare_input(inputs.x, "x", cs::unspecified_shape<1>());
+        declare_output(outputs.y, "y", cs::unspecified_shape<1>());
     }
-    void pre_forward() override { set_shape(y_, shape_of(x_)[0]); }  // the output follows the input (section 10: no derived dims)
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config({x_}, {y_}, {}); }
+    void pre_forward() override { set_shape(outputs.y, shape_of(inputs.x)[0]); }  // the output follows the input (section 10: no derived dims)
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(); }
 };
-struct NopHostBody {
+
+class NopHost : public cs::Component<NopHost> {
+public:
     struct Inputs {
         cs::Input<DType::f32, 1> x;
     };
     struct Outputs {
         cs::Output<DType::f32, 1> y;
     };
-    void operator()(cs::Host, Inputs, Outputs) const {}
-};
-class NopHost : public cs::Component<NopHostBody> {
-    cs::Input<DType::f32, 1>  x_;
-    cs::Output<DType::f32, 1> y_;
+    static void compute_impl(cs::Host, const Inputs&, const Outputs&) {}
 
-public:
+    Inputs  inputs;
+    Outputs outputs;
+
     void setup() override {
-        declare_input(x_, "x", cs::unspecified_shape<1>());
-        declare_output(y_, "y", cs::unspecified_shape<1>());
+        declare_input(inputs.x, "x", cs::unspecified_shape<1>());
+        declare_output(outputs.y, "y", cs::unspecified_shape<1>());
     }
-    void pre_forward() override { set_shape(y_, shape_of(x_)[0]); }  // the output follows the input (section 10: no derived dims)
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config({x_}, {y_}, {}); }
+    void pre_forward() override { set_shape(outputs.y, shape_of(inputs.x)[0]); }  // the output follows the input (section 10: no derived dims)
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(); }
 };
 
 constexpr int  kLen = 12;  // the group cases; the group body's work-group is 8, so the last group is ragged
@@ -566,7 +588,7 @@ TEST_CASE("independent children: plain + group with scratch + host in a system_f
     cs::Model model = tfl::make([](cs::System& s) {
         s.add_subsystem(cs::subsystem_desc<tfl::Src1>("src", std::array<int, 1>{tfl::kLen}));
         s.add_subsystem(cs::system_from("par", cs::subsystem_desc<tfl::Elem<0>>("plain"),
-                                        cs::subsystem_desc<tfl::GroupStage<tfl::RevBody>>("group", std::size_t{8}),
+                                        cs::subsystem_desc<tfl::GroupStage<tfl::kRev>>("group", std::size_t{8}),
                                         cs::subsystem_desc<tfl::Prefix>("host")));
         s.add_subsystem(cs::subsystem_desc<tfl::Sum3>("sum", tfl::kLen));
         s.connect("src.y", "par.plain.x");
@@ -653,8 +675,8 @@ TEST_CASE("fused sequential: two group+scratch stages, B's own barrier, own loca
     cs::Model model = tfl::make([](cs::System& s) {
         s.add_subsystem(cs::subsystem_desc<tfl::Src1>("src", std::array<int, 1>{200}));
         s.add_subsystem(cst::fuse<tfl::kSeq>("f", cs::connects_desc({{"a.y", "b.x"}}),
-                                                       cs::subsystem_desc<tfl::GroupStage<tfl::RevBody>>("a"),
-                                                       cs::subsystem_desc<tfl::GroupStage<tfl::MirrorBody>>("b")));
+                                                       cs::subsystem_desc<tfl::GroupStage<tfl::kRev>>("a"),
+                                                       cs::subsystem_desc<tfl::GroupStage<tfl::kMirror>>("b")));
         s.connect("src.y", "f.a.x");
     });
     model.setup();
@@ -739,11 +761,11 @@ TEST_CASE("fused: stages asking for different work-group shapes throw at forward
     // New (design review, section 4: group shape belongs to the component): the wave has ONE shape, so two stages that ask
     // for different ones are refused when the launches are collected.
     const auto build = [](auto strategy_tag) {
-        constexpr cst::FuseMode S = decltype(strategy_tag)::value;
+        static constexpr cst::FuseMode S = decltype(strategy_tag)::value;
         return tfl::make([](cs::System& s) {
             s.add_subsystem(cs::subsystem_desc<tfl::Src1>("src", std::array<int, 1>{256}));
-            s.add_subsystem(cst::fuse<S>("f", cs::subsystem_desc<tfl::GroupStage<tfl::RevBody>>("a", std::size_t{32}),
-                                                   cs::subsystem_desc<tfl::GroupStage<tfl::RevBody>>("b", std::size_t{64})));
+            s.add_subsystem(cst::fuse<S>("f", cs::subsystem_desc<tfl::GroupStage<tfl::kRev>>("a", std::size_t{32}),
+                                                   cs::subsystem_desc<tfl::GroupStage<tfl::kRev>>("b", std::size_t{64})));
             s.connect("src.y", "f.a.x");
             s.connect("src.y", "f.b.x");
         });
@@ -794,8 +816,8 @@ TEST_CASE("fused parallel: independent stages of different sizes, three forwards
         cs::Model model = tfl::make([](cs::System& s) {
             s.add_subsystem(cs::subsystem_desc<tfl::Src1>("src1", std::array<int, 1>{640}));
             s.add_subsystem(cs::subsystem_desc<tfl::Src1>("src2", std::array<int, 1>{200}));
-            s.add_subsystem(cst::fuse<tfl::kPar>("f", cs::subsystem_desc<tfl::GroupStage<tfl::RevBody>>("r"),
-                                                           cs::subsystem_desc<tfl::GroupStage<tfl::MirrorBody>>("m")));
+            s.add_subsystem(cst::fuse<tfl::kPar>("f", cs::subsystem_desc<tfl::GroupStage<tfl::kRev>>("r"),
+                                                           cs::subsystem_desc<tfl::GroupStage<tfl::kMirror>>("m")));
             s.connect("src1.y", "f.r.x");
             s.connect("src2.y", "f.m.x");
         });
@@ -989,9 +1011,10 @@ TEST_CASE("transient: a system_from group and a fused component release after th
     // The pool's bytes in use are the sum of the live containers' capacities rounded up to whole nodes. With the group gone
     // only the eternal src.y is left: 12 floats (48 B) are one node.
     const auto base = cst::pool_in_use(model);
-    // ... and the launch arrays of the eternal src (argument, pointer and geometry arrays).
-    CHECK(base == cst::pool_bytes_of(tfl::kLen * sizeof(float)) + cst::solo_launch_bytes(1));
-    CHECK(base == cst::pool_node_bytes + cst::solo_launch_bytes(1));
+    // ... and the launch arrays of the eternal src (argument, pointer and geometry arrays), and its two scalar free inputs
+    // (scale and offset: a node each).
+    CHECK(base == cst::pool_bytes_of(tfl::kLen * sizeof(float)) + 2 * cst::pool_node_bytes + cst::solo_launch_bytes(1));
+    CHECK(base == 3 * cst::pool_node_bytes + cst::solo_launch_bytes(1));
     model.forward();
     model.forward();
     model.wait();

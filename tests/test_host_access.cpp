@@ -66,56 +66,59 @@ Floats ha_values(const View& v) {
 }
 
 // ---- HaScale: y = 2 x; x is a free input of 4 with an initial value, y has 4 elements ----------------------------------------
-struct HaScaleBody {
+
+class HaScale : public cs::Component<HaScale> {
+public:
     struct Inputs {
         cs::Input<DType::f32, 1> x;
     };
     struct Outputs {
         cs::Output<DType::f32, 1> y;
     };
-    void operator()(sycl::id<1> i, Inputs in, Outputs out) const { out.y[i] = 2.0f * in.x[i]; }
-};
-class HaScale : public cs::Component<HaScaleBody> {
-    cs::Input<DType::f32, 1>  x_;
-    cs::Output<DType::f32, 1> y_;
+    static void compute_impl(sycl::id<1> i, const Inputs& in, const Outputs& out) { out.y[i] = 2.0f * in.x[i]; }
 
-public:
+    Inputs  inputs;
+    Outputs outputs;
+
     void setup() override {
-        declare_input(x_, "x", 4);
-        declare_output(y_, "y", 4);
+        declare_input(inputs.x, "x", 4);
+        declare_output(outputs.y, "y", 4);
         init_input("x", cs::init::from_host(Floats{1, 2, 3, 4}));
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(x_.shape(), {x_}, {y_}, {}); }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(cs::range_desc(inputs.x.shape())); }
 };
 
 // ---- HaMaxSize: y[i] = i + 1, with max(v) elements: v is read through view_input in pre_forward ------------------------------
-struct HaMaxSizeBody {
+
+class HaMaxSize : public cs::Component<HaMaxSize> {
+public:
     struct Inputs {
         cs::Input<DType::u32, 1> v;
     };
     struct Outputs {
         cs::Output<DType::f32, 1> y;
     };
-    void operator()(sycl::id<1> i, Inputs, Outputs out) const { out.y[i] = static_cast<float>(i[0] + 1); }
-};
-class HaMaxSize : public cs::Component<HaMaxSizeBody> {
-    cs::Input<DType::u32, 1>                      v_;
-    cs::Output<DType::f32, 1>                     y_;
+    static void compute_impl(sycl::id<1> i, const Inputs&, const Outputs& out) { out.y[i] = static_cast<float>(i[0] + 1); }
+
+    Inputs  inputs;
+    Outputs outputs;
+
+private:
     std::optional<cs::HostView<DType::u32, 1>>    view_;  // made on the first forward, kept: it is a holder on the host
 
 public:
     void setup() override {
-        declare_input(v_, "v", 5);
-        declare_output(y_, "y", cs::unspecified);
+        declare_input(inputs.v, "v", 5);
+        declare_output(outputs.y, "y", cs::unspecified);
         init_input("v", cs::init::from_host(std::vector<std::uint32_t>{3, 1, 2, 3, 2}));
     }
     void pre_forward() override {
-        if (!view_) view_ = view_input(v_);
+        if (!view_) view_ = view_input(inputs.v);
         view_->sync();
         const auto s = view_->span();
-        set_shape(y_, static_cast<std::size_t>(*std::max_element(s.begin(), s.end())));
+        set_shape(outputs.y, static_cast<std::size_t>(*std::max_element(s.begin(), s.end())));
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(y_.shape(), {v_}, {y_}, {}); }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(cs::range_desc(outputs.y.shape())); }
 };
 
 }  // namespace tha

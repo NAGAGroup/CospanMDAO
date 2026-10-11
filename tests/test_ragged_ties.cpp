@@ -69,36 +69,41 @@ std::vector<float> flat_of(const View& v) {
 }
 
 // ---- CProd: counts = a free u32 input (init from the host), copied ----------------------------------------
-struct CProdBody {
+
+class CProd : public cs::Component<CProd> {
+public:
     struct Inputs {
         cs::Input<DType::u32, 1> raw;
     };
     struct Outputs {
         cs::Output<DType::u32, 1> counts;
     };
-    void operator()(sycl::id<1> i, Inputs a, Outputs o) const { o.counts[i] = a.raw[i]; }
-};
-class CProd : public cs::Component<CProdBody> {
+    static void compute_impl(sycl::id<1> i, const Inputs& a, const Outputs& o) { o.counts[i] = a.raw[i]; }
+
+    Inputs  inputs;
+    Outputs outputs;
+
+private:
     Counts                    init_;
-    cs::Input<DType::u32, 1>  raw_;
-    cs::Output<DType::u32, 1> counts_;
 
 public:
     explicit CProd(Counts init) : init_{std::move(init)} {}
     void setup() override {
-        declare_input(raw_, "raw", init_.size());
+        declare_input(inputs.raw, "raw", init_.size());
         init_input("raw", cs::init::from_host(init_));
-        declare_output(counts_, "counts", init_.size());
+        declare_output(outputs.counts, "counts", init_.size());
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(counts_.shape(), {raw_}, {counts_}, {});
+        return create_launch_config(cs::range_desc(outputs.counts.shape()));
     }
 };
 
 // ---- Gen: pts [N, c_i], p[i][q] = i * 1000 + q ----------------------------------------------------------------
 // `layout` is hooked by the System (counts_from the counts); Gen copies its shape. `counts` is an (unused) connected input, a
 // hook source of its own.
-struct GenBody {
+
+class Gen : public cs::Component<Gen> {
+public:
     struct Inputs {
         cs::Input<DType::u32, 1>       counts;
         cs::RaggedInput<DType::f32, 2> layout;
@@ -106,41 +111,42 @@ struct GenBody {
     struct Outputs {
         cs::RaggedOutput<DType::f32, 2> pts;
     };
-    void operator()(sycl::id<1> id, Inputs, Outputs o) const {
+    static void compute_impl(sycl::id<1> id, const Inputs&, const Outputs& o) {
         auto b = o.pts.block(id[0]);
         for (std::size_t q = 0; q < b.size(); ++q) b[q] = static_cast<float>(id[0] * 1000 + q);
     }
-};
-class Gen : public cs::Component<GenBody> {
-    cs::Input<DType::u32, 1>        counts_;
-    cs::RaggedInput<DType::f32, 2>  layout_;
-    cs::RaggedOutput<DType::f32, 2> pts_;
+
+    Inputs  inputs;
+    Outputs outputs;
+
+private:
     int                             mode_;  // 0 copy layout's shape; 1 pts's counts come from a definition (set nothing); 2 copy anyway
 
 public:
     explicit Gen(int mode = 0) : mode_{mode} {}
     void setup() override {
-        declare_input(counts_, "counts", cs::unspecified);
-        declare_input(layout_, "layout");
-        declare_output(pts_, "pts");
+        declare_input(inputs.counts, "counts", cs::unspecified);
+        declare_input(inputs.layout, "layout");
+        declare_output(outputs.pts, "pts");
     }
     void pre_forward() override {
-        if (mode_ != 1) set_shape(pts_, shape_of(layout_));
+        if (mode_ != 1) set_shape(outputs.pts, shape_of(inputs.layout));
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(sycl::range<1>{layout_.size()}, {counts_, layout_}, {pts_}, {});
+        return create_launch_config(cs::range_desc(sycl::range<1>{inputs.layout.size()}));
     }
 };
 
 // ---- tie members: a rank-2 ragged output with all dims unspecified ----------------------------------------------------------
 /// Op: 0 zero, 1 accumulate (t += (i+1)(q+1)), 2 build (t = (i+1)(q+1)), 3 factor (t = 2 t + 1, reads its own output).
 template <int Op>
-struct TieBody {
+class TieMember : public cs::Component<TieMember<Op>> {
+public:
     struct Inputs {};
     struct Outputs {
         cs::RaggedOutput<DType::f32, 2> t;
     };
-    void operator()(sycl::id<1> id, Inputs, Outputs o) const {
+    static void compute_impl(sycl::id<1> id, const Inputs&, const Outputs& o) {
         auto        b    = o.t.block(id[0]);
         const float base = static_cast<float>(id[0] + 1);
         for (std::size_t q = 0; q < b.size(); ++q) {
@@ -150,35 +156,30 @@ struct TieBody {
             if constexpr (Op == 3) b[q] = 2.0f * b[q] + 1.0f;
         }
     }
-};
-template <int Op>
-class TieMember : public cs::Component<TieBody<Op>> {
-    cs::RaggedOutput<DType::f32, 2> t_;
 
-public:
-    void setup() override { this->declare_output(t_, "t"); }
+    Inputs  inputs;
+    Outputs outputs;
+
+    void setup() override { this->declare_output(outputs.t, "t"); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return this->create_launch_config(sycl::range<1>{t_.size()}, {}, {t_}, {});
+        return this->create_launch_config(cs::range_desc(sycl::range<1>{outputs.t.size()}));
     }
 };
 /// A member that declares its leading dimension (N = 4): it meets the alias's definition at the tie.
-class TieMemberLead : public cs::Component<TieBody<0>> {
-    cs::RaggedOutput<DType::f32, 2> t_;
-
+class TieMemberLead : public TieMember<0> {
 public:
-    void setup() override { declare_output(t_, "t", 4); }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(sycl::range<1>{t_.size()}, {}, {t_}, {});
-    }
+    void setup() override { declare_output(outputs.t, "t", 4); }
 };
 // ---- atomic ragged members: zero (store), accumulate (fetch_add) ------------------------------------------------
+
 template <int Op>
-struct TieBodyA {
+class TieMemberA : public cs::Component<TieMemberA<Op>> {
+public:
     struct Inputs {};
     struct Outputs {
         cs::RaggedOutput<DType::atomic_f32, 2> t;
     };
-    void operator()(sycl::id<1> id, Inputs, Outputs o) const {
+    static void compute_impl(sycl::id<1> id, const Inputs&, const Outputs& o) {
         auto        b    = o.t.block(id[0]);
         const float base = static_cast<float>(id[0] + 1);
         for (std::size_t q = 0; q < b.size(); ++q) {
@@ -186,15 +187,13 @@ struct TieBodyA {
             if constexpr (Op == 1) b[q].fetch_add(base * static_cast<float>(q + 1));
         }
     }
-};
-template <int Op>
-class TieMemberA : public cs::Component<TieBodyA<Op>> {
-    cs::RaggedOutput<DType::atomic_f32, 2> t_;
 
-public:
-    void setup() override { this->declare_output(t_, "t"); }
+    Inputs  inputs;
+    Outputs outputs;
+
+    void setup() override { this->declare_output(outputs.t, "t"); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return this->create_launch_config(sycl::range<1>{t_.size()}, {}, {t_}, {});
+        return this->create_launch_config(cs::range_desc(sycl::range<1>{outputs.t.size()}));
     }
 };
 using ZeroA = TieMemberA<0>;
@@ -206,32 +205,32 @@ using Build0 = TieMember<2>;
 using Factor = TieMember<3>;
 
 // ---- SumT: sums[i] = the sum of block i of a ragged input ---------------------------------------------------------------
-struct SumTBody {
+
+class SumT : public cs::Component<SumT> {
+public:
     struct Inputs {
         cs::RaggedInput<DType::f32, 2> pts;
     };
     struct Outputs {
         cs::Output<DType::f32, 1> sums;
     };
-    void operator()(sycl::id<1> id, Inputs in, Outputs out) const {
+    static void compute_impl(sycl::id<1> id, const Inputs& in, const Outputs& out) {
         auto  b = in.pts.block(id[0]);
         float s = 0.0f;
         for (std::size_t q = 0; q < b.size(); ++q) s += b[q];
         out.sums[id] = s;
     }
-};
-class SumT : public cs::Component<SumTBody> {
-    cs::RaggedInput<DType::f32, 2> pts_;
-    cs::Output<DType::f32, 1>      sums_;
 
-public:
+    Inputs  inputs;
+    Outputs outputs;
+
     void setup() override {
-        declare_input(pts_, "pts");
-        declare_output(sums_, "sums", cs::unspecified);
+        declare_input(inputs.pts, "pts");
+        declare_output(outputs.sums, "sums", cs::unspecified);
     }
-    void pre_forward() override { set_shape(sums_, shape_of(pts_).n); }
+    void pre_forward() override { set_shape(outputs.sums, shape_of(inputs.pts).n); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(sums_.shape(), {pts_}, {sums_}, {});
+        return create_launch_config(cs::range_desc(outputs.sums.shape()));
     }
 };
 
@@ -304,34 +303,33 @@ void run_tie_out(cs::Model& m, const Counts& counts, bool factor) {
 }
 
 // ---- tie_inputs top: gen -> (two ragged inputs tied, connected from a ragged output) -----------------------------------------------
+
 template <int K>
-struct SumKBody {
+class SumK : public cs::Component<SumK<K>> {
+public:
     struct Inputs {
         cs::RaggedInput<DType::f32, 2> pts;
     };
     struct Outputs {
         cs::Output<DType::f32, 1> sums;
     };
-    void operator()(sycl::id<1> id, Inputs in, Outputs out) const {
+    static void compute_impl(sycl::id<1> id, const Inputs& in, const Outputs& out) {
         auto  b = in.pts.block(id[0]);
         float s = 0.0f;
         for (std::size_t q = 0; q < b.size(); ++q) s += b[q];
         out.sums[id] = static_cast<float>(K) * s;
     }
-};
-template <int K>
-class SumK : public cs::Component<SumKBody<K>> {
-    cs::RaggedInput<DType::f32, 2> pts_;
-    cs::Output<DType::f32, 1>      sums_;
 
-public:
+    Inputs  inputs;
+    Outputs outputs;
+
     void setup() override {
-        this->declare_input(pts_, "pts");
-        this->declare_output(sums_, "sums", cs::unspecified);
+        this->declare_input(inputs.pts, "pts");
+        this->declare_output(outputs.sums, "sums", cs::unspecified);
     }
-    void pre_forward() override { this->set_shape(sums_, this->shape_of(pts_).n); }
+    void pre_forward() override { this->set_shape(outputs.sums, this->shape_of(inputs.pts).n); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return this->create_launch_config(sums_.shape(), {pts_}, {sums_}, {});
+        return this->create_launch_config(cs::range_desc(outputs.sums.shape()));
     }
 };
 
@@ -376,73 +374,76 @@ public:
 };
 
 // ---- Src: a plain source, x[i] = 0.5 i + 1 -----------------------------------------------------------------------
-struct SrcBody {
+
+class Src : public cs::Component<Src> {
+public:
     struct Inputs {};
     struct Outputs {
         cs::Output<DType::f32, 1> x;
     };
-    void operator()(sycl::id<1> i, Inputs, Outputs o) const { o.x[i] = 0.5f * static_cast<float>(i[0]) + 1.0f; }
-};
-class Src : public cs::Component<SrcBody> {
+    static void compute_impl(sycl::id<1> i, const Inputs&, const Outputs& o) { o.x[i] = 0.5f * static_cast<float>(i[0]) + 1.0f; }
+
+    Inputs  inputs;
+    Outputs outputs;
+
+private:
     std::size_t               n_;
-    cs::Output<DType::f32, 1> x_;
 
 public:
     explicit Src(std::size_t n) : n_{n} {}
-    void setup() override { declare_output(x_, "x", n_); }
+    void setup() override { declare_output(outputs.x, "x", n_); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(x_.shape(), {}, {x_}, {});
+        return create_launch_config(cs::range_desc(outputs.x.shape()));
     }
 };
 
 /// BuildX: t = in[i] (q + 1), a tied output; reads the outside input `in`.
-struct BuildXBody {
+
+class BuildX : public cs::Component<BuildX> {
+public:
     struct Inputs {
         cs::Input<DType::f32, 1> in;
     };
     struct Outputs {
         cs::RaggedOutput<DType::f32, 2> t;
     };
-    void operator()(sycl::id<1> id, Inputs a, Outputs o) const {
+    static void compute_impl(sycl::id<1> id, const Inputs& a, const Outputs& o) {
         auto b = o.t.block(id[0]);
         for (std::size_t q = 0; q < b.size(); ++q) b[q] = a.in[id] * static_cast<float>(q + 1);
     }
-};
-class BuildX : public cs::Component<BuildXBody> {
-    cs::Input<DType::f32, 1>        in_;
-    cs::RaggedOutput<DType::f32, 2> t_;
 
-public:
+    Inputs  inputs;
+    Outputs outputs;
+
     void setup() override {
-        declare_input(in_, "in", cs::unspecified);
-        declare_output(t_, "t");
+        declare_input(inputs.in, "in", cs::unspecified);
+        declare_output(outputs.t, "t");
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(sycl::range<1>{t_.size()}, {in_}, {t_}, {});
+        return create_launch_config(cs::range_desc(sycl::range<1>{outputs.t.size()}));
     }
 };
 
-struct ConsBody {
+class Cons : public cs::Component<Cons> {
+public:
     struct Inputs {
         cs::Input<DType::f32, 1> in;
     };
     struct Outputs {
         cs::Output<DType::f32, 1> out;
     };
-    void operator()(sycl::id<1> i, Inputs a, Outputs o) const { o.out[i] = 2.0f * a.in[i] + 1.0f; }
-};
-class Cons : public cs::Component<ConsBody> {
-    cs::Input<DType::f32, 1>  in_;
-    cs::Output<DType::f32, 1> out_;
+    static void compute_impl(sycl::id<1> i, const Inputs& a, const Outputs& o) { o.out[i] = 2.0f * a.in[i] + 1.0f; }
 
-public:
+    Inputs  inputs;
+    Outputs outputs;
+
     void setup() override {
-        declare_input(in_, "in", cs::unspecified);
-        declare_output(out_, "out", cs::unspecified);
+        declare_input(inputs.in, "in", cs::unspecified);
+        declare_output(outputs.out, "out", cs::unspecified);
     }
-    void pre_forward() override { set_shape(out_, shape_of(in_)[0]); }
+    void pre_forward() override { set_shape(outputs.out, shape_of(inputs.in)[0]); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(out_.shape(), {in_}, {out_}, {});
+        return create_launch_config(cs::range_desc(outputs.out.shape()));
     }
 };
 
@@ -508,7 +509,9 @@ std::vector<float> nested_ref(const Sizes& sizes) {
 
 // ---- tie shapes from INPUTS of a nested System --------------------------------------------------------------------------
 /// BuildS: t = in (q + 1); also has the u32 input `sizes` (promoted by G; the alias hook reads its values).
-struct BuildSBody {
+
+class BuildS : public cs::Component<BuildS> {
+public:
     struct Inputs {
         cs::Input<DType::f32, 1> in;
         cs::Input<DType::u32, 1> sizes;
@@ -516,51 +519,48 @@ struct BuildSBody {
     struct Outputs {
         cs::RaggedOutput<DType::f32, 2> t;
     };
-    void operator()(sycl::id<1> id, Inputs a, Outputs o) const {
+    static void compute_impl(sycl::id<1> id, const Inputs& a, const Outputs& o) {
         auto b = o.t.block(id[0]);
         for (std::size_t q = 0; q < b.size(); ++q) b[q] = a.in[id] * static_cast<float>(q + 1);
     }
-};
-class BuildS : public cs::Component<BuildSBody> {
-    cs::Input<DType::f32, 1>        in_;
-    cs::Input<DType::u32, 1>        sizes_;
-    cs::RaggedOutput<DType::f32, 2> t_;
 
-public:
+    Inputs  inputs;
+    Outputs outputs;
+
     void setup() override {
-        declare_input(in_, "in", cs::unspecified);
-        declare_input(sizes_, "sizes", cs::unspecified);
-        declare_output(t_, "t");
+        declare_input(inputs.in, "in", cs::unspecified);
+        declare_input(inputs.sizes, "sizes", cs::unspecified);
+        declare_output(outputs.t, "t");
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(sycl::range<1>{t_.size()}, {in_, sizes_}, {t_}, {});
+        return create_launch_config(cs::range_desc(sycl::range<1>{outputs.t.size()}));
     }
 };
 
 /// AccX: an ATOMIC ragged tie member: t += in (q + 1).
-struct AccXBody {
+
+class AccX : public cs::Component<AccX> {
+public:
     struct Inputs {
         cs::Input<DType::f32, 1> in;
     };
     struct Outputs {
         cs::RaggedOutput<DType::atomic_f32, 2> t;
     };
-    void operator()(sycl::id<1> id, Inputs a, Outputs o) const {
+    static void compute_impl(sycl::id<1> id, const Inputs& a, const Outputs& o) {
         auto b = o.t.block(id[0]);
         for (std::size_t q = 0; q < b.size(); ++q) b[q].fetch_add(a.in[id] * static_cast<float>(q + 1));
     }
-};
-class AccX : public cs::Component<AccXBody> {
-    cs::Input<DType::f32, 1>               in_;
-    cs::RaggedOutput<DType::atomic_f32, 2> t_;
 
-public:
+    Inputs  inputs;
+    Outputs outputs;
+
     void setup() override {
-        declare_input(in_, "in", cs::unspecified);
-        declare_output(t_, "t");
+        declare_input(inputs.in, "in", cs::unspecified);
+        declare_output(outputs.t, "t");
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(sycl::range<1>{t_.size()}, {in_}, {t_}, {});
+        return create_launch_config(cs::range_desc(sycl::range<1>{outputs.t.size()}));
     }
 };
 
@@ -688,29 +688,29 @@ public:
 };
 
 /// AccIn: t += in[i] (q + 1); `t` is a tied ragged output, `in` a plain input.
-struct AccInBody {
+
+class AccIn : public cs::Component<AccIn> {
+public:
     struct Inputs {
         cs::Input<DType::f32, 1> in;
     };
     struct Outputs {
         cs::RaggedOutput<DType::f32, 2> t;
     };
-    void operator()(sycl::id<1> id, Inputs a, Outputs o) const {
+    static void compute_impl(sycl::id<1> id, const Inputs& a, const Outputs& o) {
         auto b = o.t.block(id[0]);
         for (std::size_t q = 0; q < b.size(); ++q) b[q] += a.in[id] * static_cast<float>(q + 1);
     }
-};
-class AccIn : public cs::Component<AccInBody> {
-    cs::Input<DType::f32, 1>        in_;
-    cs::RaggedOutput<DType::f32, 2> t_;
 
-public:
+    Inputs  inputs;
+    Outputs outputs;
+
     void setup() override {
-        declare_input(in_, "in", cs::unspecified);
-        declare_output(t_, "t");
+        declare_input(inputs.in, "in", cs::unspecified);
+        declare_output(outputs.t, "t");
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(sycl::range<1>{t_.size()}, {in_}, {t_}, {});
+        return create_launch_config(cs::range_desc(sycl::range<1>{outputs.t.size()}));
     }
 };
 

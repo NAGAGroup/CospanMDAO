@@ -1,7 +1,7 @@
 #pragma once
 
 // =============================================================================
-// naga/cospan/component.hpp — ComponentBase and Component<KB>
+// naga/cospan/component.hpp — ComponentBase and Component<X>
 // =============================================================================
 //
 // A component is the leaf that does work, and it SUBMITS ITSELF (docs/design-review-2026-10-03.md, sections 3 and
@@ -23,7 +23,7 @@
 // queue and no device of its own: the device of each instance is a field of the instance (section 2), and a
 // Runtime is given for the duration of a forward step.
 //
-// Component<KB> adds the typed layer. ONE KERNEL BODY PER COMPONENT: the body's signature fixes the kind (plain:
+// Component<X> adds the typed layer (CRTP). ONE KERNEL BODY PER COMPONENT: X::compute_impl's signature fixes the kind (plain:
 // sycl::id<R>; group: GroupItem<R>; custom-op: CustomOp&; host: Host) and the kernel rank at COMPILE TIME, so there
 // is no run-time branching on rank. Custom-op and host bodies cannot be fused (section 4): the fuse helper enforces
 // it on the traits below.
@@ -41,6 +41,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <type_traits>
 #include <unordered_map>
 #include <variant>
@@ -456,7 +457,7 @@ public:
     }
 
     // ---- what a fused owner needs to know, without knowing the KernelBody type --
-    // Answered by Component<KB> from its body's signature. An owner reads
+    // Answered by Component<X> from its body's signature. An owner reads
     // these; nothing here knows what fusing is.
     virtual int  kernel_rank() const { return 0; }       ///< 0 for custom-op and host bodies
     virtual bool is_group_body() const { return false; }
@@ -471,7 +472,7 @@ public:
         throw std::logic_error("naga::cospan: " + describe() + " has no stage function");
     }
 
-    // ---- the stage interface of a group launcher (kernel bodies only; implemented by Component<KB>) ----
+    // ---- the stage interface of a group launcher (kernel bodies only; implemented by Component<X>) ----
     /// The component's one-element argument array on its device: created (capacity 1, so its address is final) the first
     /// time.
     virtual void stage_args_ensure(detail::Runtime&) { throw_no_stage(); }
@@ -510,7 +511,7 @@ protected:
     /// The storage kind of this Component's I/O: device, or host for a host body.
     virtual sk::kind default_storage_kind() const { return sk::kind::device; }
 
-    /// The launch of this forward (describe): implemented by Component<KB> from the user's compute_forward().
+    /// The launch of this forward (describe): implemented by Component<X> from the user's compute_forward().
     virtual std::unique_ptr<LaunchDescription> compute_forward_impl() = 0;
 
     std::string describe() const { return path().empty() ? std::string{"component"} : "'" + path() + "'"; }
@@ -1085,74 +1086,270 @@ private:
 }  // namespace detail
 
 // -----------------------------------------------------------------------------
-// Component<KB>
+// Launch descriptors and the synthesized body (the component form)
 // -----------------------------------------------------------------------------
 
-/// One KernelBody type per component: the one-kernel rule, by type.
-template <KernelBodyC KB>
+/// The launch descriptors of create_launch_config: each its own type, in any order. range_desc is required for plain and
+/// group bodies; wg_desc is optional; scratch_desc is optional and only for a body with a Scratch. Custom-op and host bodies
+/// take none.
+template <int R>
+struct RangeDesc {
+    sycl::range<R> value;
+};
+template <int R>
+struct WgDesc {
+    sycl::range<R> value;
+};
+template <class S>
+struct ScratchDesc {
+    S value;
+};
+
+template <int R>
+RangeDesc<R> range_desc(const sycl::range<R>& r) {
+    return RangeDesc<R>{r};
+}
+template <int R>
+WgDesc<R> wg_desc(const sycl::range<R>& r) {
+    return WgDesc<R>{r};
+}
+template <class S>
+ScratchDesc<S> scratch_desc(const S& s) {
+    return ScratchDesc<S>{s};
+}
+
+namespace detail {
+
+/// kind: 0 range, 1 work-group shape, 2 scratch; -1 not a descriptor.
+template <class D>
+struct desc_info {
+    static constexpr int kind = -1;
+    static constexpr int rank = 0;
+};
+template <int R>
+struct desc_info<RangeDesc<R>> {
+    static constexpr int kind = 0;
+    static constexpr int rank = R;
+};
+template <int R>
+struct desc_info<WgDesc<R>> {
+    static constexpr int kind = 1;
+    static constexpr int rank = R;
+};
+template <class S>
+struct desc_info<ScratchDesc<S>> {
+    static constexpr int kind = 2;
+    static constexpr int rank = 0;
+};
+
+template <class KB, class D>
+constexpr bool scratch_desc_type_ok() {
+    if constexpr (desc_info<D>::kind != 2)
+        return true;
+    else
+        return std::is_same_v<D, ScratchDesc<scratch_t<KB>>>;
+}
+
+/// Whether the descriptors `Ds...` are a valid launch for the body KB: a range (of the body's rank) for plain and group bodies,
+/// at most one of each descriptor, a scratch_desc only for a body with Scratch (of its type), none at all for custom-op and host.
+template <class KB, class... Ds>
+constexpr bool launch_descs_ok() {
+    if constexpr (!((desc_info<Ds>::kind >= 0) && ...)) {
+        return false;
+    } else {
+        constexpr int nr = ((desc_info<Ds>::kind == 0 ? 1 : 0) + ... + 0);
+        constexpr int nw = ((desc_info<Ds>::kind == 1 ? 1 : 0) + ... + 0);
+        constexpr int ns = ((desc_info<Ds>::kind == 2 ? 1 : 0) + ... + 0);
+        if constexpr (CustomOpBody<KB> || HostBody<KB>) {
+            return sizeof...(Ds) == 0;
+        } else if constexpr (PlainBody<KB> || GroupBody<KB>) {
+            constexpr int  R        = kernel_rank_v<KB>;
+            constexpr bool ranks_ok = ((desc_info<Ds>::kind == 2 || desc_info<Ds>::rank == R) && ...);
+            constexpr bool types_ok = (scratch_desc_type_ok<KB, Ds>() && ...);
+            constexpr bool scr_ok   = HasScratch<KB> ? (ns <= 1) : (ns == 0);
+            return nr == 1 && nw <= 1 && ranks_ok && types_ok && scr_ok;
+        } else {
+            return false;
+        }
+    }
+}
+template <class KB, class... Ds>
+inline constexpr bool launch_descs_ok_v = launch_descs_ok<KB, Ds...>();
+
+template <class T, class... Ds>
+inline constexpr bool has_desc_v = (std::is_same_v<T, Ds> || ...);
+
+/// The call signature of X::compute_impl (a static member function): its first four parameters.
+template <class F>
+struct impl_call {
+    static constexpr bool        valid = false;
+    static constexpr std::size_t nargs = 0;
+    using a0 = None; using a1 = None; using a2 = None; using a3 = None;
+};
+template <class R, class... A>
+struct impl_call<R (*)(A...)> {
+    static constexpr bool        valid = true;
+    static constexpr std::size_t nargs = sizeof...(A);
+    using a0 = typename arg_or<0, None, A...>::type;
+    using a1 = typename arg_or<1, None, A...>::type;
+    using a2 = typename arg_or<2, None, A...>::type;
+    using a3 = typename arg_or<3, None, A...>::type;
+};
+template <class R, class... A>
+struct impl_call<R (*)(A...) noexcept> : impl_call<R (*)(A...)> {};
+
+template <class X, class = void>
+struct impl_traits : impl_call<void> {};
+template <class X>
+struct impl_traits<X, std::void_t<decltype(&X::compute_impl)>> : impl_call<decltype(&X::compute_impl)> {};
+
+/// The Inputs and Outputs a synthesized body carries (a copy of the component's `inputs` and `outputs`).
+template <class X>
+struct SynthData {
+    using Inputs  = typename X::Inputs;
+    using Outputs = typename X::Outputs;
+
+    SynthData(const Inputs& i, const Outputs& o) : in{i}, out{o} {}
+
+    Inputs  in;
+    Outputs out;
+};
+
+/// The kernel body of a component X: ONE distinct type per component, trivially copyable. Its call operator has the FIXED
+/// signature the KernelBody concepts read (first argument, Inputs, Outputs[, Scratch]) and forwards to X::compute_impl; the
+/// signature is chosen by specialization on the kind (the first parameter of compute_impl) and on Scratch.
+template <class X, int Kind, bool WithScratch>
+struct SynthImpl : SynthData<X> {
+    using SynthData<X>::SynthData;  // no call operator: not a body (the concepts fail, Component's static_assert says why)
+};
+
+template <class X>
+struct SynthImpl<X, 0, false> : SynthData<X> {
+    using SynthData<X>::SynthData;
+    void operator()(sycl::id<first_traits<typename impl_traits<X>::a0>::rank> i, typename X::Inputs in,
+                    typename X::Outputs out) const {
+        X::compute_impl(i, in, out);
+    }
+};
+
+template <class X>
+struct SynthImpl<X, 1, false> : SynthData<X> {
+    using SynthData<X>::SynthData;
+    void operator()(GroupItem<first_traits<typename impl_traits<X>::a0>::rank> it, typename X::Inputs in,
+                    typename X::Outputs out) const {
+        X::compute_impl(it, in, out);
+    }
+};
+
+template <class X>
+struct SynthImpl<X, 1, true> : SynthData<X> {
+    using SynthData<X>::SynthData;
+    using Scratch = typename X::Scratch;
+    void operator()(GroupItem<first_traits<typename impl_traits<X>::a0>::rank> it, typename X::Inputs in,
+                    typename X::Outputs out, Scratch scratch) const {
+        X::compute_impl(it, in, out, scratch);
+    }
+};
+
+template <class X>
+struct SynthImpl<X, 2, false> : SynthData<X> {
+    using SynthData<X>::SynthData;
+    void operator()(CustomOp& op, typename X::Inputs in, typename X::Outputs out) const { X::compute_impl(op, in, out); }
+};
+
+template <class X>
+struct SynthImpl<X, 3, false> : SynthData<X> {
+    using SynthData<X>::SynthData;
+    void operator()(Host h, typename X::Inputs in, typename X::Outputs out) const { X::compute_impl(h, in, out); }
+};
+
+/// The name Component<X> uses. Its base (which reads X::compute_impl) is chosen when SynthBody<X> is instantiated, not when it
+/// is named: Component<X> names it while X is still incomplete.
+template <class X>
+struct SynthBody : SynthImpl<X, first_traits<typename impl_traits<X>::a0>::kind, (impl_traits<X>::nargs == 4)> {
+    using Base = SynthImpl<X, first_traits<typename impl_traits<X>::a0>::kind, (impl_traits<X>::nargs == 4)>;
+    SynthBody(const typename X::Inputs& i, const typename X::Outputs& o) : Base{i, o} {}
+};
+
+}  // namespace detail
+
+// -----------------------------------------------------------------------------
+// Component<X>
+// -----------------------------------------------------------------------------
+
+/// The typed layer, by CRTP: `class Axpb : public cs::Component<Axpb>`. The component declares nested `Inputs` and `Outputs`
+/// structs of ports, a static `compute_impl` (its first parameter fixes the kind and rank: sycl::id<R> plain, GroupItem<R>
+/// group, CustomOp& custom-op, Host host; a group body with a nested `Scratch` takes it as the 4th) and PUBLIC members `inputs`
+/// and `outputs`. create_launch_config(descriptors...) makes the launch from them. ONE KERNEL BODY PER COMPONENT, by type.
+///
+/// CRTP rule: the members of X (Inputs, Outputs, Scratch, compute_impl, inputs, outputs) are named only inside member-function
+/// bodies and lazily instantiated templates here, never at class scope: X is incomplete while this class is instantiated.
+template <class X>
 class Component : public ComponentBase {
 public:
-    using body_type = KB;
+    using body_type = detail::SynthBody<X>;
 
-    /// USER, every forward: assemble Inputs/Outputs (and body config, and
-    /// Scratch shapes) from the already-synced members; state the launch
-    /// parameters. Returns the description the component submits (section 3).
+    Component() { static_assert(KernelBodyC<body_type>, "naga::cospan: X::compute_impl is not a valid kernel body: it must be a static function (sycl::id<R> | GroupItem<R> | CustomOp& | Host, const Inputs&, const Outputs&[, Scratch]) with trivially copyable Inputs, Outputs and Scratch"); }
+
+    /// USER, every forward: state the launch with create_launch_config(descriptors...). Returns the description the component
+    /// submits (section 3).
     virtual std::unique_ptr<LaunchDescription> compute_forward() = 0;
 
     // ---- read off the body's signature, for a fused owner --------------------
-    int  kernel_rank() const override { return kernel_rank_v<KB>; }
-    bool is_group_body() const override { return GroupBody<KB>; }
-    bool has_scratch() const override { return HasScratch<KB>; }
-    bool is_custom_op() const override { return CustomOpBody<KB>; }
-    bool is_host() const override { return HostBody<KB>; }
-    bool is_kernel_stage() const override { return PlainBody<KB> || GroupBody<KB>; }
+    int  kernel_rank() const override { return kernel_rank_v<body_type>; }
+    bool is_group_body() const override { return GroupBody<body_type>; }
+    bool has_scratch() const override { return HasScratch<body_type>; }
+    bool is_custom_op() const override { return CustomOpBody<body_type>; }
+    bool is_host() const override { return HostBody<body_type>; }
+    bool is_kernel_stage() const override { return PlainBody<body_type> || GroupBody<body_type>; }
     detail::JitId definition_id() const override {
-        if constexpr (CustomOpBody<KB> || HostBody<KB>)
+        if constexpr (CustomOpBody<body_type> || HostBody<body_type>)
             throw std::logic_error("naga::cospan: " + describe() +
                                    " is a custom-op or host body: it has no stage function");
         else
-            return detail::stage_definition_id<KB>();  // a function-local static, one per body type
+            return detail::stage_definition_id<body_type>();  // a function-local static, one per body type
     }
 
     // ---- the stage interface (plain and group bodies) ------------------------------
     void stage_args_ensure(detail::Runtime& rt) override {
-        if constexpr (PlainBody<KB> || GroupBody<KB>) {
+        if constexpr (PlainBody<body_type> || GroupBody<body_type>) {
             if (!args_) {
-                args_.emplace(rt.allocator_for<detail::StageArgs<KB>>(this->device_of(), sk::kind::device));
-                args_->reserve(1);  // capacity 1 from the start: the address the pointer array holds is final
+                auto v = std::make_shared<ArgsVec>(rt.allocator_for<detail::StageArgs<body_type>>(this->device_of(), sk::kind::device));
+                v->reserve(1);  // capacity 1 from the start: the address the pointer array holds is final
+                args_ = std::move(v);
             }
         } else {
             this->throw_no_stage();
         }
     }
     const void* stage_args_ptr() const override {
-        if constexpr (PlainBody<KB> || GroupBody<KB>) {
+        if constexpr (PlainBody<body_type> || GroupBody<body_type>) {
             if (!args_) throw std::logic_error("naga::cospan: " + this->describe() + ": the argument array does not exist yet (precompute first)");
-            return args_->data();
+            return args()->data();
         } else {
             this->throw_no_stage();
         }
     }
     std::vector<sycl::event> stage_args_deps() const override {
-        if constexpr (PlainBody<KB> || GroupBody<KB>) {
-            return args_->read_deps();
+        if constexpr (PlainBody<body_type> || GroupBody<body_type>) {
+            return args()->read_deps();
         } else {
             this->throw_no_stage();
         }
     }
     void stage_args_register_read(const sycl::event& e) override {
-        if constexpr (PlainBody<KB> || GroupBody<KB>) {
-            args_->register_read(e);
+        if constexpr (PlainBody<body_type> || GroupBody<body_type>) {
+            args()->register_read(e);
         } else {
             this->throw_no_stage();
         }
     }
     sycl::range<3> stage_upload([[maybe_unused]] detail::Runtime& rt, [[maybe_unused]] LaunchDescription& d,
                                 [[maybe_unused]] const sycl::range<3>& wg) override {
-        if constexpr (PlainBody<KB> || GroupBody<KB>) {
-            auto&                        kl = dynamic_cast<detail::KernelLaunch<KB>&>(d);
-            const detail::StageArgs<KB>& a  = kl.finalize(wg);
-            args_->from_host(std::span<const detail::StageArgs<KB>>{&a, 1});  // the host member into the array: a container write
+        if constexpr (PlainBody<body_type> || GroupBody<body_type>) {
+            auto&                                kl = dynamic_cast<detail::KernelLaunch<body_type>&>(d);
+            const detail::StageArgs<body_type>& a  = kl.finalize(wg);
+            args()->from_host(std::span<const detail::StageArgs<body_type>>{&a, 1});  // the host member into the array: a container write
             return kl.group_range();
         } else {
             this->throw_no_stage();
@@ -1160,70 +1357,44 @@ public:
     }
 
 protected:
-    static constexpr int LR = launch_rank_v<KB>;
-
     std::unique_ptr<LaunchDescription> compute_forward_impl() override { return compute_forward(); }
 
-    /// Kernel bodies: range, Inputs, Outputs, body (default work-group).
-    std::unique_ptr<LaunchDescription> create_launch_config(sycl::range<LR> range,
-                                                            typename KB::Inputs in,
-                                                            typename KB::Outputs out, KB body = {})
-        requires((PlainBody<KB> || GroupBody<KB>) && !HasScratch<KB>)
-    {
-        return make_launch(range, std::nullopt, in, out, body, detail::NoScratchValue<KB>());
-    }
-
-    /// Group bodies without Scratch, with an explicit work-group shape.
-    std::unique_ptr<LaunchDescription> create_launch_config(sycl::range<LR> range, sycl::range<LR> wg,
-                                                            typename KB::Inputs in,
-                                                            typename KB::Outputs out, KB body = {})
-        requires(GroupBody<KB> && !HasScratch<KB>)
-    {
-        return make_launch(range, wg, in, out, body, detail::NoScratchValue<KB>());
-    }
-
-    /// Group bodies with Scratch: the Scratch is laid out here.
-    std::unique_ptr<LaunchDescription> create_launch_config(sycl::range<LR> range, sycl::range<LR> wg,
-                                                            typename KB::Inputs in,
-                                                            typename KB::Outputs out,
-                                                            detail::scratch_t<KB> scratch,
-                                                            KB body = {})
-        requires HasScratch<KB>
-    {
-        return make_launch(range, wg, in, out, body, scratch);
-    }
-
-    /// Custom-op bodies (D1): no range; the body enqueues native work.
-    std::unique_ptr<LaunchDescription> create_launch_config(typename KB::Inputs in,
-                                                            typename KB::Outputs out, KB body = {})
-        requires CustomOpBody<KB>
-    {
-        return std::make_unique<detail::CustomOpLaunch<KB>>(in, out, body);
-    }
-
-    /// Host bodies (D3): no range; the body runs on the host over host-kind USM.
-    std::unique_ptr<LaunchDescription> create_launch_config(typename KB::Inputs in,
-                                                            typename KB::Outputs out, KB body = {})
-        requires HostBody<KB>
-    {
-        return std::make_unique<detail::HostLaunch<KB>>(in, out, body);
+    /// The launch of this component, from its `inputs` and `outputs` members and the descriptors, in any order:
+    /// plain and group bodies: range_desc(range) (required), wg_desc(range) (optional), scratch_desc(value) (optional, a body
+    /// with Scratch only); custom-op and host bodies: none.
+    template <class... Ds>
+        requires(detail::launch_descs_ok_v<detail::SynthBody<X>, Ds...>)
+    std::unique_ptr<LaunchDescription> create_launch_config(Ds... ds) {
+        using KB   = detail::SynthBody<X>;
+        X&   self  = static_cast<X&>(*this);
+        KB   body{self.inputs, self.outputs};
+        if constexpr (CustomOpBody<KB>) {
+            return std::make_unique<detail::CustomOpLaunch<KB>>(self.inputs, self.outputs, body);
+        } else if constexpr (HostBody<KB>) {
+            return std::make_unique<detail::HostLaunch<KB>>(self.inputs, self.outputs, body);
+        } else {
+            constexpr int LR = launch_rank_v<KB>;
+            const std::tuple<Ds...> t{ds...};
+            const sycl::range<LR>   range = std::get<RangeDesc<LR>>(t).value;
+            std::optional<sycl::range<LR>> wg;
+            if constexpr (detail::has_desc_v<WgDesc<LR>, Ds...>) wg = std::get<WgDesc<LR>>(t).value;
+            detail::scratch_t<KB> scratch = detail::NoScratchValue<KB>();
+            if constexpr (detail::has_desc_v<ScratchDesc<detail::scratch_t<KB>>, Ds...>)
+                scratch = std::get<ScratchDesc<detail::scratch_t<KB>>>(t).value;
+            return std::make_unique<detail::KernelLaunch<KB>>(range, wg, self.inputs, self.outputs, body, scratch);
+        }
     }
 
     sk::kind default_storage_kind() const override {
-        return HostBody<KB> ? sk::kind::host : sk::kind::device;
+        return HostBody<body_type> ? sk::kind::host : sk::kind::device;
     }
 
 private:
-    /// The component's argument array (plain and group bodies only).
-    using ArgsVec = sk::usm_vector<detail::StageArgs<KB>>;
-    std::conditional_t<PlainBody<KB> || GroupBody<KB>, std::optional<ArgsVec>, std::monostate> args_;
-
-    std::unique_ptr<LaunchDescription> make_launch(sycl::range<LR> range,
-                                                   std::optional<sycl::range<LR>> wg,
-                                                   typename KB::Inputs in, typename KB::Outputs out,
-                                                   KB body, detail::scratch_t<KB> scratch) {
-        return std::make_unique<detail::KernelLaunch<KB>>(range, wg, in, out, body, scratch);
-    }
+    /// The component's argument array (plain and group bodies only), type-erased: this class is instantiated while X is still
+    /// incomplete, so its type cannot be named in a member declaration.
+    using ArgsVec = sk::usm_vector<detail::StageArgs<detail::SynthBody<X>>>;
+    std::shared_ptr<void> args_;
+    ArgsVec*              args() const { return static_cast<ArgsVec*>(args_.get()); }
 };
 
 }  // namespace naga::cospan

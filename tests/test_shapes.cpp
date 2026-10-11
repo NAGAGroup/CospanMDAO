@@ -88,212 +88,246 @@ inline std::vector<float> sh_iota(std::size_t n, float scale = 1.0f) {
 }
 
 // ---- ShProd: y[i] = i + 1; y is declared `declared` (>= 0: fixed) or unspecified; the producer sets n elements ------------------
-struct ShProdBody {
-    struct Inputs {};
-    struct Outputs {
-        cs::Output<DType::f32, 1> y;
-    };
-    void operator()(sycl::id<1> i, Inputs, Outputs o) const { o.y[i] = static_cast<float>(i[0] + 1); }
-};
 /// ShProd's n: the producer passes cs::as_is (its dimension comes from the definition or a hook).
 inline constexpr std::size_t kAsIs = static_cast<std::size_t>(-1);
 
 /// n: the number it sets (kAsIs: cs::as_is). A producer sets a number only on an UNSPECIFIED dimension, so with a declared
 /// (fixed) y it sets nothing unless `force` asks for the refused call.
-class ShProd : public cs::Component<ShProdBody> {
-    std::size_t               n_;
-    int                       declared_;
-    bool                      force_;
-    cs::Output<DType::f32, 1> y_;
+class ShProd : public cs::Component<ShProd> {
+public:
+    struct Inputs {};
+    struct Outputs {
+        cs::Output<DType::f32, 1> y;
+    };
+    static void compute_impl(sycl::id<1> i, const Inputs&, const Outputs& o) { o.y[i] = static_cast<float>(i[0] + 1); }
+
+    Inputs  inputs;
+    Outputs outputs;
+
+private:
+    std::size_t n_;
+    int         declared_;
+    bool        force_;
 
 public:
     explicit ShProd(std::size_t n, int declared = -1, bool force = false) : n_{n}, declared_{declared}, force_{force} {}
     void setup() override {
         if (declared_ >= 0)
-            declare_output(y_, "y", declared_);
+            declare_output(outputs.y, "y", declared_);
         else
-            declare_output(y_, "y", cs::unspecified);
+            declare_output(outputs.y, "y", cs::unspecified);
     }
     void pre_forward() override {
         if (n_ == kAsIs)
-            set_shape(y_, cs::as_is);
+            set_shape(outputs.y, cs::as_is);
         else if (declared_ < 0 || force_)
-            set_shape(y_, n_);
+            set_shape(outputs.y, n_);
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(y_.shape(), {}, {y_}, {}); }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(cs::range_desc(outputs.y.shape())); }
 };
 
 // ---- ShBad: calls set_shape in compute_forward, outside pre_forward ---------------------------------------------------------
-class ShBad : public cs::Component<ShProdBody> {
-    cs::Output<DType::f32, 1> y_;
-
+class ShBad : public cs::Component<ShBad> {
 public:
-    void setup() override { declare_output(y_, "y", cs::unspecified); }
-    void pre_forward() override { set_shape(y_, 3); }  // legal: the output has its shape when compute_forward runs
+    struct Inputs {};
+    struct Outputs {
+        cs::Output<DType::f32, 1> y;
+    };
+    static void compute_impl(sycl::id<1> i, const Inputs&, const Outputs& o) { o.y[i] = static_cast<float>(i[0] + 1); }
+
+    Inputs  inputs;
+    Outputs outputs;
+
+    void setup() override { declare_output(outputs.y, "y", cs::unspecified); }
+    void pre_forward() override { set_shape(outputs.y, 3); }  // legal: the output has its shape when compute_forward runs
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        set_shape(y_, 3);  // illegal here
-        return create_launch_config(y_.shape(), {}, {y_}, {});
+        set_shape(outputs.y, 3);  // illegal here
+        return create_launch_config(cs::range_desc(outputs.y.shape()));
     }
 };
 
 // ---- ShScale: y = 2 x; x fixed (>= 0) or unspecified, y follows x -------------------------------------------------------
-struct ShScaleBody {
+
+class ShScale : public cs::Component<ShScale> {
+public:
     struct Inputs {
         cs::Input<DType::f32, 1> x;
     };
     struct Outputs {
         cs::Output<DType::f32, 1> y;
     };
-    void operator()(sycl::id<1> i, Inputs in, Outputs out) const { out.y[i] = 2.0f * in.x[i]; }
-};
-class ShScale : public cs::Component<ShScaleBody> {
+    static void compute_impl(sycl::id<1> i, const Inputs& in, const Outputs& out) { out.y[i] = 2.0f * in.x[i]; }
+
+    Inputs  inputs;
+    Outputs outputs;
+
+private:
     int                       fixed_;
-    cs::Input<DType::f32, 1>  x_;
-    cs::Output<DType::f32, 1> y_;
 
 public:
     explicit ShScale(int fixed = -1) : fixed_{fixed} {}
     void setup() override {
         if (fixed_ >= 0)
-            declare_input(x_, "x", fixed_);
+            declare_input(inputs.x, "x", fixed_);
         else
-            declare_input(x_, "x", cs::unspecified);
-        declare_output(y_, "y", cs::unspecified);
+            declare_input(inputs.x, "x", cs::unspecified);
+        declare_output(outputs.y, "y", cs::unspecified);
     }
-    void pre_forward() override { set_shape(y_, shape_of(x_)[0]); }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(x_.shape(), {x_}, {y_}, {}); }
+    void pre_forward() override { set_shape(outputs.y, shape_of(inputs.x)[0]); }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(cs::range_desc(inputs.x.shape())); }
 };
 
 // ---- ShScale2: y = 2 x, rank 2; each x dimension fixed (>= 0) or unspecified ------------------------------------------------
-struct ShScale2Body {
+
+class ShScale2 : public cs::Component<ShScale2> {
+public:
     struct Inputs {
         cs::Input<DType::f32, 2> x;
     };
     struct Outputs {
         cs::Output<DType::f32, 2> y;
     };
-    void operator()(sycl::id<2> ij, Inputs in, Outputs out) const { out.y[ij] = 2.0f * in.x[ij]; }
-};
-class ShScale2 : public cs::Component<ShScale2Body> {
+    static void compute_impl(sycl::id<2> ij, const Inputs& in, const Outputs& out) { out.y[ij] = 2.0f * in.x[ij]; }
+
+    Inputs  inputs;
+    Outputs outputs;
+
+private:
     int                       d0_, d1_;
-    cs::Input<DType::f32, 2>  x_;
-    cs::Output<DType::f32, 2> y_;
 
 public:
     explicit ShScale2(int d0 = -1, int d1 = -1) : d0_{d0}, d1_{d1} {}
     void setup() override {
         if (d0_ >= 0 && d1_ >= 0)
-            declare_input(x_, "x", d0_, d1_);
+            declare_input(inputs.x, "x", d0_, d1_);
         else if (d0_ >= 0)
-            declare_input(x_, "x", d0_, cs::unspecified);
+            declare_input(inputs.x, "x", d0_, cs::unspecified);
         else if (d1_ >= 0)
-            declare_input(x_, "x", cs::unspecified, d1_);
+            declare_input(inputs.x, "x", cs::unspecified, d1_);
         else
-            declare_input(x_, "x", cs::unspecified_shape<2>());
-        declare_output(y_, "y", cs::unspecified_shape<2>());
+            declare_input(inputs.x, "x", cs::unspecified_shape<2>());
+        declare_output(outputs.y, "y", cs::unspecified_shape<2>());
     }
-    void pre_forward() override { set_shape(y_, shape_of(x_)[0], shape_of(x_)[1]); }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(x_.shape(), {x_}, {y_}, {}); }
+    void pre_forward() override { set_shape(outputs.y, shape_of(inputs.x)[0], shape_of(inputs.x)[1]); }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(cs::range_desc(inputs.x.shape())); }
 };
 
 // ---- ShN: n[0] = v, a one-element u32 output (a value source for from_value) -------------------------------------------------
-struct ShNBody {
-    struct Inputs {};
+
+class ShN : public cs::Component<ShN> {
+public:
+    struct Inputs {
+        cs::Input<DType::f32, 1> v;  // a free input of extent 1, initialized from the constructor's value
+    };
     struct Outputs {
         cs::Output<DType::u32, 1> n;
     };
-    float v;
-    void operator()(sycl::id<1> i, Inputs, Outputs out) const { out.n[i] = static_cast<std::uint32_t>(v); }
-};
-class ShN : public cs::Component<ShNBody> {
+    static void compute_impl(sycl::id<1> i, const Inputs& in, const Outputs& out) { out.n[i] = static_cast<std::uint32_t>(in.v[std::size_t{0}]); }
+
+    Inputs  inputs;
+    Outputs outputs;
+
+private:
     float                     v_;
-    cs::Output<DType::u32, 1> n_;
 
 public:
     explicit ShN(float v) : v_{v} {}
-    void setup() override { declare_output(n_, "n", 1); }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(n_.shape(), {}, {n_}, {v_}); }
+    void setup() override {
+        declare_input(inputs.v, "v", 1);
+        init_input("v", cs::init::fill(v_)); declare_output(outputs.n, "n", 1); }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(cs::range_desc(outputs.n.shape())); }
 };
 
 // ---- ShU32: out = raw, a u32 vector given by the host (counts or offsets for a ragged hook) ----------------------------------------
-struct ShU32Body {
+
+class ShU32 : public cs::Component<ShU32> {
+public:
     struct Inputs {
         cs::Input<DType::u32, 1> raw;
     };
     struct Outputs {
         cs::Output<DType::u32, 1> out;
     };
-    void operator()(sycl::id<1> i, Inputs a, Outputs o) const { o.out[i] = a.raw[i]; }
-};
-class ShU32 : public cs::Component<ShU32Body> {
+    static void compute_impl(sycl::id<1> i, const Inputs& a, const Outputs& o) { o.out[i] = a.raw[i]; }
+
+    Inputs  inputs;
+    Outputs outputs;
+
+private:
     U32s                      init_;
-    cs::Input<DType::u32, 1>  raw_;
-    cs::Output<DType::u32, 1> out_;
 
 public:
     explicit ShU32(U32s init) : init_{std::move(init)} {}
     void setup() override {
-        declare_input(raw_, "raw", init_.size());
+        declare_input(inputs.raw, "raw", init_.size());
         init_input("raw", cs::init::from_host(init_));
-        declare_output(out_, "out", init_.size());
+        declare_output(outputs.out, "out", init_.size());
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(out_.shape(), {raw_}, {out_}, {}); }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(cs::range_desc(outputs.out.shape())); }
 };
 
 // ---- ShRagSink: a free ragged input r (rank 2); sums[i] = the size of block i -----------------------------------------------------
-struct ShRagSinkBody {
+
+class ShRagSink : public cs::Component<ShRagSink> {
+public:
     struct Inputs {
         cs::RaggedInput<DType::f32, 2> r;
     };
     struct Outputs {
         cs::Output<DType::f32, 1> sums;
     };
-    void operator()(sycl::id<1> id, Inputs in, Outputs out) const { out.sums[id] = static_cast<float>(in.r.block(id[0]).size()); }
-};
-class ShRagSink : public cs::Component<ShRagSinkBody> {
-    cs::RaggedInput<DType::f32, 2> r_;
-    cs::Output<DType::f32, 1>      sums_;
+    static void compute_impl(sycl::id<1> id, const Inputs& in, const Outputs& out) { out.sums[id] = static_cast<float>(in.r.block(id[0]).size()); }
 
-public:
+    Inputs  inputs;
+    Outputs outputs;
+
     void setup() override {
-        declare_input(r_, "r");
-        declare_output(sums_, "sums", cs::unspecified);
+        declare_input(inputs.r, "r");
+        declare_output(outputs.sums, "sums", cs::unspecified);
     }
-    void pre_forward() override { set_shape(sums_, shape_of(r_).n); }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(sums_.shape(), {r_}, {sums_}, {}); }
+    void pre_forward() override { set_shape(outputs.sums, shape_of(inputs.r).n); }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(cs::range_desc(outputs.sums.shape())); }
 };
 
 // ---- ShZero / ShAdd: atomic tie_outputs members (unspecified), zero then accumulate --------------------------------------------
-struct ShZeroBody {
-    struct Inputs {};
-    struct Outputs {
-        cs::Output<DType::atomic_f32, 1> acc;
-    };
-    void operator()(sycl::id<1> i, Inputs, Outputs out) const { out.acc[i].store(0.0f); }
-};
-class ShZero : public cs::Component<ShZeroBody> {
-    cs::Output<DType::atomic_f32, 1> acc_;
 
+class ShZero : public cs::Component<ShZero> {
 public:
-    void setup() override { declare_output(acc_, "acc", cs::unspecified_shape<1>()); }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(acc_.shape(), {}, {acc_}, {}); }
-};
-struct ShAddBody {
     struct Inputs {};
     struct Outputs {
         cs::Output<DType::atomic_f32, 1> acc;
     };
-    float v;
-    void operator()(sycl::id<1> i, Inputs, Outputs out) const { out.acc[i].fetch_add(v); }
+    static void compute_impl(sycl::id<1> i, const Inputs&, const Outputs& out) { out.acc[i].store(0.0f); }
+
+    Inputs  inputs;
+    Outputs outputs;
+
+    void setup() override { declare_output(outputs.acc, "acc", cs::unspecified_shape<1>()); }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(cs::range_desc(outputs.acc.shape())); }
 };
-class ShAdd : public cs::Component<ShAddBody> {
-    cs::Output<DType::atomic_f32, 1> acc_;
+
+class ShAdd : public cs::Component<ShAdd> {
+public:
+    struct Inputs {
+        cs::Input<DType::f32, 1> v;  // a free input of extent 1, initialized from the constructor's value
+    };
+    struct Outputs {
+        cs::Output<DType::atomic_f32, 1> acc;
+    };
+    static void compute_impl(sycl::id<1> i, const Inputs& in, const Outputs& out) { out.acc[i].fetch_add(in.v[std::size_t{0}]); }
+
+    Inputs  inputs;
+    Outputs outputs;
+
+private:
     float                            v_;
 
 public:
     explicit ShAdd(float v) : v_{v} {}
-    void setup() override { declare_output(acc_, "acc", cs::unspecified_shape<1>()); }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(acc_.shape(), {}, {acc_}, {v_}); }
+    void setup() override {
+        declare_input(inputs.v, "v", 1);
+        init_input("v", cs::init::fill(v_)); declare_output(outputs.acc, "acc", cs::unspecified_shape<1>()); }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(cs::range_desc(outputs.acc.shape())); }
 };
 
 // ---- ShCube: a rank-3 producer, y [?, ?, 3]; `mode` picks which set_shape call it makes ---------------------------------------
@@ -301,52 +335,60 @@ public:
 // 1: set_shape(y, 5, 7, as_is)         a number on dimension 0 (hook-owned in the tests that use it)
 // 2: set_shape(y, as_is, 7, 3)         a number on the declared dimension 2, even though it matches
 // 3: set_shape(y, as_is, 7)            two entries for a rank-3 output
-struct ShCubeBody {
+
+class ShCube : public cs::Component<ShCube> {
+public:
     struct Inputs {};
     struct Outputs {
         cs::Output<DType::f32, 3> y;
     };
-    void operator()(sycl::id<3> i, Inputs, Outputs o) const { o.y[i] = static_cast<float>(i[0] * 100 + i[1] * 10 + i[2]); }
-};
-class ShCube : public cs::Component<ShCubeBody> {
+    static void compute_impl(sycl::id<3> i, const Inputs&, const Outputs& o) { o.y[i] = static_cast<float>(i[0] * 100 + i[1] * 10 + i[2]); }
+
+    Inputs  inputs;
+    Outputs outputs;
+
+private:
     int                       mode_;
-    cs::Output<DType::f32, 3> y_;
 
 public:
     explicit ShCube(int mode = 0) : mode_{mode} {}
-    void setup() override { declare_output(y_, "y", cs::unspecified, cs::unspecified, 3); }
+    void setup() override { declare_output(outputs.y, "y", cs::unspecified, cs::unspecified, 3); }
     void pre_forward() override {
         switch (mode_) {
-            case 0: set_shape(y_, cs::as_is, 7, cs::as_is); break;
-            case 1: set_shape(y_, 5, 7, cs::as_is); break;
-            case 2: set_shape(y_, cs::as_is, 7, 3); break;
-            default: set_shape(y_, cs::as_is, 7); break;
+            case 0: set_shape(outputs.y, cs::as_is, 7, cs::as_is); break;
+            case 1: set_shape(outputs.y, 5, 7, cs::as_is); break;
+            case 2: set_shape(outputs.y, cs::as_is, 7, 3); break;
+            default: set_shape(outputs.y, cs::as_is, 7); break;
         }
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(y_.shape(), {}, {y_}, {}); }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(cs::range_desc(outputs.y.shape())); }
 };
 
 // ---- ShRagGen: a ragged producer [N, c_i]: set_shape(pts, as_is, counts), the n left to a hook ---------------------------------
-struct ShRagGenBody {
+
+class ShRagGen : public cs::Component<ShRagGen> {
+public:
     struct Inputs {};
     struct Outputs {
         cs::RaggedOutput<DType::f32, 2> pts;
     };
-    void operator()(sycl::id<1> id, Inputs, Outputs o) const {
+    static void compute_impl(sycl::id<1> id, const Inputs&, const Outputs& o) {
         auto b = o.pts.block(id[0]);
         for (std::size_t q = 0; q < b.size(); ++q) b[q] = static_cast<float>(id[0] * 10 + q);
     }
-};
-class ShRagGen : public cs::Component<ShRagGenBody> {
+
+    Inputs  inputs;
+    Outputs outputs;
+
+private:
     std::vector<std::size_t>        counts_;
-    cs::RaggedOutput<DType::f32, 2> pts_;
 
 public:
     explicit ShRagGen(std::vector<std::size_t> counts) : counts_{std::move(counts)} {}
-    void setup() override { declare_output(pts_, "pts"); }
-    void pre_forward() override { set_shape(pts_, cs::as_is, counts_); }
+    void setup() override { declare_output(outputs.pts, "pts"); }
+    void pre_forward() override { set_shape(outputs.pts, cs::as_is, counts_); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(sycl::range<1>{counts_.size()}, {}, {pts_}, {});
+        return create_launch_config(cs::range_desc(sycl::range<1>{counts_.size()}));
     }
 };
 
@@ -709,7 +751,6 @@ TEST_CASE("hook run point: a hook declared after the target's child still runs b
     CHECK(cst::synced_input<DType::f32, 1>(m, "c.x").shape()[0] == 5);
     CHECK(cst::synced_output<DType::f32, 1>(m, "later.y").shape()[0] == 5);
 }
-
 
 // =============================================================================================================================
 // 5. P5: per-dimension set_shape, hooks on outputs, wiring anywhere

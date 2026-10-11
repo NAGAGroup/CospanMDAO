@@ -42,89 +42,93 @@ const cs::property_list kTransient{cs::property::transient{}};
 
 // ---- components -------------------------------------------------------------------------------------------------
 /// W1: y[i] = i + 1.
-struct W1Body {
+
+class W1 : public cs::Component<W1> {
+public:
     struct Inputs {};
     struct Outputs {
         cs::Output<DType::f32, 1> y;
     };
-    void operator()(sycl::id<1> i, Inputs, Outputs o) const { o.y[i] = static_cast<float>(i[0] + 1); }
-};
-class W1 : public cs::Component<W1Body> {
-    cs::Output<DType::f32, 1> y_;
+    static void compute_impl(sycl::id<1> i, const Inputs&, const Outputs& o) { o.y[i] = static_cast<float>(i[0] + 1); }
 
-public:
-    void setup() override { declare_output(y_, "y", kN); }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(y_.shape(), {}, {y_}, {}); }
+    Inputs  inputs;
+    Outputs outputs;
+
+    void setup() override { declare_output(outputs.y, "y", kN); }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(cs::range_desc(outputs.y.shape())); }
 };
 
 /// Rd: z = 2 x.
-struct RdBody {
+
+class Rd : public cs::Component<Rd> {
+public:
     struct Inputs {
         cs::Input<DType::f32, 1> x;
     };
     struct Outputs {
         cs::Output<DType::f32, 1> z;
     };
-    void operator()(sycl::id<1> i, Inputs a, Outputs o) const { o.z[i] = 2.0f * a.x[i]; }
-};
-class Rd : public cs::Component<RdBody> {
-    cs::Input<DType::f32, 1>  x_;
-    cs::Output<DType::f32, 1> z_;
+    static void compute_impl(sycl::id<1> i, const Inputs& a, const Outputs& o) { o.z[i] = 2.0f * a.x[i]; }
 
-public:
+    Inputs  inputs;
+    Outputs outputs;
+
     void setup() override {
-        declare_input(x_, "x", cs::unspecified);
-        declare_output(z_, "z", cs::unspecified_shape<1>());
+        declare_input(inputs.x, "x", cs::unspecified);
+        declare_output(outputs.z, "z", cs::unspecified_shape<1>());
     }
-    void pre_forward() override { set_shape(z_, shape_of(x_)[0]); }  // the output follows the input (section 10: no derived dims)
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(z_.shape(), {x_}, {z_}, {}); }
+    void pre_forward() override { set_shape(outputs.z, shape_of(inputs.x)[0]); }  // the output follows the input (section 10: no derived dims)
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(cs::range_desc(outputs.z.shape())); }
 };
 
 /// Tied members: zero (t = 0) and accumulate (t += i + 1), plain (TieOutputsPolicy::allow_plain).
+
 template <bool Zero>
-struct TieBody {
+class TieMember : public cs::Component<TieMember<Zero>> {
+public:
     struct Inputs {};
     struct Outputs {
         cs::Output<DType::f32, 1> t;
     };
-    void operator()(sycl::id<1> i, Inputs, Outputs o) const {
+    static void compute_impl(sycl::id<1> i, const Inputs&, const Outputs& o) {
         if constexpr (Zero)
             o.t[i] = 0.0f;
         else
             o.t[i] = o.t[i] + static_cast<float>(i[0] + 1);
     }
-};
-template <bool Zero>
-class TieMember : public cs::Component<TieBody<Zero>> {
-    cs::Output<DType::f32, 1> t_;
 
-public:
-    void setup() override { this->declare_output(t_, "t", cs::unspecified_shape<1>()); }
+    Inputs  inputs;
+    Outputs outputs;
+
+    void setup() override { this->declare_output(outputs.t, "t", cs::unspecified_shape<1>()); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return this->create_launch_config(t_.shape(), {}, {t_}, {});
+        return this->create_launch_config(cs::range_desc(outputs.t.shape()));
     }
 };
 
 /// Fin: a free input x [kN] with an init (0 fill 3, 1 from_host 4, 2 custom_host 5); y = x.
-struct FinBody {
+
+class Fin : public cs::Component<Fin> {
+public:
     struct Inputs {
         cs::Input<DType::f32, 1> x;
     };
     struct Outputs {
         cs::Output<DType::f32, 1> y;
     };
-    void operator()(sycl::id<1> i, Inputs a, Outputs o) const { o.y[i] = a.x[i]; }
-};
-class Fin : public cs::Component<FinBody> {
+    static void compute_impl(sycl::id<1> i, const Inputs& a, const Outputs& o) { o.y[i] = a.x[i]; }
+
+    Inputs  inputs;
+    Outputs outputs;
+
+private:
     int                       kind_;
-    cs::Input<DType::f32, 1>  x_;
-    cs::Output<DType::f32, 1> y_;
 
 public:
     explicit Fin(int kind) : kind_{kind} {}
     void setup() override {
-        declare_input(x_, "x", kN);
-        declare_output(y_, "y", kN);
+        declare_input(inputs.x, "x", kN);
+        declare_output(outputs.y, "y", kN);
         if (kind_ == 0) init_input("x", cs::init::fill(3.0f));
         if (kind_ == 1) init_input("x", cs::init::from_host(std::vector<float>(kN, 4.0f)));
         if (kind_ == 2)
@@ -133,14 +137,16 @@ public:
                                     for (std::size_t k = 0; k < h.size(); ++k) h[k] = 5.0f;
                                 }}));
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(y_.shape(), {x_}, {y_}, {}); }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(cs::range_desc(outputs.y.shape())); }
 };
 
 /// RGen: a free u32 input `counts` [n] drives the ragged output r [n, counts[i]]; r block i = 1000 i + q.
 /// Section 10: ragged is rank 2 (was [n, counts[i], 3]); a component cannot read values, so RGenTop hooks the free ragged input
 /// `layout` with counts_from(g.counts) and r copies its shape in pre_forward.
 /// The same device as Fill in test_ragged.cpp: it tests a hook (counts_from) on a ragged INPUT.
-struct RGenBody {
+
+class RGen : public cs::Component<RGen> {
+public:
     struct Inputs {
         cs::Input<DType::u32, 1>       counts;
         cs::RaggedInput<DType::f32, 2> layout;
@@ -148,28 +154,28 @@ struct RGenBody {
     struct Outputs {
         cs::RaggedOutput<DType::f32, 2> r;
     };
-    void operator()(sycl::id<1> id, Inputs, Outputs o) const {
+    static void compute_impl(sycl::id<1> id, const Inputs&, const Outputs& o) {
         auto b = o.r.block(id[0]);
         for (std::size_t q = 0; q < b.size(); ++q) b[q] = static_cast<float>(id[0] * 1000 + q);
     }
-};
-class RGen : public cs::Component<RGenBody> {
+
+    Inputs  inputs;
+    Outputs outputs;
+
+private:
     std::vector<std::uint32_t>      init_;
-    cs::Input<DType::u32, 1>        counts_;
-    cs::RaggedInput<DType::f32, 2>  layout_;
-    cs::RaggedOutput<DType::f32, 2> r_;
 
 public:
     explicit RGen(std::vector<std::uint32_t> init) : init_{std::move(init)} {}
     void setup() override {
-        declare_input(counts_, "counts", init_.size());
+        declare_input(inputs.counts, "counts", init_.size());
         init_input("counts", cs::init::from_host(init_));
-        declare_input(layout_, "layout");
-        declare_output(r_, "r");
+        declare_input(inputs.layout, "layout");
+        declare_output(outputs.r, "r");
     }
-    void pre_forward() override { set_shape(r_, shape_of(layout_)); }
+    void pre_forward() override { set_shape(outputs.r, shape_of(inputs.layout)); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(counts_.shape(), {counts_, layout_}, {r_}, {});
+        return create_launch_config(cs::range_desc(inputs.counts.shape()));
     }
 };
 

@@ -65,144 +65,133 @@ cs::Model make(Build b) { return cs::create_model<Top>(default_config(), std::mo
 std::vector<float> out_of(cs::Model& m, const char* path) { return to_vector(cst::synced_output<DType::f32, 1>(m, path)); }
 
 // ---- Src: y[i] = i + 1 ---------------------------------------------------------------------------
-struct SrcBody {
+
+class Src : public cs::Component<Src> {
+public:
     struct Inputs {};
     struct Outputs {
         cs::Output<DType::f32, 1> y;
     };
-    void operator()(sycl::id<1> i, Inputs, Outputs out) const { out.y[i] = static_cast<float>(i[0] + 1); }
-};
-class Src : public cs::Component<SrcBody> {
+    static void compute_impl(sycl::id<1> i, const Inputs&, const Outputs& out) { out.y[i] = static_cast<float>(i[0] + 1); }
+
+    Inputs  inputs;
+    Outputs outputs;
+
+private:
     int n_;
 
 public:
     explicit Src(int n) : n_{n} {}
-    void setup() override { declare_output(y_, "y", n_); }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(y_.shape(), {}, {y_}, {}); }
+    void setup() override { declare_output(outputs.y, "y", n_); }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(cs::range_desc(outputs.y.shape())); }
 
 private:
-    cs::Output<DType::f32, 1> y_;
 };
 
 // ---- Plus1 (plain): y = x + 1, the output follows the input ----------------------------------------
-struct Plus1Body {
-    struct Inputs {
-        cs::Input<DType::f32, 1> x;
-    };
-    struct Outputs {
-        cs::Output<DType::f32, 1> y;
-    };
-    void operator()(sycl::id<1> i, Inputs in, Outputs out) const { out.y[i] = in.x[i] + 1.0f; }
-};
-class Plus1 : public cs::Component<Plus1Body> {
-    cs::Input<DType::f32, 1>  x_;
-    cs::Output<DType::f32, 1> y_;
 
+class Plus1 : public cs::Component<Plus1> {
 public:
+    struct Inputs {
+        cs::Input<DType::f32, 1> x;
+    };
+    struct Outputs {
+        cs::Output<DType::f32, 1> y;
+    };
+    static void compute_impl(sycl::id<1> i, const Inputs& in, const Outputs& out) { out.y[i] = in.x[i] + 1.0f; }
+
+    Inputs  inputs;
+    Outputs outputs;
+
     void setup() override {
-        declare_input(x_, "x", cs::unspecified_shape<1>());
-        declare_output(y_, "y", cs::unspecified_shape<1>());
+        declare_input(inputs.x, "x", cs::unspecified_shape<1>());
+        declare_output(outputs.y, "y", cs::unspecified_shape<1>());
     }
-    void pre_forward() override { set_shape(y_, shape_of(x_)[0]); }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(x_.shape(), {x_}, {y_}, {}); }
+    void pre_forward() override { set_shape(outputs.y, shape_of(inputs.x)[0]); }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(cs::range_desc(inputs.x.shape())); }
 };
 
-// ---- group bodies ---------------------------------------------------------------------------------
-/// y[g] = segment * 1000 + groups(segment 0) * 100 + groups(segment 1) * 10 + segment count (the second term is 0 with one
-/// segment): what the stage sees of its segment structure.
-struct TagBody {
-    struct Inputs {
-        cs::Input<DType::f32, 1> x;
-    };
-    struct Outputs {
-        cs::Output<DType::f32, 1> y;
-    };
-    void operator()(cs::GroupItem<1> it, Inputs in, Outputs out) const {
-        const std::size_t g = it.get_global_id(0);
-        if (g >= in.x.shape()[0]) return;
-        const std::size_t segs = it.get_segment_count();
-        const std::size_t gc0  = it.get_segment_group_count(0)[0];
-        const std::size_t gc1  = segs > 1 ? it.get_segment_group_count(1)[0] : 0;
-        out.y[g]               = static_cast<float>(it.get_segment() * 1000 + gc0 * 100 + gc1 * 10 + segs);
-    }
-};
-/// y[g] = the group range the stage sees (own: its own groups; whole: the segment's block).
-struct RangeBody {
-    struct Inputs {
-        cs::Input<DType::f32, 1> x;
-    };
-    struct Outputs {
-        cs::Output<DType::f32, 1> y;
-    };
-    void operator()(cs::GroupItem<1> it, Inputs in, Outputs out) const {
-        const std::size_t g = it.get_global_id(0);
-        if (g < in.x.shape()[0]) out.y[g] = static_cast<float>(it.get_group_range(0));
-    }
-};
-/// Shared local memory, stage 1: leaves t[l] = l + 1 in the stage's slice and passes x through.
-struct LeaveBody {
-    struct Inputs {
-        cs::Input<DType::f32, 1> x;
-    };
-    struct Outputs {
-        cs::Output<DType::f32, 1> y;
-    };
-    void operator()(cs::GroupItem<1> it, Inputs in, Outputs out) const {
-        float*            t = it.local<float>(kWg);
-        const std::size_t g = it.get_global_id(0);
-        if (t != nullptr) t[it.get_local_linear_id()] = static_cast<float>(it.get_local_linear_id() + 1);
-        if (g < in.x.shape()[0]) out.y[g] = in.x[g];
-    }
-};
-/// Shared local memory, stage 2: reads the reversed tile after a group barrier, writing nothing itself.
-struct TakeBody {
-    struct Inputs {
-        cs::Input<DType::f32, 1> x;
-    };
-    struct Outputs {
-        cs::Output<DType::f32, 1> y;
-    };
-    void operator()(cs::GroupItem<1> it, Inputs in, Outputs out) const {
-        float*            t = it.local<float>(kWg);
-        const std::size_t g = it.get_global_id(0);
-        cs::group_barrier(it.get_group());
-        if (g < in.x.shape()[0]) out.y[g] = t != nullptr ? t[kWg - 1 - it.get_local_linear_id()] : -1.0f;
-    }
-};
-/// Partitioned local memory: write t[l] = Base + l into the stage's OWN slice, barrier, read the reversed tile.
+// ---- group stages ---------------------------------------------------------------------------------
+// One component template, GStage<Kind>: the kind is a compile-time parameter that picks the body (no run-time branch).
+//   kTag      y[g] = segment * 1000 + groups(segment 0) * 100 + groups(segment 1) * 10 + segment count (the second term is 0
+//             with one segment): what the stage sees of its segment structure.
+//   kRange    y[g] = the group range the stage sees (own: its own groups; whole: the segment's block).
+//   kLeave    shared local memory, stage 1: leaves t[l] = l + 1 in the stage's slice and passes x through.
+//   kTake     shared local memory, stage 2: reads the reversed tile after a group barrier, writing nothing itself.
+//   kOwn<B>   partitioned local memory: write t[l] = B + l into the stage's OWN slice, barrier, read the reversed tile.
+//   kWrite    segment 1 of the cross-group cases: y[i] = x[i] + 1 (every group writes its own slice).
+//   kReadNext<Mode>  segment 2: group g copies the slice a DIFFERENT group (g + 1) wrote. Mode 0: nothing here (a
+//             cs::global_barrier() before the segment does the waiting); 1: wait_group(0, (g + 1) % G); 2: wait_earlier_segments().
+constexpr int kTag  = 0;
+constexpr int kRange = 1;
+constexpr int kLeave = 2;
+constexpr int kTake  = 3;
+constexpr int kWrite = 4;
+template <int Mode>
+constexpr int kReadNext = 10 + Mode;
 template <int Base>
-struct OwnTileBody {
-    struct Inputs {
-        cs::Input<DType::f32, 1> x;
-    };
-    struct Outputs {
-        cs::Output<DType::f32, 1> y;
-    };
-    void operator()(cs::GroupItem<1> it, Inputs in, Outputs out) const {
-        float*            t = it.local<float>(kWg);
-        const std::size_t g = it.get_global_id(0);
-        if (t != nullptr) t[it.get_local_linear_id()] = static_cast<float>(Base + it.get_local_linear_id());
-        cs::group_barrier(it.get_group());
-        if (g < in.x.shape()[0]) out.y[g] = t != nullptr ? t[kWg - 1 - it.get_local_linear_id()] : -1.0f;
-    }
-};
+constexpr int kOwn = 1000 + Base;
 
 /// A group stage over its input's shape, with work-group `wg` and `local_bytes` of requested local memory.
-template <class Body>
-class GStage : public cs::Component<Body> {
-    cs::Input<DType::f32, 1>  x_;
-    cs::Output<DType::f32, 1> y_;
-    std::size_t               wg_, local_bytes_;
+template <int Kind>
+class GStage : public cs::Component<GStage<Kind>> {
+public:
+    struct Inputs {
+        cs::Input<DType::f32, 1> x;
+    };
+    struct Outputs {
+        cs::Output<DType::f32, 1> y;
+    };
+    static void compute_impl(cs::GroupItem<1> it, const Inputs& in, const Outputs& out) {
+        const std::size_t g = it.get_global_id(0);
+        if constexpr (Kind == kTag) {
+            if (g >= in.x.shape()[0]) return;
+            const std::size_t segs = it.get_segment_count();
+            const std::size_t gc0  = it.get_segment_group_count(0)[0];
+            const std::size_t gc1  = segs > 1 ? it.get_segment_group_count(1)[0] : 0;
+            out.y[g]               = static_cast<float>(it.get_segment() * 1000 + gc0 * 100 + gc1 * 10 + segs);
+        } else if constexpr (Kind == kRange) {
+            if (g < in.x.shape()[0]) out.y[g] = static_cast<float>(it.get_group_range(0));
+        } else if constexpr (Kind == kLeave) {
+            float* t = it.template local<float>(kWg);
+            if (t != nullptr) t[it.get_local_linear_id()] = static_cast<float>(it.get_local_linear_id() + 1);
+            if (g < in.x.shape()[0]) out.y[g] = in.x[g];
+        } else if constexpr (Kind == kTake) {
+            float* t = it.template local<float>(kWg);
+            cs::group_barrier(it.get_group());
+            if (g < in.x.shape()[0]) out.y[g] = t != nullptr ? t[kWg - 1 - it.get_local_linear_id()] : -1.0f;
+        } else if constexpr (Kind >= 1000) {
+            constexpr int Base = Kind - 1000;
+            float*        t    = it.template local<float>(kWg);
+            if (t != nullptr) t[it.get_local_linear_id()] = static_cast<float>(Base + it.get_local_linear_id());
+            cs::group_barrier(it.get_group());
+            if (g < in.x.shape()[0]) out.y[g] = t != nullptr ? t[kWg - 1 - it.get_local_linear_id()] : -1.0f;
+        } else if constexpr (Kind == kWrite) {
+            if (g < in.x.shape()[0]) out.y[g] = in.x[g] + 1.0f;
+        } else {
+            constexpr int Mode = Kind - 10;
+            const std::size_t G = it.get_group_range(0), gi = it.get_group(0), wg = it.get_local_range(0), l = it.get_local_linear_id();
+            if constexpr (Mode == 1) it.wait_group(0, sycl::id<1>{(gi + 1) % G});  // collective: every work-item calls it
+            if constexpr (Mode == 2) it.wait_earlier_segments();                  // collective
+            out.y[gi * wg + l] = in.x[((gi + 1) % G) * wg + l];
+        }
+    }
+
+    Inputs  inputs;
+    Outputs outputs;
+
+private:
+    std::size_t wg_, local_bytes_;
 
 public:
     explicit GStage(std::size_t wg = kWg, std::size_t local_bytes = 0) : wg_{wg}, local_bytes_{local_bytes} {}
     void setup() override {
-        this->declare_input(x_, "x", cs::unspecified_shape<1>());
-        this->declare_output(y_, "y", cs::unspecified_shape<1>());
+        this->declare_input(inputs.x, "x", cs::unspecified_shape<1>());
+        this->declare_output(outputs.y, "y", cs::unspecified_shape<1>());
     }
-    void pre_forward() override { this->set_shape(y_, this->shape_of(x_)[0]); }
+    void pre_forward() override { this->set_shape(outputs.y, this->shape_of(inputs.x)[0]); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        auto d = this->create_launch_config(x_.shape(), sycl::range<1>{wg_}, {x_}, {y_});
+        auto d = this->create_launch_config(cs::range_desc(inputs.x.shape()), cs::wg_desc(sycl::range<1>{wg_}));
         if (local_bytes_ != 0) d->request_local_bytes(local_bytes_);
         return d;
     }
@@ -210,45 +199,14 @@ public:
 
 constexpr std::size_t kTile = kWg * sizeof(float);
 
-/// Segment 1 of the cross-group cases: y[i] = x[i] + 1 (every group writes its own slice).
-struct WriteBody {
-    struct Inputs {
-        cs::Input<DType::f32, 1> x;
-    };
-    struct Outputs {
-        cs::Output<DType::f32, 1> y;
-    };
-    void operator()(cs::GroupItem<1> it, Inputs in, Outputs out) const {
-        const std::size_t i = it.get_global_id(0);
-        if (i < in.x.shape()[0]) out.y[i] = in.x[i] + 1.0f;
-    }
-};
-/// Segment 2: group g copies the slice a DIFFERENT group (g + 1) wrote. Mode 0: nothing here (a cs::global_barrier() before
-/// the segment does the waiting); 1: wait_group(0, (g + 1) % G); 2: wait_earlier_segments().
-template <int Mode>
-struct ReadNextBody {
-    struct Inputs {
-        cs::Input<DType::f32, 1> x;
-    };
-    struct Outputs {
-        cs::Output<DType::f32, 1> y;
-    };
-    void operator()(cs::GroupItem<1> it, Inputs in, Outputs out) const {
-        const std::size_t G = it.get_group_range(0), g = it.get_group(0), wg = it.get_local_range(0), l = it.get_local_linear_id();
-        if constexpr (Mode == 1) it.wait_group(0, sycl::id<1>{(g + 1) % G});  // collective: every work-item calls it
-        if constexpr (Mode == 2) it.wait_earlier_segments();     // collective
-        out.y[g * wg + l] = in.x[((g + 1) % G) * wg + l];
-    }
-};
-
 /// y[g] = the neighbor group's value + 1, over `forwards` forwards with new inputs every time (so a stale wait state or a
 /// missed wait shows). Kind: 1 = the group_waits_enabled property, no barrier; 2 = a global_barrier() before segment 2 (the
-/// barrier alone gives the group its waits). Mode: see ReadNextBody.
+/// barrier alone gives the group its waits). Mode: see kReadNext.
 template <int Mode, int Kind>
 void neighbor_case(std::size_t wg, std::size_t G, int forwards) {
     cs::Model model = make([wg](cs::System& s) {
-        auto a = cs::subsystem_desc<GStage<WriteBody>>("a", wg);
-        auto b = cs::subsystem_desc<GStage<ReadNextBody<Mode>>>("b", wg);
+        auto a = cs::subsystem_desc<GStage<kWrite>>("a", wg);
+        auto b = cs::subsystem_desc<GStage<kReadNext<Mode>>>("b", wg);
         if constexpr (Kind == 2)
             s.add_subsystem(cs::fuse_components("f", cs::connects_desc({{"a.y", "b.x"}}), cs::segment(a), cs::global_barrier(), cs::segment(b)));
         else
@@ -285,8 +243,8 @@ std::vector<float> filled(std::size_t n, float v) { return std::vector<float>(n,
 
 }  // namespace tfg
 
-using TagStage   = tfg::GStage<tfg::TagBody>;
-using RangeStage = tfg::GStage<tfg::RangeBody>;
+using TagStage   = tfg::GStage<tfg::kTag>;
+using RangeStage = tfg::GStage<tfg::kRange>;
 
 TEST_CASE("fused groups: two segments, each stage sees its own segment's group count", "[fused_groups]") {
     cs::Model model = tfg::make([](cs::System& s) {
@@ -348,8 +306,8 @@ TEST_CASE("fused groups: shared local memory carries a stage's values to the nex
         s.add_subsystem(cs::subsystem_desc<tfg::Src>("src", 128));
         s.add_subsystem(cs::fuse_components(
             "f", cs::connects_desc({{"a.y", "b.x"}}),
-            cs::segment<cs::local_mem::shared>(cs::subsystem_desc<tfg::GStage<tfg::LeaveBody>>("a", tfg::kWg, tfg::kTile),
-                                               cs::subsystem_desc<tfg::GStage<tfg::TakeBody>>("b", tfg::kWg, tfg::kTile))));
+            cs::segment<cs::local_mem::shared>(cs::subsystem_desc<tfg::GStage<tfg::kLeave>>("a", tfg::kWg, tfg::kTile),
+                                               cs::subsystem_desc<tfg::GStage<tfg::kTake>>("b", tfg::kWg, tfg::kTile))));
         s.connect("src.y", "f.a.x");
     });
     model.setup();
@@ -366,8 +324,8 @@ TEST_CASE("fused groups: partitioned local memory gives each stage its own slice
     cs::Model model = tfg::make([](cs::System& s) {
         s.add_subsystem(cs::subsystem_desc<tfg::Src>("src", 128));
         s.add_subsystem(cs::fuse_components(
-            "f", cs::segment<cs::local_mem::partitioned>(cs::subsystem_desc<tfg::GStage<tfg::OwnTileBody<1>>>("a", tfg::kWg, tfg::kTile),
-                                                         cs::subsystem_desc<tfg::GStage<tfg::OwnTileBody<1000>>>("b", tfg::kWg, tfg::kTile))));
+            "f", cs::segment<cs::local_mem::partitioned>(cs::subsystem_desc<tfg::GStage<tfg::kOwn<1>>>("a", tfg::kWg, tfg::kTile),
+                                                         cs::subsystem_desc<tfg::GStage<tfg::kOwn<1000>>>("b", tfg::kWg, tfg::kTile))));
         s.connect("src.y", "f.a.x");
         s.connect("src.y", "f.b.x");
     });
@@ -459,7 +417,6 @@ TEST_CASE("fused groups: a transient group rebuilt every forward (the config cac
         CHECK(tfg::out_of(model, "sink.y") == tfg::filled(100, 1423));  // grp.b.y = 1422, plus 1
     }
 }
-
 
 // =============================================================================================
 // P7b: boundaries, group waits, connect order
@@ -606,107 +563,134 @@ TEST_CASE("fused groups: a connect to the same or an earlier stage throws at set
 namespace tfg {
 
 // TAdder: y[i] += v on an ATOMIC output (a tie_outputs member); TZero stores 0 first (outputs are never initialized).
-struct TAdderBody {
-    struct Inputs {};
+
+class TAdder : public cs::Component<TAdder> {
+public:
+    struct Inputs {
+        cs::Input<DType::f32, 1> v;  // a free input of extent 1, initialized from the constructor's value
+    };
     struct Outputs {
         cs::Output<DType::atomic_f32, 1> y;
     };
-    float v;
-    void operator()(sycl::id<1> i, Inputs, Outputs out) const { out.y[i].fetch_add(v); }
-};
-class TAdder : public cs::Component<TAdderBody> {
-    cs::Output<DType::atomic_f32, 1> y_;
+    static void compute_impl(sycl::id<1> i, const Inputs& in, const Outputs& out) { out.y[i].fetch_add(in.v[std::size_t{0}]); }
+
+    Inputs  inputs;
+    Outputs outputs;
+
+private:
     float                            v_;
 
 public:
     explicit TAdder(float v) : v_{v} {}
-    void setup() override { declare_output(y_, "y", cs::unspecified_shape<1>()); }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(y_.shape(), {}, {y_}, {v_}); }
+    void setup() override {
+        declare_input(inputs.v, "v", 1);
+        init_input("v", cs::init::fill(v_)); declare_output(outputs.y, "y", cs::unspecified_shape<1>()); }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(cs::range_desc(outputs.y.shape())); }
 };
-struct TZeroBody {
+
+class TZero : public cs::Component<TZero> {
+public:
     struct Inputs {};
     struct Outputs {
         cs::Output<DType::atomic_f32, 1> y;
     };
-    void operator()(sycl::id<1> i, Inputs, Outputs out) const { out.y[i].store(0.0f); }
-};
-class TZero : public cs::Component<TZeroBody> {
-    cs::Output<DType::atomic_f32, 1> y_;
+    static void compute_impl(sycl::id<1> i, const Inputs&, const Outputs& out) { out.y[i].store(0.0f); }
 
-public:
-    void setup() override { declare_output(y_, "y", cs::unspecified_shape<1>()); }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(y_.shape(), {}, {y_}, {}); }
+    Inputs  inputs;
+    Outputs outputs;
+
+    void setup() override { declare_output(outputs.y, "y", cs::unspecified_shape<1>()); }
+    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(cs::range_desc(outputs.y.shape())); }
 };
 
 // TGAdder / TGZero: the same as TAdder / TZero as WORK-GROUP stages (a global_barrier needs group-body stages), work-group kWg.
-struct TGAdderBody {
-    struct Inputs {};
+
+class TGAdder : public cs::Component<TGAdder> {
+public:
+    struct Inputs {
+        cs::Input<DType::f32, 1> v;  // a free input of extent 1, initialized from the constructor's value
+    };
     struct Outputs {
         cs::Output<DType::atomic_f32, 1> y;
     };
-    float v;
-    void operator()(cs::GroupItem<1> it, Inputs, Outputs out) const {
+    static void compute_impl(cs::GroupItem<1> it, const Inputs& in, const Outputs& out) {
         const std::size_t g = it.get_global_id(0);
-        if (g < out.y.shape()[0]) out.y[g].fetch_add(v);
+        if (g < out.y.shape()[0]) out.y[g].fetch_add(in.v[std::size_t{0}]);
     }
-};
-class TGAdder : public cs::Component<TGAdderBody> {
-    cs::Output<DType::atomic_f32, 1> y_;
+
+    Inputs  inputs;
+    Outputs outputs;
+
+private:
     float                            v_;
 
 public:
     explicit TGAdder(float v) : v_{v} {}
-    void setup() override { declare_output(y_, "y", cs::unspecified_shape<1>()); }
+    void setup() override {
+        declare_input(inputs.v, "v", 1);
+        init_input("v", cs::init::fill(v_)); declare_output(outputs.y, "y", cs::unspecified_shape<1>()); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(y_.shape(), sycl::range<1>{kWg}, {}, {y_}, {v_});
+        return create_launch_config(cs::range_desc(outputs.y.shape()), cs::wg_desc(sycl::range<1>{kWg}));
     }
 };
-struct TGZeroBody {
+
+class TGZero : public cs::Component<TGZero> {
+public:
     struct Inputs {};
     struct Outputs {
         cs::Output<DType::atomic_f32, 1> y;
     };
-    void operator()(cs::GroupItem<1> it, Inputs, Outputs out) const {
+    static void compute_impl(cs::GroupItem<1> it, const Inputs&, const Outputs& out) {
         const std::size_t g = it.get_global_id(0);
         if (g < out.y.shape()[0]) out.y[g].store(0.0f);
     }
-};
-class TGZero : public cs::Component<TGZeroBody> {
-    cs::Output<DType::atomic_f32, 1> y_;
 
-public:
-    void setup() override { declare_output(y_, "y", cs::unspecified_shape<1>()); }
+    Inputs  inputs;
+    Outputs outputs;
+
+    void setup() override { declare_output(outputs.y, "y", cs::unspecified_shape<1>()); }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(y_.shape(), sycl::range<1>{kWg}, {}, {y_}, {});
+        return create_launch_config(cs::range_desc(outputs.y.shape()), cs::wg_desc(sycl::range<1>{kWg}));
     }
 };
 
 // TSlice: y[i] = v for lo <= i < hi and nothing else, a PLAIN output (disjoint slices of one tie). `reshape`: its
 // pre_forward calls set_shape on the output, which a tied member may not do.
-struct TSliceBody {
-    struct Inputs {};
+
+class TSlice : public cs::Component<TSlice> {
+public:
+    struct Inputs {
+        cs::Input<DType::f32, 1> lo, hi, v;  // a free input of extent 1, initialized from the constructor's value
+    };
     struct Outputs {
         cs::Output<DType::f32, 1> y;
     };
-    float lo, hi, v;
-    void operator()(sycl::id<1> i, Inputs, Outputs out) const {
+    static void compute_impl(sycl::id<1> i, const Inputs& in, const Outputs& out) {
         const float k = static_cast<float>(i[0]);
-        if (k >= lo && k < hi) out.y[i] = v;
+        if (k >= in.lo[std::size_t{0}] && k < in.hi[std::size_t{0}]) out.y[i] = in.v[std::size_t{0}];
     }
-};
-class TSlice : public cs::Component<TSliceBody> {
-    cs::Output<DType::f32, 1> y_;
+
+    Inputs  inputs;
+    Outputs outputs;
+
+private:
     float                     lo_, hi_, v_;
     bool                      reshape_;
 
 public:
     TSlice(float lo, float hi, float v, bool reshape = false) : lo_{lo}, hi_{hi}, v_{v}, reshape_{reshape} {}
-    void setup() override { declare_output(y_, "y", cs::unspecified_shape<1>()); }
+    void setup() override {
+        declare_input(inputs.lo, "lo", 1);
+        init_input("lo", cs::init::fill(lo_));
+        declare_input(inputs.hi, "hi", 1);
+        init_input("hi", cs::init::fill(hi_));
+        declare_input(inputs.v, "v", 1);
+        init_input("v", cs::init::fill(v_)); declare_output(outputs.y, "y", cs::unspecified_shape<1>()); }
     void pre_forward() override {
-        if (reshape_) set_shape(y_, 12);
+        if (reshape_) set_shape(outputs.y, 12);
     }
     std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config(y_.shape(), {}, {y_}, {lo_, hi_, v_});
+        return create_launch_config(cs::range_desc(outputs.y.shape()));
     }
 };
 
