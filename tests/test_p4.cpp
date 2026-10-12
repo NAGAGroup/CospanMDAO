@@ -232,11 +232,11 @@ public:
     explicit OverTop(int mode, int rearm_at = 0, bool post_rearm = false) : mode_{mode}, rearm_at_{rearm_at}, post_rearm_{post_rearm} {}
     void setup() override {
         add_subsystem(cs::subsystem_desc<Mid>("b"));
-        if (mode_ == 1) override_run_policy("b.c");
+        if (mode_ == 1) set_run_policy("b.c");
     }
     void pre_forward() override {
         ++n_;
-        if (mode_ == 2 && n_ == 2) override_run_policy("b.c", cs::property_list{});
+        if (mode_ == 2 && n_ == 2) set_run_policy("b.c", cs::property_list{});
         if (rearm_at_ == n_) rearm("b");
     }
     void post_forward() override {
@@ -362,7 +362,7 @@ TEST_CASE("wiring after setup: connect, promote, init_input, tie_inputs and tie_
             s.add_subsystem(cs::subsystem_desc<tp4::Axpb>("c", 2.0f, 1.0f));
         });
         model.setup();
-        model.root().connect("p.y", "c.x");  // after setup, before anything has run
+        model.get_subsystem("").connect("p.y", "c.x");  // after setup, before anything has run
         tp4::run(model);
         CHECK(tp4::out(model, "c.y") == tp4::filled(11.0f));
     }
@@ -371,7 +371,7 @@ TEST_CASE("wiring after setup: connect, promote, init_input, tie_inputs and tie_
             s.add_subsystem(cs::subsystem_desc<tp4::Gen>("p", 5.0f));
         });
         model.setup();
-        model.root().promote<DType::f32, 1>("p.y", "y");
+        model.get_subsystem("").promote<DType::f32, 1>("p.y", "y");
         tp4::run(model);
         CHECK(tp4::out(model, "y") == tp4::filled(5.0f));
     }
@@ -380,7 +380,7 @@ TEST_CASE("wiring after setup: connect, promote, init_input, tie_inputs and tie_
             s.add_subsystem(cs::subsystem_desc<tp4::Axpb>("c", 2.0f, 1.0f));
         });
         model.setup();
-        model.root().init_input("c.x", cs::init::fill(3.0f));
+        model.get_subsystem("").init_input("c.x", cs::init::fill(3.0f));
         tp4::run(model);
         CHECK(tp4::out(model, "c.y") == tp4::filled(7.0f));
     }
@@ -390,7 +390,7 @@ TEST_CASE("wiring after setup: connect, promote, init_input, tie_inputs and tie_
             s.add_subsystem(cs::subsystem_desc<tp4::Axpb>("b", 3.0f, 0.0f));
         });
         model.setup();
-        model.root().tie_inputs<DType::f32, 1>({"a.x", "b.x"}, "t", cs::shape(tp4::kN));
+        model.get_subsystem("").tie_inputs<DType::f32, 1>({"a.x", "b.x"}, "t", cs::shape(tp4::kN));
         model.update_input("t", cs::init::fill(1.0f));
         tp4::run(model);
         CHECK(tp4::out(model, "a.y") == tp4::filled(2.0f));
@@ -402,7 +402,7 @@ TEST_CASE("wiring after setup: connect, promote, init_input, tie_inputs and tie_
             s.add_subsystem(cs::subsystem_desc<tp4::Half>("b", 4u, 8u));
         });
         model.setup();
-        model.root().tie_outputs<DType::f32, 1>({"a.y", "b.y"}, "t", cs::shape(tp4::kN), cs::TieOutputsPolicy::allow_plain);
+        model.get_subsystem("").tie_outputs<DType::f32, 1>({"a.y", "b.y"}, "t", cs::shape(tp4::kN), cs::TieOutputsPolicy::allow_plain);
         tp4::run(model);
         CHECK(tp4::out(model, "t") == tp4::iota_from_one());
     }
@@ -415,7 +415,7 @@ TEST_CASE("wiring: merging two materialized variables is an error at the call", 
     });
     model.setup();
     tp4::run(model);  // p.y and c.x are both materialized now
-    tp4::expect_throws_all([&] { model.root().connect("p.y", "c.x"); },
+    tp4::expect_throws_all([&] { model.get_subsystem("").connect("p.y", "c.x"); },
                            {"connect", "merging two materialized variables is not defined (yet)"});
     tp4::run(model);  // the failed call changed nothing: the model still runs
     CHECK(tp4::out(model, "c.y") == tp4::filled(1.0f));
@@ -429,50 +429,50 @@ TEST_CASE("override_run_policy: a transient grandchild made eternal by its grand
         cs::Model model = cs::create_model<tp4::OverTop>(default_config(), 0);
         model.setup();
         tp4::run(model);
-        CHECK(model.get_subsystem("b.c") == nullptr);
+        CHECK(cs::detail::ModelAccess::subsystem(model, "b.c") == nullptr);
     }
     SECTION("applied in the grandparent's setup") {
         cs::Model model = cs::create_model<tp4::OverTop>(default_config(), 1);
         model.setup();
         tp4::run(model);
-        REQUIRE(model.get_subsystem("b.c") != nullptr);
-        const auto var = model.root().instance_at("b.c.y")->meta;
+        REQUIRE(cs::detail::ModelAccess::subsystem(model, "b.c") != nullptr);
+        const auto var = cs::detail::ModelAccess::instance(model, "b.c.y")->meta;
         CHECK(tp4::out(model, "b.c.y") == tp4::filled(6.0f));
         for (int k = 0; k < 2; ++k) {
             tp4::run(model);
-            REQUIRE(model.get_subsystem("b.c") != nullptr);
-            CHECK(model.root().instance_at("b.c.y")->meta == var);  // the same variable: its data was kept
+            REQUIRE(cs::detail::ModelAccess::subsystem(model, "b.c") != nullptr);
+            CHECK(cs::detail::ModelAccess::instance(model, "b.c.y")->meta == var);  // the same variable: its data was kept
         }
         CHECK(tp4::out(model, "b.c.y") == tp4::filled(6.0f));
     }
     SECTION("applied after setup, through the root") {
         cs::Model model = cs::create_model<tp4::OverTop>(default_config(), 0);
         model.setup();
-        model.root().override_run_policy("b.c");
+        model.get_subsystem("").set_run_policy("b.c");
         tp4::run(model);
         tp4::run(model);
-        CHECK(model.get_subsystem("b.c") != nullptr);
+        CHECK(cs::detail::ModelAccess::subsystem(model, "b.c") != nullptr);
     }
     SECTION("a policy for a child of a Component or an unknown name is an error") {
         cs::Model model = cs::create_model<tp4::OverTop>(default_config(), 0);
         model.setup();
-        tp4::expect_throws_all([&] { model.root().override_run_policy("b.zz"); }, {"override_run_policy('b.zz')", "no such subsystem"});
-        tp4::expect_throws_all([&] { model.root().override_run_policy("zz.c"); }, {"has no subsystem 'zz'"});
-        tp4::expect_throws_all([&] { model.root().override_run_policy("b.c.y"); }, {"is a Component"});
+        tp4::expect_throws_all([&] { model.get_subsystem("").set_run_policy("b.zz"); }, {"set_run_policy('b.zz')", "no such subsystem"});
+        tp4::expect_throws_all([&] { model.get_subsystem("").set_run_policy("zz.c"); }, {"has no subsystem 'zz'"});
+        tp4::expect_throws_all([&] { model.get_subsystem("").set_run_policy("b.c.y"); }, {"is a Component"});
     }
     SECTION("the other policies") {
         cs::Model model = cs::create_model<tp4::OverTop>(default_config(), 0);
         model.setup();
-        model.root().override_run_policy("b", cs::property::run_n{2});  // an eternal System takes two turns
+        model.get_subsystem("").set_run_policy("b", cs::property::run_n{2});  // an eternal System takes two turns
         tp4::run(model);
-        CHECK(model.get_subsystem("b") != nullptr);
+        CHECK(cs::detail::ModelAccess::subsystem(model, "b") != nullptr);
         tp4::run(model);
-        CHECK(model.get_subsystem("b") == nullptr);
-        model.root().override_run_policy("b", cs::property::do_once{});  // gone and not transient: it comes back, once
-        REQUIRE(model.get_subsystem("b") != nullptr);
+        CHECK(cs::detail::ModelAccess::subsystem(model, "b") == nullptr);
+        model.get_subsystem("").set_run_policy("b", cs::property::do_once{});  // gone and not transient: it comes back, once
+        REQUIRE(cs::detail::ModelAccess::subsystem(model, "b") != nullptr);
         tp4::run(model);
-        CHECK(model.get_subsystem("b") == nullptr);
-        tp4::expect_throws_all([&] { model.root().override_run_policy("b", cs::property_list{cs::property::transient{}, cs::property::run_n{2}}); },
+        CHECK(cs::detail::ModelAccess::subsystem(model, "b") == nullptr);
+        tp4::expect_throws_all([&] { model.get_subsystem("").set_run_policy("b", cs::property_list{cs::property::transient{}, cs::property::run_n{2}}); },
                                {"transient cannot be combined with run_n or do_once"});
     }
 }
@@ -481,14 +481,14 @@ TEST_CASE("override_run_policy: applied from pre_forward", "[p4][policy]") {
     cs::Model model = cs::create_model<tp4::OverTop>(default_config(), 2);
     model.setup();
     tp4::run(model);  // forward 1: c is transient and gone after its turn
-    CHECK(model.get_subsystem("b.c") == nullptr);
+    CHECK(cs::detail::ModelAccess::subsystem(model, "b.c") == nullptr);
     tp4::run(model);  // forward 2: pre_forward makes it eternal (it is rebuilt at once: it was gone)
-    REQUIRE(model.get_subsystem("b.c") != nullptr);
-    const auto var = model.root().instance_at("b.c.y")->meta;
+    REQUIRE(cs::detail::ModelAccess::subsystem(model, "b.c") != nullptr);
+    const auto var = cs::detail::ModelAccess::instance(model, "b.c.y")->meta;
     CHECK(tp4::out(model, "b.c.y") == tp4::filled(6.0f));
     tp4::run(model);  // forward 3: it kept its variable
-    REQUIRE(model.get_subsystem("b.c") != nullptr);
-    CHECK(model.root().instance_at("b.c.y")->meta == var);
+    REQUIRE(cs::detail::ModelAccess::subsystem(model, "b.c") != nullptr);
+    CHECK(cs::detail::ModelAccess::instance(model, "b.c.y")->meta == var);
 }
 
 TEST_CASE("override_run_policy is not logged: rearming the parent applies the declared policy again", "[p4][policy][rearm]") {
@@ -496,9 +496,9 @@ TEST_CASE("override_run_policy is not logged: rearming the parent applies the de
     model.setup();
     tp4::run(model);
     tp4::run(model);
-    CHECK(model.get_subsystem("b.c") != nullptr);  // eternal by the override
+    CHECK(cs::detail::ModelAccess::subsystem(model, "b.c") != nullptr);  // eternal by the override
     tp4::run(model);                                // forward 3: "b" is rebuilt, c with its declared (transient) policy
-    CHECK(model.get_subsystem("b.c") == nullptr);
+    CHECK(cs::detail::ModelAccess::subsystem(model, "b.c") == nullptr);
 }
 
 // =============================================================================================
@@ -525,7 +525,7 @@ TEST_CASE("cycle: a two-component cycle reads its initializer first, then the pr
         cs::Model        model = cs::create_model<tp4::CycleTop>(default_config(), mode);
         model.setup();
         CHECK(cap.buf.str().find("this is a cycle") != std::string::npos);  // the warning stays
-        CHECK(model.root().instance_at("p.x")->meta->cycle);
+        CHECK(cs::detail::ModelAccess::instance(model, "p.x")->meta->cycle);
         tp4::run(model);
         // p read the initializer (10) on the first forward, though p.x is connected: p.y = 10 + 1. (p.x is q.y's variable, so
         // after the forward it holds what q produced.)
@@ -564,7 +564,7 @@ TEST_CASE("cycle: a correctly ordered connection is not a cycle", "[p4][cycle]")
         s.connect("p.y", "c.x");  // c's own initializer is dropped: the source supplies the values
     });
     model.setup();
-    CHECK_FALSE(model.root().instance_at("c.x")->meta->cycle);
+    CHECK_FALSE(cs::detail::ModelAccess::instance(model, "c.x")->meta->cycle);
     tp4::run(model);
     CHECK(tp4::out(model, "c.y") == tp4::filled(11.0f));
 }
@@ -581,10 +581,10 @@ TEST_CASE("tie devices: the default device is where a tie_inputs alias lives and
     });
     model.setup();
     const sycl::device def = cs::detail::default_device();
-    CHECK(model.root().instance_at("x")->device == def);
-    REQUIRE(model.root().instance_at("x")->meta->init_device.has_value());
-    CHECK(*model.root().instance_at("x")->meta->init_device == def);
-    CHECK(model.root().instance_at("t")->device == def);
+    CHECK(cs::detail::ModelAccess::instance(model, "x")->device == def);
+    REQUIRE(cs::detail::ModelAccess::instance(model, "x")->meta->init_device.has_value());
+    CHECK(*cs::detail::ModelAccess::instance(model, "x")->meta->init_device == def);
+    CHECK(cs::detail::ModelAccess::instance(model, "t")->device == def);
 }
 
 TEST_CASE("tie devices: tie_outputs refuses a member on another device at the call", "[p4][tie][devices][errors]") {
@@ -613,7 +613,7 @@ TEST_CASE("tie devices: tie_outputs refuses a member on another device at the ca
             s.tie_outputs<DType::f32, 1>({"a.y", "b.y"}, "t", cs::shape(tp4::kN), cs::TieOutputsPolicy::allow_plain, other);
         });
         CHECK_NOTHROW(model.setup());
-        CHECK(model.root().instance_at("t")->device == other);
+        CHECK(cs::detail::ModelAccess::instance(model, "t")->device == other);
         tp4::run(model);
         CHECK(tp4::out(model, "t") == tp4::iota_from_one());
     }
@@ -629,7 +629,7 @@ TEST_CASE("tie devices: a member moved by set_device after the tie errors at the
     });
     model.setup();
     tp4::run(model);  // fine: both on the default device
-    model.get_subsystem("b")->set_device(other);
+    cs::detail::ModelAccess::subsystem(model, "b")->set_device(other);
     tp4::expect_throws_all([&] { model.run(); },
                            {"tie_outputs 't'", "member 'b.y' is on", "but the tie is on", "every member must be on the tie's device"});
 }
@@ -642,8 +642,8 @@ TEST_CASE("tie devices: a device given to add_subsystem moves the whole subtree,
         s.add_subsystem(other, cs::subsystem_desc<tp4::TieInner>("in", true, false));
     });
     model.setup();
-    CHECK(model.root().instance_at("in.a.y")->device == other);
-    CHECK(model.root().instance_at("in.t")->device == other);  // the alias moved with them
+    CHECK(cs::detail::ModelAccess::instance(model, "in.a.y")->device == other);
+    CHECK(cs::detail::ModelAccess::instance(model, "in.t")->device == other);  // the alias moved with them
     CHECK_NOTHROW(tp4::run(model));                              // so the run-time check passes
     CHECK(tp4::out(model, "in.t") == tp4::filled(1.0f));
 }
@@ -659,9 +659,9 @@ TEST_CASE("tie devices: tie_inputs on a given device, and a moved subtree moves 
             s.init_input("x", cs::init::fill(2.0f));
         });
         model.setup();
-        CHECK(model.root().instance_at("x")->device == other);
-        REQUIRE(model.root().instance_at("x")->meta->init_device.has_value());
-        CHECK(*model.root().instance_at("x")->meta->init_device == other);
+        CHECK(cs::detail::ModelAccess::instance(model, "x")->device == other);
+        REQUIRE(cs::detail::ModelAccess::instance(model, "x")->meta->init_device.has_value());
+        CHECK(*cs::detail::ModelAccess::instance(model, "x")->meta->init_device == other);
         tp4::run(model);
         CHECK(tp4::out(model, "a.y") == tp4::filled(4.0f));  // members on the default device got the copy
         CHECK(tp4::out(model, "b.y") == tp4::filled(6.0f));
@@ -671,9 +671,9 @@ TEST_CASE("tie devices: tie_inputs on a given device, and a moved subtree moves 
             s.add_subsystem(other, cs::subsystem_desc<tp4::TieInner>("in", false, false));
         });
         model.setup();
-        CHECK(model.root().instance_at("in.t")->device == other);
-        REQUIRE(model.root().instance_at("in.t")->meta->init_device.has_value());
-        CHECK(*model.root().instance_at("in.t")->meta->init_device == other);
+        CHECK(cs::detail::ModelAccess::instance(model, "in.t")->device == other);
+        REQUIRE(cs::detail::ModelAccess::instance(model, "in.t")->meta->init_device.has_value());
+        CHECK(*cs::detail::ModelAccess::instance(model, "in.t")->meta->init_device == other);
     }
 }
 
@@ -699,8 +699,8 @@ TEST_CASE("ties: the input and output marks are kept separately", "[p4][tie]") {
         s.add_subsystem(cs::subsystem_desc<tp4::TieInner>("o", true, false));
     });
     model.setup();
-    const auto ti = model.root().instance_at("i.t")->meta;
-    const auto to = model.root().instance_at("o.t")->meta;
+    const auto ti = cs::detail::ModelAccess::instance(model, "i.t")->meta;
+    const auto to = cs::detail::ModelAccess::instance(model, "o.t")->meta;
     CHECK(ti->tied_input);
     CHECK_FALSE(ti->tied_output);
     CHECK(to->tied_output);
@@ -714,7 +714,7 @@ TEST_CASE("ties: promoting a tie works, for both kinds", "[p4][tie]") {
             s.add_subsystem(cs::subsystem_desc<tp4::TieInner>("in", false, true));
         });
         model.setup();
-        CHECK(model.root().instance_at("in.pt")->meta == model.root().instance_at("in.t")->meta);
+        CHECK(cs::detail::ModelAccess::instance(model, "in.pt")->meta == cs::detail::ModelAccess::instance(model, "in.t")->meta);
         model.update_input("in.pt", cs::init::fill(2.0f));
         tp4::run(model);
         CHECK(tp4::out(model, "in.a.y") == tp4::filled(4.0f));
@@ -725,7 +725,7 @@ TEST_CASE("ties: promoting a tie works, for both kinds", "[p4][tie]") {
             s.add_subsystem(cs::subsystem_desc<tp4::TieInner>("in", true, true));
         });
         model.setup();
-        CHECK(model.root().instance_at("in.pt")->meta == model.root().instance_at("in.t")->meta);
+        CHECK(cs::detail::ModelAccess::instance(model, "in.pt")->meta == cs::detail::ModelAccess::instance(model, "in.t")->meta);
         tp4::run(model);
         CHECK(tp4::out(model, "in.pt") == tp4::filled(1.0f));
     }
@@ -746,7 +746,7 @@ TEST_CASE("tied outputs: a consumer on another device right after the members re
         s.connect("t", "c.x");
     });
     model.setup();
-    CHECK(model.root().instance_at("a.y")->meta->push_suppressed);
+    CHECK(cs::detail::ModelAccess::instance(model, "a.y")->meta->push_suppressed);
     tp4::run(model);  // ONE forward: the push comes right after b, before c
     CHECK(tp4::out(model, "c.y") == tp4::iota_from_one());
     tp4::run(model);
@@ -773,7 +773,7 @@ TEST_CASE("replay skips a logged connection whose other side was deleted: the re
     model.setup();
     tp4::run(model);  // p (do_once) wrote 5; c = 2 * 5 + 1; p is deleted after its turn
     CHECK(tp4::out(model, "c.y") == tp4::filled(11.0f));
-    CHECK(model.get_subsystem("p") == nullptr);
+    CHECK(cs::detail::ModelAccess::subsystem(model, "p") == nullptr);
     CHECK_NOTHROW(tp4::run(model));  // pre_forward rearms c: the connect to the deleted p is skipped
     CHECK(tp4::out(model, "c.y") == tp4::filled(1.0f));  // c.x is a fresh variable (zeros): 2 * 0 + 1
 }
@@ -787,11 +787,11 @@ TEST_CASE("a connect after setup moves the host holder's container into the devi
         s.add_subsystem(cs::subsystem_desc<tp4::HostInc>("h"));
     });
     model.setup();
-    const auto p_y    = model.root().instance_at("p.y");
-    const auto h_x    = model.root().instance_at("h.x");
+    const auto p_y    = cs::detail::ModelAccess::instance(model, "p.y");
+    const auto h_x    = cs::detail::ModelAccess::instance(model, "h.x");
     const auto before = h_x->data;  // the host placement's own (empty) container
     REQUIRE(before != nullptr);
-    model.root().connect("p.y", "h.x");
+    model.get_subsystem("").connect("p.y", "h.x");
     CHECK(h_x->meta == p_y->meta);
     CHECK(h_x->data == before);      // the winner had none for the host key: it adopted this one, identity kept
     CHECK(p_y->data != h_x->data);   // two placements of one variable: device and host

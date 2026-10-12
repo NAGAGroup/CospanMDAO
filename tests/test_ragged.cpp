@@ -501,7 +501,7 @@ TEST_CASE("Ragged: a hook on a ragged output hands its column's resize events to
     for (std::size_t r = 0; r < runs.size(); ++r) {
         const auto& counts = runs[r];
         INFO("forward " << r + 1 << ", n = " << counts.size());
-        const auto        meta   = model.root().instance_at("c.v")->meta;
+        const auto        meta   = cs::detail::ModelAccess::instance(model, "c.v")->meta;
         const std::size_t before = meta->hook_resize_notes;
 
         model.update_input("c.cnt", cs::init::from_host(counts));

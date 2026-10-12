@@ -258,7 +258,7 @@ TEST_CASE("Transient: a transient subsystem is deleted after its turn, every for
     for (int r = 0; r < 2; ++r) {
         // the transient is deleted after its turn, so its variables cannot be read afterwards
         forward_and_wait(m);
-        CHECK(m.get_subsystem("op") == nullptr);
+        CHECK(cs::detail::ModelAccess::subsystem(m, "op") == nullptr);
     }
 }
 

@@ -112,7 +112,7 @@ TEST_CASE("a second holder on a new placement gets its own container, a copy of 
     model.run();
     model.wait();
 
-    const auto               p_y  = model.root().instance_at("p.y");
+    const auto               p_y  = cs::detail::ModelAccess::instance(model, "p.y");
     const cs::detail::VarMeta& meta = *p_y->meta;
     REQUIRE(p_y->data != nullptr);
     CHECK(tev::bound_placements(meta) == 1);  // the device container, and nothing else
@@ -169,7 +169,7 @@ TEST_CASE("the first materialization, asked by an input, is global and initializ
     // Before the first forward every holder has its container, empty and unbound.
     for (const char* p : {"a.x", "b.x"}) {
         INFO(p);
-        const auto inst = model.root().instance_at(p);
+        const auto inst = cs::detail::ModelAccess::instance(model, p);
         REQUIRE(inst->data != nullptr);
         CHECK_FALSE(inst->data->bound());
         CHECK(inst->data->size() == 0);

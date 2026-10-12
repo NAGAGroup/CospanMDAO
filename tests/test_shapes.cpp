@@ -729,7 +729,7 @@ TEST_CASE("hook replay: a transient target child, rebuilt each forward, still ge
         INFO("forward " << r + 1);
         CHECK_NOTHROW(m.run());
         m.wait();
-        CHECK(m.get_subsystem("tr") == nullptr);  // deleted after its turn; rebuilt for the next forward
+        CHECK(cs::detail::ModelAccess::subsystem(m, "tr") == nullptr);  // deleted after its turn; rebuilt for the next forward
         CHECK(cst::synced_output<DType::f32, 1>(m, "sink.y").shape()[0] == 6);
     }
 }
@@ -827,8 +827,8 @@ TEST_CASE("shape_hook and depends_on called after setup work", "[shapes][hook][p
         s.init_input("c.x", cs::init::fill(1.5f));
     });
     m.setup();
-    CHECK_NOTHROW(m.root().shape_hook("c.x", cs::dim::from_value("nn.n", 0)));
-    CHECK_NOTHROW(m.root().depends_on("b", "a"));
+    CHECK_NOTHROW(m.get_subsystem("").shape_hook("c.x", cs::dim::from_value("nn.n", 0)));
+    CHECK_NOTHROW(m.get_subsystem("").depends_on("b", "a"));
     m.run();
     m.wait();
     CHECK(cst::synced_input<DType::f32, 1>(m, "c.x").shape()[0] == 4);
@@ -844,7 +844,7 @@ TEST_CASE("a late init_input on a materialized free input re-initializes at the 
     m.run();
     m.wait();
     CHECK(cst::to_vector(cst::synced_output<DType::f32, 1>(m, "c.y")) == std::vector<float>(4, 2.0f));
-    m.root().init_input("c.x", cs::init::fill(3.0f, {4}));  // after the variable was materialized
+    m.get_subsystem("").init_input("c.x", cs::init::fill(3.0f, {4}));  // after the variable was materialized
     m.run();
     m.wait();
     CHECK(cst::to_vector(cst::synced_output<DType::f32, 1>(m, "c.y")) == std::vector<float>(4, 6.0f));

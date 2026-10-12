@@ -1003,7 +1003,7 @@ TEST_CASE("transient: a system_from group and a fused component release after th
     // FIRST forward: what the group's variables held is then gone (the group is deleted with its staging).
     model.run();
     model.wait();
-    CHECK(model.get_subsystem("grp") == nullptr);  // the group is deleted after its turn, its variables with it
+    CHECK(cs::detail::ModelAccess::subsystem(model, "grp") == nullptr);  // the group is deleted after its turn, its variables with it
     for (const char* p : {"grp.a.y", "grp.b.y"}) {
         INFO(p);
         tfl::expect_throws([&] { (void)cst::synced_output<DType::f32, 1>(model, p); }, {"was deleted"});
@@ -1047,6 +1047,6 @@ TEST_CASE("replay: a transient host reader of a deleted do_once producer reads i
         model.wait();
         CHECK(tfl::out_of<1>(model, "e2.y") == want);
     }
-    CHECK(model.get_subsystem("src") == nullptr);   // the producer ran once and is gone
-    CHECK(model.get_subsystem("host") == nullptr);  // the transient host stage is deleted at the end of each forward
+    CHECK(cs::detail::ModelAccess::subsystem(model, "src") == nullptr);   // the producer ran once and is gone
+    CHECK(cs::detail::ModelAccess::subsystem(model, "host") == nullptr);  // the transient host stage is deleted at the end of each forward
 }

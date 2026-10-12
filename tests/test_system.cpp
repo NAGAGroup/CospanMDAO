@@ -1272,7 +1272,7 @@ TEST_CASE("connect: identity, producer to consumer", "[system][connect]") {
     model.setup();
     auto y = wait_and_view<DType::f32, 1>(model, "cons.y");
     CHECK(all_close(to_vector(y), tsys::iota_plus(1.0f, tsys::kLen, 2.0f, 1.0f)));  // 2 (i + 1) + 1
-    CHECK(model.root().instance_at("prod.y")->meta == model.root().instance_at("cons.x")->meta);  // one variable
+    CHECK(cs::detail::ModelAccess::instance(model, "prod.y")->meta == cs::detail::ModelAccess::instance(model, "cons.x")->meta);  // one variable
 }
 
 // =============================================================================================
@@ -1308,8 +1308,8 @@ TEST_CASE("ties: tie_inputs gives one variable; a tie of a tie gives three membe
     SECTION("one tie: update_input on the alias is seen by both") {
         cs::Model model = cs::create_model<tsys::TieInSys>(default_config());
         model.setup();
-        CHECK(model.root().instance_at("a.x")->meta == model.root().instance_at("b.x")->meta);
-        CHECK(model.root().instance_at("x")->meta == model.root().instance_at("a.x")->meta);
+        CHECK(cs::detail::ModelAccess::instance(model, "a.x")->meta == cs::detail::ModelAccess::instance(model, "b.x")->meta);
+        CHECK(cs::detail::ModelAccess::instance(model, "x")->meta == cs::detail::ModelAccess::instance(model, "a.x")->meta);
         model.update_input("x", cs::init::from_host(x));
         model.run();
         model.wait();
@@ -1347,7 +1347,7 @@ TEST_CASE("ties: tie_outputs", "[system][tie]") {
     SECTION("require_atomic on atomic outputs: both writers accumulate into the one variable") {
         cs::Model model = cs::create_model<tsys::TieOutAtomic>(default_config());
         model.setup();
-        CHECK(model.root().instance_at("a.acc")->meta == model.root().instance_at("b.acc")->meta);
+        CHECK(cs::detail::ModelAccess::instance(model, "a.acc")->meta == cs::detail::ModelAccess::instance(model, "b.acc")->meta);
         auto sum = wait_and_view<DType::f32, 1>(model, "sum");
         CHECK(to_vector(sum) == std::vector<float>(tsys::kLen, 3.0f));  // 1 + 2
         CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "c.y")) == std::vector<float>(tsys::kLen, 3.0f));
@@ -1365,7 +1365,7 @@ TEST_CASE("ties: tie_outputs", "[system][tie]") {
     SECTION("plain outputs with allow_plain are accepted") {
         cs::Model model = cs::create_model<tsys::TieOutPlain>(default_config(), true);
         model.setup();
-        CHECK(model.root().instance_at("a.y")->meta == model.root().instance_at("b.y")->meta);
+        CHECK(cs::detail::ModelAccess::instance(model, "a.y")->meta == cs::detail::ModelAccess::instance(model, "b.y")->meta);
         CHECK(to_vector(wait_and_view<DType::f32, 1>(model, "t")) == tsys::iota_plus(1.0f, tsys::kLen));
     }
 }
@@ -1519,7 +1519,7 @@ std::size_t pool_in_use(cs::Model& m) { return cst::pool_in_use(m); }
 TEST_CASE("transient: deleted after its turn, kept outputs, back-to-back forwards", "[system][transient]") {
     cs::Model model = cs::create_model<tsys::TopC>(cst::pooled_config());
     model.setup();
-    CHECK(model.get_subsystem("tr") != nullptr);  // built at setup, deleted after its first turn
+    CHECK(cs::detail::ModelAccess::subsystem(model, "tr") != nullptr);  // built at setup, deleted after its first turn
 
     // The pool's bytes in use are the sum of the live containers' capacities rounded up to whole nodes. After the first
     // forward the transient's prod.y and mid.y are gone; the eternal cons.y (= sink.x) and sink.y stay: two nodes of 8 floats.
@@ -1529,7 +1529,7 @@ TEST_CASE("transient: deleted after its turn, kept outputs, back-to-back forward
     SECTION("host access to a deleted subsystem's variable throws") {
         model.run();
         model.wait();
-        CHECK(model.get_subsystem("tr") == nullptr);  // the transient is deleted after its turn
+        CHECK(cs::detail::ModelAccess::subsystem(model, "tr") == nullptr);  // the transient is deleted after its turn
         tsys::expect_throws([&] { (void)cst::synced_output<DType::f32, 1>(model, "tr.mid.y"); }, "was deleted");
         tsys::expect_throws([&] { (void)cst::synced_output<DType::f32, 1>(model, "tr.prod.y"); }, "was deleted");
     }
@@ -1537,7 +1537,7 @@ TEST_CASE("transient: deleted after its turn, kept outputs, back-to-back forward
     SECTION("an output connected outside the subtree stays eternal") {
         model.run();
         model.wait();
-        CHECK(model.get_subsystem("tr") == nullptr);  // the intermediates went with the transient
+        CHECK(cs::detail::ModelAccess::subsystem(model, "tr") == nullptr);  // the intermediates went with the transient
         // tr.cons.y's variable is held by the sink's port outside: it is still readable
         CHECK(to_vector(cst::synced_input<DType::f32, 1>(model, "sink.x")) == want_cons());
         CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "sink.y")) == want_sink());
@@ -1576,8 +1576,8 @@ TEST_CASE("transient: sequential Components A then B are deleted after their tur
 
     model.run();
     model.wait();
-    CHECK(model.get_subsystem("a") == nullptr);  // A and B are transient: deleted after their turns, A's output with them
-    CHECK(model.get_subsystem("b") == nullptr);
+    CHECK(cs::detail::ModelAccess::subsystem(model, "a") == nullptr);  // A and B are transient: deleted after their turns, A's output with them
+    CHECK(cs::detail::ModelAccess::subsystem(model, "b") == nullptr);
     tsys::expect_throws([&] { (void)cst::synced_output<DType::f32, 1>(model, "a.y"); }, "was deleted");
     // B's output is held by the plain C's port: still readable (b.y = 2 (i + 1) + 1)
     CHECK(to_vector(cst::synced_input<DType::f32, 1>(model, "c.x")) == tsys::iota_plus(1.0f, tsys::kLen, 2.0f, 1.0f));
@@ -1590,7 +1590,7 @@ TEST_CASE("transient: a variable read by a transient and a non-transient Compone
     model.setup();
     model.run();
     model.wait();
-    CHECK(model.get_subsystem("p") == nullptr);  // the transient producer is deleted; the plain reader's port holds p.y
+    CHECK(cs::detail::ModelAccess::subsystem(model, "p") == nullptr);  // the transient producer is deleted; the plain reader's port holds p.y
     CHECK(to_vector(cst::synced_input<DType::f32, 1>(model, "n.x")) == tsys::iota_plus(1.0f, tsys::kLen));
 }
 
@@ -1601,7 +1601,7 @@ TEST_CASE("transient: promotion inside a transient stays transient; re-promoted 
         model.setup();
         model.run();
         model.wait();
-        CHECK(model.get_subsystem("tr") == nullptr);
+        CHECK(cs::detail::ModelAccess::subsystem(model, "tr") == nullptr);
         tsys::expect_throws([&] { (void)cst::synced_output<DType::f32, 1>(model, "tr.y"); }, "was deleted");
     }
     SECTION("re-promoted at a non-transient level") {
@@ -1649,7 +1649,7 @@ TEST_CASE("run-N: n = 1 runs once; once its child is deleted, an init_input on i
     model.run();
     model.wait();
     CHECK(to_vector(cst::synced_input<DType::f32, 1>(model, "sink.x")) == tsys::filled(2.0f));  // op.a.y's variable
-    CHECK(model.get_subsystem("op") == nullptr);  // run_n{1}: deleted after its turn
+    CHECK(cs::detail::ModelAccess::subsystem(model, "op") == nullptr);  // run_n{1}: deleted after its turn
 
     // Nothing can apply a later init: the child is gone, and so is its free input. The output is held by the sink.
     tsys::expect_throws([&] { tsys::set_x(model, "op.a.x", 5.0f); }, "was deleted");
@@ -1694,7 +1694,7 @@ TEST_CASE("run-N subtree: its variables live for the n runs and are freed after 
     model.run();
     model.wait();
     CHECK(tsys::count_of("op.prod") == 1);
-    CHECK(model.get_subsystem("op") != nullptr);
+    CHECK(cs::detail::ModelAccess::subsystem(model, "op") != nullptr);
     CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "op.mid.y")) == tsys::filled(8.0f));   // 2 * 4
     CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "op.cons.y")) == tsys::filled(11.0f));  // 2 * 4 + 3
     CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "sink.y")) == tsys::filled(11.5f));
@@ -1706,7 +1706,7 @@ TEST_CASE("run-N subtree: its variables live for the n runs and are freed after 
     model.run();
     model.wait();
     CHECK(tsys::count_of("op.prod") == 1);
-    CHECK(model.get_subsystem("op") == nullptr);  // deleted after its last run: mid.y went with it
+    CHECK(cs::detail::ModelAccess::subsystem(model, "op") == nullptr);  // deleted after its last run: mid.y went with it
     CHECK(to_vector(cst::synced_input<DType::f32, 1>(model, "sink.x")) == tsys::filled(11.0f));  // op.cons.y's variable, held by the sink
     const std::size_t after2 = tsys::pool_in_use_of(model);
     CHECK(after2 == 4 * cst::pool_node_bytes + cst::solo_launch_bytes(1));  // the sink keeps its launch arrays and its a, b
@@ -1793,7 +1793,7 @@ TEST_CASE("run_policy: run_n(3) runs exactly 3 forwards, then is skipped", "[sys
         forwards(model, 1);
         CHECK(tsys::runs_of("a") == static_cast<std::size_t>(k <= 3 ? k : 3));
     }
-    CHECK(model.get_subsystem("a") == nullptr);  // run_n{3}: deleted by its parent after its third turn
+    CHECK(cs::detail::ModelAccess::subsystem(model, "a") == nullptr);  // run_n{3}: deleted by its parent after its third turn
 }
 
 TEST_CASE("run_policy: do_once runs once", "[system][run_policy]") {
@@ -1804,10 +1804,10 @@ TEST_CASE("run_policy: do_once runs once", "[system][run_policy]") {
         },
         err);
     forwards(model, 1);
-    CHECK(model.get_subsystem("a") == nullptr);  // do_once: deleted right after its forward
+    CHECK(cs::detail::ModelAccess::subsystem(model, "a") == nullptr);  // do_once: deleted right after its forward
     forwards(model, 3);
     CHECK(tsys::runs_of("a") == 1);
-    CHECK(model.get_subsystem("a") == nullptr);
+    CHECK(cs::detail::ModelAccess::subsystem(model, "a") == nullptr);
 }
 
 TEST_CASE("run_policy: run_n{0} throws invalid_argument", "[system][run_policy]") {
@@ -1845,8 +1845,8 @@ TEST_CASE("run_policy: the clamp table", "[system][run_policy]") {
             err);
         forwards(model, 5);
         CHECK(tsys::runs_of("c") == 2);
-        CHECK(model.get_subsystem("p") == nullptr);
-        CHECK(model.get_subsystem("p.c") == nullptr);
+        CHECK(cs::detail::ModelAccess::subsystem(model, "p") == nullptr);
+        CHECK(cs::detail::ModelAccess::subsystem(model, "p.c") == nullptr);
     }
     SECTION("run_n(5) under transient: both run every forward") {
         cs::Model model = policy_model(
@@ -1868,7 +1868,7 @@ TEST_CASE("run_policy: the clamp table", "[system][run_policy]") {
         forwards(model, 6);
         CHECK(tsys::runs_of("p") == 3);
         CHECK(tsys::runs_of("c") == 3);
-        CHECK(model.get_subsystem("p") == nullptr);
+        CHECK(cs::detail::ModelAccess::subsystem(model, "p") == nullptr);
     }
 }
 
@@ -1883,18 +1883,18 @@ TEST_CASE("run_policy: rearm re-enables an exhausted run_n parent and its descen
     forwards(model, 4);
     CHECK(tsys::runs_of("p") == 2);
     CHECK(tsys::runs_of("c") == 2);
-    CHECK(model.get_subsystem("p") == nullptr);
+    CHECK(cs::detail::ModelAccess::subsystem(model, "p") == nullptr);
 
     // rearm is protected and legal inside pre_forward() only (design review, section 3): the root re-arms "p" at the
     // start of the next forward. It is rebuilt by its parent with the counter back to run_n(2); its child is rebuilt with it.
     tsys::rearm_next(model, "p");
     forwards(model, 1);
-    CHECK(model.get_subsystem("p") != nullptr);  // rebuilt, and it has taken one of its two turns
-    CHECK(model.get_subsystem("p.c") != nullptr);
+    CHECK(cs::detail::ModelAccess::subsystem(model, "p") != nullptr);  // rebuilt, and it has taken one of its two turns
+    CHECK(cs::detail::ModelAccess::subsystem(model, "p.c") != nullptr);
     forwards(model, 3);
     CHECK(tsys::runs_of("p") == 4);
     CHECK(tsys::runs_of("c") == 4);
-    CHECK(model.get_subsystem("p") == nullptr);
+    CHECK(cs::detail::ModelAccess::subsystem(model, "p") == nullptr);
 }
 
 // =============================================================================================
@@ -2493,7 +2493,7 @@ TEST_CASE("alias: a connected tie_inputs alias joins the producer's root", "[sys
     SECTION("members take the connected output's shape; the producer owns the root") {
         auto model = tsys2::make(build(std::nullopt));
         model.setup();
-        CHECK(model.root().instance_at("a.x")->meta == model.root().instance_at("v.b")->meta);
+        CHECK(cs::detail::ModelAccess::instance(model, "a.x")->meta == cs::detail::ModelAccess::instance(model, "v.b")->meta);
         for (const std::uint32_t n : {4u, 2u}) {
             INFO("n = " << n);
             model.update_input("v.n", cs::init::from_host(tsys2::one_u32(n)));
@@ -2570,7 +2570,7 @@ TEST_CASE("alias: a tie alias inside a transient subsystem is released and the p
         model.run();
         model.wait();
         auto& sys = model.root();
-        CHECK(model.get_subsystem("tr") == nullptr);  // the transient System is deleted after its turn
+        CHECK(cs::detail::ModelAccess::subsystem(model, "tr") == nullptr);  // the transient System is deleted after its turn
         CHECK(tsys::pool_in_use_of(model) == base);
         tsys::expect_throws([&] { (void)cst::synced_input<DType::f32, 1>(model, "tr.x"); }, "was deleted");
     }
@@ -2587,8 +2587,8 @@ TEST_CASE("lifetime: a bare transient producer and a transient reader are delete
         INFO("run " << run);
         model.run();
         model.wait();
-        CHECK(model.get_subsystem("p") == nullptr);  // transient: deleted after its turn
-        CHECK(model.get_subsystem("t") == nullptr);
+        CHECK(cs::detail::ModelAccess::subsystem(model, "p") == nullptr);  // transient: deleted after its turn
+        CHECK(cs::detail::ModelAccess::subsystem(model, "t") == nullptr);
         CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "sink.y")) == tsys::iota_plus(1.0f, tsys::kLen, 2.0f, 1.0f));
         if (run == 1) {
             steady = pool_in_use(model);
@@ -2618,7 +2618,7 @@ TEST_CASE("lifetime: a run_n(3) parent's roots are freed after the third run unl
         INFO("forward " << k);
         model.run();
         model.wait();
-        CHECK((model.get_subsystem("op") != nullptr) == (k < 3));  // deleted by its parent after the third run
+        CHECK((cs::detail::ModelAccess::subsystem(model, "op") != nullptr) == (k < 3));  // deleted by its parent after the third run
         if (k < 3) CHECK_NOTHROW(cst::synced_output<DType::f32, 1>(model, "op.mid.y"));  // still alive: its variable is readable
     }
     CHECK(tsys::count_of("op.prod") == 1);
@@ -2631,7 +2631,7 @@ TEST_CASE("lifetime: a do_once producer with an eternal reader is eternal; its v
         INFO("run " << run);
         model.run();
         model.wait();
-        CHECK(model.get_subsystem("p") == nullptr);  // do_once: deleted; r's port keeps the variable alive
+        CHECK(cs::detail::ModelAccess::subsystem(model, "p") == nullptr);  // do_once: deleted; r's port keeps the variable alive
         CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "r.y")) == tsys::iota_plus(1.0f, tsys::kLen, 2.0f, 0.0f));
     }
 }
@@ -2646,7 +2646,7 @@ TEST_CASE("lifetime: a do_once producer with a transient reader: the rebuilt rea
     model.setup();
     model.run();  // run 1: both run, the variable is freed after them
     model.wait();
-    CHECK(model.get_subsystem("p") == nullptr);
+    CHECK(cs::detail::ModelAccess::subsystem(model, "p") == nullptr);
     std::string what = "<no exception>";
     try {
         model.run();
@@ -2666,7 +2666,7 @@ TEST_CASE("lifetime: a tie_outputs variable under a transient System is deleted 
         INFO("run " << run);
         model.run();
         model.wait();
-        CHECK(model.get_subsystem("tr") == nullptr);
+        CHECK(cs::detail::ModelAccess::subsystem(model, "tr") == nullptr);
         CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "sink.y")) == tsys::iota_plus(1.0f, tsys::kLen));
         if (run == 1)
             steady = pool_in_use(model);  // rd.y, kept by the sink, outlives the forward
@@ -2725,7 +2725,7 @@ TEST_CASE("lifetime: a mark under a transient System is collected at setup and s
     CHECK(model.design_vars()[0].path == "tr.a.x");
     model.run();
     model.wait();
-    CHECK(model.get_subsystem("tr") == nullptr);  // deleted after its turn
+    CHECK(cs::detail::ModelAccess::subsystem(model, "tr") == nullptr);  // deleted after its turn
     REQUIRE(model.design_vars().size() == 1);
     CHECK(model.design_vars()[0].path == "tr.a.x");
 }
@@ -2738,13 +2738,13 @@ TEST_CASE("lifetime: rearm sends a do_once's variables back out of scope and the
     forwards(model, 3);
     CHECK(tsys::count_of("p") == 1);
     CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "r.y")) == tsys::filled(8.0f));  // 2 * (1 * 4)
-    CHECK(model.get_subsystem("p") == nullptr);
+    CHECK(cs::detail::ModelAccess::subsystem(model, "p") == nullptr);
 
     tsys::rearm_next(model, "p");  // rebuilt by the parent at the start of the next forward: counter back to do_once
     forwards(model, 3);
     CHECK(tsys::count_of("p") == 2);  // p.x was allocated and initialized again
     CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "r.y")) == tsys::filled(8.0f));
-    CHECK(model.get_subsystem("p") == nullptr);
+    CHECK(cs::detail::ModelAccess::subsystem(model, "p") == nullptr);
 }
 
 TEST_CASE("lifetime: transient together with run_n or do_once throws, naming the subsystem", "[system][lifetime]") {
@@ -2807,7 +2807,7 @@ TEST_CASE("lifetime: a transient System with a finite value source for a hook is
         INFO("forward " << k);
         CHECK_NOTHROW(model.run());
         model.wait();
-        CHECK(model.get_subsystem("s") == nullptr);  // deleted after its turn, on schedule
+        CHECK(cs::detail::ModelAccess::subsystem(model, "s") == nullptr);  // deleted after its turn, on schedule
     }
 }
 
@@ -2829,8 +2829,8 @@ TEST_CASE("lifetime: a hook whose value source is gone keeps the last shape",
                 CHECK_NOTHROW(model.run());
                 model.wait();
                 CHECK(cst::synced_input<DType::f32, 1>(model, "s.x").shape()[0] == 4);  // the last shape stands from forward 3 on
-                CHECK((model.get_subsystem("s.nb") == nullptr) == (k >= 2));  // deleted after its second turn
-                CHECK(model.get_subsystem("s") != nullptr);
+                CHECK((cs::detail::ModelAccess::subsystem(model, "s.nb") == nullptr) == (k >= 2));  // deleted after its second turn
+                CHECK(cs::detail::ModelAccess::subsystem(model, "s") != nullptr);
                 if (hold) CHECK(to_vector(cst::synced_output<DType::u32, 1>(model, "s.n")) == std::vector<std::uint32_t>{4});  // the value
             }
         }
@@ -2871,16 +2871,16 @@ TEST_CASE("rearm: a rebuilt child rejoins the SAME variable and its consumer see
     cs::Model model = cs::create_model<tsys::DoOnceInit>(cst::pooled_config());
     model.setup();
     forwards(model, 2);
-    CHECK(model.get_subsystem("p") == nullptr);  // do_once: deleted after its turn
+    CHECK(cs::detail::ModelAccess::subsystem(model, "p") == nullptr);  // do_once: deleted after its turn
     CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "r.y")) == tsys::filled(8.0f));  // 2 * (1 * 4)
-    const auto before = model.root().instance_at("r.x")->meta;  // the variable p.y fed, held by r
+    const auto before = cs::detail::ModelAccess::instance(model, "r.x")->meta;  // the variable p.y fed, held by r
 
     tsys::g_p_x = 5.0f;  // the rebuilt child's free input takes the new value when its init is applied
     tsys::rearm_next(model, "p");
     forwards(model, 2);
-    CHECK(model.root().instance_at("r.x")->meta == before);  // the rebuilt p.y joined the variable r holds
+    CHECK(cs::detail::ModelAccess::instance(model, "r.x")->meta == before);  // the rebuilt p.y joined the variable r holds
     CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "r.y")) == tsys::filled(10.0f));  // 2 * (1 * 5): the consumer sees it
-    CHECK(model.get_subsystem("p") == nullptr);
+    CHECK(cs::detail::ModelAccess::subsystem(model, "p") == nullptr);
 }
 
 TEST_CASE("rearm: a rebuilt consumer of a deleted do_once producer still reads the producer's last value", "[system][rearm]") {
@@ -2889,12 +2889,12 @@ TEST_CASE("rearm: a rebuilt consumer of a deleted do_once producer still reads t
     cs::Model model = cs::create_model<tsys::ConsumerRebuild>(default_config());
     model.setup();
     forwards(model, 2);
-    CHECK(model.get_subsystem("p") == nullptr);  // do_once: gone
+    CHECK(cs::detail::ModelAccess::subsystem(model, "p") == nullptr);  // do_once: gone
     CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "r.y")) == tsys::iota_plus(1.0f, tsys::kLen, 2.0f, 0.0f));
 
     tsys::rearm_next(model, "r");
     forwards(model, 1);
-    CHECK(model.get_subsystem("p") == nullptr);  // p did not run again
+    CHECK(cs::detail::ModelAccess::subsystem(model, "p") == nullptr);  // p did not run again
     CHECK(to_vector(cst::synced_input<DType::f32, 1>(model, "r.x")) == tsys::iota_plus(1.0f, tsys::kLen));  // the last value
     CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "r.y")) == tsys::iota_plus(1.0f, tsys::kLen, 2.0f, 0.0f));
 }
@@ -2906,7 +2906,7 @@ TEST_CASE("lifetime: a variable survives its producer being deleted, through an 
         INFO("run " << run);
         model.run();
         model.wait();
-        CHECK(model.get_subsystem("p") == nullptr);  // the producer is gone after its one turn
+        CHECK(cs::detail::ModelAccess::subsystem(model, "p") == nullptr);  // the producer is gone after its one turn
         // r holds the variable through its port
         CHECK(to_vector(cst::synced_input<DType::f32, 1>(model, "r.x")) == tsys::iota_plus(1.0f, tsys::kLen));
         CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "r.y")) == tsys::iota_plus(1.0f, tsys::kLen, 2.0f, 0.0f));
@@ -2922,9 +2922,9 @@ TEST_CASE("lifetime: a transient producer feeding a transient reader in the same
         model.run();
         model.wait();
         // built at the start of the forward and deleted at its end: all three exist for the whole forward
-        CHECK(model.get_subsystem("p") == nullptr);
-        CHECK(model.get_subsystem("t") == nullptr);
-        CHECK(model.get_subsystem("u") == nullptr);
+        CHECK(cs::detail::ModelAccess::subsystem(model, "p") == nullptr);
+        CHECK(cs::detail::ModelAccess::subsystem(model, "t") == nullptr);
+        CHECK(cs::detail::ModelAccess::subsystem(model, "u") == nullptr);
         CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "sink.y")) == tsys::iota_plus(1.0f, tsys::kLen, 2.0f, 1.5f));
         if (run == 1)
             steady = pool_in_use(model);  // only u.y, held by the sink, outlives the forward
@@ -2968,11 +2968,11 @@ TEST_CASE("init: Model::update_input on a live variable is applied at the next r
 TEST_CASE("get_subsystem: an undeclared name throws, a declared but deleted one answers nullptr", "[system][run_policy]") {
     cs::Model model = cs::create_model<tsys::DoOnceProducer>(default_config(), false);
     model.setup();
-    CHECK(model.get_subsystem("p") != nullptr);
+    CHECK(cs::detail::ModelAccess::subsystem(model, "p") != nullptr);
     tsys::expect_throws([&] { (void)model.get_subsystem("nope"); }, "has no subsystem 'nope'");
     forwards(model, 1);
-    CHECK(model.get_subsystem("p") == nullptr);
-    CHECK(model.get_subsystem("r") != nullptr);
+    CHECK(cs::detail::ModelAccess::subsystem(model, "p") == nullptr);
+    CHECK(cs::detail::ModelAccess::subsystem(model, "r") != nullptr);
     tsys::expect_throws([&] { (void)model.get_subsystem("nope"); }, "has no subsystem 'nope'");
 }
 
@@ -3342,8 +3342,8 @@ TEST_CASE("placement: a child placed by its author on device X, added by its par
     // the author (PlacedInner) says `first`; the parent (DevTop) adds it on `host`
     cs::Model model = cs::create_model<tsys::DevTop>(default_config(), first, host);
     model.setup();
-    CHECK(model.root().instance_at("in.k.x")->device == host);
-    CHECK(model.root().instance_at("in.k.y")->device == host);
+    CHECK(cs::detail::ModelAccess::instance(model, "in.k.x")->device == host);
+    CHECK(cs::detail::ModelAccess::instance(model, "in.k.y")->device == host);
 
     model.update_input("in.k.x", cs::init::fill(3.0f));
     model.run();
@@ -3363,9 +3363,9 @@ TEST_CASE("placement: a rebuilt child keeps the outer device", "[system][placeme
     tsys::rearm_next(model, "in");
     model.run();
     model.wait();
-    REQUIRE(model.get_subsystem("in") != nullptr);
-    CHECK(model.root().instance_at("in.k.x")->device == host);
-    CHECK(model.root().instance_at("in.k.y")->device == host);
+    REQUIRE(cs::detail::ModelAccess::subsystem(model, "in") != nullptr);
+    CHECK(cs::detail::ModelAccess::instance(model, "in.k.x")->device == host);
+    CHECK(cs::detail::ModelAccess::instance(model, "in.k.y")->device == host);
     // the rebuilt child's free input is a fresh variable (zeros), and it runs on the outer device
     CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "in.k.y")) == tsys::filled(0.0f));
 }

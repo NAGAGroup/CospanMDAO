@@ -413,7 +413,7 @@ TEST_CASE("fused groups: a transient group rebuilt every forward (the config cac
         INFO("forward " << fwd);
         model.run();
         model.wait();
-        CHECK(model.get_subsystem("grp") == nullptr);  // deleted after its turn; a new group is built next forward
+        CHECK(cs::detail::ModelAccess::subsystem(model, "grp") == nullptr);  // deleted after its turn; a new group is built next forward
         CHECK(tfg::out_of(model, "sink.y") == tfg::filled(100, 1423));  // grp.b.y = 1422, plus 1
     }
 }
@@ -437,7 +437,7 @@ TEST_CASE("fused groups: group_waits_enabled gives the launch its wait state and
         CHECK(tfg::out_of(model, "f.a.y") == tfg::filled(200, 422));  // the (segment, group) indices are unchanged
         CHECK(tfg::out_of(model, "f.b.y") == tfg::filled(100, 1422));
     }
-    auto* f = dynamic_cast<cs::detail::FusedBase*>(model.get_subsystem("f"));
+    auto* f = dynamic_cast<cs::detail::FusedBase*>(cs::detail::ModelAccess::subsystem(model, "f"));
     REQUIRE(f != nullptr);
     CHECK(f->has_wait_state());
 }
@@ -457,7 +457,7 @@ TEST_CASE("fused groups: a group with neither group_waits_enabled nor a global_b
         CHECK(tfg::out_of(model, "f.a.y") == tfg::filled(200, 422));
         CHECK(tfg::out_of(model, "f.b.y") == tfg::filled(100, 1422));
     }
-    auto* f = dynamic_cast<cs::detail::FusedBase*>(model.get_subsystem("f"));
+    auto* f = dynamic_cast<cs::detail::FusedBase*>(cs::detail::ModelAccess::subsystem(model, "f"));
     REQUIRE(f != nullptr);
     CHECK_FALSE(f->has_wait_state());
 }

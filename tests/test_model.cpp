@@ -929,8 +929,8 @@ TEST_CASE("Two devices: a producer on one, its consumer on the other", "[model][
         cs::model_config_desc{cs::pool_desc{std::vector<sycl::device>{first, host}, std::size_t{1} << 20}}, other);
     model.setup();
 
-    CHECK(model.root().instance_at("src.y")->device == dflt);
-    CHECK(model.root().instance_at("mid.y")->device == other);
+    CHECK(cs::detail::ModelAccess::instance(model, "src.y")->device == dflt);
+    CHECK(cs::detail::ModelAccess::instance(model, "mid.y")->device == other);
 
     for (int round = 0; round < 2; ++round) {
         std::vector<float> x(tmod::kLen), want_mid(tmod::kLen), want_out(tmod::kLen);
@@ -1297,7 +1297,7 @@ TEST_CASE("a subsystem placed on a device no pool_desc names runs correctly", "[
     // The only pool is on the default device; p goes to the other one, which no pool_desc names.
     auto model = cs::create_model<tmod::PlacedTop>(cs::model_config_desc{cs::pool_desc{dflt, std::size_t{1} << 20}}, other, 6.0f);
     model.setup();
-    CHECK(model.root().instance_at("p.y")->device == other);
+    CHECK(cs::detail::ModelAccess::instance(model, "p.y")->device == other);
     CHECK(tmod::p_is(model, 6.0f));
     CHECK(tmod::report_on(model, other).os_allocations > 0);
 }

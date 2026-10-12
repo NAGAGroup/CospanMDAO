@@ -628,8 +628,8 @@ TEST_CASE("a launch's event is registered on the container of every port it touc
 
     // Before any forward every holder already has its container (declaration creates it), but it is empty and unbound:
     // setup allocates nothing (design review section 2), so there are no events either.
-    const auto xi = model.root().instance_at("aff.x");
-    const auto yi = model.root().instance_at("aff.y");
+    const auto xi = cs::detail::ModelAccess::instance(model, "aff.x");
+    const auto yi = cs::detail::ModelAccess::instance(model, "aff.y");
     REQUIRE(xi->data != nullptr);
     REQUIRE(yi->data != nullptr);
     CHECK_FALSE(xi->data->bound());
@@ -647,7 +647,7 @@ TEST_CASE("a launch's event is registered on the container of every port it touc
     // writer of x (which waits on x's reads) and a reader of y (which waits on y's writes) both come after it. Checked
     // through the events themselves: after waiting on those lists the kernel's event is complete.
     const sycl::event kernel = [&] {
-        const std::vector<sycl::event> ev = model.get_subsystem("aff")->events();
+        const std::vector<sycl::event> ev = cs::detail::ModelAccess::subsystem(model, "aff")->events();
         REQUIRE(ev.size() == 1);
         return ev.front();
     }();
@@ -723,8 +723,8 @@ TEST_CASE("host component chain: producer -> host prefix sum -> consumer", "[com
     model.setup();
 
     // The host component's I/O are host-kind USM (moved by the ordinary copy rule).
-    CHECK(model.root().instance_at("prefix.y")->storage_kind == sk::kind::host);
-    CHECK(model.root().instance_at("prefix.z")->storage_kind == sk::kind::host);
+    CHECK(cs::detail::ModelAccess::instance(model, "prefix.y")->storage_kind == sk::kind::host);
+    CHECK(cs::detail::ModelAccess::instance(model, "prefix.z")->storage_kind == sk::kind::host);
 
     auto w = wait_and_view<DType::f32, 1>(model, "plus1.w");
     REQUIRE(w.size() == tc::kN);
@@ -750,8 +750,8 @@ TEST_CASE("custom op: device_ptr at submission is the storage the consumer reads
     (void)wait_and_view<DType::f32, 1>(model, "plus1.w");  // runs the model; only the recorded pointers are checked
 
     // The device data of the variables, read off the instances (the old per-root storage_on(placement) is gone).
-    const void* want_in  = model.root().instance_at("iota.y")->data->raw();
-    const void* want_out = model.root().instance_at("rec.y")->data->raw();
+    const void* want_in  = cs::detail::ModelAccess::instance(model, "iota.y")->data->raw();
+    const void* want_out = cs::detail::ModelAccess::instance(model, "rec.y")->data->raw();
     CHECK(tc::g_in_rec.load() != nullptr);
     CHECK(tc::g_in_rec.load() == want_in);
     CHECK(tc::g_out_rec.load() != nullptr);
@@ -845,7 +845,7 @@ TEST_CASE("initial values: metadata rules (connected, output, duplicates, last d
 TEST_CASE("phase guards: init_input, set_shape and declare outside their phase throw", "[component][init][guards]") {
     auto model = cs::create_model<tc::TopInit>(default_config());
     model.setup();
-    auto& c = dynamic_cast<tc::InitDemo&>((*model.get_subsystem("ini")));
+    auto& c = dynamic_cast<tc::InitDemo&>((*cs::detail::ModelAccess::subsystem(model, "ini")));
 
     SECTION("init_input outside setup() throws") {
         tc::expect_throws([&] { c.try_init(); }, "setup() only");

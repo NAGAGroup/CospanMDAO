@@ -66,6 +66,7 @@ namespace naga::cospan {
 class Model;
 
 namespace detail {
+struct ModelAccess;  // INTERNAL: tests and tools that look inside a model (below the Model)
 
 /// The only host write (section 5), by instance: assigns the initializer to the input's variable and marks it STALE (and
 /// pending, so the next run's first pass acts on it); on an input that has a source it warns and does nothing (unless the
@@ -396,6 +397,8 @@ template <class Sys, class Cfg, class... Args>
 Model create_model(Cfg&& cfg, Args&&... args);
 
 class Model {
+    friend struct detail::ModelAccess;
+
 public:
     using RootFactory = std::function<std::unique_ptr<System>()>;
 
@@ -926,6 +929,22 @@ private:
 
     std::unique_ptr<Impl> s_;
 };
+
+namespace detail {
+/// INTERNAL: a look inside a model for tests (the metadata, a holder by full name, a subsystem object). Not part of the user API.
+struct ModelAccess {
+    static ModelMeta& meta(Model& m) { return *m.ready("ModelAccess::meta").meta; }
+    /// The holder with the full name `full`, else null.
+    static std::shared_ptr<Instance> instance(Model& m, std::string_view full) { return meta(m).find_holder(full); }
+    /// The subsystem object at the full name `full`, else null ("" is the root).
+    static Subsystem* subsystem(Model& m, std::string_view full) {
+        Node* n = meta(m).find_node(full);
+        return n == nullptr ? nullptr : n->sub.get();
+    }
+    /// The node at the full name, else null.
+    static Node* node(Model& m, std::string_view full) { return meta(m).find_node(full); }
+};
+}  // namespace detail
 
 template <class Sys, class... Args>
     requires(std::derived_from<Sys, System> && !detail::first_is_config_v<Args...>)
