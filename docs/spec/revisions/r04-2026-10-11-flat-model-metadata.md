@@ -71,10 +71,59 @@ Open questions:
 - **The full table of which calls are legal in which state.** First guess: structural calls only while Editable; rearm, policy changes, update_input, views, wait and inspection at run time.
 - **Which checks belong to which tier,** item by item.
 
+Change notes (from Phase 2):
+- **Procedural building, revised.** Subsystems come from `main` only through `model.add_subsystem`, which adds to the root and only before `model.setup()`. Between `setup()` and the first run, `main` may connect, promote, tie, override run policies and call `update_input`. This replaces "everything is added from `main` between `setup()` and the first run".
+- **Systems have no `pre_forward` / `post_forward`.** Rearm is `model.rearm_subsystem(path)`, called from `main` between runs.
+- **Run-policy override, direction.** An override is judged by the policy itself, not by who sets it. For lifetimes, an override may not shorten the lifetime the owning system set. Future policies define their own override conditions. This replaces options (a) and (b) in the open questions above.
+
 ### Phase 2: Names and the metadata object
-Fully resolved names; the maps (name → input/output metadata, subsystem → inputs/outputs, Systems, name → list index); subsystems not owning their inputs and outputs; how a declarer's resolved name is assigned; namespace views for Systems, `main` and `get_subsystem` handles. Inventory: 1, 3, 19, 32, 33.
-- Decisions: none yet.
-- Open questions: none yet.
+First pass, 2026-10-11. Inventory: 1, 3, 19, 32, 33.
+
+Decisions (first pass):
+- **Names.**
+  - A resolved name is the parent's resolved name, a ".", and the local name. The root is "" and adds no dot.
+  - Dots are only for readability: names are never parsed. A local name may contain dots, for example a subsystem "b.d" or an input "x.y".
+  - Every full name is unique across the whole model. A declaration whose full name already exists is refused at the call.
+  - A lookup is a single map lookup by full name. Nothing walks the tree to resolve a name.
+- **Representations in the metadata object** (first sketch):
+  - full name → input/output (holder) metadata;
+  - the execution list of leaves, and a separate list of systems;
+  - subsystem name → a descriptor saying whether it is a system or a leaf, and its index in that list;
+  - a tree of names: the root is "", each system sets its own children, and a map goes from a resolved subsystem name to its node.
+
+  Subtree membership comes from the tree, never from a name prefix. No system holds a pointer to its parent. The model can walk the tree without recursion; this is mostly for visualization.
+
+  A map from each subsystem to its inputs and outputs may not be needed: `get_subsystem(p).get_input(n)` resolves to `p + "." + n`.
+- **Ownership.** Components keep owning their holder metadata, so the hot path is unchanged; the maps refer to it. Variable metadata, holders and device data keep today's design.
+- **The execution list is built during setup.**
+  - A leaf is appended the moment it is added. Depth-first setup guarantees the order.
+  - Each system's leaves form a contiguous range that never moves.
+- **Each execution item is a leaf plus its before- and after-operations.**
+  - The before- and after-operations are special operations, such as shape hooks, tied-output pushes and depends_on handoffs.
+  - A declaration that needs one attaches it to the relevant item at the call. For example, a tied push goes after whichever member comes last in list order, and depends on every member's events.
+  - Special operations are called unconditionally, and each decides for itself whether to act. A tied push acts if any of its owners is in scope, depends only on the owners that are, and does nothing if none are.
+- **Fused groups are the leaf.**
+  - A plain component is a fused group with one stage.
+  - Stages are not registered as leaves, and a group's internal metadata is opaque to the model.
+- **Handles.**
+  - `get_subsystem` returns a handle for any subsystem, system or leaf, found through the name → descriptor map.
+  - A handle resolves a relative name as prefix + "." + name, and accepts only names below it.
+- **Systems have only `setup()`.**
+  - `pre_forward` and `post_forward` are removed from systems; components keep theirs.
+  - Rearm is `model.rearm_subsystem(path)`, called from `main` between runs. Run policies may gain rearm conditions later.
+- **Structural edits happen only during setup.** `add_subsystem` is only legal in a `setup()`, or as `model.add_subsystem` (on the root) before `model.setup()`.
+
+Open questions:
+- **An out-of-scope subsystem's holders:** do they leave the maps?
+- **Reaching a fused group's stage through `get_subsystem`.** Three options:
+  - refuse it;
+  - return a wrapper around the group that maps the stage's names to the group's;
+  - register stage records.
+- **Reverse operations.** Two options:
+  - each system owns its own and they are played recursively;
+  - one log with a slice per system. A rearm appends new entries, which breaks the slice's contiguity.
+- **Strings or interned ids** for the paths off the hot path.
+- **Shape hooks:** setup-only or not.
 
 ### Phase 3: Declarations and construction
 `add_subsystem`, factories, depth-first setup order; declaration sequence numbers; one declaration store with several indexes (by variable, by declarer, by subsystem touched); device placement and "the outer call wins", including edits after setup; helper-built systems (composed systems, fused groups). Inventory: 2, 4, 14, 34.
