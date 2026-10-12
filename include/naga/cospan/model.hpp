@@ -734,7 +734,7 @@ private:
         }
         try {
             place_devices(m);
-            place_hooks(m);
+            place_shape_hooks(m);
             place_tied_pushes(m);
             place_depends(m);
         } catch (...) {
@@ -765,7 +765,7 @@ private:
 
     /// (2) A hook runs directly after the last producer of the sources it names; with no traceable source, just before the
     /// first holder of its target. A source produced at or after the first holder of the target is an error.
-    static void place_hooks(detail::ModelMeta& m) {
+    static void place_shape_hooks(detail::ModelMeta& m) {
         for (detail::HookRecord& h : m.hooks) {
             const std::shared_ptr<detail::Instance> target = h.target_inst.lock();
             if (!target) continue;

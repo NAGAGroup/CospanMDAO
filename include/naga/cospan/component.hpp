@@ -740,7 +740,7 @@ private:
 
     bool                declaring_      = false;
     bool                in_pre_forward_ = false;
-    detail::Runtime*    rt_             = nullptr;  ///< set during run_precompute only
+    detail::Runtime*    rt_             = nullptr;  ///< set during the pre steps of a forward only
 };
 
 namespace detail {

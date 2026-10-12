@@ -402,7 +402,7 @@ public:
     bool materialized = false;
 
     /// Set by tie_outputs: the members' own postcompute pushes to the variable's other placements are off, and the System
-    /// that owns the tie alias pushes through the alias instead (System::run_compute).
+    /// that owns the tie alias pushes through the alias instead (the push finalize places after the last member's leaf).
     bool push_suppressed = false;
 
     /// The variable closes a cycle (connect found a consumer registered before its producer). Its initializer is kept and
