@@ -413,7 +413,8 @@ TEST_CASE("fused groups: a transient group rebuilt every forward (the config cac
         INFO("forward " << fwd);
         model.run();
         model.wait();
-        CHECK(cs::detail::ModelAccess::subsystem(model, "grp") == nullptr);  // deleted after its turn; a new group is built next forward
+        REQUIRE(cs::detail::ModelAccess::node(model, "grp") != nullptr);  // r04: the node stays; out of scope after its turn
+        CHECK_FALSE(cs::detail::ModelAccess::node(model, "grp")->in_scope);
         CHECK(tfg::out_of(model, "sink.y") == tfg::filled(100, 1423));  // grp.b.y = 1422, plus 1
     }
 }

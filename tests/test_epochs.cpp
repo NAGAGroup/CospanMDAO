@@ -258,7 +258,9 @@ TEST_CASE("Transient: a transient subsystem is deleted after its turn, every for
     for (int r = 0; r < 2; ++r) {
         // the transient is deleted after its turn, so its variables cannot be read afterwards
         forward_and_wait(m);
-        CHECK(cs::detail::ModelAccess::subsystem(m, "op") == nullptr);
+        // r04: the node stays in the tree; its turn over, it is out of scope (dearmed)
+        REQUIRE(cs::detail::ModelAccess::node(m, "op") != nullptr);
+        CHECK_FALSE(cs::detail::ModelAccess::node(m, "op")->in_scope);
     }
 }
 

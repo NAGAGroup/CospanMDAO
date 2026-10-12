@@ -729,7 +729,8 @@ TEST_CASE("hook replay: a transient target child, rebuilt each forward, still ge
         INFO("forward " << r + 1);
         CHECK_NOTHROW(m.run());
         m.wait();
-        CHECK(cs::detail::ModelAccess::subsystem(m, "tr") == nullptr);  // deleted after its turn; rebuilt for the next forward
+        REQUIRE(cs::detail::ModelAccess::node(m, "tr") != nullptr);  // r04: the node stays; out of scope after its turn, rearmed next forward
+        CHECK_FALSE(cs::detail::ModelAccess::node(m, "tr")->in_scope);
         CHECK(cst::synced_output<DType::f32, 1>(m, "sink.y").shape()[0] == 6);
     }
 }

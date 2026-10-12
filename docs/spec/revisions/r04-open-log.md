@@ -36,3 +36,10 @@ The audit in phase 9 must bring all of these to zero outside `chunked_system.hpp
 4. **Ties of ties.** The member refusals are removed from wiring.hpp; System::tie_* mark the tie aliases already in the members' variables `absorbed` (read before the merge).
 5. **Dearm / rearm.** Dearm = `inst->data.reset()` on the node's holders, keeping the VarMeta. Rearm = `refresh_container()`, plus `forget_materialization()` when the variable has no live data, plus `mark_pending`. CountedPolicy counts a turn in `after` only when the node is in scope; TransientPolicy rearms in `before` if out of scope and always dearms in `after`.
 6. **Ordinals.** A leaf's ordinal is assigned at registration (depth-first, setup is depth-first); a system node carries the first/last ordinals of its subtree. Cycle detection uses the last producer's ordinal and the consumer's ordinal.
+
+
+## Stopped at
+
+Phase 8 (tests) is partly done. Phases 0-7 are written (unbuilt). Phase 8 so far: the mechanical rename of removed Model API in the built tests (`model.root().X` -> `get_subsystem("").X`, `.root().instance_at(` -> `cs::detail::ModelAccess::instance(`, `get_subsystem(..) ==/->` -> `ModelAccess::subsystem`, `override_run_policy` -> `set_run_policy`), and the three 'deleted after its turn' checks in test_epochs, test_shapes and test_fused_groups, now `ModelAccess::node(..)->in_scope == false`.
+
+Not done: test_system.cpp (about 77 sites: system hooks, `rearm(` in pre_forward, `run_policy_of`/`child_of`, replay and rebuilt-child tests to delete or port), test_p4.cpp (about 32), test_flavors.cpp (about 12; `get_subsystem("grp") == nullptr` style checks), and follow-ups such as `dynamic_cast` of get_subsystem results. Also not done: tests/test_r04.cpp and its CMake entry, phase 9 (examples, getting-started, README, docs, spec status, audit) and phase 10 (build, suites, --check runs, docs-build, push of the built result). Nothing has been compiled yet, so expect compile errors in phase 10.
