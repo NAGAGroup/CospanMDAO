@@ -529,6 +529,7 @@ inline void declare_init(const WiringSite& site, const std::shared_ptr<Instance>
         wiring_fail(site, "init_input", "'" + inst->full_path() + "' is an output; outputs are never initialized");
     VarMeta& v = *inst->meta;
     if (first_of_kind(v, IOKind::output) && !v.cycle) return;  // a cycle variable is connected and still has an initializer
+    if (spec.shape()) v.check_init_against_definition(*spec.shape());  // an initializer with a shape: checked at the call
     v.init = std::move(spec);
     // A declaration made after the variable holds data (System::init_input, legal anywhere) is stale-making, like
     // Model::update_input: the variable initializes again at the next forward.

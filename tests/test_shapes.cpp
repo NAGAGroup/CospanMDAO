@@ -554,6 +554,32 @@ TEST_CASE("hook from_value: two dimensions from two different sources", "[shapes
     CHECK(cst::synced_output<DType::f32, 2>(m, "c.y").shape()[1] == 5);
 }
 
+TEST_CASE("hook from_value: a source that is gone leaves its dimension alone; the other still follows its source", "[shapes][hook][r04]") {
+    auto m = tshape::sh_make([](cs::System& s) {
+        s.add_subsystem(cs::subsystem_desc<tshape::ShN>("nb", 5.0f));
+        // na is added after nb, so the hook runs after na's turn (and before its do_once dearms it on run 1)
+        s.add_subsystem(cs::property_list{cs::property::do_once{}}, cs::subsystem_desc<tshape::ShN>("na", 3.0f));
+        s.add_subsystem(cs::subsystem_desc<tshape::ShScale2>("c"));
+        s.shape_hook("c.x", cs::dim::from_value("na.n", 0), cs::dim::from_value("nb.n", 0));
+    });
+    m.setup();
+    const auto shape_is = [&](std::size_t d0, std::size_t d1) {
+        const auto x = cst::synced_input<DType::f32, 2>(m, "c.x");
+        CHECK(x.shape()[0] == d0);
+        CHECK(x.shape()[1] == d1);
+    };
+    m.run();
+    m.wait();
+    shape_is(3, 5);
+    m.run();  // na ran its one turn: na.n is gone, dimension 0 keeps 3
+    m.wait();
+    shape_is(3, 5);
+    m.update_input("nb.v", cs::init::fill(7.0f));
+    m.run();  // dimension 1 still follows nb.n
+    m.wait();
+    shape_is(3, 7);
+}
+
 TEST_CASE("hook custom: a function of the hook context", "[shapes][hook]") {
     auto m = tshape::sh_make([](cs::System& s) {
         s.add_subsystem(cs::subsystem_desc<tshape::ShProd>("p", std::size_t{4}));

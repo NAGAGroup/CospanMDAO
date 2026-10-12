@@ -727,3 +727,13 @@ TEST_CASE("r04 dearm: A transient, B eternal, C transient: A and C release their
         CHECK_THROWS_AS((model.view_output<DType::f32, 1>("c.y")), std::logic_error);
     }
 }
+
+TEST_CASE("r04 init shapes: update_input with a shape that disagrees with a fixed dimension throws at the call", "[r04][init]") {
+    cs::Model model = tr04::make([](cs::System& s) { s.add_subsystem(cs::subsystem_desc<tr04::Inc>("c", 0.0f)); });
+    model.setup();
+    tr04::run(model);
+    tr04::expect_throws_all([&] { model.update_input("c.x", cs::init::fill(1.0f, {5})); },
+                            {"init for 'c.x' has dimension 0 = 5", "(fixed) = 8"});
+    tr04::run(model);  // the old initializer stands
+    CHECK(tr04::out(model, "c.y") == tr04::filled(1.0f));
+}

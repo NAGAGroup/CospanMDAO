@@ -65,6 +65,19 @@ void forward_throws(cs::Model& m, const std::vector<std::string>& needles) {
     for (const auto& n : needles) CHECK_THAT(what, Catch::Matchers::ContainsSubstring(n));
 }
 
+/// setup() throws; its message holds every needle.
+void setup_throws(cs::Model& m, const std::vector<std::string>& needles) {
+    std::string what = "<no exception>";
+    try {
+        m.setup();
+    } catch (const std::exception& e) {
+        what = e.what();
+    }
+    INFO("thrown: " << what);
+    CHECK(what != "<no exception>");
+    for (const auto& n : needles) CHECK_THAT(what, Catch::Matchers::ContainsSubstring(n));
+}
+
 // ---- Probe: y = x + w; x, w dense rank 1, n a one-element u32 -------------------------------------------------------
 
 /// mode 0: x, w fixed 5.  mode 1: x, w unspecified (shaped by their initializers).  mode 2: x fixed 3, w unspecified
@@ -241,27 +254,36 @@ void check_blocks(const View& v) {
 // =============================================================================================================================
 // every dimension is checked, and the message names both sides (at the first forward, section 2)
 // =============================================================================================================================
-TEST_CASE("shape: an init that disagrees with a FIXED dim names both sides", "[shape][init]") {
+TEST_CASE("shape: an init that disagrees with a FIXED dim names both sides, at the call", "[shape][init]") {
     auto m = tis::make([](cs::System& s) {
         s.add_subsystem(cs::subsystem_desc<tis::Probe>("p", 0));
         s.init_input("p.x", cs::init::fill(1.0f, {4}));
     });
-    CHECK_NOTHROW(m.setup());  // the check fires when the variable is materialized (section 2)
-    tis::forward_throws(m, {"init for 'p.x' has dimension 0 = 4", "'p.x' resolved dimension 0 (fixed) = 5"});
+    tis::setup_throws(m, {"init for 'p.x' has dimension 0 = 4", "'p.x' resolved dimension 0 (fixed) = 5"});
 }
 
 // The old INHERITED case (w = FromInputDim{x, 0}, an init on w disagreeing with the dim it inherits) is DELETED: derived
 // dimensions are removed (design review, section 10); w would simply be shaped by its own initializer.
-TEST_CASE("shape: an init that disagrees with a HOOKED dim names both sides", "[shape][init]") {
-    // was: a VALUE-DRIVEN dim (FromInput{n, 0}); a size from an upstream value is a shape hook now
-    auto m = tis::make([](cs::System& s) {
-        s.add_subsystem(cs::subsystem_desc<tis::Probe>("p", 2));
-        s.init_input("p.n", cs::init::from_host(std::vector<std::uint32_t>{3}));  // w has 3 elements
-        s.shape_hook("p.w", cs::dim::from_value("p.n", 0));
-        s.init_input("p.w", cs::init::fill(1.0f, {5}));
-    });
-    m.setup();
-    tis::forward_throws(m, {"init for 'p.w' has dimension 0 = 5", "'p.w' resolved dimension 0 (set by a shape hook) = 3"});
+TEST_CASE("shape: an init with a shape on a HOOKED dim throws at the call, in either order", "[shape][init]") {
+    // An initializer with a shape defines every dimension, so it conflicts with a shape hook on any of them.
+    SECTION("the hook first, then init_input") {
+        auto m = tis::make([](cs::System& s) {
+            s.add_subsystem(cs::subsystem_desc<tis::Probe>("p", 2));
+            s.init_input("p.n", cs::init::from_host(std::vector<std::uint32_t>{3}));
+            s.shape_hook("p.w", cs::dim::from_value("p.n", 0));
+            s.init_input("p.w", cs::init::fill(1.0f, {5}));
+        });
+        tis::setup_throws(m, {"init for 'p.w' has dimension 0 = 5", "is set by a shape hook"});
+    }
+    SECTION("init_input first, then the hook") {
+        auto m = tis::make([](cs::System& s) {
+            s.add_subsystem(cs::subsystem_desc<tis::Probe>("p", 2));
+            s.init_input("p.n", cs::init::from_host(std::vector<std::uint32_t>{3}));
+            s.init_input("p.w", cs::init::fill(1.0f, {5}));
+            s.shape_hook("p.w", cs::dim::from_value("p.n", 0));
+        });
+        tis::setup_throws(m, {"init for 'p.w' has dimension 0 = 5", "is set by a shape hook"});
+    }
 }
 
 TEST_CASE("shape: an init that disagrees with a PER-INDEX dim names both sides, element by element", "[shape][init]") {
@@ -269,8 +291,7 @@ TEST_CASE("shape: an init that disagrees with a PER-INDEX dim names both sides, 
         s.add_subsystem(cs::subsystem_desc<tis::RagSum>("p", 2, tis::Sizes{3, 1, 4}));
         s.init_input("p.x", cs::init::from_host(std::vector<float>(7, 1.0f), cs::init::ragged(3, tis::Sizes{3, 0, 4})));
     });
-    m.setup();
-    tis::forward_throws(m, {"init for 'p.x' has dimension 1 = [3,0,4]", "'p.x' resolved dimension 1 (fixed counts [3,1,4]) = [3,1,4]"});
+    tis::setup_throws(m, {"init for 'p.x' has dimension 1 = [3,0,4]", "'p.x' resolved dimension 1 (fixed counts [3,1,4]) = [3,1,4]"});
 }
 
 TEST_CASE("shape: an init that agrees with a per-index dim runs", "[shape][init]") {
@@ -290,8 +311,7 @@ TEST_CASE("shape: a rank mismatch names both sides", "[shape][init]") {
         s.add_subsystem(cs::subsystem_desc<tis::Probe>("p", 0));
         s.init_input("p.x", cs::init::fill(1.0f, {2, 3}));
     });
-    m.setup();
-    tis::forward_throws(m, {"init for 'p.x' has rank 2", "'p.x' resolved rank 1"});
+    tis::setup_throws(m, {"init for 'p.x' has rank 2", "'p.x' resolved rank 1"});
 }
 
 TEST_CASE("shape: an init with no shape still needs every dim specified; thrown at the first forward", "[shape][init]") {
@@ -396,11 +416,10 @@ TEST_CASE("shape: a ragged init on a tie", "[shape][init][ragged][tie]") {
     tis::check_blocks(v);
 }
 
-TEST_CASE("shape: a ragged init that disagrees with the declared sizes throws at the first forward", "[shape][init][ragged]") {
+TEST_CASE("shape: a ragged init that disagrees with the declared sizes throws at the call", "[shape][init][ragged]") {
     auto m = tis::make([](cs::System& s) {
         s.add_subsystem(cs::subsystem_desc<tis::RagSum>("p", 2, tis::Sizes{3, 1, 4}));
         s.init_input("p.x", cs::init::from_host(tis::iota(8), cs::init::ragged(2, tis::Sizes{4, 4})));  // two blocks, not three
     });
-    CHECK_NOTHROW(m.setup());
-    tis::forward_throws(m, {"init for 'p.x' has dimension 0 = 2", "'p.x' resolved dimension 0 (fixed) = 3"});
+    tis::setup_throws(m, {"init for 'p.x' has dimension 0 = 2", "'p.x' resolved dimension 0 (fixed) = 3"});
 }

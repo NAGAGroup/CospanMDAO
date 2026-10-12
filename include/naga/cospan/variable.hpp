@@ -593,8 +593,6 @@ public:
     /// sets its shape) is materialized lazily, the first time a holder touches it.
     bool shape_resolvable() const {
         if (shape.known) return true;
-        for (const DimRecord& r : definition)
-            if (r.how == DimRecord::How::hook) return false;  // a hook sets it when it runs, in the walk
         if (init && init->shape()) return true;
         return !definition.empty() &&
                std::all_of(definition.begin(), definition.end(), [](const DimRecord& r) { return r.how == DimRecord::How::fixed; });
@@ -769,6 +767,42 @@ public:
         if (any) set_dims(rt, s, mask, SetterId{SetterId::Kind::initializer, 0, "the initializer of '" + display_path() + "'"});
     }
 
+    /// The initializer's shape against the definition: the rank, every fixed dimension (equal), and no hooked dimension (an initializer with a shape defines every dimension). Checked at init_input, update_input, shape_hook and finalize.
+    void check_init_against_definition(const InitShape& is) const {
+        if (is.flat && rank != 1) return;
+        const std::string name = display_path();
+        if (is.rank != rank)
+            throw std::invalid_argument("naga::cospan: init for '" + name + "' has rank " + std::to_string(is.rank) + " but '" + name +
+                                        "' resolved rank " + std::to_string(rank));
+        for (int d = 0; d < rank; ++d) {
+            const auto       u = static_cast<std::size_t>(d);
+            const DimRecord& r = definition[u];
+            if (r.how == DimRecord::How::hook) {
+                const std::string got = (u == 1 && is.per) ? extents_str(is.per_index) : std::to_string(is.extents[u]);
+                throw std::invalid_argument("naga::cospan: init for '" + name + "' has dimension " + std::to_string(d) + " = " + got +
+                                            " but dimension " + std::to_string(d) + " of '" + name +
+                                            "' is set by a shape hook; an initializer with a shape defines every dimension");
+            }
+            if (r.how != DimRecord::How::fixed) continue;
+            std::vector<std::size_t> init_v, def_v;
+            bool                     as_counts = false;
+            if (u == 1 && def_counts) {
+                as_counts = true;
+                init_v    = is.per ? is.per_index : std::vector<std::size_t>(is.extents[0], is.extents[1]);
+                def_v     = *def_counts;
+            } else {
+                as_counts = u == 1 && is.per;
+                init_v    = as_counts ? is.per_index : std::vector<std::size_t>{is.extents[u]};
+                def_v     = {r.extent};
+            }
+            if (init_v == def_v) continue;
+            throw std::invalid_argument("naga::cospan: init for '" + name + "' has dimension " + std::to_string(d) + " = " +
+                                        (as_counts ? extents_str(init_v) : std::to_string(init_v.front())) + " but '" + name +
+                                        "' resolved dimension " + std::to_string(d) + " (" + declared_rule(d) + ") = " +
+                                        (as_counts ? extents_str(def_v) : std::to_string(r.extent)));
+        }
+    }
+
     /// "4x[2,0,1,1]": a shape as text for messages (a per-index dimension prints its extents, read down from the device
     /// here: use on error paths only).
     std::string shape_text(const ResolvedShape& r, Runtime& rt) const {
@@ -854,36 +888,6 @@ private:
                            extents_str(s.per_index_on_host(rt)));
             if (s.extents[u] != r.extent)
                 shape_fail(dim + " is declared as " + std::to_string(r.extent) + " but " + who + " gave " + std::to_string(s.extents[u]));
-        }
-    }
-
-    /// The initializer's shape against the fixed dimensions of the definition (and the rank).
-    void check_init_against_definition(const InitShape& is) const {
-        if (is.flat && rank != 1) return;
-        const std::string name = display_path();
-        if (is.rank != rank)
-            throw std::invalid_argument("naga::cospan: init for '" + name + "' has rank " + std::to_string(is.rank) + " but '" + name +
-                                        "' resolved rank " + std::to_string(rank));
-        for (int d = 0; d < rank; ++d) {
-            const auto       u = static_cast<std::size_t>(d);
-            const DimRecord& r = definition[u];
-            if (r.how != DimRecord::How::fixed) continue;
-            std::vector<std::size_t> init_v, def_v;
-            bool                     as_counts = false;
-            if (u == 1 && def_counts) {
-                as_counts = true;
-                init_v    = is.per ? is.per_index : std::vector<std::size_t>(is.extents[0], is.extents[1]);
-                def_v     = *def_counts;
-            } else {
-                as_counts = u == 1 && is.per;
-                init_v    = as_counts ? is.per_index : std::vector<std::size_t>{is.extents[u]};
-                def_v     = {r.extent};
-            }
-            if (init_v == def_v) continue;
-            throw std::invalid_argument("naga::cospan: init for '" + name + "' has dimension " + std::to_string(d) + " = " +
-                                        (as_counts ? extents_str(init_v) : std::to_string(init_v.front())) + " but '" + name +
-                                        "' resolved dimension " + std::to_string(d) + " (" + declared_rule(d) + ") = " +
-                                        (as_counts ? extents_str(def_v) : std::to_string(r.extent)));
         }
     }
 

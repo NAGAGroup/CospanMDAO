@@ -188,6 +188,9 @@ public:
         Step* raw                 = step.get();
         const HookTarget found    = install_hook(std::string{target}, infos, owner);
         raw->set_target(found.inst);
+        // An initializer with a shape defines every dimension: one already declared conflicts with the dimensions this hook owns.
+        if (const detail::VarMeta& tv = *found.inst->meta; tv.init && tv.init->shape() && (!tv.has_producer() || tv.cycle))
+            tv.check_init_against_definition(*tv.init->shape());
         detail::HookRecord rec;
         rec.target      = detail::ModelMeta::child_name(path(), target);
         rec.target_inst = found.inst;

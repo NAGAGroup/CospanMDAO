@@ -406,10 +406,8 @@ public:
         if (!inst) return;  // the target's child is gone: nothing to set
         VarMeta&          tm  = *inst->meta;
         const std::string who = "the shape hook on '" + path_ + "'";
-        // A named source whose instance is gone (its child was deleted, e.g. a producer that ran its last turn) can never change
-        // again: while the target's shape is known the hook does nothing and the last shape stands. "... does not exist right
-        // now" is thrown only when the shape was never known (source() below).
-        if (tm.shape.known && any_source_gone()) return;
+        // Per dimension: a dimension whose named source is gone is not set while the target's shape is known (it keeps its last
+        // extent; the other dimensions still follow their sources). With the shape never known, a gone source throws (source()).
 
         ResolvedShape            s = tm.shape;  // dimensions the hook does not own are not touched (set_dims takes the mask)
         DimMask                  mask{};
@@ -418,6 +416,7 @@ public:
 
         if constexpr (kRagged) {
             using R = std::tuple_element_t<0, std::tuple<D...>>;
+            if (tm.shape.known && gone(src_[0])) return;  // its one source is gone
             const std::shared_ptr<VarMeta> m = source(0, who, std::get<0>(ds_).path);
             if (!column_) column_ = std::make_shared<DeviceColumn>();
             evs.push_back(build_column(rt, *m, tm, *column_, std::is_same_v<R, ragged::OffsetsFrom>));
@@ -451,14 +450,9 @@ public:
 private:
     /// A named source is gone when its instance expired, or (r04) when its variable was materialized and all of its data was
     /// freed since (its producer went out of scope and nothing else holds it): it can never change again.
-    bool any_source_gone() const {
-        const auto gone = [](const std::weak_ptr<Instance>& w) {
-            const std::shared_ptr<Instance> i = w.lock();
-            return !i || (i->meta->materialized && !i->meta->has_live_data());
-        };
-        return [&]<std::size_t... I>(std::index_sequence<I...>) {
-            return ((names_source_v<std::tuple_element_t<I, std::tuple<D...>>> && gone(src_[I])) || ...);
-        }(std::index_sequence_for<D...>{});
+    static bool gone(const std::weak_ptr<Instance>& w) {
+        const std::shared_ptr<Instance> i = w.lock();
+        return !i || (i->meta->materialized && !i->meta->has_live_data());
     }
 
     std::shared_ptr<VarMeta> source(std::size_t i, const std::string& who, const std::string& path) const {
@@ -477,6 +471,7 @@ private:
         if constexpr (std::is_same_v<Dsc, dim::AsIs> || std::is_same_v<Dsc, dim::FixedAtRun>) {
             (void)rt, (void)who, (void)s, (void)mask, (void)evs, (void)reads;  // fixed_at_run made the dimension specified at the call
         } else if constexpr (std::is_same_v<Dsc, dim::FromShape>) {
+            if (tm.shape.known && gone(src_[I])) return;  // this dimension's source is gone: left as it is
             const std::shared_ptr<VarMeta> m = source(I, who, d.path);
             if (!m->shape.known && !m->has_producer()) m->materialize(rt);
             if (!m->shape.known) throw std::logic_error("naga::cospan: " + who + ": the shape of '" + d.path + "' is not known yet");
@@ -489,6 +484,7 @@ private:
             s.extents[I] = m->shape.extents[d.d];
             mask[I]      = true;
         } else if constexpr (std::is_same_v<Dsc, dim::FromValue>) {
+            if (tm.shape.known && gone(src_[I])) return;  // this dimension's source is gone: left as it is
             const std::shared_ptr<VarMeta> m = source(I, who, d.path);
             reads.emplace_back(I, queue_value_read(rt, *m, d.index, evs));
             mask[I] = true;

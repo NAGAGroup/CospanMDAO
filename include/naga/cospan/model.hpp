@@ -77,6 +77,7 @@ inline void update_input_instance(ModelMeta& m, const std::string& path, const I
         std::cerr << "naga::cospan: warning: input '" << path << "' is connected to an output; update_input is never applied\n";
         return;
     }
+    if (init.shape()) v.check_init_against_definition(*init.shape());  // at the call: on a throw the old initializer stands
     v.init = std::move(init);  // later than every declaration made in setup, so it replaces them
     v.mark_stale();
     m.mark_pending(inst.meta);
@@ -724,7 +725,7 @@ private:
     }
 
     // ---- finalize ----------------------------------------------------------------------
-    /// In order: (1) devices, one tree walk, the outermost set_device wins; (2) shape-hook placement; (3) one tied-output push
+    /// In order: (0) stored initializer shapes are checked; (1) devices, one tree walk, the outermost set_device wins; (2) shape-hook placement; (3) one tied-output push
     /// per non-absorbed tie_outputs alias, with the one-device check; (4) depends_on; (5) the shape definitions are fixed (the
     /// state change is what fixes them: structural calls throw from now on); (6) every variable goes into the pending set; (7)
     /// state = finalized. A throw leaves the state editable with the placed operations removed again, so finalize can be
@@ -736,6 +737,7 @@ private:
             n->after.clear();
         }
         try {
+            check_initializer_shapes(m);
             place_devices(m);
             place_shape_hooks(m);
             place_tied_pushes(m);
@@ -749,6 +751,19 @@ private:
         }
         fill_pending(m);
         m.state = detail::Lifecycle::finalized;
+    }
+
+    /// (0) Every stored initializer with a shape against its variable's final definition: a tie or promotion merged after the
+    /// init_input call can have fixed a dimension since.
+    static void check_initializer_shapes(detail::ModelMeta& m) {
+        std::unordered_set<const detail::VarMeta*> seen;
+        for (const auto& [name, w] : m.holders) {
+            const std::shared_ptr<detail::Instance> inst = w.lock();
+            if (!inst) continue;
+            const detail::VarMeta& v = *inst->meta;
+            if (!seen.insert(&v).second) continue;
+            if (v.init && v.init->shape() && (!v.has_producer() || v.cycle)) v.check_init_against_definition(*v.init->shape());
+        }
     }
 
     /// (1) One walk from the root; a node with a device override places its whole subtree and the walk does not go inside it,
