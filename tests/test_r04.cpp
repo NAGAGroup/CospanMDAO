@@ -580,6 +580,9 @@ TEST_CASE("r04 devices: a tie's initializer runs on the tie's device, a free inp
         s.tie_inputs<DType::f32, 1>({"a.x", "b.x"}, "t", cs::shape(tr04::kN), dev);
         s.add_subsystem(cs::subsystem_desc<tr04::Gen>("g", 1.0f));
         s.promote<DType::f32, 1>("g.v", "gv");
+        s.add_subsystem(cs::subsystem_desc<tr04::Inc>("c"));
+        s.add_subsystem(cs::subsystem_desc<tr04::Inc>("d"));
+        s.tie_inputs<DType::f32, 1>({"c.x", "d.x"}, "u", cs::shape(tr04::kN));  // no device given: the default device
     });
     model.setup();
     const auto t = cs::detail::ModelAccess::instance(model, "t");
@@ -587,8 +590,13 @@ TEST_CASE("r04 devices: a tie's initializer runs on the tie's device, a free inp
     CHECK(*t->meta->init_device == dev);
     CHECK(t->meta->init_home() == dev);
     const auto v = cs::detail::ModelAccess::instance(model, "g.v");
-    CHECK_FALSE(v->meta->init_device.has_value());
+    REQUIRE(v->meta->init_device.has_value());  // set at its declaration
+    CHECK(*v->meta->init_device == v->device);
     CHECK(v->meta->init_home() == v->device);  // the free input's own device, unchanged by the promotion "gv"
+    const auto u = cs::detail::ModelAccess::instance(model, "u");
+    REQUIRE(u->meta->init_device.has_value());  // a tie without a device is on the default device; its members say nothing
+    CHECK(*u->meta->init_device == cs::detail::default_device());
+    CHECK(u->device == cs::detail::default_device());
     CHECK(cs::detail::ModelAccess::instance(model, "gv")->meta == v->meta);
     tr04::run(model);
     CHECK(tr04::out(model, "g.y") == tr04::filled(1.0f));
@@ -657,4 +665,65 @@ TEST_CASE("r04 listing: list_inputs and list_outputs walk the subtree in declara
     CHECK_FALSE(has(pouts, "py"));  // the alias belongs to the root
     CHECK(model.get_subsystem("g").list_inputs() == std::vector<std::string>{"g.v"});
     CHECK(model.get_subsystem("g").list_outputs() == std::vector<std::string>{"g.y"});
+}
+
+// =============================================================================================
+// dearm frees at once; transient neighbours share the placement
+// =============================================================================================
+TEST_CASE("r04 dearm: a transient producer feeds a transient reader through a promotion", "[r04][dearm][transient]") {
+    // A transient's data is released when it is dearmed after its turn. The producer's output must be held by something
+    // in scope to reach a transient reader: its promotion, which lives on the (eternal) root.
+    const cs::property_list tr{cs::property::transient{}};
+    cs::Model               model = tr04::make([tr](cs::System& s) {
+        s.add_subsystem(tr, cs::subsystem_desc<tr04::Gen>("a", 1.0f));
+        s.add_subsystem(tr, cs::subsystem_desc<tr04::Inc>("b"));
+        s.add_subsystem(cs::subsystem_desc<tr04::Inc>("s"));
+        s.promote<DType::f32, 1>("a.y", "ay");
+        s.connect("ay", "b.x");
+        s.connect("b.y", "s.x");
+    });
+    model.setup();
+    for (int k = 1; k <= 3; ++k) {
+        INFO("run " << k);
+        tr04::run(model);
+        CHECK_FALSE(cs::detail::ModelAccess::in_scope(model, "a"));
+        CHECK_FALSE(cs::detail::ModelAccess::in_scope(model, "b"));
+        CHECK(cs::detail::ModelAccess::instance(model, "a.y")->data == nullptr);  // the producer's own holder released it
+        CHECK(cs::detail::ModelAccess::instance(model, "ay")->data != nullptr);   // the promotion holds it
+        CHECK(tr04::out(model, "s.y") == tr04::filled(3.0f));                    // 1 -> 2 -> 3
+    }
+}
+
+TEST_CASE("r04 dearm: A transient, B eternal, C transient: A and C release their own data at once, B's placements stay", "[r04][dearm][transient]") {
+    const cs::property_list tr{cs::property::transient{}};
+    cs::Model               model = cs::create_model<tr04::TopFn>(cst::pooled_config(), std::function<void(cs::System&)>{[tr](cs::System& s) {
+        s.add_subsystem(tr, cs::subsystem_desc<tr04::Gen>("a", 1.0f));
+        s.add_subsystem(cs::subsystem_desc<tr04::Inc>("b"));
+        s.add_subsystem(tr, cs::subsystem_desc<tr04::Inc>("c"));
+        s.connect("a.y", "b.x");
+        s.connect("b.y", "c.x");
+    }});
+    model.setup();
+    std::size_t steady = 0;
+    for (int k = 1; k <= 3; ++k) {
+        INFO("run " << k);
+        tr04::run(model);
+        CHECK_FALSE(cs::detail::ModelAccess::in_scope(model, "a"));
+        CHECK(cs::detail::ModelAccess::in_scope(model, "b"));
+        CHECK_FALSE(cs::detail::ModelAccess::in_scope(model, "c"));
+        // A's own data (its free input v) and C's own data (its output y) are released; so are the holders A and C had of the
+        // neighbours' variables. What B holds stays: a.y (= b.x) and b.y (= c.x), a node each, whoever else shared them.
+        CHECK(cs::detail::ModelAccess::instance(model, "a.v")->data == nullptr);
+        CHECK(cs::detail::ModelAccess::instance(model, "a.y")->data == nullptr);
+        CHECK(cs::detail::ModelAccess::instance(model, "c.y")->data == nullptr);
+        CHECK(cs::detail::ModelAccess::instance(model, "c.x")->data == nullptr);
+        CHECK(cs::detail::ModelAccess::instance(model, "b.x")->data != nullptr);
+        CHECK(cs::detail::ModelAccess::instance(model, "b.y")->data != nullptr);
+        const std::size_t now = cst::pool_in_use(model);  // memory_report: the pool bytes in use
+        CHECK(now == 2 * cst::pool_node_bytes + cst::solo_launch_bytes(3));  // b.x, b.y and the three components' launch arrays
+        if (k == 1) steady = now;
+        else CHECK(now == steady);
+        CHECK(tr04::out(model, "b.y") == tr04::filled(2.0f));
+        CHECK_THROWS_AS((model.view_output<DType::f32, 1>("c.y")), std::logic_error);
+    }
 }

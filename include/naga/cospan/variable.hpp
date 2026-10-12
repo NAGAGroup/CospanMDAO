@@ -527,18 +527,11 @@ public:
         return best->first;
     }
 
-    /// Where this variable's initializer runs (r04, Phase 6): the tie's device for a tied input; else the device the free
-    /// input was declared on (promotions share the variable and keep it); else, for a variable with no input, its first
-    /// instance's. There is no "busiest device" fallback.
-    sycl::device init_home() const {
-        if (init_device) return *init_device;
-        for (const auto& w : instances)
-            if (const std::shared_ptr<Instance> s = w.lock())
-                if (kind_of(*s) == IOKind::input) return device_of(*s);
-        for (const auto& w : instances)
-            if (const std::shared_ptr<Instance> s = w.lock()) return device_of(*s);
-        return default_device();
-    }
+    /// Where this variable's initializer runs: `init_device`. A tie alias gets it from the tie call (the device passed, else the
+    /// default device); a free input port gets it at its declaration (its own device, kept in step with set_device; a
+    /// promotion shares the variable and changes nothing). The members' devices say nothing about a tie's. No fallbacks: a
+    /// variable with none has no free input, is never initialized, and answers the default device.
+    sycl::device init_home() const { return init_device ? *init_device : default_device(); }
 
     // ---- containers ----------------------------------------------------------------------------------
     /// A new EMPTY, unbound data of this variable's type for `key`.

@@ -150,7 +150,6 @@ struct ModelMeta {
     std::set<std::string>                  warned_cycles;
     std::vector<std::weak_ptr<VarMeta>>    pending;      ///< variables to visit at the start of the next run
     std::unordered_set<const VarMeta*>     pending_set;  ///< dedupe
-    std::vector<Node*>                     release_later;  ///< nodes dearmed this run: their data is released when the run ends
 
     // ---- names -----------------------------------------------------------------------
     /// The full resolved name of `local` under `parent`: the root ("") adds no dot. Names are never parsed.
@@ -329,7 +328,12 @@ inline void apply_device_node(Node& n, const sycl::device& d) {
         if (!inst) continue;
         inst->device = d;
         inst->refresh_container();  // the container of the new placement
-        if (inst->role == Role::tie && inst->kind == IOKind::input && inst->meta->init_device) inst->meta->init_device = d;
+        // A tie alias moves its initializer with it. A free input port moves its own (a port that is a member of a tie has the
+        // tie's variable, which keeps the tie's device; a promotion changes nothing).
+        if (inst->kind == IOKind::input && inst->meta->init_device) {
+            if (inst->role == Role::tie) inst->meta->init_device = d;
+            else if (inst->role == Role::port && !inst->meta->tied_input) inst->meta->init_device = d;
+        }
     }
 }
 inline void apply_device_subtree(Node& root, const sycl::device& d) {

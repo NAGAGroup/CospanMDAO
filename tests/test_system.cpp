@@ -770,15 +770,16 @@ public:
 };
 
 // ---- lifetime fixtures ---------------------------------------------------------------------
-/// p (transient Src) -> t (transient Axpb, y = 2 x + 1) -> sink (plain Axpb): t.y is eternal (the sink answers -1);
-/// p.y and t.x come into scope and go out of it with every run.
+/// p (transient Src) -> t (transient Axpb, y = 2 x + 1) -> sink (plain Axpb). p.y reaches t through its promotion "py",
+/// which the (eternal) root holds; t.y is held by the sink.
 class TransChain : public cs::System {
 public:
     void setup() override {
         add_subsystem(kTransient, cs::subsystem_desc<Src>("p"));
         add_subsystem(kTransient, cs::subsystem_desc<Axpb>("t", 2.0f, 1.0f));
         add_subsystem(cs::subsystem_desc<Axpb>("sink", 1.0f, 0.0f));
-        connect("p.y", "t.x");
+        promote<DType::f32, 1>("p.y", "py");
+        connect("py", "t.x");
         connect("t.y", "sink.x");
     }
 };
@@ -2596,10 +2597,10 @@ TEST_CASE("alias: a tie alias inside a transient subsystem is released and the p
 // =============================================================================================
 // 6d. lifetime by counting
 // =============================================================================================
-TEST_CASE("lifetime: a bare transient producer and a transient reader are deleted every run, values right on run 2", "[system][lifetime]") {
+TEST_CASE("lifetime: a bare transient producer feeds a transient reader through a promotion, values right on run 2", "[system][lifetime]") {
     cs::Model model = cs::create_model<tsys::TransChain>(cst::pooled_config());
     model.setup();
-    std::size_t steady = 0;  // the pool in use after the first run: t.y (= sink.x) and sink.y, a node each
+    std::size_t steady = 0;  // the pool in use after the first run: p.y (held by "py"), t.y (= sink.x) and sink.y, a node each
     for (int run = 1; run <= 3; ++run) {
         INFO("run " << run);
         model.run();
@@ -2609,7 +2610,7 @@ TEST_CASE("lifetime: a bare transient producer and a transient reader are delete
         CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "sink.y")) == tsys::iota_plus(1.0f, tsys::kLen, 2.0f, 1.0f));
         if (run == 1) {
             steady = pool_in_use(model);
-            CHECK(steady == 4 * cst::pool_node_bytes + cst::solo_launch_bytes(3));  // and the sink's a, b and launch arrays
+            CHECK(steady == 5 * cst::pool_node_bytes + cst::solo_launch_bytes(3));  // and the sink's a, b and launch arrays
         } else {
             CHECK(pool_in_use(model) == steady);
         }
@@ -2853,8 +2854,12 @@ public:
         add_subsystem(tsys::kTransient, cs::subsystem_desc<tsys::Axpb>("t", 2.0f, 1.0f));
         add_subsystem(tsys::kTransient, cs::subsystem_desc<tsys::Axpb>("u", 1.0f, 0.5f));
         add_subsystem(cs::subsystem_desc<tsys::Axpb>("sink", 1.0f, 0.0f));
-        connect("p.y", "t.x");
-        connect("t.y", "u.x");
+        // A transient's data goes when it is dearmed after its turn. What a later transient reads must be held by
+        // something that stays in scope: promote it, and connect the promotion.
+        promote<DType::f32, 1>("p.y", "py");
+        promote<DType::f32, 1>("t.y", "ty");
+        connect("py", "t.x");
+        connect("ty", "u.x");
         connect("u.y", "sink.x");
     }
 };
@@ -2874,7 +2879,7 @@ TEST_CASE("lifetime: a variable survives its producer being deleted, through an 
     }
 }
 
-TEST_CASE("lifetime: a transient producer feeding a transient reader in the same forward", "[system][lifetime][transient]") {
+TEST_CASE("lifetime: a chain of transients keeps its data through promotions", "[system][lifetime][transient]") {
     cs::Model model = cs::create_model<tsys3::TransThree>(cst::pooled_config());
     model.setup();
     std::size_t steady = 0;  // the pool in use after the first run
@@ -2882,13 +2887,13 @@ TEST_CASE("lifetime: a transient producer feeding a transient reader in the same
         INFO("run " << run);
         model.run();
         model.wait();
-        // built at the start of the forward and deleted at its end: all three exist for the whole forward
+        // each transient is rearmed before its own turn and dearmed right after it
         CHECK_FALSE(cs::detail::ModelAccess::in_scope(model, "p"));
         CHECK_FALSE(cs::detail::ModelAccess::in_scope(model, "t"));
         CHECK_FALSE(cs::detail::ModelAccess::in_scope(model, "u"));
         CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "sink.y")) == tsys::iota_plus(1.0f, tsys::kLen, 2.0f, 1.5f));
         if (run == 1)
-            steady = pool_in_use(model);  // only u.y, held by the sink, outlives the forward
+            steady = pool_in_use(model);  // p.y and t.y (held by their promotions) and u.y (held by the sink) outlive the forward
         else
             CHECK(pool_in_use(model) == steady);
     }

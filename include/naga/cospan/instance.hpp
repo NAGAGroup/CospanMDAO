@@ -312,6 +312,8 @@ inline void adopt_new_meta(const std::shared_ptr<Instance>& inst, DType dt, int 
     inst->meta->def_counts = inst->def_counts;
     inst->meta->add_instance(inst);
     inst->refresh_container();  // its (still default) placement; refreshed again when the device or kind is set
+    // A free input initializes on the device it was declared on (set_device keeps this in step: apply_device_node).
+    if (inst->kind == IOKind::input) inst->meta->init_device = inst->device;
 }
 
 /// The caller owns the returned instance (a component keeps its ports; a System its aliases).

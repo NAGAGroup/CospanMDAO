@@ -476,7 +476,6 @@ public:
         ++s.rt.forward;
         detail::materialize_pending(*s.meta, s.rt);
         walk(*s.meta, s.rt);
-        detail::release_dearmed(*s.meta);
     }
 
     /// queue.wait_and_throw() on both queues. OPTIONAL: for "everything I submitted is done" and to surface

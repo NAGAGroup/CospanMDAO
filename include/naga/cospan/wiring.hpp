@@ -403,7 +403,7 @@ std::shared_ptr<Instance> build_tie_alias(const WiringSite& site, const char* ve
     std::vector<DimRecord>                  dims = tie_dims<Rank>(site, verb, spec, ragged, counts);
     std::shared_ptr<VarMeta> meta = make_var_meta(DT, Rank, dims, ragged);
     meta->def_counts              = counts;
-    meta->init_device             = device;
+    meta->init_device             = device.value_or(default_device());  // the tie's device: the one passed, else the default
     const bool input              = kind == IOKind::input;
     std::shared_ptr<Instance> alias = make_alias_instance(DT, Rank, std::move(name), declarer, kind,
                                                           Role::tie, std::move(dims), /*can_source=*/!input,
