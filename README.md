@@ -24,8 +24,8 @@ formalism for composing open systems along shared boundaries, and *MDAO* credits
 - **Shapes.** A component says per dimension only "specified" or `cs::unspecified`. A shape comes from a connection, an
   initializer, a producer's `pre_forward()` (`set_shape`), or a System's `shape_hook`.
 - **Run.** `Model::run()` enqueues one run and returns. Kernels are ordered by events, never by queue order, so
-  independent work overlaps. Run policy (`run_n`, `do_once`, `transient`) belongs to the parent, which deletes finished
-  children and can `rearm` them.
+  independent work overlaps. Run policy (`run_n`, `do_once`, `transient`) is set on a subsystem; a finished
+  subsystem goes out of scope and releases its data, and `Model::rearm_subsystem` brings it back.
 - **Host access.** `Model::update_input` is the only write; `view_output` gives a host view of a result after a run, and
   `sync()` makes it current.
 - **Memory.** One [SlabKit](https://github.com/NAGAGroup/SlabKit) pool per device, sized by you, with a counted OS fallback.
@@ -77,7 +77,7 @@ int main() {
     model.update_input("a.x", cs::init::from_host(std::vector<float>{1, 2, 3, 4}));  // supplies a.x and its shape
     model.run();                                         // enqueues and returns; the update is applied here
 
-    auto y = model.view_output<DType::f32, 1>("b.y");        // a view can be made any time, once its shape is known
+    auto y = model.view_output<DType::f32, 1>("b.y");        // views are available once the model is finalized (the first run does it)
     y.sync();                                                // wait for the data before reading
     // y.shape()[0] == 4, y[0] == 4.0f, y[3] == 16.0f
 }

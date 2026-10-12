@@ -63,8 +63,8 @@ More: [Connect, promote and tie](connect-promote-tie.md).
 
 - **Shapes and values.** Shape hooks can be used to size inputs and outputs, and input initializers to give free inputs their starting values. More: [Shapes and initialization](shapes-and-initialization.md).
 - **Order.** Subsystems are added producers first. A consumer added before its producer is read as a cycle, and a warning is printed. Which subsystems can run at the same time follows from the data. More: [Execution and synchronization](execution-and-synchronization.md).
-- **When and where subsystems run.** Run policies, rebuilding a subsystem, and which device a subsystem runs on. More: [Advanced](advanced.md).
+- **When and where subsystems run.** Run policies, rearming a subsystem, and which device a subsystem runs on. More: [Advanced](advanced.md).
 
-## pre_forward and post_forward
+## No forward of its own
 
-Like a component, a system can override `pre_forward()` and `post_forward()`, which run before and after each forward of the system. Both are optional.
+A system does no work and has no `pre_forward()` or `post_forward()`: it only groups subsystems and declares wiring. Work belongs to components. To bring a finished subsystem back into play, call `model.rearm_subsystem(path)` from `main` between runs.
