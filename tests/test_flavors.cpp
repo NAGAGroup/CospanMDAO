@@ -1013,8 +1013,10 @@ TEST_CASE("transient: a system_from group and a fused component release after th
     const auto base = cst::pool_in_use(model);
     // ... and the launch arrays of the eternal src (argument, pointer and geometry arrays), and its two scalar free inputs
     // (scale and offset: a node each).
-    CHECK(base == cst::pool_bytes_of(tfl::kLen * sizeof(float)) + 2 * cst::pool_node_bytes + cst::solo_launch_bytes(1));
-    CHECK(base == 3 * cst::pool_node_bytes + cst::solo_launch_bytes(1));
+    // r04: the components keep their launch arrays after they are dearmed (stages a, b; a fused group keeps its group arrays)
+    const std::size_t kept = fused ? cst::group_launch_bytes(2) : cst::solo_launch_bytes(2);
+    CHECK(base == cst::pool_bytes_of(tfl::kLen * sizeof(float)) + 2 * cst::pool_node_bytes + cst::solo_launch_bytes(1) + kept);
+    CHECK(base == 3 * cst::pool_node_bytes + cst::solo_launch_bytes(1) + kept);
     model.run();
     model.run();
     model.wait();

@@ -163,6 +163,7 @@ TEST_CASE("handles: get_input on an output and get_output on an input throw, nam
 TEST_CASE("views any time: a free initialized input shows its initial values after sync, before any forward", "[host_access][view]") {
     auto m = tha::ha_make([](cs::System& s) { s.add_subsystem(cs::subsystem_desc<tha::HaScale>("c")); });
     m.setup();
+    m.finalize();  // r04: views are available after finalize
     auto xv = m.get_input<DType::f32, 1>("c.x").view();  // no forward has run
     CHECK(xv.shape()[0] == 4);
     CHECK(tha::ha_values(xv) == tha::Floats{1, 2, 3, 4});
@@ -180,6 +181,7 @@ TEST_CASE("views any time: a view made after setup and before the first forward 
           "[host_access][view]") {
     auto m = tha::ha_make([](cs::System& s) { s.add_subsystem(cs::subsystem_desc<tha::HaScale>("c")); });
     m.setup();
+    m.finalize();  // r04: views are available after finalize
     auto yv = m.get_output<DType::f32, 1>("c.y").view();
     m.run();
     yv.sync();  // no wait(): sync waits on the host container's write list
@@ -189,6 +191,7 @@ TEST_CASE("views any time: a view made after setup and before the first forward 
 TEST_CASE("views any time: a view whose shape cannot be resolved yet throws and the model is unharmed", "[host_access][view][errors]") {
     auto m = tha::ha_make([](cs::System& s) { s.add_subsystem(cs::subsystem_desc<tha::HaMaxSize>("p")); });
     m.setup();
+    m.finalize();  // r04: views are available after finalize
     // p.y's size is set by its producer in pre_forward: before a run it is unknown
     tha::ha_throws([&] { (void)m.get_output<DType::f32, 1>("p.y").view(); }, {"p.y"});
     m.run();

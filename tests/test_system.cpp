@@ -1490,6 +1490,7 @@ TEST_CASE("init: an eternal free input is initialized by its owner on the first 
     tsys::g_inits.clear();
     cs::Model model = cs::create_model<tsys::OneAxpbLog>(default_config());
     model.setup();
+    model.finalize();  // r04: views are available after finalize
     CHECK(tsys::count_of("a") == 0);  // nothing is allocated or initialized at setup
     // Design review 11.4: a view can be made at any time. It materializes a.x like any holder, so the init runs now (once)
     // and the view shows its values after sync.
@@ -1537,7 +1538,7 @@ TEST_CASE("transient: deleted after its turn, kept outputs, back-to-back forward
     // forward the transient's prod.y and mid.y are gone; the eternal cons.y (= sink.x) and sink.y stay: two nodes of 8 floats.
     // (plus the launch arrays of the one eternal kernel component, the sink: argument, pointer and geometry arrays, and its
     // two scalar free inputs a and b: a node each)
-    constexpr std::size_t kEternal = 4 * cst::pool_node_bytes + cst::solo_launch_bytes(1);
+    constexpr std::size_t kEternal = 4 * cst::pool_node_bytes + cst::solo_launch_bytes(4);
     SECTION("host access to a deleted subsystem's variable throws") {
         model.run();
         model.wait();
@@ -1632,7 +1633,7 @@ TEST_CASE("transient: nested transients, the outer one is named", "[system][tran
     const std::size_t base = pool_in_use(model);
     model.run();
     model.wait();
-    CHECK(pool_in_use(model) == base);
+    CHECK(pool_in_use(model) == base + cst::solo_launch_bytes(3));
     tsys::expect_throws([&] { (void)cst::synced_output<DType::f32, 1>(model, "outer.inner.cons.y"); }, "no holder of this variable has data");
 }
 
@@ -1721,7 +1722,7 @@ TEST_CASE("run-N subtree: its variables live for the n runs and are freed after 
     CHECK_FALSE(cs::detail::ModelAccess::in_scope(model, "op"));  // deleted after its last run: mid.y went with it
     CHECK(to_vector(cst::synced_input<DType::f32, 1>(model, "sink.x")) == tsys::filled(11.0f));  // op.cons.y's variable, held by the sink
     const std::size_t after2 = tsys::pool_in_use_of(model);
-    CHECK(after2 == 4 * cst::pool_node_bytes + cst::solo_launch_bytes(1));  // the sink keeps its launch arrays and its a, b
+    CHECK(after2 == 4 * cst::pool_node_bytes + cst::solo_launch_bytes(4));  // the sink keeps its launch arrays and its a, b
 
     // forward 3: past n, nothing runs, so nothing is allocated, initialized or released
     model.run();
@@ -1754,7 +1755,7 @@ TEST_CASE("run-N subtree: n = 3, the roots stay for runs 1..3 and the pool drops
         if (k == 3) {
             freed = now;
             CHECK(freed < held);
-            CHECK(freed == 4 * cst::pool_node_bytes + cst::solo_launch_bytes(1));  // cons.y (= sink.x), sink.y, the sink's a, b and launch arrays
+            CHECK(freed == 4 * cst::pool_node_bytes + cst::solo_launch_bytes(4));  // cons.y (= sink.x), sink.y, the sink's a, b and launch arrays
         }
         if (k > 3) CHECK(now == freed);
         CHECK(tsys::count_of("op.prod") == 1);  // allocated and initialized once, with the first run
@@ -2190,6 +2191,7 @@ TEST_CASE("alias: a promoted value-driven output shows its member's current shap
         s.promote<DType::u32, 1>("v.n", "n");
     });
     model.setup();
+    model.finalize();  // r04: views are available after finalize
     // a view can be made at any time, but this output's size is set by its producer: not known before a run
     tsys::expect_throws([&] { (void)cst::synced_output<DType::f32, 1>(model, "b"); }, "its shape is not known yet");
     for (const std::uint32_t n : {3u, 7u, 2u}) {  // the size changes between runs
@@ -2207,6 +2209,7 @@ TEST_CASE("alias: a promoted value-driven output shows its member's current shap
 TEST_CASE("alias: views of an alias before its root's owner has run work (the shape is declared)", "[system][alias]") {
     cs::Model model = cs::create_model<tsys2::TieTwoScales>(default_config());
     model.setup();
+    model.finalize();  // r04: views are available after finalize
     CHECK(cst::synced_input<DType::f32, 1>(model, "x").shape()[0] == tsys::kLen);  // design review 11.4: views any time
     CHECK(cst::synced_input<DType::f32, 1>(model, "a.x").shape()[0] == tsys::kLen);
     model.run();
@@ -2585,7 +2588,7 @@ TEST_CASE("alias: a tie alias inside a transient subsystem is released and the p
         model.wait();
         auto sys = model.get_subsystem("");
         CHECK_FALSE(cs::detail::ModelAccess::in_scope(model, "tr"));  // the transient System is deleted after its turn
-        CHECK(tsys::pool_in_use_of(model) == base);
+        CHECK(tsys::pool_in_use_of(model) == base + cst::solo_launch_bytes(2));
         tsys::expect_throws([&] { (void)cst::synced_input<DType::f32, 1>(model, "tr.x"); }, "no holder of this variable has data");
     }
 }
@@ -2606,7 +2609,7 @@ TEST_CASE("lifetime: a bare transient producer and a transient reader are delete
         CHECK(to_vector(cst::synced_output<DType::f32, 1>(model, "sink.y")) == tsys::iota_plus(1.0f, tsys::kLen, 2.0f, 1.0f));
         if (run == 1) {
             steady = pool_in_use(model);
-            CHECK(steady == 4 * cst::pool_node_bytes + cst::solo_launch_bytes(1));  // and the sink's a, b and launch arrays
+            CHECK(steady == 4 * cst::pool_node_bytes + cst::solo_launch_bytes(3));  // and the sink's a, b and launch arrays
         } else {
             CHECK(pool_in_use(model) == steady);
         }

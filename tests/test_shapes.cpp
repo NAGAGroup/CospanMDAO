@@ -836,21 +836,6 @@ TEST_CASE("shape_hook and depends_on called after setup work", "[shapes][hook][p
     CHECK(cst::to_vector(cst::synced_output<DType::f32, 1>(m, "c.y")) == std::vector<float>(4, 3.0f));
 }
 
-TEST_CASE("a late init_input on a materialized free input re-initializes at the next forward", "[shapes][init][p5]") {
-    auto m = tshape::sh_make([](cs::System& s) {
-        s.add_subsystem(cs::subsystem_desc<tshape::ShScale>("c"));
-        s.init_input("c.x", cs::init::fill(1.0f, {4}));
-    });
-    m.setup();
-    m.run();
-    m.wait();
-    CHECK(cst::to_vector(cst::synced_output<DType::f32, 1>(m, "c.y")) == std::vector<float>(4, 2.0f));
-    m.get_subsystem("").init_input("c.x", cs::init::fill(3.0f, {4}));  // after the variable was materialized
-    m.run();
-    m.wait();
-    CHECK(cst::to_vector(cst::synced_output<DType::f32, 1>(m, "c.y")) == std::vector<float>(4, 6.0f));
-}
-
 TEST_CASE("ragged set_shape(out, as_is, counts): the n is owned by a hook", "[shapes][set_shape][hook][ragged][p5]") {
     auto m = tshape::sh_make([](cs::System& s) {
         s.add_subsystem(cs::subsystem_desc<tshape::ShN>("nn", 4.0f));

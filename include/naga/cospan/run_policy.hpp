@@ -116,11 +116,21 @@ inline void dearm_subtree(ModelMeta& m, Node& root) {
         n->in_scope = false;
         for (const std::weak_ptr<Instance>& w : n->holders)
             if (const std::shared_ptr<Instance> inst = w.lock()) {
-                inst->dearmed = true;
-                inst->data.reset();
+                inst->dearmed = true;  // the data goes at the end of the run (release_dearmed): a later node of this run may still read it
             }
+        m.release_later.push_back(n);
         for (Node* c : n->children) stack.push_back(c);
     }
+}
+
+/// The end of a run: the data of the holders of every node that is still out of scope is released (their variable metadata stays).
+inline void release_dearmed(ModelMeta& m) {
+    for (Node* n : m.release_later)
+        if (!n->in_scope)
+            for (const std::weak_ptr<Instance>& w : n->holders)
+                if (const std::shared_ptr<Instance> inst = w.lock())
+                    if (inst->dearmed) inst->data.reset();
+    m.release_later.clear();
 }
 
 /// Puts the subtree back in scope: policies rearmed, every holder given a container again, every variable pending.

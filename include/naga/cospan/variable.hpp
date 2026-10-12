@@ -340,6 +340,7 @@ class Instance;  // instance.hpp
 // What VarMeta needs to know of an instance, defined in instance.hpp (which includes this header).
 inline DataKey             key_of(const Instance& i);
 inline std::shared_ptr<DeviceDataBase> data_of(const Instance& i);  // the container the holder holds
+inline bool                is_dearmed(const Instance& i);            // the holder is out of scope (dearmed)
 inline void                refresh_container(Instance& i);           // fetch the holder's container for its key
 inline IOKind              kind_of(const Instance& i);
 inline bool                is_output_port(const Instance& i);
@@ -599,6 +600,8 @@ public:
     /// sets its shape) is materialized lazily, the first time a holder touches it.
     bool shape_resolvable() const {
         if (shape.known) return true;
+        for (const DimRecord& r : definition)
+            if (r.how == DimRecord::How::hook) return false;  // a hook sets it when it runs, in the walk
         if (init && init->shape()) return true;
         return !definition.empty() &&
                std::all_of(definition.begin(), definition.end(), [](const DimRecord& r) { return r.how == DimRecord::How::fixed; });
@@ -952,7 +955,7 @@ public:
         const std::vector<std::shared_ptr<Instance>> insts = live_instances();
         if (insts.empty()) return;
         for (const auto& i : insts)
-            if (!i->dearmed) refresh_container(*i);  // every in-scope holder has the container of its own key
+            if (!is_dearmed(*i)) refresh_container(*i);  // every in-scope holder has the container of its own key
 
         if (!materialized) {
             first_materialization(rt, trigger);

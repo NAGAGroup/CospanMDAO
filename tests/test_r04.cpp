@@ -276,11 +276,12 @@ TEST_CASE("r04 names: dotted local names resolve by concatenation; the root adds
     cs::Model model = tr04::make([](cs::System& s) {
         s.add_subsystem(cs::subsystem_desc<tr04::Gen>("a.b", 2.0f));  // a dot inside a local name is allowed
         s.add_subsystem(cs::subsystem_desc<tr04::Pair>("s"));
-        s.connect("a.b.y", "s.c.x");  // wiring names are full-name strings, never parsed
+        s.add_subsystem(cs::subsystem_desc<tr04::Inc>("d"));
+        s.connect("a.b.y", "d.x");  // wiring names are full-name strings, never parsed
     });
     model.setup();
     tr04::run(model);
-    CHECK(tr04::out(model, "s.c.y") == tr04::filled(3.0f));
+    CHECK(tr04::out(model, "d.y") == tr04::filled(3.0f));
     CHECK(cs::detail::ModelAccess::subsystem(model, "")->path().empty());
     CHECK(cs::detail::ModelAccess::subsystem(model, "a.b")->path() == "a.b");
     CHECK(cs::detail::ModelAccess::subsystem(model, "s.g")->path() == "s.g");
@@ -476,7 +477,7 @@ TEST_CASE("r04 policies: an out-of-scope subtree is skipped whole, its policies 
     CHECK_NOTHROW(tr04::run(model));
     CHECK_NOTHROW(tr04::run(model));
     // s.c is the only holder of its output and it is out of scope: there is nothing to view
-    CHECK_THROWS_AS(model.view_output<DType::f32, 1>("s.c.y"), std::logic_error);
+    CHECK_THROWS_AS((model.view_output<DType::f32, 1>("s.c.y")), std::logic_error);
 }
 
 TEST_CASE("r04 policies: run_n, do_once and transient on leaves, and rearm", "[r04][policy][rearm]") {
@@ -624,7 +625,7 @@ TEST_CASE("r04 views: a view before finalize is a logic error", "[r04][views][er
     model.setup();
     tr04::expect_throws_all([&] { (void)model.view_output<DType::f32, 1>("p.c.y"); }, {"view_output", "only after finalize"});
     tr04::expect_throws_all([&] { (void)model.get_output<DType::f32, 1>("p.c.y").view(); }, {"only after finalize"});
-    CHECK_THROWS_AS(model.view_output<DType::f32, 1>("p.c.y"), std::logic_error);
+    CHECK_THROWS_AS((model.view_output<DType::f32, 1>("p.c.y")), std::logic_error);
     model.finalize();
     CHECK_NOTHROW((void)model.view_output<DType::f32, 1>("p.c.y"));  // the shape is fixed: it materializes the variable
 }

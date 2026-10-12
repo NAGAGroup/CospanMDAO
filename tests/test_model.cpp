@@ -760,10 +760,11 @@ TEST_CASE("Lifecycle: errors before setup, setup twice, moved-from", "[model][li
         auto m = cs::create_model<Top>(default_config());
         tmod::expect_throws([&] { (void)m.view_output<DType::f32, 1>("obj.f"); }, {"before setup"});
     }
-    SECTION("setup twice throws") {
+    SECTION("setup twice resets the model (r04)") {
         auto m = cs::create_model<Top>(default_config());
         m.setup();
-        tmod::expect_throws([&] { m.setup(); }, {"runs once"});
+        CHECK_NOTHROW(m.setup());
+        CHECK_NOTHROW(m.run());
     }
     SECTION("run on a moved-from Model throws; the moved-to Model runs") {
         auto m = cs::create_model<Top>(default_config());
@@ -961,6 +962,7 @@ TEST_CASE("Two devices: a producer on one, its consumer on the other", "[model][
 TEST_CASE("empty: a size-0 root is present and empty; its consumer runs as a no-op", "[model][init][empty]") {
     auto model = cs::create_model<tmod::EmptyTop>(default_config());
     model.setup();
+    model.finalize();  // r04: views are available after finalize
     // Design review, 11.4: a view can be made at any time; it fails only when the shape cannot be resolved yet. bins.bins is
     // sized by its producer in pre_forward, so before the first forward its shape is not known.
     tmod::expect_throws([&] { (void)model.view_output<DType::f32, 1>("bins.bins"); }, {"bins.bins", "not known yet"});

@@ -158,6 +158,7 @@ public:
 inline DataKey             key_of(const Instance& i) { return i.key(); }
 inline std::shared_ptr<DeviceDataBase> data_of(const Instance& i) { return i.data; }
 inline void                refresh_container(Instance& i) { i.refresh_container(); }
+inline bool                is_dearmed(const Instance& i) { return i.dearmed; }
 inline IOKind              kind_of(const Instance& i) { return i.kind; }
 inline bool                is_output_port(const Instance& i) { return i.kind == IOKind::output && i.role == Role::port; }
 inline std::string         path_of(const Instance& i) { return i.full_path(); }

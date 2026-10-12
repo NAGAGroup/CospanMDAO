@@ -842,7 +842,7 @@ TEST_CASE("ties_desc: errors", "[fused_groups][ties][errors]") {
         });
         tfg::expect_throws([&] { model.setup(); }, {"tie_outputs", "already tied"});
     }
-    SECTION("a tie of a tie: the owner ties the alias of the group") {
+    SECTION("a tie of a tie is allowed (r04): the owner ties the alias of the group") {
         cs::Model model = tfg::make([](cs::System& s) {
             s.add_subsystem(cs::fuse_components(
                 "f", cs::ties_desc({cs::tie_outputs<DType::f32, 1>({"a.y", "b.y"}, "y", cs::shape(12), cs::TieOutputsPolicy::allow_plain)}),
@@ -850,7 +850,7 @@ TEST_CASE("ties_desc: errors", "[fused_groups][ties][errors]") {
             s.add_subsystem(cs::subsystem_desc<tfg::TSlice>("g", 0.0f, 12.0f, 3.0f));
             s.tie_outputs<DType::f32, 1>({"f.y", "g.y"}, "z", cs::shape(12), cs::TieOutputsPolicy::allow_plain);
         });
-        tfg::expect_throws([&] { model.setup(); }, {"tie_outputs", "tying a tie is not allowed"});
+        CHECK_NOTHROW(model.setup());
     }
     SECTION("set_shape on a tied member") {
         cs::Model model = tfg::make([](cs::System& s) {
