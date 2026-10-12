@@ -76,6 +76,13 @@ Change notes (from Phase 2):
 - **Systems have no `pre_forward` / `post_forward`.** Rearm is `model.rearm_subsystem(path)`, called from `main` between runs.
 - **Run-policy override, direction.** An override is judged by the policy itself, not by who sets it. For lifetimes, an override may not shorten the lifetime the owning system set. Future policies define their own override conditions. This replaces options (a) and (b) in the open questions above.
 
+Change notes (from Phase 3):
+- **Reverse operations are removed.** Scope changes are handled by dearm and rearm (Phase 3).
+- **Rearm no longer reruns setup, and nothing is replayed.**
+- **Reset** clears the metadata object and runs `setup()` again.
+
+These replace the Phase 1 decisions on reverse operations, outside declarations kept for replay, and rearm rerunning setup.
+
 ### Phase 2: Names and the metadata object
 First pass, 2026-10-11. Inventory: 1, 3, 19, 32, 33.
 
@@ -125,10 +132,37 @@ Open questions:
 - **Strings or interned ids** for the paths off the hot path.
 - **Shape hooks:** setup-only or not.
 
+Change notes (from Phase 3):
+- **Out-of-scope holders.** Holders are not deleted. They release their device data and keep their variable metadata.
+- **Reverse operations are removed** in favor of dearm and rearm.
+
+These answer the open questions on out-of-scope holders and on reverse operations.
+
 ### Phase 3: Declarations and construction
-`add_subsystem`, factories, depth-first setup order; declaration sequence numbers; one declaration store with several indexes (by variable, by declarer, by subsystem touched); device placement and "the outer call wins", including edits after setup; helper-built systems (composed systems, fused groups). Inventory: 2, 4, 14, 34.
-- Decisions: none yet.
-- Open questions: none yet.
+First pass, 2026-10-11. Inventory: 2, 4, 14, 34.
+
+Decisions (first pass):
+- **`add_subsystem`** constructs the child from its descriptor and registers it before its `setup()` runs:
+  - it gives the child its resolved name and the metadata pointer;
+  - it adds the child's tree node and its name → descriptor entry;
+  - it appends the child to the execution list if it is a leaf, or to the systems list if it is a system.
+
+  It then runs the child's `setup()` immediately (depth-first). Declaration order is execution order.
+- **No stored factories.**
+- **Declaration order wins.** There are no sequence numbers. Declarations are never replayed, so their order plays out only once: during setup, and from `main` before the first run.
+- **Dearm and rearm.** Every kind of subsystem has both.
+  - **The walk.** When a run policy takes a subsystem out of scope, the model starts at its tree node and walks the subtree depth-first, parent before children, calling dearm. Rearm walks the same way.
+  - **Dearm.** A leaf disables its execution entry and has its holders release their device data. A system has its aliases release their device data.
+  - **Holders are not deleted.** They keep their variable metadata, so variable metadata lives until reset, and no separate variable map is needed.
+  - **Rearm** re-enables the entries. Holders materialize again the next time they are touched, as on the first run. A variable whose data was all freed runs its initializer again: a free input re-enters the eager initializer list (Phase 6).
+  - **Nothing is replayed.** The connections, the merged shape definitions and the initializers are already in the variable metadata. Hooked dimensions recompute, or reuse the last run's.
+- **Devices.** `set_device` stays: it lets someone who uses a system override the devices its author chose. The outer call wins, and devices are fixed at finalize. As a result, the check that a tie's output members are all on one device runs at finalize, not every run.
+- **Fused groups.** The group is the leaf. Its stages' inputs and outputs are registered by full name, as they are now.
+- **Helper-built systems** (`ComposedSystem`, `FusedGroup`) still build through `setup()`, unchanged.
+
+Open questions:
+- Where depends_on goes when the dependent subsystem is a system (deferred to Phase 5).
+- How `set_device` is applied in the flat design: walking the tree, or recorded per subsystem and resolved at finalize.
 
 ### Phase 4: Variables and wiring
 Variable metadata and its representations; connect, promote and tie in the new store (which merge rules carry over); ties of ties and which level wins; shape definitions (fixed at the first run); aliases; marks; cycles from list position. Inventory: 12, 13, 18, 19, 20, 21.
