@@ -526,7 +526,18 @@ public:
         return best->first;
     }
 
-    sycl::device pick_init_device() const { return init_device ? *init_device : busiest_device(); }
+    /// Where this variable's initializer runs (r04, Phase 6): the tie's device for a tied input; else the device the free
+    /// input was declared on (promotions share the variable and keep it); else, for a variable with no input, its first
+    /// instance's. There is no "busiest device" fallback.
+    sycl::device init_home() const {
+        if (init_device) return *init_device;
+        for (const auto& w : instances)
+            if (const std::shared_ptr<Instance> s = w.lock())
+                if (kind_of(*s) == IOKind::input) return device_of(*s);
+        for (const auto& w : instances)
+            if (const std::shared_ptr<Instance> s = w.lock()) return device_of(*s);
+        return default_device();
+    }
 
     // ---- containers ----------------------------------------------------------------------------------
     /// A new EMPTY, unbound data of this variable's type for `key`.
@@ -570,6 +581,28 @@ public:
     /// until its initializer has run again (docs/design-review-2026-10-03.md, section 5).
     bool is_stale() const { return !is_materialized() || stale_; }
     void mark_stale() { stale_ = true; }
+
+    /// Some placement still holds bound data. A variable all of whose holders were dearmed has none.
+    bool has_live_data() const {
+        for (const auto& p : data)
+            if (const std::shared_ptr<DeviceDataBase> b = p.second.lock())
+                if (b->bound()) return true;
+        return false;
+    }
+    /// All the data was freed (dearm): the next materialization is a first one again (a free input initializes again).
+    void forget_materialization() {
+        materialized = false;
+        stale_       = true;
+    }
+    /// The start-of-run pass can size this variable now: every dimension is fixed by the definition, or the shape is
+    /// already known, or the initializer carries its own shape. Anything else (a hooked dimension, an output whose producer
+    /// sets its shape) is materialized lazily, the first time a holder touches it.
+    bool shape_resolvable() const {
+        if (shape.known) return true;
+        if (init && init->shape()) return true;
+        return !definition.empty() &&
+               std::all_of(definition.begin(), definition.end(), [](const DimRecord& r) { return r.how == DimRecord::How::fixed; });
+    }
 
     // ---- the shape: definition, actual shape, and who may change it (section 10) ----------------------
     /// How a dimension was declared, for messages.
@@ -1025,9 +1058,10 @@ private:
         }
     }
 
-    /// Where the initializer runs: the tie's init_device, else the holder that asked, else the busiest device (a
-    /// device-kind container preferred on it).
+    /// Where the initializer runs: the tie's device, else the device the free input was declared on (init_home), a
+    /// device-kind container preferred on it.
     std::shared_ptr<Data> pick_init_container(const std::vector<std::shared_ptr<Data>>& live, const Instance* trigger) const {
+        (void)trigger;
         const auto on = [&](const sycl::device& dev) -> std::shared_ptr<Data> {
             std::shared_ptr<Data> any;
             for (const auto& d : live) {
@@ -1037,13 +1071,7 @@ private:
             }
             return any;
         };
-        if (init_device)
-            if (std::shared_ptr<Data> d = on(*init_device)) return d;
-        if (trigger != nullptr) {
-            const std::shared_ptr<Data> t = std::static_pointer_cast<Data>(data_of(*trigger));
-            if (t && std::find(live.begin(), live.end(), t) != live.end()) return t;
-        }
-        if (std::shared_ptr<Data> d = on(busiest_device())) return d;
+        if (std::shared_ptr<Data> d = on(init_home())) return d;
         return live.empty() ? nullptr : live.front();
     }
 

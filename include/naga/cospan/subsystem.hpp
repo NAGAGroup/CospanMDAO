@@ -1,31 +1,23 @@
 #pragma once
 
 // =============================================================================
-// naga/cospan/subsystem.hpp — the owner/child contract
+// naga/cospan/subsystem.hpp — the contract between the model's tree and what it holds
 // =============================================================================
 //
 // Standalone: it needs SYCL, SlabKit and the standard library, and nothing from CoSpan (the types it names are
-// forward-declared). A Subsystem is what a System owns: a Component (the leaf that does work) or a System (the
-// node that orders it).
+// forward-declared). A Subsystem is a node of the model's tree: a Component or a FusedGroup (a LEAF: the node that does
+// work) or a System (the node that groups leaves and declares wiring).
 //
-// THE OWNER/CHILD CONTRACT. The OWNER (a System) builds a child, gives it its name, its dotted path and
-// itself as owner (the private fields, set through friendship), and only then asks it to declare itself. The
-// child never reaches back: it holds no pointer to its owner's data, and the owner holds the child alone (by
-// unique_ptr, in a slot).
+// r04 (docs/spec/revisions/r04-2026-10-11-flat-model-metadata.md). The model owns every subsystem object through its
+// ModelMeta (model_meta.hpp). A subsystem is given its FULL RESOLVED NAME (the root's is "") and a pointer to the
+// metadata when it is registered, BEFORE its setup runs; it holds no pointer to a parent. Names are never parsed.
 //
-// TWO SETUP PASSES (docs/design-review-2026-10-03.md, section 2):
-//   1. setup: run_setup() declares the child's inputs, outputs, aliases and children. It is recursive through
-//      add_subsystem: each add_subsystem builds the child and runs its setup before it returns.
-//   2. finalize: the Model collects the marks. A Subsystem has no part in it.
-// NOTHING IS PASSED DOWN AT SETUP: no context, no queue, no device. A device reaches a subtree only through
-// set_device, which the factory (System::add_subsystem) calls after the child's setup (section 2), and the outer
-// call wins.
-//
-// THE FORWARD. The three steps and the event getter below belong to section 3 of the record and to r02 section 3.
-// They are implemented by components and by Systems; deleting a child waits on nothing (its containers free after their own events).
+// A leaf has ONE forward(rt): the run's tree walk calls it. A System has only setup() (run_setup here) and the
+// declaration calls; it never gets a forward.
 
 #include <memory>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -42,61 +34,56 @@ class System;
 class Model;
 
 namespace detail {
-class Instance;  // instance.hpp
-struct Runtime;  // runtime.hpp
+class Instance;    // instance.hpp
+struct Runtime;    // runtime.hpp
+struct ModelMeta;  // model_meta.hpp
+struct SubsystemAccess;
 }  // namespace detail
 
-/// The ONE contract between an owner and what it owns.
+/// The ONE contract between the model's tree and a node of it.
 class Subsystem {
 public:
     virtual ~Subsystem() = default;
     Subsystem(const Subsystem&)            = delete;
     Subsystem& operator=(const Subsystem&) = delete;
 
-    std::string_view   name() const noexcept { return name_; }   ///< in the owner's namespace
-    const std::string& path() const noexcept { return path_; }   ///< dotted from the root
-    const System*      owner() const noexcept { return owner_; } ///< null at the root
+    /// The full resolved name ("" for the root). `name()` and `path()` are the same string: messages and launch
+    /// descriptions use them.
+    const std::string& name() const noexcept { return name_; }
+    const std::string& path() const noexcept { return name_; }
 
-    // ---- setup (section 2) ---------------------------------------------------------
-    /// Declares this subsystem. Called once by its owner, after it was named and placed, before add_subsystem returns.
+    // ---- setup ---------------------------------------------------------------------
+    /// Declares this subsystem. Called once, after it was named and registered, before add_subsystem returns. It is
+    /// recursive through add_subsystem (depth-first).
     virtual void run_setup() = 0;
 
-    /// Places this subsystem on `d`: a component sets the device of each of its instances; a System sets the
-    /// device of each of its own aliases and calls this on each live child (section 2). The OUTER call always wins.
-    virtual void set_device(const sycl::device& d) = 0;
+    /// A leaf (a component or a fused group) does work and has a forward; a System does not.
+    virtual bool is_leaf() const noexcept = 0;
 
-    /// This subsystem's OWN instance by local name (a component's input or output, a System's alias), else null.
-    virtual std::shared_ptr<detail::Instance> find_instance(std::string_view name) const = 0;
+    // ---- the run (leaves only) -----------------------------------------------------
+    /// One forward: materialize the inputs, run pre_forward, materialize the outputs, point the wrappers, submit, record
+    /// the events, push to the other placements, run post_forward. Called by the model's tree walk for a leaf in scope.
+    virtual void forward(detail::Runtime& rt) {
+        (void)rt;
+        throw std::logic_error("naga::cospan: '" + name_ + "' is not a leaf; it has no forward");
+    }
 
-    /// Appends this subsystem's own instances (not its children's).
-    virtual void collect_instances(std::vector<std::shared_ptr<detail::Instance>>& out) const = 0;
+    /// A leaf: its launch event(s). What depends_on hands on. A System has none.
+    virtual std::vector<sycl::event> events() const { return {}; }
 
-    // ---- forward (section 3): implemented by components and Systems ----------
-    /// A component: materialize the inputs, run pre_forward, materialize the outputs, point the wrappers (design review,
-    /// section 10). A System: rebuild transient children, then pre_forward.
-    virtual void run_precompute(detail::Runtime& rt) = 0;
-    /// A component: submit its work. A System: call each child's forward in declaration order.
-    virtual void run_compute(detail::Runtime& rt) = 0;
-    /// A component: its postcompute work. A System: the same for its children.
-    virtual void run_postcompute(detail::Runtime& rt) = 0;
-
-    /// A component: its launch event(s). A System: its children's events plus its own push events. What depends_on
-    /// hands on.
-    virtual std::vector<sycl::event> events() const = 0;
-
-    /// depends_on: events added to every submission of this subsystem for ONE forward.
-    virtual void add_dependencies(std::span<const sycl::event> deps) = 0;
+    /// depends_on: events added to every submission of this leaf for ONE forward. A System ignores them.
+    virtual void add_dependencies(std::span<const sycl::event> deps) { (void)deps; }
 
 protected:
     Subsystem() = default;
 
-private:
-    friend class System;  // places its children
-    friend class Model;   // places the root
+    /// The metadata this subsystem is registered in (null before registration).
+    detail::ModelMeta* meta_ = nullptr;
 
-    std::string   name_;
-    std::string   path_;
-    const System* owner_ = nullptr;
+private:
+    friend struct detail::SubsystemAccess;  // the metadata names and binds what it registers
+
+    std::string name_;
 };
 
 }  // namespace naga::cospan
