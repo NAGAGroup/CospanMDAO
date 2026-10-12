@@ -295,9 +295,34 @@ Open questions:
 - **The API names** for clearing a policy, and for setting a policy on a system with each of the two modes.
 
 ### Phase 8: Host access, inspection and teardown
-Handles and the `get_subsystem` handle's API; views; update_input; memory_report; wait; diagnostics; destruction order. Inventory: 26, 27, 28.
-- Decisions: none yet.
-- Open questions: none yet.
+First pass, 2026-10-11. Inventory: 26, 27, 28.
+
+Decisions (first pass):
+- **Handles.**
+  - The model's own calls go through the root handle: `model.get_input`, `get_output`, the view calls, `update_input`, `list_inputs` and `list_outputs`.
+  - `get_subsystem(path)` returns a handle for any subsystem. It offers the same inspection calls: `get_input<DT, R>(name)`, `get_output<DT, R>(name)`, views, `update_input`, `list_inputs` and `list_outputs`.
+  - Inputs and outputs are resolved as `prefix + "." + name`.
+- **Listing.** `list_inputs` and `list_outputs` are offered on every handle, so the per-subsystem map of inputs and outputs comes back. Its exact form waits for the metadata-layout proposal (open questions).
+- **Wiring.** Only system handles accept wiring calls, and only before finalize: connect, promote, tie, marks, run policies, shape hooks and depends_on. A leaf handle (a component or a fused group) refuses them, because aliases belong to systems.
+- **Views.**
+  - Views can be made only after finalize.
+  - **No holder has data:** a view on a variable whose holders hold no data (all of them out of scope) is refused, with an error saying so.
+  - **Some holder has data:** the view joins the variable and copies from that holder, as it does today.
+- **Out-of-scope subsystems.** `get_input` and `get_output` on an out-of-scope subsystem still work, because the holders exist even though their data has been released.
+- **`update_input`** may be called at any time. On a connected input it keeps today's warning and has no effect.
+- **Reset invalidates handles.** We don't guard against stale handles. Like iterators after a vector resize, any handle held across a reset is invalid, and that is documented. A handle holds a weak pointer to what it refers to, so a call on an invalid handle throws instead of being undefined behavior.
+- **Views outlive the model.** A view keeps its variable's metadata and its host data, as it does today, and stays usable after a reset as a detached snapshot.
+- **Teardown order:**
+  1. the subsystem objects, and with them the holders and the device data (each free waits on its own events);
+  2. the metadata object;
+  3. the marks;
+  4. the pools;
+  5. the queues;
+  6. the context.
+- **Unchanged:** `memory_report()` and `wait()`. The cycle-warning set moves from the root system to the metadata object.
+
+Open questions:
+- **The metadata-object layout:** Jack plans to propose a change, which decides the form of the per-subsystem input and output maps.
 
 ### Phase 9: Fit check and migration
 Check against chunked systems (a range run N times), a backward pass (the list in reverse) and solver groups over cycles. Then the final API surface, the implementation order, and the migration of tests, examples and docs. Inventory: 35, 36.
