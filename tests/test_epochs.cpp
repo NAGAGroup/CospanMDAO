@@ -323,7 +323,7 @@ TEST_CASE("Views: a value-driven ragged output follows its driver", "[epoch][vie
     for (std::size_t i = 0; i < next.size(); ++i) CHECK(w.block(i).size() == static_cast<std::size_t>(next[i]));
 }
 
-TEST_CASE("Views: a deleted transient's variables cannot be viewed by path", "[epoch][view][transient]") {
+TEST_CASE("Views: a dearmed transient's variables cannot be viewed by path", "[epoch][view][transient]") {
     cs::Model m = cs::create_model<tep::TransTop>(default_config());
     m.setup();
     forward_and_wait(m);
@@ -336,8 +336,8 @@ TEST_CASE("Views: a deleted transient's variables cannot be viewed by path", "[e
         }
         INFO("thrown: " << what);
         CHECK(what != "<no exception>");
-        // The wording is System::instance_at's: "... does not exist right now (it was deleted)".
-        CHECK(what.find("was deleted") != std::string::npos);
+        // r04: the holder is found by name; its variable has no data (the node is out of scope).
+        CHECK(what.find("no holder of this variable has data") != std::string::npos);
     }
     // the eternal sink is still readable
     const auto v = synced_output<DType::f32, 1>(m, "sink.z");
