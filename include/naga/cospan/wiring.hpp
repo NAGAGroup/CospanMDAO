@@ -22,11 +22,10 @@
 //            last-declaration-wins rule (design review, section 9; a tie's own initializer replaces its members').
 //            A member's initializer is carried only when the alias has none.
 //   promote: the MEMBER's metadata wins: the promotion joins the member's variable directly.
-// One exception, in merge_into: when exactly one side already holds data (a rebuilt child rejoining live data),
-// that side's object survives, carrying the merged shape definition, and keeping its own
-// resolved shape, initializer, stale and materialized flags and data. A merge never touches stale flags or the data
-// of a placement that has some; it only moves HOLDERS: the survivor adopts the loser's containers for the keys it has
-// none for, and every holder of the loser switches to the survivor's container for its own key (Instance::rebind).
+// A merge never touches stale flags or the data of a placement that has some; it only moves HOLDERS: the survivor
+// adopts the loser's containers for the keys it has none for, and every holder of the loser switches to the survivor's
+// container for its own key (Instance::rebind). Declarations happen before the first run, so no variable holds data
+// when a merge happens; two materialized variables are still refused, as a guard.
 // "Holds data" below means the variable is materialized (VarMeta::materialized), not that a container exists:
 // every holder has an empty container from its declaration.
 //
@@ -214,21 +213,13 @@ inline constexpr const char* kBothMaterialized = "merging two materialized varia
 inline std::shared_ptr<VarMeta> merge_into(const WiringSite& site, std::shared_ptr<VarMeta> winner,
                                            std::shared_ptr<VarMeta> loser) {
     if (winner == loser) return winner;
-    const bool wm = winner->is_materialized();
-    const bool lm = loser->is_materialized();
-    if (wm && lm) wiring_fail(site, "merge", kBothMaterialized);
-    std::shared_ptr<VarMeta> survivor = winner;
-    std::shared_ptr<VarMeta> other    = loser;
-    if (lm) {  // a rebuilt child rejoining live data: its object survives, with the merged shape definition
-        survivor              = loser;
-        other                 = winner;
-        survivor->definition  = winner->definition;
-        survivor->def_counts  = winner->def_counts;
-    }
+    if (winner->is_materialized() && loser->is_materialized()) wiring_fail(site, "merge", kBothMaterialized);
+    const std::shared_ptr<VarMeta>& survivor = winner;
+    const std::shared_ptr<VarMeta>& other    = loser;
     survivor->adopt_containers(*other);  // a key the survivor has no container for takes the loser's (identity kept)
     for (const std::shared_ptr<Instance>& i : other->live_instances()) i->rebind(survivor);
     // The sticky marks of the loser stay true of the variable: a tie alias's variable that loses to a source is still a
-    // tie (no tie of a tie), a tied output still pushes through its alias, a cycle is still a cycle.
+    // tie, a tied output still pushes through its alias, a cycle is still a cycle.
     survivor->push_suppressed = survivor->push_suppressed || other->push_suppressed;
     survivor->tied_input      = survivor->tied_input || other->tied_input;
     survivor->tied_output     = survivor->tied_output || other->tied_output;
@@ -260,7 +251,7 @@ inline bool is_cycle(const WiringSite& site) {
     return site.src_order && site.dst_order && *site.src_order > *site.dst_order;
 }
 
-/// The merge of a connect (and of its replay): the source's variable wins. On a cycle the survivor is marked `cycle` and
+/// The merge of a connect: the source's variable wins. On a cycle the survivor is marked `cycle` and
 /// keeps the TARGET's initializer (and the device it runs on), which a plain connect drops; a survivor that already holds
 /// data keeps its own. Returns the survivor.
 inline std::shared_ptr<VarMeta> merge_connected(const WiringSite& site, const Instance& src, const Instance& dst,
@@ -540,7 +531,7 @@ inline void declare_init(const WiringSite& site, const std::shared_ptr<Instance>
     if (first_of_kind(v, IOKind::output) && !v.cycle) return;  // a cycle variable is connected and still has an initializer
     v.init = std::move(spec);
     // A declaration made after the variable holds data (System::init_input, legal anywhere) is stale-making, like
-    // Model::update_input: the variable initializes again at the next forward. (A replay does not re-initialize.)
+    // Model::update_input: the variable initializes again at the next forward.
     if (restale) v.mark_stale();
 }
 
