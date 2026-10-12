@@ -172,6 +172,9 @@ Open questions:
 - Where depends_on goes when the dependent subsystem is a system (deferred to Phase 5).
 - How `set_device` is applied in the flat design: walking the tree, or recorded per subsystem and resolved at finalize.
 
+Change notes (from Phase 6):
+- There is no separate eager initializer list. A rearmed free input whose data was freed is picked up by the start-of-run materialization pass (Phase 6). This replaces "re-enters the eager initializer list".
+
 ### Phase 4: Variables and wiring
 First pass, 2026-10-11. Inventory: 12, 13, 18, 19, 20, 21.
 
@@ -236,9 +239,25 @@ Open questions:
 - How finalize computes "the last producer of a source" when a source is a promotion or a tie alias. (The rule matches cycle detection in Phase 4.)
 
 ### Phase 6: Initialization and materialization
-The initializer list at the start of the first run; deferral when a shape is unknown; update_input; when variables are sized and allocated; host views made before the first run. Inventory: 15, 16, 17, 27. Likely to be pulled forward when the discussion needs it.
-- Decisions: none yet.
-- Open questions: none yet.
+First pass, 2026-10-11. Inventory: 15, 16, 17, 27.
+
+Decisions (first pass):
+- **No initializer list.** At the start of a run, before anything else is submitted, a materialization pass walks the variables. Inputs are the one special case: they are also initialized.
+  - **Shape known:** every variable whose shape is known has all its placements allocated up front, outputs included, so nothing is allocated in the middle of the run. A shape is known when the definition is fully specified, or when an initializer carries its own shape (for example `from_host` with a vector).
+  - **Unconnected inputs** (free inputs, promoted or not, and tie input aliases) are also initialized in the same pass when they can be materialized. The ones that can't be are skipped.
+  - **A variable whose shape isn't known yet,** for example a dimension owned by a shape hook, or an output whose producer sets its shape, is materialized the first time a holder touches it during the run. Today's lazy path survives for these alone.
+- **The default zero initializer is just an initializer.** Declaring an input without one declares it with the zero initializer, so no special case exists anywhere.
+- **The device that runs an initializer** comes from the merge rules:
+  - a tied input runs on the tie's device;
+  - a free input that isn't tied runs on the device its input was declared on. Promotions keep the same device.
+
+  The result is then copied to the variable's other placements. The "busiest device" fallback in today's code (`variable.hpp`, `pick_init_device`) is removed.
+- **`update_input`** marks the variable stale. The next run's pass initializes it again, in place, waiting on the previous run's readers. Several updates before a run collapse into the last one.
+- **A rearmed free input whose data was freed** is picked up by the same pass, because it is no longer materialized.
+- **Host views** can be made only after finalize. A view made between finalize and the first run may materialize and initialize its variable early, and that is fine.
+
+Open questions:
+- Whether the pass walks every variable on every run, or keeps a set of stale or unmaterialized variables to visit.
 
 ### Phase 7: Run policies, rearm and deletion
 Policy objects (when checked, what firing means, subtree reset); rearm of any path (rerun setup, replay outside declarations); override_run_policy (recorded, replayed or not); deletion (what leaves the maps, what stays); live data rejoining after a rebuild. Inventory: 22, 23, 24, 25, 17.
