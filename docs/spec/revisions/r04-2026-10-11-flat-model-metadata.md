@@ -83,6 +83,11 @@ Change notes (from Phase 3):
 
 These replace the Phase 1 decisions on reverse operations, outside declarations kept for replay, and rearm rerunning setup.
 
+Change notes (from Phase 4):
+- **Host views** can be made only after finalize. No variable is materialized before then, so two materialized variables can never be merged.
+- **Marks** may be declared after `setup()` and before finalize.
+- **`finalize()` does real work:** anything that needs the whole structure in place. The first such job is registering the tied-output pushes (Phase 4).
+
 ### Phase 2: Names and the metadata object
 First pass, 2026-10-11. Inventory: 1, 3, 19, 32, 33.
 
@@ -165,9 +170,33 @@ Open questions:
 - How `set_device` is applied in the flat design: walking the tree, or recorded per subsystem and resolved at finalize.
 
 ### Phase 4: Variables and wiring
-Variable metadata and its representations; connect, promote and tie in the new store (which merge rules carry over); ties of ties and which level wins; shape definitions (fixed at the first run); aliases; marks; cycles from list position. Inventory: 12, 13, 18, 19, 20, 21.
-- Decisions: none yet.
-- Open questions: none yet.
+First pass, 2026-10-11. Inventory: 12, 13, 18, 19, 20, 21.
+
+Decisions (first pass):
+- **Carried over unchanged** (wiring.hpp, variable.hpp):
+  - **The data model:** shared variable metadata, holders on it, and per-placement device data freed by the last holder.
+  - **The merge rules,** checked at the call before anything changes: on a connect the source's variable wins; on a tie the alias's wins; on a promote the member's wins.
+  - **Shape-definition merging:** unspecified absorbs specified, two specified values must agree, and a hooked dimension meets only an unspecified one.
+  - **The connect checks:** an input has at most one source; a ragged source cannot feed a dense input; dtype and rank must match; a hooked or tied input cannot be connected to, and a tied output cannot be connected from.
+  - **Aliases** (promotions, tie aliases) are holders owned by the system that declares them, registered by full name.
+- **Resolution.** Every wiring call resolves names through the metadata object, relative to the caller's handle, with one lookup per name. Deep paths, such as `a.b.c.x`, are allowed.
+- **No replay.** The merge exception for a rebuilt child rejoining live data is removed.
+- **When wiring is legal:** in `setup()`, and from `main` between `setup()` and finalize. The rules are the same either way.
+- **Marks** may be declared after `setup()` and before finalize.
+- **Shape definitions** are fixed at finalize.
+- **Two materialized variables can't merge.** Host views can be made only after finalize, so no variable is materialized before then.
+- **Cycles** are found at the connect, by comparing positions in the execution list:
+  - the consumer is the leaf that holds the input;
+  - the producer is the leaf that produces the source variable, looking through promotions, and taking the last member for a tied output.
+
+  This is exact across the whole model. The list is fixed once setup has run.
+- **Ties of ties are allowed.**
+  - **Inputs.** An inner tie's alias is a free input and can be a member of an outer `tie_inputs`. The existing merge rules decide the rest: the outer alias's variable wins, the definitions merge, and the initializers fold. The outer tie's own initializer wins, because it is declared later.
+  - **Outputs.** An inner tie's alias can be a member of an outer `tie_outputs`. The atomic rule and the one-device rule apply to the outer tie as a whole.
+- **Tied-output pushes are registered at finalize, not when the tie is declared.** By then every tie of ties has been merged, so each tied variable gets exactly one push, placed after its last member in list order. This is the first job that gives `finalize()` real work.
+
+Open questions:
+- How finalize finds the outermost tie of each tied variable, and attaches its single push.
 
 ### Phase 5: The execution list
 The entry base class and its protocol (run, events, owner). What becomes an entry: components; fused groups (stages named, not entered); System pre/post wrappers; shape hooks; tied-output pushes; depends_on handoffs. How positions are computed and recomputed. What stays inside a component's own entry. Inventory: 6, 7, 8, 9, 10, 11, 29.
