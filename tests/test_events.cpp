@@ -150,7 +150,7 @@ TEST_CASE("the first materialization, asked by an input, is global and initializ
     // has its container, bound and sized, because the first materialization is global.
     auto observe = [&] {
         ++observed;
-        const auto bx = mp->root().instance_at("b.x");
+        const auto bx = cs::detail::ModelAccess::instance(*mp, "b.x");
         CHECK(bx->meta->is_materialized());
         REQUIRE(bx->data != nullptr);
         CHECK(bx->data->bound());

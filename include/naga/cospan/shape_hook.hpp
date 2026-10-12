@@ -449,9 +449,15 @@ public:
     }
 
 private:
+    /// A named source is gone when its instance expired, or (r04) when its variable was materialized and all of its data was
+    /// freed since (its producer went out of scope and nothing else holds it): it can never change again.
     bool any_source_gone() const {
+        const auto gone = [](const std::weak_ptr<Instance>& w) {
+            const std::shared_ptr<Instance> i = w.lock();
+            return !i || (i->meta->materialized && !i->meta->has_live_data());
+        };
         return [&]<std::size_t... I>(std::index_sequence<I...>) {
-            return ((names_source_v<std::tuple_element_t<I, std::tuple<D...>>> && src_[I].expired()) || ...);
+            return ((names_source_v<std::tuple_element_t<I, std::tuple<D...>>> && gone(src_[I])) || ...);
         }(std::index_sequence_for<D...>{});
     }
 

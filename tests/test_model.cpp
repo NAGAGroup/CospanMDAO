@@ -610,7 +610,7 @@ TEST_CASE("Sellar forward: f32 and f64 over several design points", "[model][sel
 TEST_CASE("Marks: design variables, objective, constraints, one record per root", "[model][marks]") {
     auto model = cs::create_model<tmod::SellarTop<DType::f32>>(default_config());
     model.setup();
-    auto& sys = model.root();
+    auto sys = model.get_subsystem("");
 
     REQUIRE(model.design_vars().size() == 2);
     REQUIRE(model.objectives().size() == 1);
@@ -618,14 +618,14 @@ TEST_CASE("Marks: design variables, objective, constraints, one record per root"
 
     // A Mark is {path, inst, rec}; the instance is held weakly (design review, section 1) and the variable it names
     // is its `meta`, shared by every instance of the variable. This replaces the old per-root entry comparison.
-    const auto zr = sys.instance_at("z")->meta;
-    const auto xr = sys.instance_at("x")->meta;
+    const auto zr = cs::detail::ModelAccess::instance(model, "z")->meta;
+    const auto xr = cs::detail::ModelAccess::instance(model, "x")->meta;
     // The three components' z entries share the one variable, so one record serves all three.
-    CHECK(sys.instance_at("d1.z")->meta == zr);
-    CHECK(sys.instance_at("d2.z")->meta == zr);
-    CHECK(sys.instance_at("obj.z")->meta == zr);
-    CHECK(sys.instance_at("d1.x")->meta == xr);
-    CHECK(sys.instance_at("obj.x")->meta == xr);
+    CHECK(cs::detail::ModelAccess::instance(model, "d1.z")->meta == zr);
+    CHECK(cs::detail::ModelAccess::instance(model, "d2.z")->meta == zr);
+    CHECK(cs::detail::ModelAccess::instance(model, "obj.z")->meta == zr);
+    CHECK(cs::detail::ModelAccess::instance(model, "d1.x")->meta == xr);
+    CHECK(cs::detail::ModelAccess::instance(model, "obj.x")->meta == xr);
 
     std::size_t on_z = 0, on_x = 0;
     for (const auto& d : model.design_vars()) {
@@ -655,11 +655,11 @@ TEST_CASE("Marks: design variables, objective, constraints, one record per root"
     {
         const auto inst = model.objectives()[0].inst.lock();
         REQUIRE(inst);
-        CHECK(inst->meta == sys.instance_at("obj.f")->meta);
+        CHECK(inst->meta == cs::detail::ModelAccess::instance(model, "obj.f")->meta);
     }
 
-    const auto g1 = sys.instance_at("g1.g")->meta;
-    const auto g2 = sys.instance_at("g2.g")->meta;
+    const auto g1 = cs::detail::ModelAccess::instance(model, "g1.g")->meta;
+    const auto g2 = cs::detail::ModelAccess::instance(model, "g2.g")->meta;
     std::size_t on_g1 = 0, on_g2 = 0;
     for (const auto& c : model.constraints()) {
         const auto inst = c.inst.lock();
