@@ -341,5 +341,25 @@ inline void apply_device_subtree(Node& root, const sycl::device& d) {
     }
 }
 
+/// The start-of-run pass over the pending variables (those whose state changed since the last run: finalize fills it with
+/// every variable, update_input and init_input after the first run and rearm add theirs). A variable whose shape is already
+/// settled is materialized now, on every in-scope placement (outputs included; an unconnected input also initializes); one
+/// whose shape is not (a hooked dimension, an output whose producer sets it) is left to the first holder that touches it.
+/// The set is empty afterwards.
+inline void materialize_pending(ModelMeta& m, Runtime& rt) {
+    std::vector<std::weak_ptr<VarMeta>> work;
+    work.swap(m.pending);
+    m.pending_set.clear();
+    for (const std::weak_ptr<VarMeta>& w : work) {
+        const std::shared_ptr<VarMeta> v = w.lock();
+        if (!v || !v->shape_resolvable()) continue;
+        bool any_in_scope = false;
+        for (const std::shared_ptr<Instance>& i : v->live_instances())
+            if (!i->dearmed) any_in_scope = true;
+        if (!any_in_scope) continue;
+        v->materialize(rt, nullptr);
+    }
+}
+
 }  // namespace detail
 }  // namespace naga::cospan

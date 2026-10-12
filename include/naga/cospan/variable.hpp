@@ -796,7 +796,7 @@ public:
 
     /// MATERIALIZATION (section 3). The FIRST one of a variable is global: it sizes EVERY live container to the shape
     /// and, unless `trigger` (the holder that asked) is an output, runs the initializer on one placement (the tie's
-    /// init_device, else the trigger's, else the busiest device) and copies the result to the other containers. After
+    /// init_device, else the first input's device: init_home) and copies the result to the other containers. After
     /// it a holder checks only ITS OWN container: an empty one is sized and copied from the first live container that
     /// holds data. A stale variable (update_input) is initialized again in place. `trigger` may be null (a shape hook
     /// reading a variable that is not materialized yet).
@@ -951,7 +951,8 @@ public:
     void materialize(Runtime& rt, const Instance* trigger) override {
         const std::vector<std::shared_ptr<Instance>> insts = live_instances();
         if (insts.empty()) return;
-        for (const auto& i : insts) refresh_container(*i);  // every holder has the container of its own key
+        for (const auto& i : insts)
+            if (!i->dearmed) refresh_container(*i);  // every in-scope holder has the container of its own key
 
         if (!materialized) {
             first_materialization(rt, trigger);

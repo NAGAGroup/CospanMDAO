@@ -115,7 +115,10 @@ inline void dearm_subtree(ModelMeta& m, Node& root) {
         stack.pop_back();
         n->in_scope = false;
         for (const std::weak_ptr<Instance>& w : n->holders)
-            if (const std::shared_ptr<Instance> inst = w.lock()) inst->data.reset();
+            if (const std::shared_ptr<Instance> inst = w.lock()) {
+                inst->dearmed = true;
+                inst->data.reset();
+            }
         for (Node* c : n->children) stack.push_back(c);
     }
 }
@@ -131,6 +134,7 @@ inline void rearm_subtree(ModelMeta& m, Node& root) {
         for (const std::weak_ptr<Instance>& w : n->holders) {
             const std::shared_ptr<Instance> inst = w.lock();
             if (!inst) continue;
+            inst->dearmed = false;
             inst->refresh_container();
             // A variable all of whose data was freed starts over: it materializes (and, for a free input, initializes)
             // again in the start-of-run pass.

@@ -370,7 +370,7 @@ private:
 
 namespace detail {
 
-/// What a System stores of a hook: only a forward. (The concrete step is the template below.)
+/// What the model metadata stores of a hook: only a forward (finalize wraps it in an Operation placed by the sources). (The concrete step is the template below.)
 class HookBase {
 public:
     virtual ~HookBase()                  = default;
@@ -384,8 +384,8 @@ inline constexpr bool names_source_v = is_one_of_v<D, dim::FromShape, dim::FromV
 /// ragged descriptor), and forward() evaluates every dimension by compile-time dispatch on them. It computes the dimensions
 /// its target's variable gives it, from the named sources, and sets them (checked against the definition: it owns them).
 /// from_value copies are batched and waited for once; counts_from / offsets_from build a device column with the parallel scan
-/// and only the total comes back to the host. The System runs it every forward right before the first child that holds its
-/// target (System::run_compute).
+/// and only the total comes back to the host. It runs as an Operation of the model's tree walk, placed at finalize (directly
+/// after the last producer of its sources, else just before the first holder of its target).
 template <HookDescriptor... D>
 class ShapeHookStep final : public HookBase {
     static_assert(sizeof...(D) >= 1, "cospan: a shape hook takes one descriptor per dimension");
@@ -397,7 +397,7 @@ public:
     ShapeHookStep(std::tuple<D...> descriptors, std::string path, std::uint32_t owner, InstanceResolver resolve)
         : ds_{std::move(descriptors)}, path_{std::move(path)}, owner_{owner}, resolve_{std::move(resolve)} {}
 
-    /// The System points the step at its target and at the sources the descriptors name (declaration and replay).
+    /// The System points the step at its target and at the sources the descriptors name (at declaration).
     void set_target(std::shared_ptr<Instance> t) { target_ = std::move(t); }
     void set_source(std::size_t i, std::shared_ptr<Instance> s) { src_[i] = std::move(s); }
 
@@ -500,7 +500,7 @@ private:
     std::uint32_t                        owner_;
     InstanceResolver                     resolve_;  ///< for the context of custom descriptors
     std::weak_ptr<Instance>              target_;
-    std::array<std::weak_ptr<Instance>, N> src_;  ///< the named sources, resolved by the System (declaration and replay)
+    std::array<std::weak_ptr<Instance>, N> src_;  ///< the named sources, resolved by the System at declaration
     std::shared_ptr<DeviceColumn>        column_;   ///< a ragged hook's device counts and offsets, reused across forwards
 };
 

@@ -112,6 +112,8 @@ public:
     /// A tie alias that became a member of another tie (ties of ties): the outermost alias is the one that pushes and
     /// that owns the shape; an absorbed alias keeps its name and its variable.
     bool absorbed = false;
+    /// The holder's node is out of scope (dearmed): it holds no data and no materialization gives it any until it is rearmed.
+    bool dearmed = false;
 
     sycl::device device       = default_device();  ///< section 2: set_device overrides it
     sk::kind     storage_kind = sk::kind::device;
