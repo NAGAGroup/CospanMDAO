@@ -96,6 +96,7 @@ struct Node {
     std::vector<Operation>      before, after;
     std::optional<sycl::device> device_override;       ///< set_device, applied at finalize
     std::vector<std::weak_ptr<Instance>> holders;     ///< the instances this node owns (a system's aliases, a leaf's ports)
+    std::vector<sycl::event>             extra_events;  ///< this turn's events of the leaf's after-operations (tied pushes)
 };
 
 /// One declared tie_outputs, for finalize (its push and its one-device check).
@@ -133,6 +134,7 @@ struct ModelMeta {
     Node*                                                    root = nullptr;
     std::unordered_map<const Subsystem*, Node*>              node_of_sub;  ///< a node's object, and a fused group's stage objects
     std::unordered_map<std::string, std::weak_ptr<Instance>> holders;
+    std::unordered_set<std::string>                          stage_names;  ///< a fused group's stages: objects, not tree nodes
     std::size_t                                              next_ordinal = 0;
 
     // ---- records for finalize --------------------------------------------------------
@@ -166,7 +168,9 @@ struct ModelMeta {
             throw std::invalid_argument("naga::cospan: " + where + ": the " + what + " name must be non-empty");
     }
 
-    bool name_taken(const std::string& full) const { return nodes.contains(full) || holders.contains(full); }
+    bool name_taken(const std::string& full) const {
+        return nodes.contains(full) || holders.contains(full) || stage_names.contains(full);
+    }
 
     // ---- registration ----------------------------------------------------------------
     /// Registers `sub` as a child of `parent` (null for the root) under the full name `full`: binds its name and the
@@ -315,6 +319,27 @@ struct ModelMeta {
         ModelMeta*  m_;
     };
 };
+
+/// Places the holders of `n` and of everything under it on `d` (an author's or a caller's placement; the outermost one wins
+/// when finalize applies them again from the root).
+inline void apply_device_node(Node& n, const sycl::device& d) {
+    for (const std::weak_ptr<Instance>& w : n.holders) {
+        const std::shared_ptr<Instance> inst = w.lock();
+        if (!inst) continue;
+        inst->device = d;
+        inst->refresh_container();  // the container of the new placement
+        if (inst->role == Role::tie && inst->kind == IOKind::input && inst->meta->init_device) inst->meta->init_device = d;
+    }
+}
+inline void apply_device_subtree(Node& root, const sycl::device& d) {
+    std::vector<Node*> stack{&root};
+    while (!stack.empty()) {
+        Node* n = stack.back();
+        stack.pop_back();
+        apply_device_node(*n, d);
+        for (Node* c : n->children) stack.push_back(c);
+    }
+}
 
 }  // namespace detail
 }  // namespace naga::cospan

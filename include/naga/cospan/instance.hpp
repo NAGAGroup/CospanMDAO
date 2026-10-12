@@ -107,8 +107,11 @@ public:
     /// A shape hook targets this input (section 10): it cannot be connected or tied (can_be_target is cleared with it).
     bool hooked = false;
     /// A member of a tie_outputs: it cannot set its output's shape (the tie's System owns it, through a hook on the alias) and
-    /// cannot be a hook target. Set by the tie call; a replay marks a rebuilt member again.
+    /// cannot be a hook target. Set by the tie call.
     bool tied_member = false;
+    /// A tie alias that became a member of another tie (ties of ties): the outermost alias is the one that pushes and
+    /// that owns the shape; an absorbed alias keeps its name and its variable.
+    bool absorbed = false;
 
     sycl::device device       = default_device();  ///< section 2: set_device overrides it
     sk::kind     storage_kind = sk::kind::device;

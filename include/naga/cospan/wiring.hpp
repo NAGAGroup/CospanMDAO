@@ -33,11 +33,12 @@
 // EVERY RULE IS CHECKED IN ITS OWN CALL, BEFORE ANYTHING IS CHANGED: a call that throws has changed nothing
 // that outlives it (a tie builds its alias first, but that is only reachable once the call returns).
 //
-// CALLER CONTRACT (the System, phase 4): it resolves paths to instances; it passes the WiringSite (its location
-// text, the child positions of the two ends, its warning set); it passes the initializer to declare_init (the last
-// declaration wins); it keeps the returned alias instances alive (instances are owned by their declarer); and
-// to wire a rebuilt child back in, it replays these same calls in declaration order. It checks names and the
-// "legal inside setup()" guard itself: neither is a wiring rule.
+// CALLER CONTRACT (the System, r04): it resolves paths to instances through the model metadata; it passes the
+// WiringSite (its location text, the leaf ordinals of the two ends, the model's warning set); it passes the
+// initializer to declare_init (the last declaration wins); it keeps the returned alias instances alive (instances are
+// owned by their declarer). Nothing is replayed. It checks names and the lifecycle guard itself: neither is a wiring
+// rule. TIES OF TIES are allowed: a tie alias (or a promotion of one) may be a member of an outer tie; the System marks
+// the inner alias ABSORBED, and the existing merge rules decide the rest.
 
 #include <algorithm>
 #include <array>
@@ -73,8 +74,8 @@ namespace detail {
 /// Where a wiring call happens, supplied by the calling System.
 struct WiringSite {
     std::string                where;                 ///< "the root System" or "System 'path'": the prefix of every error
-    std::optional<std::size_t> src_order, dst_order;  ///< child positions in the calling System; nullopt = its own alias
-    std::set<std::string>*     warned = nullptr;      ///< cycle warnings already printed (kept by the root System)
+    std::optional<std::size_t> src_order, dst_order;  ///< depth-first leaf ordinals: the source's last producer, the consumer
+    std::set<std::string>*     warned = nullptr;      ///< cycle warnings already printed (kept by the model metadata)
 };
 
 /// The error of a wiring rule: the format of System::fail ("naga::cospan: <where>: <verb>: <reason>").
@@ -472,8 +473,6 @@ std::shared_ptr<Instance> tie_inputs(const WiringSite& site, const TieMembers& m
         if (!m->can_be_target && m->hooked)
             wiring_fail(site, verb, "'" + path + "' is the target of a shape hook; a shape hook and a tie exclude each other");
         if (!m->can_be_target) wiring_fail(site, verb, "'" + path + "' is already tied: connect through its tie alias");
-        if (m->meta->tied_input)
-            wiring_fail(site, verb, "'" + path + "' is a tie (or a promotion of one); tying a tie is not allowed (yet): tie its members instead");
         check_typed_instance<DT, Rank>(site, verb, *m);
     }
 
@@ -499,8 +498,6 @@ std::shared_ptr<Instance> tie_outputs(const WiringSite& site, const TieMembers& 
     for (const auto& [path, m] : members) {
         if (m->kind != IOKind::output) wiring_fail(site, verb, "'" + path + "' is not an output");
         if (!m->can_be_source) wiring_fail(site, verb, "'" + path + "' is already tied: connect from its tie alias");
-        if (m->meta->tied_output)
-            wiring_fail(site, verb, "'" + path + "' is a tie (or a promotion of one); tying a tie is not allowed (yet): tie its members instead");
         if (const std::shared_ptr<Instance> down = first_of_kind(*m->meta, IOKind::input))
             wiring_fail(site, verb, "'" + path + "' is already connected downstream to '" + down->full_path() +
                                         "': tie before connecting, or connect from the alias");
