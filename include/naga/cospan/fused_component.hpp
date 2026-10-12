@@ -104,11 +104,18 @@ inline constexpr bool split_supports_rank_v = Sp != Split::padded || Rank <= 2;
 /// A fused group's machinery: not the user path, a base for FusedGroup. `segments` says which consecutive stages share
 /// groups and how (range mode, local memory); they cover the stages in order. `group_waits`: the group has the
 /// group_waits_enabled property or contains a global_barrier, so its launch carries the wait state.
+///
+/// A fused group is a LEAF of the model's tree (is_leaf): one forward, one launch. It keeps System's declaration calls for
+/// its own setup (stages, ties, connections), but its stages are objects it owns (children_are_stages), not tree nodes: their
+/// ports are registered as `<group>.<stage>.<port>` and answer to the group's node.
 class FusedBase : public System {
 public:
     FusedBase(std::vector<SegmentSpec> segments, bool group_waits, Split split)
         : segments_{std::move(segments)}, group_waits_{group_waits}, split_{split} {}
     ~FusedBase() override = default;
+
+    /// A fused group is a leaf of the tree.
+    bool is_leaf() const noexcept override { return true; }
 
     /// Setup, then the setup-end check: no ragged ports.
     void run_setup() override {
@@ -116,36 +123,22 @@ public:
         check_no_ragged_ports(stages());
     }
 
-    void run_precompute(Runtime& rt) override {
+    /// ONE forward for the group: every stage's pre steps, the single launch, every stage's post steps. The group's own tied
+    /// outputs are pushed by the after-operation finalize placed on this leaf (the same as for any leaf).
+    void forward(Runtime& rt) override {
         const std::vector<ComponentBase*> st = stages();
+        if (st.empty()) throw std::invalid_argument("naga::cospan: " + describe() + ": a fused group has no stages");
         for (ComponentBase* s : st) {
             s->precompute_steps(rt);
             s->stage_args_ensure(rt);
         }
-        launcher_.prepare(rt, st);  // once, at the first precompute
-    }
-
-    /// One kernel, one submission.
-    void run_compute(Runtime& rt) override {
-        const std::vector<ComponentBase*> st = stages();
-        if (st.empty()) throw std::invalid_argument("naga::cospan: " + describe() + ": a fused group has no stages");
-        check_tied_output_devices();  // a member moved off its tie's device since the tie was made is an error
+        launcher_.prepare(rt, st);  // once, at the first forward
         (void)launcher_.launch(rt, st, segments_, describe(), group_waits_, split_);
-        // The loop of a System never runs for a group, so its "after the last child holding a member" turn never comes: the
-        // group's own tied outputs are pushed here, after the single launch (the copies wait on the launch's writes).
-        push_events_ = push_own_tied_outputs();
+        for (ComponentBase* s : st) s->step_post(rt);
     }
 
-    void run_postcompute(Runtime& rt) override {
-        for (ComponentBase* s : stages()) s->run_postcompute(rt);
-    }
-
-    /// The launch's events, and the events of the pushes of the group's own tied outputs (after the launch).
-    std::vector<sycl::event> events() const override {
-        std::vector<sycl::event> out = launcher_.events();
-        out.insert(out.end(), push_events_.begin(), push_events_.end());
-        return out;
-    }
+    /// The launch's events.
+    std::vector<sycl::event> events() const override { return launcher_.events(); }
 
     /// The group's own ties (cs::ties_desc): the same logic as System::tie_inputs / tie_outputs, on the group, on the default
     /// device that the group's set_device moves with the rest. Called by the TieEntry objects in setup().
@@ -168,19 +161,19 @@ public:
         for (ComponentBase* s : stages()) s->add_dependencies(deps);
     }
 
-private:
-    /// The live children, as components: a fused group's children are components only.
-    std::vector<ComponentBase*> stages() const {
-        std::vector<ComponentBase*> out;
-        for (Subsystem* c : child_ptrs_) {
-            if (c == nullptr) continue;
-            auto* s = dynamic_cast<ComponentBase*>(c);
-            if (s == nullptr)
-                throw std::logic_error("naga::cospan: " + describe() + ": child '" + c->path() + "' is not a Component");
-            out.push_back(s);
-        }
-        return out;
+protected:
+    bool children_are_stages() const noexcept override { return true; }
+    void adopt_stage(std::unique_ptr<Subsystem> stage) override {
+        auto* c = dynamic_cast<ComponentBase*>(stage.get());
+        if (c == nullptr)
+            throw std::invalid_argument("naga::cospan: " + describe() + ": child '" + stage->path() + "' is not a Component");
+        stage_ptrs_.push_back(c);
+        stage_objs_.push_back(std::move(stage));
     }
+
+private:
+    /// The stages, as components, in order: a fused group's children are components only.
+    std::vector<ComponentBase*> stages() const { return stage_ptrs_; }
 
     /// A child with any ragged port (RaggedInput / RaggedOutput, or a per-index dimension) is a setup error.
     void check_no_ragged_ports(const std::vector<ComponentBase*>& st) const {
@@ -194,7 +187,8 @@ private:
     bool                     group_waits_ = false;
     Split                    split_       = Split::flatten;
     GroupLauncher            launcher_;
-    std::vector<sycl::event> push_events_;  ///< the pushes of the group's own tied outputs, this forward
+    std::vector<std::unique_ptr<Subsystem>> stage_objs_;  ///< the group owns its stages
+    std::vector<ComponentBase*>             stage_ptrs_;  ///< the same objects, as components
 };
 
 /// The component type of a SubsystemDesc.

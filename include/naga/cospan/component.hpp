@@ -61,6 +61,7 @@
 #include "naga/cospan/instance.hpp"
 #include "naga/cospan/kernel.hpp"
 #include "naga/cospan/metadata.hpp"
+#include "naga/cospan/model_meta.hpp"
 #include "naga/cospan/runtime.hpp"
 #include "naga/cospan/subsystem.hpp"
 #include "naga/cospan/variable.hpp"
@@ -341,25 +342,13 @@ public:
 
     // ---- Subsystem verbs ---------------------------------------------------
     void run_setup() override {
-        detail::FlagScope scope{declaring_};
+        detail::FlagScope             scope{declaring_};
+        detail::ModelMeta::SetupScope setup_scope{meta_};
         setup();
     }
 
-    /// Section 2: each of this component's instances goes to `d`. The outer call wins.
-    void set_device(const sycl::device& d) override {
-        for (const auto& inst : order_) {
-            inst->device = d;
-            inst->refresh_container();  // the container of the new placement
-        }
-    }
-
-    std::shared_ptr<detail::Instance> find_instance(std::string_view name) const override {
-        const auto it = by_name_.find(std::string{name});
-        return it == by_name_.end() ? nullptr : it->second;
-    }
-    void collect_instances(std::vector<std::shared_ptr<detail::Instance>>& out) const override {
-        for (const auto& i : order_) out.push_back(i);
-    }
+    /// A component is a leaf of the model's tree: it has a forward.
+    bool is_leaf() const noexcept override { return true; }
 
     /// The last launch's event(s): what depends_on hands on. (Deleting a component waits on nothing: the containers
     /// it held free themselves after their own events.)
@@ -370,10 +359,18 @@ public:
         pending_deps_.insert(pending_deps_.end(), deps.begin(), deps.end());
     }
 
-    // ---- the forward (section 3) ---------------------------------------------
-    /// The precompute steps below; a kernel component that launches by itself (not as a stage of a fused group) then keeps
-    /// its argument array and, at the first precompute, its launcher's pointer array.
-    void run_precompute(detail::Runtime& rt) override {
+    // ---- the forward ---------------------------------------------------------
+    /// ONE forward (r04): the pre steps, the submission, the post steps. A fused group runs the same pieces across its stages
+    /// around its single launch.
+    void forward(detail::Runtime& rt) override {
+        step_pre(rt);
+        step_submit(rt);
+        step_post(rt);
+    }
+
+    /// The pre steps below; a kernel component that launches by itself (not as a stage of a fused group) then keeps its
+    /// argument array and, at the first forward, its launcher's pointer array.
+    void step_pre(detail::Runtime& rt) {
         precompute_steps(rt);
         if (is_kernel_stage()) {
             stage_args_ensure(rt);
@@ -412,7 +409,7 @@ public:
     /// tied outputs run concurrently; there is no queue-wide wait anywhere (section 3). The pieces are protected so a
     /// fused component (section 4) can submit ONE launch for its stages and still give each stage the event as if it had
     /// submitted alone.
-    void run_compute(detail::Runtime& rt) override {
+    void step_submit(detail::Runtime& rt) {
         if (is_kernel_stage()) {
             // A plain or group body launches through the one path: a group of one stage in one default segment.
             (void)solo_.launch(rt, std::vector<ComponentBase*>{this}, std::vector<detail::SegmentSpec>{detail::SegmentSpec{}}, describe());
@@ -429,7 +426,7 @@ public:
     /// by container assignment, which waits on the output's writes and registers the read, unless the variable's push is
     /// suppressed. A tied output is pushed by the tie's System (phase 6). Then the user's hook. (The launch's events were
     /// registered on the containers at submit, in record_launch.)
-    void run_postcompute(detail::Runtime& rt) override {
+    void step_post(detail::Runtime& rt) {
         (void)rt;
         std::vector<detail::VarMeta*> seen;
         for (const auto& inst : order_) {
@@ -684,8 +681,13 @@ private:
         if (by_member_.contains(member))
             throw std::invalid_argument("naga::cospan: " + describe() + ": member wrapper of '" + key +
                                         "' is already declared");
+        if (meta_ == nullptr)
+            throw std::logic_error("naga::cospan: " + describe() + " is not part of a model yet (it is registered by add_subsystem)");
         inst->storage_kind = default_storage_kind();
         inst->refresh_container();  // the container of its placement, empty until the first materialization
+        // The holder is registered in the model-wide map under the component's full name + "." + its own name (the node of
+        // a fused group's stage is the group's).
+        meta_->register_holder(detail::ModelMeta::child_name(path(), key), inst, meta_->node_for(this), describe());
         if (ragged) ragged_ports_.insert(inst.get());
         order_.push_back(inst);
         by_member_.emplace(member, inst.get());
