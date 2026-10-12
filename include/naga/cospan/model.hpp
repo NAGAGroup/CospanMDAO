@@ -943,6 +943,12 @@ struct ModelAccess {
     }
     /// The node at the full name, else null.
     static Node* node(Model& m, std::string_view full) { return meta(m).find_node(full); }
+    /// Whether the node at `full` is in scope (it and all its ancestors); throws std::invalid_argument for an unknown node.
+    static bool in_scope(Model& m, std::string_view full) {
+        const Node* n = meta(m).find_node(full);
+        if (n == nullptr) throw std::invalid_argument("naga::cospan: ModelAccess::in_scope: no subsystem '" + std::string{full} + "'");
+        return ModelMeta::effective_scope(*n);
+    }
 };
 }  // namespace detail
 

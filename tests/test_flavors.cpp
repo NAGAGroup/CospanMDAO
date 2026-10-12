@@ -1003,10 +1003,10 @@ TEST_CASE("transient: a system_from group and a fused component release after th
     // FIRST forward: what the group's variables held is then gone (the group is deleted with its staging).
     model.run();
     model.wait();
-    CHECK(cs::detail::ModelAccess::subsystem(model, "grp") == nullptr);  // the group is deleted after its turn, its variables with it
+    CHECK_FALSE(cs::detail::ModelAccess::in_scope(model, "grp"));  // r04: the group is dearmed after its turn, its data with it
     for (const char* p : {"grp.a.y", "grp.b.y"}) {
         INFO(p);
-        tfl::expect_throws([&] { (void)cst::synced_output<DType::f32, 1>(model, p); }, {"was deleted"});
+        tfl::expect_throws([&] { (void)cst::synced_output<DType::f32, 1>(model, p); }, {"no holder of this variable has data"});
     }
     // The pool's bytes in use are the sum of the live containers' capacities rounded up to whole nodes. With the group gone
     // only the eternal src.y is left: 12 floats (48 B) are one node.
@@ -1021,7 +1021,7 @@ TEST_CASE("transient: a system_from group and a fused component release after th
     CHECK(cst::pool_in_use(model) == base);  // every later forward returns what it allocated
 }
 
-TEST_CASE("replay: a transient host reader of a deleted do_once producer reads its last value on every forward",
+TEST_CASE("a transient host reader of a dearmed do_once producer reads its last value on every forward",
           "[flavors][transient]") {
     // src.y is written once (do_once, then deleted). The eternal e1 keeps its variable alive. The transient host-kind Prefix is
     // rebuilt every forward and reads the producer's last value (nothing runs the producer again).
@@ -1047,6 +1047,6 @@ TEST_CASE("replay: a transient host reader of a deleted do_once producer reads i
         model.wait();
         CHECK(tfl::out_of<1>(model, "e2.y") == want);
     }
-    CHECK(cs::detail::ModelAccess::subsystem(model, "src") == nullptr);   // the producer ran once and is gone
-    CHECK(cs::detail::ModelAccess::subsystem(model, "host") == nullptr);  // the transient host stage is deleted at the end of each forward
+    CHECK_FALSE(cs::detail::ModelAccess::in_scope(model, "src"));   // the producer ran once and is out of scope
+    CHECK_FALSE(cs::detail::ModelAccess::in_scope(model, "host"));  // the transient host stage is dearmed at the end of each forward
 }

@@ -220,27 +220,15 @@ public:
     }
 };
 
-/// The grandparent of c. mode 0: no override; 1: override "b.c" to eternal in setup; 2: override it from pre_forward on the
-/// second forward. `rearm_at`: the forward on whose pre_forward "b" is rearmed (0: never). `post_rearm`: rearm "b" from
-/// post_forward on the first forward instead (rearm outside pre_forward).
+/// The grandparent of c. mode 0: no override; 1: override "b.c" to eternal in setup.
 class OverTop : public cs::System {
-    int  mode_, rearm_at_;
-    bool post_rearm_;
-    int  n_ = 0;
+    int mode_;
 
 public:
-    explicit OverTop(int mode, int rearm_at = 0, bool post_rearm = false) : mode_{mode}, rearm_at_{rearm_at}, post_rearm_{post_rearm} {}
+    explicit OverTop(int mode) : mode_{mode} {}
     void setup() override {
         add_subsystem(cs::subsystem_desc<Mid>("b"));
         if (mode_ == 1) set_run_policy("b.c");
-    }
-    void pre_forward() override {
-        ++n_;
-        if (mode_ == 2 && n_ == 2) set_run_policy("b.c", cs::property_list{});
-        if (rearm_at_ == n_) rearm("b");
-    }
-    void post_forward() override {
-        if (post_rearm_ && n_ == 1) rearm("b");
     }
 };
 
@@ -260,27 +248,13 @@ public:
     }
 };
 
-/// Counts how many child pre_forwards ran before this System's own, at each forward.
-inline int              g_child_pre = 0;
-inline std::vector<int> g_seen;
-class PreTop : public cs::System {
-public:
-    void setup() override { add_subsystem(cs::subsystem_desc<Axpb>("a", 1.0f, 0.0f, std::optional<float>{}, &g_child_pre)); }
-    void pre_forward() override { g_seen.push_back(g_child_pre); }
-};
-
-/// p (do_once, y = 5) feeds c (y = 2 x + 1); rearms c on the second forward.
+/// p (do_once, y = 5) feeds c (y = 2 x + 1).
 class ReplayTop : public cs::System {
-    int n_ = 0;
-
 public:
     void setup() override {
         add_subsystem(cs::property_list{cs::property::do_once{}}, cs::subsystem_desc<Gen>("p", 5.0f));
         add_subsystem(cs::subsystem_desc<Axpb>("c", 2.0f, 1.0f));
         connect("p.y", "c.x");
-    }
-    void pre_forward() override {
-        if (++n_ == 2) rearm("c");
     }
 };
 
@@ -408,39 +382,38 @@ TEST_CASE("wiring after setup: connect, promote, init_input, tie_inputs and tie_
     }
 }
 
-TEST_CASE("wiring: merging two materialized variables is an error at the call", "[p4][wiring][errors]") {
+TEST_CASE("wiring: a structural call after finalize is a logic error", "[p4][wiring][errors]") {
     cs::Model model = cs::create_model<tp4::TopFn>(default_config(), [](cs::System& s) {
         s.add_subsystem(cs::subsystem_desc<tp4::Gen>("p", 5.0f));
         s.add_subsystem(cs::subsystem_desc<tp4::Axpb>("c", 2.0f, 1.0f));
     });
     model.setup();
-    tp4::run(model);  // p.y and c.x are both materialized now
-    tp4::expect_throws_all([&] { model.get_subsystem("").connect("p.y", "c.x"); },
-                           {"connect", "merging two materialized variables is not defined (yet)"});
+    tp4::run(model);  // finalized: the structure is fixed (r04: two materialized variables can never be merged)
+    tp4::expect_throws_all([&] { model.get_subsystem("").connect("p.y", "c.x"); }, {"connect", "illegal after finalize"});
     tp4::run(model);  // the failed call changed nothing: the model still runs
     CHECK(tp4::out(model, "c.y") == tp4::filled(1.0f));
 }
 
 // =============================================================================================
-// run-policy override
+// run policies set from setup() and from main
 // =============================================================================================
-TEST_CASE("override_run_policy: a transient grandchild made eternal by its grandparent keeps its data", "[p4][policy]") {
-    SECTION("without the override it is deleted after its turn") {
+TEST_CASE("set_run_policy: a transient grandchild made eternal by its grandparent keeps its data", "[p4][policy]") {
+    SECTION("without the override it is out of scope after its turn") {
         cs::Model model = cs::create_model<tp4::OverTop>(default_config(), 0);
         model.setup();
         tp4::run(model);
-        CHECK(cs::detail::ModelAccess::subsystem(model, "b.c") == nullptr);
+        CHECK_FALSE(cs::detail::ModelAccess::in_scope(model, "b.c"));
     }
     SECTION("applied in the grandparent's setup") {
         cs::Model model = cs::create_model<tp4::OverTop>(default_config(), 1);
         model.setup();
         tp4::run(model);
-        REQUIRE(cs::detail::ModelAccess::subsystem(model, "b.c") != nullptr);
+        REQUIRE(cs::detail::ModelAccess::in_scope(model, "b.c"));
         const auto var = cs::detail::ModelAccess::instance(model, "b.c.y")->meta;
         CHECK(tp4::out(model, "b.c.y") == tp4::filled(6.0f));
         for (int k = 0; k < 2; ++k) {
             tp4::run(model);
-            REQUIRE(cs::detail::ModelAccess::subsystem(model, "b.c") != nullptr);
+            REQUIRE(cs::detail::ModelAccess::in_scope(model, "b.c"));
             CHECK(cs::detail::ModelAccess::instance(model, "b.c.y")->meta == var);  // the same variable: its data was kept
         }
         CHECK(tp4::out(model, "b.c.y") == tp4::filled(6.0f));
@@ -448,71 +421,64 @@ TEST_CASE("override_run_policy: a transient grandchild made eternal by its grand
     SECTION("applied after setup, through the root") {
         cs::Model model = cs::create_model<tp4::OverTop>(default_config(), 0);
         model.setup();
-        model.get_subsystem("").set_run_policy("b.c");
+        model.set_run_policy("b.c");
         tp4::run(model);
         tp4::run(model);
-        CHECK(cs::detail::ModelAccess::subsystem(model, "b.c") != nullptr);
+        CHECK(cs::detail::ModelAccess::in_scope(model, "b.c"));
     }
-    SECTION("a policy for a child of a Component or an unknown name is an error") {
+    SECTION("applied between runs, through the root") {
         cs::Model model = cs::create_model<tp4::OverTop>(default_config(), 0);
         model.setup();
-        tp4::expect_throws_all([&] { model.get_subsystem("").set_run_policy("b.zz"); }, {"set_run_policy('b.zz')", "no such subsystem"});
-        tp4::expect_throws_all([&] { model.get_subsystem("").set_run_policy("zz.c"); }, {"has no subsystem 'zz'"});
-        tp4::expect_throws_all([&] { model.get_subsystem("").set_run_policy("b.c.y"); }, {"is a Component"});
+        tp4::run(model);
+        CHECK_FALSE(cs::detail::ModelAccess::in_scope(model, "b.c"));
+        model.set_run_policy("b.c");  // the scope is not changed by a policy call: rearm_subsystem puts it back
+        CHECK_FALSE(cs::detail::ModelAccess::in_scope(model, "b.c"));
+        model.rearm_subsystem("b.c");
+        tp4::run(model);
+        CHECK(cs::detail::ModelAccess::in_scope(model, "b.c"));
+    }
+    SECTION("a policy for an unknown name or a port is an error") {
+        cs::Model model = cs::create_model<tp4::OverTop>(default_config(), 0);
+        model.setup();
+        tp4::expect_throws_all([&] { model.set_run_policy("b.zz"); }, {"set_run_policy", "no subsystem 'b.zz'"});
+        tp4::expect_throws_all([&] { model.set_run_policy("zz.c"); }, {"set_run_policy", "no subsystem 'zz.c'"});
+        tp4::expect_throws_all([&] { model.set_run_policy("b.c.y"); }, {"set_run_policy", "no subsystem 'b.c.y'"});
     }
     SECTION("the other policies") {
         cs::Model model = cs::create_model<tp4::OverTop>(default_config(), 0);
         model.setup();
-        model.get_subsystem("").set_run_policy("b", cs::property::run_n{2});  // an eternal System takes two turns
+        model.set_run_policy("b", cs::property::run_n{2});  // an eternal System takes two turns
         tp4::run(model);
-        CHECK(cs::detail::ModelAccess::subsystem(model, "b") != nullptr);
+        CHECK(cs::detail::ModelAccess::in_scope(model, "b"));
         tp4::run(model);
-        CHECK(cs::detail::ModelAccess::subsystem(model, "b") == nullptr);
-        model.get_subsystem("").set_run_policy("b", cs::property::do_once{});  // gone and not transient: it comes back, once
-        REQUIRE(cs::detail::ModelAccess::subsystem(model, "b") != nullptr);
+        CHECK_FALSE(cs::detail::ModelAccess::in_scope(model, "b"));
+        model.set_run_policy("b", cs::property::do_once{});  // out of scope and not transient: rearm brings it back, once
+        model.rearm_subsystem("b");
+        REQUIRE(cs::detail::ModelAccess::in_scope(model, "b"));
         tp4::run(model);
-        CHECK(cs::detail::ModelAccess::subsystem(model, "b") == nullptr);
-        tp4::expect_throws_all([&] { model.get_subsystem("").set_run_policy("b", cs::property_list{cs::property::transient{}, cs::property::run_n{2}}); },
+        CHECK_FALSE(cs::detail::ModelAccess::in_scope(model, "b"));
+        tp4::expect_throws_all([&] { model.set_run_policy("b", cs::property_list{cs::property::transient{}, cs::property::run_n{2}}); },
                                {"transient cannot be combined with run_n or do_once"});
     }
 }
 
-TEST_CASE("override_run_policy: applied from pre_forward", "[p4][policy]") {
-    cs::Model model = cs::create_model<tp4::OverTop>(default_config(), 2);
-    model.setup();
-    tp4::run(model);  // forward 1: c is transient and gone after its turn
-    CHECK(cs::detail::ModelAccess::subsystem(model, "b.c") == nullptr);
-    tp4::run(model);  // forward 2: pre_forward makes it eternal (it is rebuilt at once: it was gone)
-    REQUIRE(cs::detail::ModelAccess::subsystem(model, "b.c") != nullptr);
-    const auto var = cs::detail::ModelAccess::instance(model, "b.c.y")->meta;
-    CHECK(tp4::out(model, "b.c.y") == tp4::filled(6.0f));
-    tp4::run(model);  // forward 3: it kept its variable
-    REQUIRE(cs::detail::ModelAccess::subsystem(model, "b.c") != nullptr);
-    CHECK(cs::detail::ModelAccess::instance(model, "b.c.y")->meta == var);
-}
-
-TEST_CASE("override_run_policy is not logged: rearming the parent applies the declared policy again", "[p4][policy][rearm]") {
-    cs::Model model = cs::create_model<tp4::OverTop>(default_config(), 1, 3);  // override in setup; rearm "b" on forward 3
-    model.setup();
-    tp4::run(model);
-    tp4::run(model);
-    CHECK(cs::detail::ModelAccess::subsystem(model, "b.c") != nullptr);  // eternal by the override
-    tp4::run(model);                                // forward 3: "b" is rebuilt, c with its declared (transient) policy
-    CHECK(cs::detail::ModelAccess::subsystem(model, "b.c") == nullptr);
-}
-
 // =============================================================================================
-// rearm outside pre_forward
+// rearm_subsystem
 // =============================================================================================
-TEST_CASE("rearm is legal outside pre_forward", "[p4][rearm]") {
-    tp4::g_mid_built = 0;
-    cs::Model model  = cs::create_model<tp4::OverTop>(default_config(), 0, 0, true);  // rearms "b" from post_forward
+TEST_CASE("rearm_subsystem: a dearmed do_once producer runs again, between runs", "[p4][rearm]") {
+    cs::Model model = cs::create_model<tp4::ReplayTop>(default_config());
     model.setup();
-    CHECK(tp4::g_mid_built == 1);
-    CHECK_NOTHROW(tp4::run(model));  // used to throw: "rearm is legal inside pre_forward() only"
-    CHECK(tp4::g_mid_built == 2);    // b was built again by the rearm in post_forward
+    tp4::run(model);  // p (do_once) wrote 5; c = 2 * 5 + 1; p is out of scope after its turn
+    CHECK(tp4::out(model, "c.y") == tp4::filled(11.0f));
+    CHECK_FALSE(cs::detail::ModelAccess::in_scope(model, "p"));
+    CHECK_NOTHROW(tp4::run(model));  // p does not run again: c reads p's last value
+    CHECK(tp4::out(model, "c.y") == tp4::filled(11.0f));
+    model.rearm_subsystem("p");
+    CHECK(cs::detail::ModelAccess::in_scope(model, "p"));
     CHECK_NOTHROW(tp4::run(model));
-    CHECK(tp4::g_mid_built == 2);
+    CHECK_FALSE(cs::detail::ModelAccess::in_scope(model, "p"));  // its counter started over: one more turn
+    CHECK(tp4::out(model, "c.y") == tp4::filled(11.0f));
+    tp4::expect_throws_all([&] { model.rearm_subsystem("zz"); }, {"rearm_subsystem", "no subsystem 'zz'"});
 }
 
 // =============================================================================================
@@ -619,7 +585,7 @@ TEST_CASE("tie devices: tie_outputs refuses a member on another device at the ca
     }
 }
 
-TEST_CASE("tie devices: a member moved by set_device after the tie errors at the next forward", "[p4][tie][devices][errors]") {
+TEST_CASE("tie devices: a member moved by set_device after the tie errors at finalize", "[p4][tie][devices][errors]") {
     sycl::device def, other;
     if (!tp4::two_devices(def, other)) SKIP("a non-OpenMP device and the OpenMP host device are not both visible");
     cs::Model model = cs::create_model<tp4::TopFn>(default_config(), [](cs::System& s) {
@@ -628,10 +594,9 @@ TEST_CASE("tie devices: a member moved by set_device after the tie errors at the
         s.tie_outputs<DType::f32, 1>({"a.y", "b.y"}, "t", cs::shape(tp4::kN), cs::TieOutputsPolicy::allow_plain);
     });
     model.setup();
-    tp4::run(model);  // fine: both on the default device
-    cs::detail::ModelAccess::subsystem(model, "b")->set_device(other);
+    model.get_subsystem("b").set_device(other);  // before finalize; the check runs at finalize (the first run)
     tp4::expect_throws_all([&] { model.run(); },
-                           {"tie_outputs 't'", "member 'b.y' is on", "but the tie is on", "every member must be on the tie's device"});
+                           {"tie_outputs 't'", "member 'b.y' is on", "but the tie is on", "members live on one device"});
 }
 
 TEST_CASE("tie devices: a device given to add_subsystem moves the whole subtree, aliases included", "[p4][tie][devices]") {
@@ -680,15 +645,27 @@ TEST_CASE("tie devices: tie_inputs on a given device, and a moved subtree moves 
 // =============================================================================================
 // no ties of ties
 // =============================================================================================
-TEST_CASE("ties: a tie of a tie is refused, for both kinds, directly and through a promotion", "[p4][tie][errors]") {
+TEST_CASE("ties: a tie of a tie is allowed, for both kinds, directly and through a promotion; the inner alias is absorbed", "[p4][tie]") {
     for (const bool outputs : {false, true})
         for (const bool via_promotion : {false, true}) {
             INFO((outputs ? "tie_outputs" : "tie_inputs") << (via_promotion ? ", the tie promoted first" : ", the tie itself"));
             cs::Model model = cs::create_model<tp4::TopFn>(default_config(), [=](cs::System& s) {
                 s.add_subsystem(cs::subsystem_desc<tp4::TieOfTie>("top", outputs, via_promotion));
             });
-            tp4::expect_throws_all([&] { model.setup(); },
-                                   {outputs ? "tie_outputs" : "tie_inputs", "tying a tie is not allowed (yet)"});
+            REQUIRE_NOTHROW(model.setup());
+            CHECK(cs::detail::ModelAccess::instance(model, "top.in.t")->absorbed);
+            CHECK_FALSE(cs::detail::ModelAccess::instance(model, "top.tt")->absorbed);
+            CHECK(cs::detail::ModelAccess::instance(model, "top.tt")->meta == cs::detail::ModelAccess::instance(model, "top.in.t")->meta);
+            if (outputs) {
+                tp4::run(model);
+                CHECK(tp4::out(model, "top.tt") == tp4::filled(1.0f));
+            } else {
+                model.update_input("top.tt", cs::init::fill(2.0f));
+                tp4::run(model);
+                CHECK(tp4::out(model, "top.in.a.y") == tp4::filled(4.0f));
+                CHECK(tp4::out(model, "top.in.b.y") == tp4::filled(6.0f));
+                CHECK(tp4::out(model, "top.c.y") == tp4::filled(8.0f));
+            }
         }
 }
 
@@ -751,31 +728,6 @@ TEST_CASE("tied outputs: a consumer on another device right after the members re
     CHECK(tp4::out(model, "c.y") == tp4::iota_from_one());
     tp4::run(model);
     CHECK(tp4::out(model, "c.y") == tp4::iota_from_one());
-}
-
-// =============================================================================================
-// the System loop
-// =============================================================================================
-TEST_CASE("System precompute runs the user's pre_forward and never a child's precompute", "[p4][loop]") {
-    tp4::g_child_pre = 0;
-    tp4::g_seen.clear();
-    cs::Model model = cs::create_model<tp4::PreTop>(default_config());
-    model.setup();
-    for (int k = 0; k < 3; ++k) tp4::run(model);
-    // The child's precompute (its pre_forward) comes after the parent's in each forward: the parent saw 0, 1, 2.
-    CHECK(tp4::g_seen == std::vector<int>{0, 1, 2});
-    CHECK(tp4::g_child_pre == 3);
-}
-
-TEST_CASE("replay skips a logged connection whose other side was deleted: the rebuilt child runs with a fresh variable",
-          "[p4][replay][rearm]") {
-    cs::Model model = cs::create_model<tp4::ReplayTop>(default_config());
-    model.setup();
-    tp4::run(model);  // p (do_once) wrote 5; c = 2 * 5 + 1; p is deleted after its turn
-    CHECK(tp4::out(model, "c.y") == tp4::filled(11.0f));
-    CHECK(cs::detail::ModelAccess::subsystem(model, "p") == nullptr);
-    CHECK_NOTHROW(tp4::run(model));  // pre_forward rearms c: the connect to the deleted p is skipped
-    CHECK(tp4::out(model, "c.y") == tp4::filled(1.0f));  // c.x is a fresh variable (zeros): 2 * 0 + 1
 }
 
 // =============================================================================================
