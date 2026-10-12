@@ -149,6 +149,12 @@ These answer the open questions on out-of-scope holders and on reverse operation
 Change notes (from Phase 5):
 - **Shape hooks may be declared from `main` before finalize.** All special operations are placed at finalize. This answers the open question on whether shape hooks are setup-only.
 
+Change notes (from Phase 8, layout revision):
+- **No flat execution list.** The run walks the tree of subsystems, using an explicit stack and no recursion. A system node holds its children in declaration order, and a leaf (a component or fused group) has no children.
+- **The flat maps stay for lookups:** full names → holders, names → subsystem handles, and each system's connections. A lookup never walks the tree.
+- **Each leaf gets a depth-first ordinal at setup.** Cycle detection and hook placement compare these ordinals, where they used to compare list positions.
+- **The name → execution-index map** becomes name → tree node.
+
 ### Phase 3: Declarations and construction
 First pass, 2026-10-11. Inventory: 2, 4, 14, 34.
 
@@ -245,6 +251,13 @@ Decisions (first pass):
 Open questions:
 - How finalize computes "the last producer of a source" when a source is a promotion or a tie alias. (The rule matches cycle detection in Phase 4.)
 
+Change notes (from Phase 8, layout revision):
+- **The run loop is a tree walk.** For each node in declaration order:
+  1. run its before-operations and its run policy's `before`;
+  2. if the node is in scope: run it if it is a leaf, or descend into its children if it is a system;
+  3. run its after-operations and its run policy's `after`.
+- **Special operations attach to tree nodes,** and are still placed at finalize.
+
 ### Phase 6: Initialization and materialization
 First pass, 2026-10-11. Inventory: 15, 16, 17, 27.
 
@@ -294,6 +307,12 @@ Open questions:
 - **What releases a system's alias data** (promotions and tie aliases)? It is not "when all of its leaves are out of scope": promotions exist precisely to keep data alive after the execution that produced it is no longer needed.
 - **The API names** for clearing a policy, and for setting a policy on a system with each of the two modes.
 
+Change notes (from Phase 8, layout revision):
+- **Run policies sit on any node,** leaf or system, with `before` and `after` around that node. A node's own policy is called even when the node is out of scope, so a transient can rearm itself.
+- **An out-of-scope system skips its whole subtree.** The walk does not descend into it, so the policies of its descendants are not called. This replaces "nested policies are independent".
+- **Rearm walks the subtree** and rearms every subsystem in it, calling each policy's `rearm`.
+- **A policy set on a system lives on that system's node.** Stamping it onto the leaves, and the two modes for doing so, are removed.
+
 ### Phase 8: Host access, inspection and teardown
 First pass, 2026-10-11. Inventory: 26, 27, 28.
 
@@ -324,10 +343,13 @@ Decisions (first pass):
 Open questions:
 - **The metadata-object layout:** Jack plans to propose a change, which decides the form of the per-subsystem input and output maps.
 
-### Phase 9: Fit check and migration
-Check against chunked systems (a range run N times), a backward pass (the list in reverse) and solver groups over cycles. Then the final API surface, the implementation order, and the migration of tests, examples and docs. Inventory: 35, 36.
-- Decisions: none yet.
-- Open questions: none yet.
+### Phase 9: Dropped
+Decided 2026-10-11. This phase is not part of this spec:
+- **Chunked systems** stay as dead reference code until their own design discussion.
+- **The backward pass and solvers** are far off.
+- **Migration** belongs to implementation planning.
+
+Inventory items 35 and 36 are out of scope here.
 
 ## Inventory (what the code does today, at 482fdd5)
 
