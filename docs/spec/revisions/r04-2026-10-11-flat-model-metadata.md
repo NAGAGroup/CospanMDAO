@@ -143,6 +143,9 @@ Change notes (from Phase 3):
 
 These answer the open questions on out-of-scope holders and on reverse operations.
 
+Change notes (from Phase 5):
+- **Shape hooks may be declared from `main` before finalize.** All special operations are placed at finalize. This answers the open question on whether shape hooks are setup-only.
+
 ### Phase 3: Declarations and construction
 First pass, 2026-10-11. Inventory: 2, 4, 14, 34.
 
@@ -199,9 +202,38 @@ Open questions:
 - How finalize finds the outermost tie of each tied variable, and attaches its single push.
 
 ### Phase 5: The execution list
-The entry base class and its protocol (run, events, owner). What becomes an entry: components; fused groups (stages named, not entered); System pre/post wrappers; shape hooks; tied-output pushes; depends_on handoffs. How positions are computed and recomputed. What stays inside a component's own entry. Inventory: 6, 7, 8, 9, 10, 11, 29.
-- Decisions: none yet.
-- Open questions: none yet.
+First pass, 2026-10-11. Inventory: 6, 7, 8, 9, 10, 11, 29.
+
+Decisions (first pass):
+- **The run loop.** For each item in the execution list, run its before-operations, then the leaf if it is enabled (in scope), then its after-operations. The eager initializer list (Phase 6) comes before the loop; the run-policy checks (Phase 7) come after it. There is no recursion.
+- **One `forward` per leaf.** Today's three steps (precompute, compute, postcompute) collapse into a single `forward`. The split existed only so that a System could interleave its children. A component's `forward` does, in order:
+  1. materialize its inputs;
+  2. call its own `pre_forward` (`set_shape`, `view_input`);
+  3. materialize its outputs;
+  4. point the wrappers;
+  5. submit;
+  6. record its events;
+  7. push to the variable's other placements;
+  8. call `post_forward`.
+
+  A fused group runs these steps across its stages, around its single launch.
+
+  Subsystems only ever have `forward`. `run` belongs to the Model alone, because it will grow into forward, backward and cycle solvers.
+- **The rest of the leaf protocol:** `events()` (this run's events), `add_dependencies(events)` (extra events for the next submission), and `dearm()` / `rearm()` (Phase 3).
+- **Special operations.** A special operation has its own run step and knows its owners. Every special operation is placed at finalize: a declaration records what it wants, and finalize decides where it runs.
+- **Shape hooks.**
+  - **Placement.** A hook is placed directly after the last producer of any of its sources: the paths named by `from_shape`, `from_value`, `counts_from` and `offsets_from`.
+  - **Ordering error.** A hook must still come before the first holder of its target. If a source is produced after that holder, it is an error, like a cycle, and it is checked right away. The error stands even if something higher in the hierarchy might override the shape: the system was defined incorrectly.
+  - **Fallback.** A `custom` hook has sources that can't be traced, so it falls back to just before the first holder of its target. A dimension that is `fixed_at_run` does nothing at run time, so a hook made only of those dimensions falls back the same way and submits nothing.
+- **depends_on.**
+  - It works over ranges: `depends_on(b, a)` collects the events of every leaf in a's range and hands them to every leaf in b's range. Either a or b may be a leaf or a system; a system means its contiguous range.
+  - It is one after-operation, on the last item of a's range.
+  - It may be declared from `main` before finalize.
+- **Tied-output pushes** are placed at finalize (Phase 4).
+- **What goes away:** each System's event aggregation (today's `forward_events_`), placing the hooks again on every run (`place_hooks`), and recursion in the run.
+
+Open questions:
+- How finalize computes "the last producer of a source" when a source is a promotion or a tie alias. (The rule matches cycle detection in Phase 4.)
 
 ### Phase 6: Initialization and materialization
 The initializer list at the start of the first run; deferral when a shape is unknown; update_input; when variables are sized and allocated; host views made before the first run. Inventory: 15, 16, 17, 27. Likely to be pulled forward when the discussion needs it.
