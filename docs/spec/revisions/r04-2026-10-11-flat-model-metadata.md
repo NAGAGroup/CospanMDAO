@@ -351,6 +351,32 @@ Decided 2026-10-11. This phase is not part of this spec:
 
 Inventory items 35 and 36 are out of scope here.
 
+## Second pass: closures (2026-10-11)
+
+These close every open question in Phases 1 to 8. Where one contradicts a phase section, this section wins.
+
+- **Phase 1, which calls are legal in each state.**
+  - **Created:** `model.add_subsystem` (adds to the root) and `setup()`.
+  - **Inside `setup()`:** every structural call.
+  - **Editable** (after `setup()`, before finalize), from `main` or a system handle: connect, promote, tie, init_input, marks, run policies, shape hooks, depends_on, set_device, `get_subsystem`, the `get_input`/`get_output` handles, `list_*` and `update_input`. Views are not allowed yet.
+  - **Finalized / running:** `run`, `wait`, views, `update_input`, `rearm_subsystem`, `set_run_policy` / `clear_run_policy`, `get_*`, `list_*` and `memory_report`. Structural calls throw.
+  - **Any time:** `setup()` again, which resets.
+- **Phase 1, the check tiers.**
+  - **At the call:** name resolution and uniqueness; dtype and rank; the merge rules and connect checks; the tie member checks; the cycle warning.
+  - **At finalize:** shape-hook placement and its ordering error; tied-output push placement and the one-device check; device resolution.
+  - **At run time:** shape resolution, shape-not-known errors, and the ragged and dense checks.
+- **Phase 1, reverse-operation details:** moot, because reverse operations were removed.
+- **Phase 2, fused-group stages.** `get_subsystem` refuses a stage of a multi-stage fused group, because a stage is not a tree node. Its inputs and outputs stay reachable by full name. A plain component is a one-stage fused group that adds no extra name segment, so to the user it behaves exactly like a component: `get_subsystem("comp")` returns it, and its inputs and outputs are `comp.x`.
+- **Phase 2, names are strings.** The hot path never resolves names.
+- **Phase 3, depends_on:** an after-operation on node a hands a's events to every leaf under node b (Phase 5).
+- **Phase 3, `set_device`:** recorded on the subsystem's node at the call, and resolved at finalize by one tree walk. An ancestor's call overrides its descendants', and each holder gets its device then.
+- **Phase 4, the outermost tie.** A tie alias that becomes a member of another tie is marked absorbed. Finalize registers a push only for tied-output aliases that are not absorbed: one push per chain.
+- **Phase 5, the last producer.** Resolve the source to its variable. Its producers are the leaves that hold output holders of that variable, tie members included. The last producer is the one with the highest depth-first ordinal; promotions share the variable, so they need no special case. Cycle detection uses the same function.
+- **Phase 6, the start-of-run pass** visits a pending set. Finalize fills it with every variable, `update_input` and rearm add to it, and the pass empties it.
+- **Phase 7, alias data.** A system node can go out of scope itself, and its own dearm releases its aliases' data. A promotion therefore keeps its data for as long as its owning system is in scope.
+- **Phase 7, API names:** `set_run_policy(path, policy)` and `clear_run_policy(path)`, replacing `override_run_policy`.
+- **Phase 8, the layout:** a tree walk plus flat maps. Each tree node keeps the holders it owns, and `list_inputs` / `list_outputs` on a handle walk that node's subtree.
+
 ## Inventory (what the code does today, at 482fdd5)
 
 Each item names a responsibility of the current code that the flat design must place somewhere.
