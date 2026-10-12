@@ -88,6 +88,9 @@ Change notes (from Phase 4):
 - **Marks** may be declared after `setup()` and before finalize.
 - **`finalize()` does real work:** anything that needs the whole structure in place. The first such job is registering the tied-output pushes (Phase 4).
 
+Change notes (from Phase 7):
+- **Run-policy overrides: the last caller wins.** No rule compares the old policy with the new one. A caller that breaks the owning system's expectations is responsible for the result. This replaces the "Run-policy override, direction" note from Phase 2.
+
 ### Phase 2: Names and the metadata object
 First pass, 2026-10-11. Inventory: 1, 3, 19, 32, 33.
 
@@ -175,6 +178,10 @@ Open questions:
 Change notes (from Phase 6):
 - There is no separate eager initializer list. A rearmed free input whose data was freed is picked up by the start-of-run materialization pass (Phase 6). This replaces "re-enters the eager initializer list".
 
+Change notes (from Phase 7):
+- **Run policies live on execution items (leaves).** A policy set on a system is propagated to the leaves in its range (Phase 7). A leaf goes out of scope through its own policy, not through a dearm walk started from a system.
+- **What releases a system's alias data is open again.** "A system has its aliases release their device data" is withdrawn. See the Phase 7 open questions.
+
 ### Phase 4: Variables and wiring
 First pass, 2026-10-11. Inventory: 12, 13, 18, 19, 20, 21.
 
@@ -260,9 +267,32 @@ Open questions:
 - Whether the pass walks every variable on every run, or keeps a set of stale or unmaterialized variables to visit.
 
 ### Phase 7: Run policies, rearm and deletion
-Policy objects (when checked, what firing means, subtree reset); rearm of any path (rerun setup, replay outside declarations); override_run_policy (recorded, replayed or not); deletion (what leaves the maps, what stays); live data rejoining after a rebuild. Inventory: 22, 23, 24, 25, 17.
-- Decisions: none yet.
-- Open questions: none yet.
+First pass, 2026-10-11. Inventory: 17, 22, 23, 24, 25.
+
+Decisions (first pass):
+- **A run policy is its own kind of object,** attached to an execution item (a leaf). It has three calls: `before`, `after` and `rearm`.
+  - **When `before` runs:** after the item's before-operations and before the item itself.
+  - **When `after` runs:** after the item's after-operations.
+  - **Even when the item is disabled.** Both calls happen whether the item is enabled or not, and the policy decides what they do.
+- **The current policies:**
+  - **run_n and do_once** count turns and dearm the leaf in `after` when they run out. Their `rearm` resets the counter.
+  - **transient** rearms the leaf in `before` and dearms it in `after`. Its own `rearm` does nothing.
+- **There is no default policy.** A leaf with no policy just runs, and a policy can be cleared.
+- **The last caller wins**, whether the policy comes from a declaration in setup, from `main`, or from an override. Nothing compares old and new. A caller that breaks the owning system's expectations is responsible for the result.
+- **Setting a policy on a system** propagates it, at the call, to the leaves in the system's range. There are two modes:
+  - override every leaf in the range;
+  - or apply it only to the leaves that have no policy.
+- **Nested policies are independent.** Each leaf's policy runs on its own, and an ancestor's scope is not consulted. For example, a transient leaf inside a system whose run_n leaves have run out keeps coming back every run, because its own policy says so.
+- **`model.rearm_subsystem(path)`.** For every leaf in the subsystem's range, it rearms the leaf and calls its policy's `rearm`. On a subsystem that is already in scope, this resets its counters.
+- **Policies are part of a system's contract.** A system's author documents the run policies it uses, so that users don't have to read its code. We don't try to handle every combination.
+- **Consequences:**
+  - **Data outlives its producer** while any holder still holds it. A do_once producer's output stays alive as long as some consumer holds that placement.
+  - **The up-front allocation pass skips leaves that are out of scope.** A transient's variables are allocated when it is rearmed during the run, not at the start.
+  - **Tied outputs and hooks** keep working while some of their owners are out of scope, because their operations check scope themselves.
+
+Open questions:
+- **What releases a system's alias data** (promotions and tie aliases)? It is not "when all of its leaves are out of scope": promotions exist precisely to keep data alive after the execution that produced it is no longer needed.
+- **The API names** for clearing a policy, and for setting a policy on a system with each of the two modes.
 
 ### Phase 8: Host access, inspection and teardown
 Handles and the `get_subsystem` handle's API; views; update_input; memory_report; wait; diagnostics; destruction order. Inventory: 26, 27, 28.
