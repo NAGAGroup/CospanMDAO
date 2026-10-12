@@ -1,6 +1,6 @@
 # r04: Flat model metadata (living spec)
 
-Status: **in discussion**. This revision is built phase by phase. Every phase stays open until the last one is settled; a later phase may revise an earlier one, and each revision is recorded in a change note in the section it changes. Nothing here is implemented.
+Status: **implemented on branch r04-impl (unreviewed)**; the text below was written while it was in discussion. This revision is built phase by phase. Every phase stays open until the last one is settled; a later phase may revise an earlier one, and each revision is recorded in a change note in the section it changes.
 
 ## Purpose
 
