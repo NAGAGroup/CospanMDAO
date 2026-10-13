@@ -14,6 +14,7 @@ Messy by design. Checkboxes, notes, strike-throughs welcome. Each item points at
   4. [ ] Toolchain and OpenMP work: the fork's OpenMP dependency-ordering bug (must be fixed before anything is published), the gemver onepass OpenMP bug, and the toolchain CI failures. Also: exceptions thrown by host tasks never reach the queue's async handler. The AdaptiveCpp fork doesn't route them there, which is why SlabKit catches them itself (HostErrors) and rethrows from wait_and_throw; the fix spans the fork and SlabKit, specifics later (2026-10-11).
   5. [ ] CI/CD for SlabKit and CoSpan.
   6. [ ] Building the site, publishing and promoting. Not defined yet.
+  7. [ ] C++20 audit: use concepts and constraints instead of static_assert throughout.
 
 Open items after the rework:
 
