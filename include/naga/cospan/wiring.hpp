@@ -336,7 +336,7 @@ std::shared_ptr<Instance> promote(const WiringSite& site, const std::shared_ptr<
                                   const Subsystem* declarer) {
     static_assert(Rank >= 1 && Rank <= 3, "cospan: rank is 1..3");
     check_typed_instance<DT, Rank>(site, "promote", *member);
-    std::shared_ptr<Instance> a = make_alias_instance(DT, Rank, std::move(name), declarer, member->kind, Role::promotion,
+    std::shared_ptr<Instance> a = make_alias_instance(DT, Rank, std::move(name), declarer->path(), declarer, member->kind, Role::promotion,
                                                       member->dims, member->can_be_source,
                                                       member->can_be_target, member->meta);
     a->device = member->device;
@@ -405,7 +405,7 @@ std::shared_ptr<Instance> build_tie_alias(const WiringSite& site, const char* ve
     meta->def_counts              = counts;
     meta->init_device             = device.value_or(default_device());  // the tie's device: the one passed, else the default
     const bool input              = kind == IOKind::input;
-    std::shared_ptr<Instance> alias = make_alias_instance(DT, Rank, std::move(name), declarer, kind,
+    std::shared_ptr<Instance> alias = make_alias_instance(DT, Rank, std::move(name), declarer->path(), declarer, kind,
                                                           Role::tie, std::move(dims), /*can_source=*/!input,
                                                           /*can_target=*/input, std::move(meta));
     alias->def_counts = std::move(counts);

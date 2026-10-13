@@ -81,7 +81,7 @@ void setup_throws(cs::Model& m, const std::vector<std::string>& needles) {
 // ---- Probe: y = x + w; x, w dense rank 1, n a one-element u32 -------------------------------------------------------
 
 /// mode 0: x, w fixed 5.  mode 1: x, w unspecified (shaped by their initializers).  mode 2: x fixed 3, w unspecified
-/// (a System shape hook sets it from the value of n). The output takes x's shape in pre_forward.
+/// (a System shape hook sets it from the value of n). The output takes x's shape in prepare_forward.
 class Probe : public cs::Component<Probe> {
 public:
     struct Inputs {
@@ -92,7 +92,7 @@ public:
     struct Outputs {
         cs::Output<DType::f32, 1> y;
     };
-    static void compute_impl(sycl::id<1> i, const Inputs& a, const Outputs& o) { o.y[i] = a.x[i] + a.w[i]; }
+    static void compute_forward(sycl::id<1> i, const Inputs& a, const Outputs& o) { o.y[i] = a.x[i] + a.w[i]; }
 
     Inputs  inputs;
     Outputs outputs;
@@ -102,7 +102,7 @@ private:
 
 public:
     explicit Probe(int mode) : mode_{mode} {}
-    void setup() override {
+    void declare() override {
         declare_input(inputs.n, "n", std::size_t{1});
         if (mode_ == 0) {
             declare_input(inputs.x, "x", std::size_t{5});
@@ -116,8 +116,8 @@ public:
         }
         declare_output(outputs.y, "y", cs::unspecified);
     }
-    void pre_forward() override { set_shape(outputs.y, shape_of(inputs.x)[0]); }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    void prepare_forward() override { set_shape(outputs.y, shape_of(inputs.x)[0]); }
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         return create_launch_config(cs::range_desc(outputs.y.shape()));
     }
 };
@@ -134,7 +134,7 @@ public:
     struct Outputs {
         cs::Output<DType::f32, 1> sums;
     };
-    static void compute_impl(sycl::id<1> id, const Inputs& i, const Outputs& o) {
+    static void compute_forward(sycl::id<1> id, const Inputs& i, const Outputs& o) {
         auto  b = i.x.block(id[0]);
         float s = 0.0f;
         for (std::size_t q = 0; q < b.size(); ++q) s += b[q];
@@ -150,15 +150,15 @@ private:
 
 public:
     RagSum(int mode, Sizes sizes) : mode_{mode}, sizes_{std::move(sizes)} {}
-    void setup() override {
+    void declare() override {
         if (mode_ == 0 || mode_ == 1)
             declare_input(inputs.x, "x");
         else
             declare_input(inputs.x, "x", cs::counts(sizes_));
         declare_output(outputs.sums, "sums", cs::unspecified);
     }
-    void pre_forward() override { set_shape(outputs.sums, shape_of(inputs.x).n); }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    void prepare_forward() override { set_shape(outputs.sums, shape_of(inputs.x).n); }
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         return create_launch_config(cs::range_desc(outputs.sums.shape()));
     }
 };
@@ -173,17 +173,17 @@ public:
     struct Outputs {
         cs::Output<DType::f32, 1> out;
     };
-    static void compute_impl(sycl::id<1> i, const Inputs& a, const Outputs& o) { o.out[i] = 2.0f * a.in[i]; }
+    static void compute_forward(sycl::id<1> i, const Inputs& a, const Outputs& o) { o.out[i] = 2.0f * a.in[i]; }
 
     Inputs  inputs;
     Outputs outputs;
 
-    void setup() override {
+    void declare() override {
         declare_input(inputs.in, "in", cs::unspecified);
         declare_output(outputs.out, "out", cs::unspecified);
     }
-    void pre_forward() override { set_shape(outputs.out, shape_of(inputs.in)[0]); }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(cs::range_desc(outputs.out.shape())); }
+    void prepare_forward() override { set_shape(outputs.out, shape_of(inputs.in)[0]); }
+    std::unique_ptr<cs::LaunchDescription> define_forward() override { return create_launch_config(cs::range_desc(outputs.out.shape())); }
 };
 
 // ---- the subtree under test, a plain System ----------------------------------------------------------------------------

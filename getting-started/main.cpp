@@ -11,17 +11,17 @@ class Axpb : public cs::Component<Axpb> {
 public:
     struct Inputs  { cs::Input<DType::f32, 1> x; };
     struct Outputs { cs::Output<DType::f32, 1> y; };
-    static void compute_impl(sycl::id<1> i, const Inputs& in, const Outputs& out) { out.y[i] = 2.0f * in.x[i] + 1.0f; }
+    static void compute_forward(sycl::id<1> i, const Inputs& in, const Outputs& out) { out.y[i] = 2.0f * in.x[i] + 1.0f; }
 
     Inputs  inputs;
     Outputs outputs;
 
-    void setup() override {
+    void declare() override {
         declare_input(inputs.x, "x", cs::unspecified);
         declare_output(outputs.y, "y", cs::unspecified);
     }
-    void pre_forward() override { set_shape(outputs.y, shape_of(inputs.x)[0]); }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    void prepare_forward() override { set_shape(outputs.y, shape_of(inputs.x)[0]); }
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         return create_launch_config(cs::range_desc(inputs.x.shape()));
     }
 };

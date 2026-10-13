@@ -26,21 +26,20 @@ namespace tdiag {
 
 // A host-body producer: y[i] = i, run as a host task.
 
-class HostIota : public cs::Component<HostIota> {
+class HostIota : public cs::HostComponent<HostIota> {
 public:
     struct Inputs {};
     struct Outputs {
         cs::Output<DType::f32, 1> y;
     };
-    static void compute_impl(cs::Host, const Inputs&, const Outputs& out) {
+    static void compute_forward(const Inputs&, const Outputs& out) {
         for (std::size_t i = 0; i < out.y.size(); ++i) out.y[i] = static_cast<float>(i);
     }
 
     Inputs  inputs;
     Outputs outputs;
 
-    void setup() override { declare_output(outputs.y, "y", 8); }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(); }
+    void declare() override { declare_output(outputs.y, "y", 8); }
 };
 
 class HostTop : public cs::System {

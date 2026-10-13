@@ -61,8 +61,8 @@ public:
     virtual bool is_leaf() const noexcept = 0;
 
     // ---- the run (leaves only) -----------------------------------------------------
-    /// One forward: materialize the inputs, run pre_forward, materialize the outputs, point the wrappers, submit, record
-    /// the events, push to the other placements, run post_forward. Called by the model's tree walk for a leaf in scope.
+    /// One forward: materialize the inputs, run prepare_forward, materialize the outputs, point the wrappers, submit, record
+    /// the events, push to the other placements. Called by the model's tree walk for a leaf in scope.
     virtual void forward(detail::Runtime& rt) {
         (void)rt;
         throw std::logic_error("naga::cospan: '" + name_ + "' is not a leaf; it has no forward");

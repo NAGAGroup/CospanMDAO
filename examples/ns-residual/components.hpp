@@ -92,7 +92,7 @@ class LoadTile : public cs::Component<LoadTile> {
 public:
     struct Inputs { In3 U; GeoIn geo; };
     struct Outputs {};
-    static void compute_impl(cs::GroupItem<2> it, const Inputs& in, const Outputs&) {
+    static void compute_forward(cs::GroupItem<2> it, const Inputs& in, const Outputs&) {
         float* L = it.local<float>(static_cast<std::size_t>(kNLoc) * kLocCells);
         tile_load(make_th(it), geo_of(in.geo), L, [&](int v, int j, int i) { return in.U[id3(v, j, i)]; });
     }
@@ -101,11 +101,11 @@ public:
     Outputs outputs;
 
     LoadTile(int nx, int ny) : geo_{make_geo(nx, ny)} {}
-    void setup() override {
+    void declare() override {
         declare_input(inputs.U, "U", cs::unspecified_shape<3>());
         declare_input(inputs.geo, "geo", cs::unspecified_shape<1>());  // tied
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         auto d = create_launch_config(cs::range_desc(tile_range(geo_)), cs::wg_desc(tile_wg()));
         d->request_local_bytes(kLocalBytes);
         return d;
@@ -121,7 +121,7 @@ class ApplyBoundary : public cs::Component<ApplyBoundary<Bc>> {
 public:
     struct Inputs { In3 U; GeoIn geo; };
     struct Outputs {};
-    static void compute_impl(cs::GroupItem<2> it, const Inputs& in, const Outputs&) {
+    static void compute_forward(cs::GroupItem<2> it, const Inputs& in, const Outputs&) {
         float* L = it.local<float>(static_cast<std::size_t>(kNLoc) * kLocCells);
         tile_boundary<Bc>(make_th(it), geo_of(in.geo), L, [&](int v, int j, int i) { return in.U[id3(v, j, i)]; });
     }
@@ -130,11 +130,11 @@ public:
     Outputs outputs;
 
     ApplyBoundary(int nx, int ny) : geo_{make_geo(nx, ny)} {}
-    void setup() override {
+    void declare() override {
         this->declare_input(inputs.U, "U", cs::unspecified_shape<3>());
         this->declare_input(inputs.geo, "geo", cs::unspecified_shape<1>());  // tied
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         auto d = this->create_launch_config(cs::range_desc(tile_range(geo_)), cs::wg_desc(tile_wg()));
         d->request_local_bytes(kLocalBytes);
         return d;
@@ -149,7 +149,7 @@ class ToPrimitive : public cs::Component<ToPrimitive> {
 public:
     struct Inputs {};
     struct Outputs {};
-    static void compute_impl(cs::GroupItem<2> it, const Inputs&, const Outputs&) {
+    static void compute_forward(cs::GroupItem<2> it, const Inputs&, const Outputs&) {
         float* L = it.local<float>(static_cast<std::size_t>(kNLoc) * kLocCells);
         tile_to_primitive(make_th(it), L);
     }
@@ -158,8 +158,8 @@ public:
     Outputs outputs;
 
     ToPrimitive(int nx, int ny) : geo_{make_geo(nx, ny)} {}
-    void setup() override {}
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    void declare() override {}
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         auto d = create_launch_config(cs::range_desc(tile_range(geo_)), cs::wg_desc(tile_wg()));
         d->request_local_bytes(kLocalBytes);
         return d;
@@ -173,7 +173,7 @@ class Gradients : public cs::Component<Gradients> {
 public:
     struct Inputs {};
     struct Outputs {};
-    static void compute_impl(cs::GroupItem<2> it, const Inputs&, const Outputs&) {
+    static void compute_forward(cs::GroupItem<2> it, const Inputs&, const Outputs&) {
         float* L = it.local<float>(static_cast<std::size_t>(kNLoc) * kLocCells);
         tile_gradients(make_th(it), L);
     }
@@ -182,8 +182,8 @@ public:
     Outputs outputs;
 
     Gradients(int nx, int ny) : geo_{make_geo(nx, ny)} {}
-    void setup() override {}
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    void declare() override {}
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         auto d = create_launch_config(cs::range_desc(tile_range(geo_)), cs::wg_desc(tile_wg()));
         d->request_local_bytes(kLocalBytes);
         return d;
@@ -199,7 +199,7 @@ class Reconstruct : public cs::Component<Reconstruct<Lim>> {
 public:
     struct Inputs {};
     struct Outputs {};
-    static void compute_impl(cs::GroupItem<2> it, const Inputs&, const Outputs&) {
+    static void compute_forward(cs::GroupItem<2> it, const Inputs&, const Outputs&) {
         float* L = it.local<float>(static_cast<std::size_t>(kNLoc) * kLocCells);
         tile_reconstruct<Lim>(make_th(it), L);
     }
@@ -208,8 +208,8 @@ public:
     Outputs outputs;
 
     Reconstruct(int nx, int ny) : geo_{make_geo(nx, ny)} {}
-    void setup() override {}
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    void declare() override {}
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         auto d = this->create_launch_config(cs::range_desc(tile_range(geo_)), cs::wg_desc(tile_wg()));
         d->request_local_bytes(kLocalBytes);
         return d;
@@ -226,7 +226,7 @@ class ConvFlux : public cs::Component<ConvFlux<Dir>> {
 public:
     struct Inputs { GeoIn geo; };
     struct Outputs { Out3 F; };
-    static void compute_impl(cs::GroupItem<2> it, const Inputs& in, const Outputs& out) {
+    static void compute_forward(cs::GroupItem<2> it, const Inputs& in, const Outputs& out) {
         const float* L = it.local<float>(static_cast<std::size_t>(kNLoc) * kLocCells);
         tile_conv_flux(make_th(it), geo_of(in.geo), L, Dir, [&](int v, int j, int i, float x) { out.F[id3(v, j, i)] = x; });
     }
@@ -235,11 +235,11 @@ public:
     Outputs outputs;
 
     ConvFlux(int nx, int ny) : geo_{make_geo(nx, ny)} {}
-    void setup() override {
+    void declare() override {
         this->declare_input(inputs.geo, "geo", cs::unspecified_shape<1>());  // tied
         this->declare_output(outputs.F, "F", 4, geo_.ny + (Dir == 1 ? 1 : 0), geo_.nx + (Dir == 0 ? 1 : 0));
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         auto d = this->create_launch_config(cs::range_desc(tile_range(geo_)), cs::wg_desc(tile_wg()));
         d->request_local_bytes(kLocalBytes);
         return d;
@@ -254,7 +254,7 @@ class ViscFlux : public cs::Component<ViscFlux<Dir>> {
 public:
     struct Inputs { GeoIn geo; };
     struct Outputs { Out3 F; };
-    static void compute_impl(cs::GroupItem<2> it, const Inputs& in, const Outputs& out) {
+    static void compute_forward(cs::GroupItem<2> it, const Inputs& in, const Outputs& out) {
         const float* L = it.local<float>(static_cast<std::size_t>(kNLoc) * kLocCells);
         tile_visc_flux(make_th(it), geo_of(in.geo), L, Dir, [&](int v, int j, int i, float x) { out.F[id3(v, j, i)] = x; });
     }
@@ -263,11 +263,11 @@ public:
     Outputs outputs;
 
     ViscFlux(int nx, int ny) : geo_{make_geo(nx, ny)} {}
-    void setup() override {
+    void declare() override {
         this->declare_input(inputs.geo, "geo", cs::unspecified_shape<1>());  // tied
         this->declare_output(outputs.F, "F", 4, geo_.ny + (Dir == 1 ? 1 : 0), geo_.nx + (Dir == 0 ? 1 : 0));
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         auto d = this->create_launch_config(cs::range_desc(tile_range(geo_)), cs::wg_desc(tile_wg()));
         d->request_local_bytes(kLocalBytes);
         return d;
@@ -298,7 +298,7 @@ public:
     struct InputsFused { In3 Fx, Fy; GeoIn geo; };
     using Inputs = std::conditional_t<Fused, InputsFused, InputsPlain>;
     struct Outputs { Out3 R; };
-    static void compute_impl(cs::GroupItem<2> it, const Inputs& in, const Outputs& out) {
+    static void compute_forward(cs::GroupItem<2> it, const Inputs& in, const Outputs& out) {
         const Th t = make_th(it);
         if constexpr (Fused) wait_tile_neighbours(it, t, geo_of(in.geo));
         cell_divergence(
@@ -310,7 +310,7 @@ public:
     Outputs outputs;
 
     ConvDivergence(int nx, int ny) : geo_{make_geo(nx, ny)} {}
-    void setup() override {
+    void declare() override {
         this->declare_input(inputs.Fx, "Fx", 4, geo_.ny, geo_.nx + 1);
         this->declare_input(inputs.Fy, "Fy", 4, geo_.ny + 1, geo_.nx);
         if constexpr (Fused) {
@@ -320,7 +320,7 @@ public:
             this->declare_output(outputs.R, "R", 4, geo_.ny, geo_.nx);
         }
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         return this->create_launch_config(cs::range_desc(tile_range(geo_)), cs::wg_desc(tile_wg()));
     }
 
@@ -333,7 +333,7 @@ class ViscDivergence : public cs::Component<ViscDivergence> {
 public:
     struct Inputs { In3 Fx, Fy; GeoIn geo; };
     struct Outputs { Out3 R; };
-    static void compute_impl(cs::GroupItem<2> it, const Inputs& in, const Outputs& out) {
+    static void compute_forward(cs::GroupItem<2> it, const Inputs& in, const Outputs& out) {
         const Th t = make_th(it);
         wait_tile_neighbours(it, t, geo_of(in.geo));
         cell_divergence(
@@ -345,13 +345,13 @@ public:
     Outputs outputs;
 
     ViscDivergence(int nx, int ny) : geo_{make_geo(nx, ny)} {}
-    void setup() override {
+    void declare() override {
         declare_input(inputs.Fx, "Fx", 4, geo_.ny, geo_.nx + 1);
         declare_input(inputs.Fy, "Fy", 4, geo_.ny + 1, geo_.nx);
         declare_input(inputs.geo, "geo", cs::unspecified_shape<1>());  // tied
         declare_output(outputs.R, "R", cs::unspecified_shape<3>());
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         return create_launch_config(cs::range_desc(tile_range(geo_)), cs::wg_desc(tile_wg()));
     }
 
@@ -364,7 +364,7 @@ class ViscDivergenceChained : public cs::Component<ViscDivergenceChained> {
 public:
     struct Inputs { In3 Rc, Fx, Fy; };
     struct Outputs { Out3 R; };
-    static void compute_impl(cs::GroupItem<2> it, const Inputs& in, const Outputs& out) {
+    static void compute_forward(cs::GroupItem<2> it, const Inputs& in, const Outputs& out) {
         cell_divergence(
             make_th(it), 1.0f, [&](int v, int j, int i) { return in.Fx[id3(v, j, i)]; }, [&](int v, int j, int i) { return in.Fy[id3(v, j, i)]; },
             [&](int v, int j, int i, float x) { out.R[id3(v, j, i)] = in.Rc[id3(v, j, i)] + x; });
@@ -374,13 +374,13 @@ public:
     Outputs outputs;
 
     ViscDivergenceChained(int nx, int ny) : geo_{make_geo(nx, ny)} {}
-    void setup() override {
+    void declare() override {
         declare_input(inputs.Rc, "Rc", 4, geo_.ny, geo_.nx);
         declare_input(inputs.Fx, "Fx", 4, geo_.ny, geo_.nx + 1);
         declare_input(inputs.Fy, "Fy", 4, geo_.ny + 1, geo_.nx);
         declare_output(outputs.R, "R", 4, geo_.ny, geo_.nx);
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         return create_launch_config(cs::range_desc(tile_range(geo_)), cs::wg_desc(tile_wg()));
     }
 
@@ -393,7 +393,7 @@ class InitDiagnostics : public cs::Component<InitDiagnostics> {
 public:
     struct Inputs {};
     struct Outputs { Acc1 Dt, Ws, Sq; };
-    static void compute_impl(cs::GroupItem<2> it, const Inputs&, const Outputs& out) {
+    static void compute_forward(cs::GroupItem<2> it, const Inputs&, const Outputs& out) {
         if (it.get_local_linear_id() == 0) {
             out.Dt[id1(0)].store(std::numeric_limits<float>::infinity());
             out.Ws[id1(0)].store(-std::numeric_limits<float>::infinity());
@@ -404,12 +404,12 @@ public:
     Inputs  inputs;
     Outputs outputs;
 
-    void setup() override {
+    void declare() override {
         declare_output(outputs.Dt, "Dt", cs::unspecified_shape<1>());
         declare_output(outputs.Ws, "Ws", cs::unspecified_shape<1>());
         declare_output(outputs.Sq, "Sq", cs::unspecified_shape<1>());
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         return create_launch_config(cs::range_desc(tile_wg()), cs::wg_desc(tile_wg()));
     }
 };
@@ -421,7 +421,7 @@ class LocalTimestep : public cs::Component<LocalTimestep<Fused>> {
 public:
     struct Inputs { In3 U; };
     struct Outputs { Acc1 Dt; Out2 Part; };
-    static void compute_impl(cs::GroupItem<2> it, const Inputs& in, const Outputs& out) {
+    static void compute_forward(cs::GroupItem<2> it, const Inputs& in, const Outputs& out) {
         const Th t = make_th(it);
         float dt, ws;
         cell_dt_ws(t, [&](int v, int j, int i) { return in.U[id3(v, j, i)]; }, dt, ws);
@@ -437,12 +437,12 @@ public:
     Outputs outputs;
 
     LocalTimestep(int nx, int ny) : geo_{make_geo(nx, ny)} {}
-    void setup() override {
+    void declare() override {
         this->declare_input(inputs.U, "U", cs::unspecified_shape<3>());
         this->declare_output(outputs.Dt, "Dt", cs::unspecified_shape<1>());
         this->declare_output(outputs.Part, "Part", geo_.ty, geo_.tx);
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         return this->create_launch_config(cs::range_desc(tile_range(geo_)), cs::wg_desc(tile_wg()));
     }
 
@@ -455,7 +455,7 @@ class WaveSpeed : public cs::Component<WaveSpeed<Fused>> {
 public:
     struct Inputs { In3 U; };
     struct Outputs { Acc1 Ws; Out2 Part; };
-    static void compute_impl(cs::GroupItem<2> it, const Inputs& in, const Outputs& out) {
+    static void compute_forward(cs::GroupItem<2> it, const Inputs& in, const Outputs& out) {
         const Th t = make_th(it);
         float dt, ws;
         cell_dt_ws(t, [&](int v, int j, int i) { return in.U[id3(v, j, i)]; }, dt, ws);
@@ -471,12 +471,12 @@ public:
     Outputs outputs;
 
     WaveSpeed(int nx, int ny) : geo_{make_geo(nx, ny)} {}
-    void setup() override {
+    void declare() override {
         this->declare_input(inputs.U, "U", cs::unspecified_shape<3>());
         this->declare_output(outputs.Ws, "Ws", cs::unspecified_shape<1>());
         this->declare_output(outputs.Part, "Part", geo_.ty, geo_.tx);
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         return this->create_launch_config(cs::range_desc(tile_range(geo_)), cs::wg_desc(tile_wg()));
     }
 
@@ -490,7 +490,7 @@ class ResidualSquares : public cs::Component<ResidualSquares<Fused>> {
 public:
     struct Inputs { In3 R; };
     struct Outputs { Acc1 Sq; Out3 Part; };
-    static void compute_impl(cs::GroupItem<2> it, const Inputs& in, const Outputs& out) {
+    static void compute_forward(cs::GroupItem<2> it, const Inputs& in, const Outputs& out) {
         const Th t = make_th(it);
         const int j = t.gy * kTile + t.ly, i = t.gx * kTile + t.lx;
         float s[4];
@@ -511,12 +511,12 @@ public:
     Outputs outputs;
 
     ResidualSquares(int nx, int ny) : geo_{make_geo(nx, ny)} {}
-    void setup() override {
+    void declare() override {
         this->declare_input(inputs.R, "R", 4, geo_.ny, geo_.nx);
         this->declare_output(outputs.Sq, "Sq", cs::unspecified_shape<1>());
         this->declare_output(outputs.Part, "Part", 4, geo_.ty, geo_.tx);
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         return this->create_launch_config(cs::range_desc(tile_range(geo_)), cs::wg_desc(tile_wg()));
     }
 
@@ -531,7 +531,7 @@ class DetNorm : public cs::Component<DetNorm> {
 public:
     struct Inputs { In3 Part; GeoIn geo; };
     struct Outputs { Out1 Det; };
-    static void compute_impl(cs::GroupItem<2> it, const Inputs& in, const Outputs& out) {
+    static void compute_forward(cs::GroupItem<2> it, const Inputs& in, const Outputs& out) {
         const Geo   geo = geo_of(in.geo);
         const Th    t   = make_th(it);
         const int   v   = static_cast<int>(it.get_group(0));  // one group per variable
@@ -544,12 +544,12 @@ public:
     Outputs outputs;
 
     DetNorm(int nx, int ny) : geo_{make_geo(nx, ny)} {}
-    void setup() override {
+    void declare() override {
         declare_input(inputs.Part, "Part", 4, geo_.ty, geo_.tx);
         declare_input(inputs.geo, "geo", cs::unspecified_shape<1>());  // tied
         declare_output(outputs.Det, "Det", 4);
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         return create_launch_config(cs::range_desc(sycl::range<2>{4 * kTile, kTile}), cs::wg_desc(tile_wg()));
     }
 
@@ -563,7 +563,7 @@ class DetExtreme : public cs::Component<DetExtreme<IsMin>> {
 public:
     struct Inputs { In2 Part; GeoIn geo; };
     struct Outputs { Out1 Det; };
-    static void compute_impl(cs::GroupItem<2> it, const Inputs& in, const Outputs& out) {
+    static void compute_forward(cs::GroupItem<2> it, const Inputs& in, const Outputs& out) {
         const Geo   geo = geo_of(in.geo);
         const Th    t   = make_th(it);
         const int   tx  = geo.tx;
@@ -576,12 +576,12 @@ public:
     Outputs outputs;
 
     DetExtreme(int nx, int ny) : geo_{make_geo(nx, ny)} {}
-    void setup() override {
+    void declare() override {
         this->declare_input(inputs.Part, "Part", geo_.ty, geo_.tx);
         this->declare_input(inputs.geo, "geo", cs::unspecified_shape<1>());  // tied
         this->declare_output(outputs.Det, "Det", 1);
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         return this->create_launch_config(cs::range_desc(tile_wg()), cs::wg_desc(tile_wg()));
     }
 
@@ -598,7 +598,7 @@ class ErrorStage : public cs::Component<ErrorStage<Fused>> {
 public:
     struct Inputs { In1 DetSq, DetDt, DetWs; };
     struct Outputs { Acc1 Dt, Ws, Sq; Out1 Err; };
-    static void compute_impl(cs::GroupItem<2> it, const Inputs& in, const Outputs& out) {
+    static void compute_forward(cs::GroupItem<2> it, const Inputs& in, const Outputs& out) {
         if constexpr (Fused)
             for (std::size_t g = 0; g < 4; ++g) it.wait_group(kSegDet, sycl::id<2>{g, 0});
         if (it.get_local_linear_id() == 0) {
@@ -611,7 +611,7 @@ public:
     Inputs  inputs;
     Outputs outputs;
 
-    void setup() override {
+    void declare() override {
         this->declare_input(inputs.DetSq, "DetSq", 4);
         this->declare_input(inputs.DetDt, "DetDt", 1);
         this->declare_input(inputs.DetWs, "DetWs", 1);
@@ -620,7 +620,7 @@ public:
         this->declare_output(outputs.Sq, "Sq", cs::unspecified_shape<1>());
         this->declare_output(outputs.Err, "Err", 6);
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         return this->create_launch_config(cs::range_desc(tile_wg()), cs::wg_desc(tile_wg()));
     }
 };
@@ -636,7 +636,7 @@ class PadBoundary : public cs::Component<PadBoundary<Bc>> {
 public:
     struct Inputs { In3 U; GeoIn geo; };
     struct Outputs { Out3 P; };
-    static void compute_impl(sycl::id<2> idx, const Inputs& in, const Outputs& out) {
+    static void compute_forward(sycl::id<2> idx, const Inputs& in, const Outputs& out) {
         const Geo geo = geo_of(in.geo);
         const int b = static_cast<int>(idx[0]), a = static_cast<int>(idx[1]);
         const int j = b - kHalo, i = a - kHalo;
@@ -661,12 +661,12 @@ public:
     Outputs outputs;
 
     PadBoundary(int nx, int ny) : geo_{make_geo(nx, ny)} {}
-    void setup() override {
+    void declare() override {
         this->declare_input(inputs.U, "U", cs::unspecified_shape<3>());
         this->declare_input(inputs.geo, "geo", cs::unspecified_shape<1>());  // tied
         this->declare_output(outputs.P, "P", 4, geo_.ny + 2 * kHalo, geo_.nx + 2 * kHalo);
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         return this->create_launch_config(
             cs::range_desc(sycl::range<2>{static_cast<std::size_t>(geo_.ny + 2 * kHalo), static_cast<std::size_t>(geo_.nx + 2 * kHalo)}));
     }
@@ -683,7 +683,7 @@ class ToPrimitiveG : public cs::Component<ToPrimitiveG> {
 public:
     struct Inputs { In3 P; };
     struct Outputs { Out3 W; };
-    static void compute_impl(sycl::id<2> idx, const Inputs& in, const Outputs& out) {
+    static void compute_forward(sycl::id<2> idx, const Inputs& in, const Outputs& out) {
         const int b = static_cast<int>(idx[0]), a = static_cast<int>(idx[1]);
         float u[4], w[4];
         for (int v = 0; v < 4; ++v) u[v] = in.P[id3(v, b, a)];
@@ -695,11 +695,11 @@ public:
     Outputs outputs;
 
     ToPrimitiveG(int nx, int ny) : geo_{make_geo(nx, ny)} {}
-    void setup() override {
+    void declare() override {
         declare_input(inputs.P, "P", 4, geo_.ny + 2 * kHalo, geo_.nx + 2 * kHalo);
         declare_output(outputs.W, "W", 4, geo_.ny + 2 * kHalo, geo_.nx + 2 * kHalo);
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         return create_launch_config(cs::range_desc(padded_range(geo_, 0)));
     }
 
@@ -711,7 +711,7 @@ class GradientsG : public cs::Component<GradientsG> {
 public:
     struct Inputs { In3 W; };
     struct Outputs { Out3 G; };
-    static void compute_impl(sycl::id<2> idx, const Inputs& in, const Outputs& out) {
+    static void compute_forward(sycl::id<2> idx, const Inputs& in, const Outputs& out) {
         const int b = 1 + static_cast<int>(idx[0]), a = 1 + static_cast<int>(idx[1]);
         float xm[4], xp[4], ym[4], yp[4], g[6];
         for (int v = 0; v < 4; ++v) {
@@ -728,11 +728,11 @@ public:
     Outputs outputs;
 
     GradientsG(int nx, int ny) : geo_{make_geo(nx, ny)} {}
-    void setup() override {
+    void declare() override {
         declare_input(inputs.W, "W", 4, geo_.ny + 2 * kHalo, geo_.nx + 2 * kHalo);
         declare_output(outputs.G, "G", 6, geo_.ny + 2 * kHalo, geo_.nx + 2 * kHalo);
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         return create_launch_config(cs::range_desc(padded_range(geo_, 1)));
     }
 
@@ -745,7 +745,7 @@ class ReconstructG : public cs::Component<ReconstructG<Lim>> {
 public:
     struct Inputs { In3 W; };
     struct Outputs { Out3 S; };
-    static void compute_impl(sycl::id<2> idx, const Inputs& in, const Outputs& out) {
+    static void compute_forward(sycl::id<2> idx, const Inputs& in, const Outputs& out) {
         const int b = 1 + static_cast<int>(idx[0]), a = 1 + static_cast<int>(idx[1]);
         for (int v = 0; v < 4; ++v) {
             const float w0 = in.W[id3(v, b, a)];
@@ -758,11 +758,11 @@ public:
     Outputs outputs;
 
     ReconstructG(int nx, int ny) : geo_{make_geo(nx, ny)} {}
-    void setup() override {
+    void declare() override {
         this->declare_input(inputs.W, "W", 4, geo_.ny + 2 * kHalo, geo_.nx + 2 * kHalo);
         this->declare_output(outputs.S, "S", 8, geo_.ny + 2 * kHalo, geo_.nx + 2 * kHalo);
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         return this->create_launch_config(cs::range_desc(padded_range(geo_, 1)));
     }
 
@@ -780,7 +780,7 @@ class ConvFluxG : public cs::Component<ConvFluxG<Dir>> {
 public:
     struct Inputs { In3 W, S; };
     struct Outputs { Out3 F; };
-    static void compute_impl(sycl::id<2> idx, const Inputs& in, const Outputs& out) {
+    static void compute_forward(sycl::id<2> idx, const Inputs& in, const Outputs& out) {
         const int j = static_cast<int>(idx[0]), i = static_cast<int>(idx[1]);
         const int b = j + kHalo, a = i + kHalo;
         const int bl = Dir == 0 ? b : b - 1, al = Dir == 0 ? a - 1 : a;
@@ -797,12 +797,12 @@ public:
     Outputs outputs;
 
     ConvFluxG(int nx, int ny) : geo_{make_geo(nx, ny)} {}
-    void setup() override {
+    void declare() override {
         this->declare_input(inputs.W, "W", 4, geo_.ny + 2 * kHalo, geo_.nx + 2 * kHalo);
         this->declare_input(inputs.S, "S", 8, geo_.ny + 2 * kHalo, geo_.nx + 2 * kHalo);
         this->declare_output(outputs.F, "F", 4, geo_.ny + (Dir == 1 ? 1 : 0), geo_.nx + (Dir == 0 ? 1 : 0));
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         return this->create_launch_config(cs::range_desc(face_range(geo_, Dir)));
     }
 
@@ -815,7 +815,7 @@ class ViscFluxG : public cs::Component<ViscFluxG<Dir>> {
 public:
     struct Inputs { In3 W, G; };
     struct Outputs { Out3 F; };
-    static void compute_impl(sycl::id<2> idx, const Inputs& in, const Outputs& out) {
+    static void compute_forward(sycl::id<2> idx, const Inputs& in, const Outputs& out) {
         const int j = static_cast<int>(idx[0]), i = static_cast<int>(idx[1]);
         const int b = j + kHalo, a = i + kHalo;
         const int bl = Dir == 0 ? b : b - 1, al = Dir == 0 ? a - 1 : a;
@@ -836,12 +836,12 @@ public:
     Outputs outputs;
 
     ViscFluxG(int nx, int ny) : geo_{make_geo(nx, ny)} {}
-    void setup() override {
+    void declare() override {
         this->declare_input(inputs.W, "W", 4, geo_.ny + 2 * kHalo, geo_.nx + 2 * kHalo);
         this->declare_input(inputs.G, "G", 6, geo_.ny + 2 * kHalo, geo_.nx + 2 * kHalo);
         this->declare_output(outputs.F, "F", 4, geo_.ny + (Dir == 1 ? 1 : 0), geo_.nx + (Dir == 0 ? 1 : 0));
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         return this->create_launch_config(cs::range_desc(face_range(geo_, Dir)));
     }
 

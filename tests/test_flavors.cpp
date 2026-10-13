@@ -111,7 +111,7 @@ public:
     struct Outputs {
         cs::Output<DType::f32, R> y;
     };
-    static void compute_impl(sycl::id<R> i, const Inputs& in, const Outputs& out) {
+    static void compute_forward(sycl::id<R> i, const Inputs& in, const Outputs& out) {
         float v = 0.0f;
         for (int d = 0; d < R; ++d) v = v * 100.0f + static_cast<float>(i[d]);
         out.y[i] = in.scale[std::size_t{0}] * v + in.offset[std::size_t{0}];
@@ -127,14 +127,14 @@ private:
 public:
     explicit SrcND(std::array<int, R> dims, float scale = 1.0f, float offset = 1.0f)
         : dims_{dims}, scale_{scale}, offset_{offset} {}
-    void setup() override {
+    void declare() override {
         std::apply([&](auto... n) { this->declare_output(outputs.y, "y", n...); }, dims_);
         this->declare_input(inputs.scale, "scale", 1);
         this->declare_input(inputs.offset, "offset", 1);
         this->init_input("scale", cs::init::fill(scale_));
         this->init_input("offset", cs::init::fill(offset_));
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         return this->create_launch_config(cs::range_desc(outputs.y.shape()));
     }
 };
@@ -153,7 +153,7 @@ public:
     struct Outputs {
         cs::Output<DType::f32, R> y;
     };
-    static void compute_impl(sycl::id<R> i, const Inputs& in, const Outputs& out) {
+    static void compute_forward(sycl::id<R> i, const Inputs& in, const Outputs& out) {
         const float x = in.x[i];
         float       y = 0.0f;
         if constexpr (Op == 0) y = 2.0f * x + 1.0f;
@@ -167,15 +167,15 @@ public:
     Inputs  inputs;
     Outputs outputs;
 
-    void setup() override {
+    void declare() override {
         this->declare_input(inputs.x, "x", cs::unspecified_shape<R>());
         this->declare_output(outputs.y, "y", cs::unspecified_shape<R>());
     }
-    void pre_forward() override {  // the output follows the input (section 10: no derived dims), one entry per dimension
+    void prepare_forward() override {  // the output follows the input (section 10: no derived dims), one entry per dimension
         const sycl::range<R> s = this->shape_of(inputs.x);
         [&]<std::size_t... I>(std::index_sequence<I...>) { this->set_shape(outputs.y, s[I]...); }(std::make_index_sequence<R>{});
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         return this->create_launch_config(cs::range_desc(inputs.x.shape()));
     }
 };
@@ -202,17 +202,17 @@ public:
     struct Outputs {
         cs::Output<DType::f32, 1> y;
     };
-    static void compute_impl(sycl::id<1> i, const Inputs& in, const Outputs& out) { out.y[i] = in.x[i] + 1.0f; }
+    static void compute_forward(sycl::id<1> i, const Inputs& in, const Outputs& out) { out.y[i] = in.x[i] + 1.0f; }
 
     Inputs  inputs;
     Outputs outputs;
 
-    void setup() override {
+    void declare() override {
         declare_input(inputs.x, "x", cs::unspecified_shape<1>());
         declare_output(outputs.y, "y", cs::unspecified_shape<1>());
     }
-    void pre_forward() override { set_shape(outputs.y, shape_of(inputs.x)[0]); }  // the output follows the input (section 10: no derived dims)
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    void prepare_forward() override { set_shape(outputs.y, shape_of(inputs.x)[0]); }  // the output follows the input (section 10: no derived dims)
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         return create_launch_config(cs::range_desc(sycl::range<1>{inputs.x.shape()[0] / 2}));
     }
 };
@@ -234,7 +234,7 @@ public:
     struct Scratch {
         cs::Local<DType::f32, 1> tile;
     };
-    static void compute_impl(cs::GroupItem<1> it, const Inputs& in, const Outputs& out, Scratch s) {
+    static void compute_forward(cs::GroupItem<1> it, const Inputs& in, const Outputs& out, Scratch s) {
         const std::size_t n = it.get_local_range(0), l = it.get_local_linear_id(), g = it.get_global_id(0);
         const std::size_t total = in.x.shape()[0];
         if constexpr (Kind == kRev) {
@@ -259,12 +259,12 @@ private:
 
 public:
     explicit GroupStage(std::size_t wg = 64) : wg_{wg} {}
-    void setup() override {
+    void declare() override {
         this->declare_input(inputs.x, "x", cs::unspecified_shape<1>());
         this->declare_output(outputs.y, "y", cs::unspecified_shape<1>());
     }
-    void pre_forward() override { this->set_shape(outputs.y, this->shape_of(inputs.x)[0]); }  // the output follows the input (section 10: no derived dims)
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    void prepare_forward() override { this->set_shape(outputs.y, this->shape_of(inputs.x)[0]); }  // the output follows the input (section 10: no derived dims)
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         Scratch s;
         s.tile.reshape(sycl::range<1>{wg_});
         return this->create_launch_config(cs::range_desc(inputs.x.shape()), cs::wg_desc(sycl::range<1>{wg_}), cs::scratch_desc(s));
@@ -273,7 +273,7 @@ public:
 
 // ---- Prefix (host body): z[i] = z[i-1] + x[i] ---------------------------------------------------------
 
-class Prefix : public cs::Component<Prefix> {
+class Prefix : public cs::HostComponent<Prefix> {
 public:
     struct Inputs {
         cs::Input<DType::f32, 1> x;
@@ -281,7 +281,7 @@ public:
     struct Outputs {
         cs::Output<DType::f32, 1> z;
     };
-    static void compute_impl(cs::Host, const Inputs& in, const Outputs& out) {
+    static void compute_forward(const Inputs& in, const Outputs& out) {
         float acc = 0.0f;
         for (std::size_t i = 0; i < in.x.size(); ++i) {
             acc += in.x[i];
@@ -292,12 +292,11 @@ public:
     Inputs  inputs;
     Outputs outputs;
 
-    void setup() override {
+    void declare() override {
         declare_input(inputs.x, "x", cs::unspecified_shape<1>());
         declare_output(outputs.z, "z", cs::unspecified_shape<1>());
     }
-    void pre_forward() override { set_shape(outputs.z, shape_of(inputs.x)[0]); }  // the output follows the input (section 10: no derived dims)
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(); }
+    void prepare_forward() override { set_shape(outputs.z, shape_of(inputs.x)[0]); }  // the output follows the input (section 10: no derived dims)
 };
 
 // ---- Sum3 (fixed size n): s = p + g + h --------------------------------------------------------------
@@ -310,7 +309,7 @@ public:
     struct Outputs {
         cs::Output<DType::f32, 1> s;
     };
-    static void compute_impl(sycl::id<1> i, const Inputs& in, const Outputs& out) { out.s[i] = in.p[i] + in.g[i] + in.h[i]; }
+    static void compute_forward(sycl::id<1> i, const Inputs& in, const Outputs& out) { out.s[i] = in.p[i] + in.g[i] + in.h[i]; }
 
     Inputs  inputs;
     Outputs outputs;
@@ -320,14 +319,14 @@ private:
 
 public:
     explicit Sum3(int n) : n_{n} {}
-    void setup() override {
+    void declare() override {
         // unspecified: the producers set the sizes (a fixed input would make a connected producer's number an error, P5)
         declare_input(inputs.p, "p", cs::unspecified_shape<1>());
         declare_input(inputs.g, "g", cs::unspecified_shape<1>());
         declare_input(inputs.h, "h", cs::unspecified_shape<1>());
         declare_output(outputs.s, "s", n_);
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         return create_launch_config(cs::range_desc(outputs.s.shape()));
     }
 };
@@ -342,7 +341,7 @@ public:
     struct Outputs {
         cs::Output<DType::atomic_f32, 1> acc;
     };
-    static void compute_impl(sycl::id<1> i, const Inputs& in, const Outputs& out) { out.acc[i].fetch_add(in.v[std::size_t{0}]); }
+    static void compute_forward(sycl::id<1> i, const Inputs& in, const Outputs& out) { out.acc[i].fetch_add(in.v[std::size_t{0}]); }
 
     Inputs  inputs;
     Outputs outputs;
@@ -352,12 +351,12 @@ private:
 
 public:
     explicit Adder(float v) : v_{v} {}
-    void setup() override {
+    void declare() override {
         declare_input(inputs.v, "v", 1);
         init_input("v", cs::init::fill(v_));
         declare_output(outputs.acc, "acc", cs::unspecified_shape<1>());  // a tie_outputs member: the alias owns the shape
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         return create_launch_config(cs::range_desc(outputs.acc.shape()));
     }
 };
@@ -371,20 +370,20 @@ public:
     struct Outputs {
         cs::Output<DType::atomic_f32, 1> acc;
     };
-    static void compute_impl(sycl::id<1> i, const Inputs&, const Outputs& out) { out.acc[i].store(0.0f); }
+    static void compute_forward(sycl::id<1> i, const Inputs&, const Outputs& out) { out.acc[i].store(0.0f); }
 
     Inputs  inputs;
     Outputs outputs;
 
-    void setup() override { declare_output(outputs.acc, "acc", cs::unspecified_shape<1>()); }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    void declare() override { declare_output(outputs.acc, "acc", cs::unspecified_shape<1>()); }
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         return create_launch_config(cs::range_desc(outputs.acc.shape()));
     }
 };
 
 // ---- NSrc / Bins: a value-driven size. NSrc writes the value n; Bins' output has n elements -----
 // Bins tests a hook on an INPUT: it takes a free input `ref` that its System hooks with from_value(n) (hook_bins), and
-// copies its shape in pre_forward. (Hooks on outputs are tested in test_shapes.cpp.)
+// copies its shape in prepare_forward. (Hooks on outputs are tested in test_shapes.cpp.)
 
 class NSrc : public cs::Component<NSrc> {
 public:
@@ -394,7 +393,7 @@ public:
     struct Outputs {
         cs::Output<DType::u32, 1> n;
     };
-    static void compute_impl(sycl::id<1> i, const Inputs& in, const Outputs& out) { out.n[i] = static_cast<std::uint32_t>(in.v[std::size_t{0}]); }
+    static void compute_forward(sycl::id<1> i, const Inputs& in, const Outputs& out) { out.n[i] = static_cast<std::uint32_t>(in.v[std::size_t{0}]); }
 
     Inputs  inputs;
     Outputs outputs;
@@ -404,12 +403,12 @@ private:
 
 public:
     explicit NSrc(float v) : v_{v} {}
-    void setup() override {
+    void declare() override {
         declare_input(inputs.v, "v", 1);
         init_input("v", cs::init::fill(v_));
         declare_output(outputs.n, "n", 1);
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         return create_launch_config(cs::range_desc(outputs.n.shape()));
     }
 };
@@ -423,18 +422,18 @@ public:
     struct Outputs {
         cs::Output<DType::f32, 1> bins;
     };
-    static void compute_impl(sycl::id<1> i, const Inputs&, const Outputs& out) { out.bins[i] = static_cast<float>(i[0]) + 1.0f; }
+    static void compute_forward(sycl::id<1> i, const Inputs&, const Outputs& out) { out.bins[i] = static_cast<float>(i[0]) + 1.0f; }
 
     Inputs  inputs;
     Outputs outputs;
 
-    void setup() override {
+    void declare() override {
         declare_input(inputs.n, "n", 1);
         declare_input(inputs.ref, "ref", cs::unspecified);
         declare_output(outputs.bins, "bins", cs::unspecified);
     }
-    void pre_forward() override { set_shape(outputs.bins, shape_of(inputs.ref)[0]); }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    void prepare_forward() override { set_shape(outputs.bins, shape_of(inputs.ref)[0]); }
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         return create_launch_config(cs::range_desc(outputs.bins.shape()));
     }
 };
@@ -456,7 +455,7 @@ public:
     struct Scratch {
         cs::Local<DType::f32, 1> tile;
     };
-    static void compute_impl(cs::GroupItem<1> it, const Inputs& in, const Outputs& out, Scratch s) {
+    static void compute_forward(cs::GroupItem<1> it, const Inputs& in, const Outputs& out, Scratch s) {
         const std::size_t l = it.get_local_linear_id(), g = it.get_global_id(0);
         const bool        ok = g < in.x.shape()[0];
         s.tile[l]            = ok ? in.x[g] : 0.0f;  // touches the local buffer (own slot): a scratch stage
@@ -471,12 +470,12 @@ private:
 
 public:
     explicit BigStage(std::size_t elems) : elems_{elems} {}
-    void setup() override {
+    void declare() override {
         declare_input(inputs.x, "x", cs::unspecified_shape<1>());
         declare_output(outputs.y, "y", cs::unspecified_shape<1>());
     }
-    void pre_forward() override { set_shape(outputs.y, shape_of(inputs.x)[0]); }  // the output follows the input (section 10: no derived dims)
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    void prepare_forward() override { set_shape(outputs.y, shape_of(inputs.x)[0]); }  // the output follows the input (section 10: no derived dims)
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         Scratch s;
         s.tile.reshape(sycl::range<1>{elems_});
         return create_launch_config(cs::range_desc(inputs.x.shape()), cs::wg_desc(sycl::range<1>{64}), cs::scratch_desc(s));
@@ -485,7 +484,7 @@ public:
 
 // ---- custom-op and host children that a wave must refuse ------------------------------------------------
 
-class NopCustom : public cs::Component<NopCustom> {
+class NopCustom : public cs::CustomComponent<NopCustom> {
 public:
     struct Inputs {
         cs::Input<DType::f32, 1> x;
@@ -493,20 +492,19 @@ public:
     struct Outputs {
         cs::Output<DType::f32, 1> y;
     };
-    static void compute_impl(cs::CustomOp&, const Inputs&, const Outputs&) {}
+    static void compute_forward(cs::CustomOp&, const Inputs&, const Outputs&) {}
 
     Inputs  inputs;
     Outputs outputs;
 
-    void setup() override {
+    void declare() override {
         declare_input(inputs.x, "x", cs::unspecified_shape<1>());
         declare_output(outputs.y, "y", cs::unspecified_shape<1>());
     }
-    void pre_forward() override { set_shape(outputs.y, shape_of(inputs.x)[0]); }  // the output follows the input (section 10: no derived dims)
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(); }
+    void prepare_forward() override { set_shape(outputs.y, shape_of(inputs.x)[0]); }  // the output follows the input (section 10: no derived dims)
 };
 
-class NopHost : public cs::Component<NopHost> {
+class NopHost : public cs::HostComponent<NopHost> {
 public:
     struct Inputs {
         cs::Input<DType::f32, 1> x;
@@ -514,17 +512,16 @@ public:
     struct Outputs {
         cs::Output<DType::f32, 1> y;
     };
-    static void compute_impl(cs::Host, const Inputs&, const Outputs&) {}
+    static void compute_forward(const Inputs&, const Outputs&) {}
 
     Inputs  inputs;
     Outputs outputs;
 
-    void setup() override {
+    void declare() override {
         declare_input(inputs.x, "x", cs::unspecified_shape<1>());
         declare_output(outputs.y, "y", cs::unspecified_shape<1>());
     }
-    void pre_forward() override { set_shape(outputs.y, shape_of(inputs.x)[0]); }  // the output follows the input (section 10: no derived dims)
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(); }
+    void prepare_forward() override { set_shape(outputs.y, shape_of(inputs.x)[0]); }  // the output follows the input (section 10: no derived dims)
 };
 
 constexpr int  kLen = 12;  // the group cases; the group body's work-group is 8, so the last group is ragged

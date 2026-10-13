@@ -45,7 +45,7 @@ enum class IOKind : uint8_t { input, output };
 // -----------------------------------------------------------------------------
 
 /// UNSPECIFIED: this dimension places no constraint and is supplied from outside: by the connection an input is connected
-/// to, by the tie the entry belongs to, by a shape hook, by its producer's pre_forward, or, for a free input, by its
+/// to, by the tie the entry belongs to, by a shape hook, by its producer's prepare_forward, or, for a free input, by its
 /// initializer's shape. A SPECIFIED dimension (an integer) is a contract: it forces that extent on anything joined to it.
 struct Unspecified {};
 inline constexpr Unspecified unspecified{};

@@ -16,7 +16,7 @@
 //   host component chain          producer -> host prefix sum -> consumer
 //   custom-op plumbing            device_ptr recorded at submission
 //   initial values                fill/zero/from_host/custom/custom_host, zeros by default,
-//                                 metadata rules; phase guards (init_input / pre_forward / setup)
+//                                 metadata rules; phase guards (init_input / prepare_forward / setup)
 
 #include <atomic>
 #include <cstddef>
@@ -72,7 +72,7 @@ public:
     struct Outputs {
         cs::Output<DType::f32, R> y;
     };
-    static void compute_impl(sycl::id<R> idx, const Inputs& in, const Outputs& out) { out.y[idx] = 2.0f * in.x[idx] + 1.0f; }
+    static void compute_forward(sycl::id<R> idx, const Inputs& in, const Outputs& out) { out.y[idx] = 2.0f * in.x[idx] + 1.0f; }
 
     Inputs  inputs;
     Outputs outputs;
@@ -82,8 +82,8 @@ private:
 
 public:
     explicit Affine(sycl::range<R> dims) : dims_{dims} {}
-    void setup() override {
-        // A free input with declared dims; the output's dims are unspecified and pre_forward gives it the input's shape
+    void declare() override {
+        // A free input with declared dims; the output's dims are unspecified and prepare_forward gives it the input's shape
         // (design review, section 10: an output is reshaped by its producing component).
         if constexpr (R == 1) {
             this->declare_input(inputs.x, "x", static_cast<int>(dims_[0]));
@@ -95,11 +95,11 @@ public:
         }
         this->declare_output(outputs.y, "y", cs::unspecified_shape<R>());
     }
-    void pre_forward() override {
+    void prepare_forward() override {
         const sycl::range<R> s = this->shape_of(inputs.x);  // one entry per dimension
         [&]<std::size_t... I>(std::index_sequence<I...>) { this->set_shape(outputs.y, s[I]...); }(std::make_index_sequence<R>{});
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         return this->create_launch_config(cs::range_desc(inputs.x.shape()));
     }
 };
@@ -145,7 +145,7 @@ public:
         cs::Output<DType::f32, 1> values;
         cs::Output<DType::f32, 1> weights;
     };
-    static void compute_impl(sycl::id<1> i, const Inputs&, const Outputs& out) {
+    static void compute_forward(sycl::id<1> i, const Inputs&, const Outputs& out) {
         out.values[i]  = (static_cast<float>((i[0] * 7) % 1000) + 0.5f) / 1000.0f;
         out.weights[i] = static_cast<float>(1 + i[0] % 3);
     }
@@ -153,11 +153,11 @@ public:
     Inputs  inputs;
     Outputs outputs;
 
-    void setup() override {
+    void declare() override {
         declare_output(outputs.values, "values", static_cast<int>(kN));
         declare_output(outputs.weights, "weights", static_cast<int>(kN));
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         return create_launch_config(cs::range_desc(sycl::range<1>{kN}));
     }
 };
@@ -173,7 +173,7 @@ public:
     struct Outputs {
         cs::Output<DType::atomic_f32, 1> bins;
     };
-    static void compute_impl(sycl::id<1> i, const Inputs& in, const Outputs& out) {
+    static void compute_forward(sycl::id<1> i, const Inputs& in, const Outputs& out) {
         const float lo = in.lo[std::size_t{0}], hi = in.hi[std::size_t{0}];
         const auto  b  = static_cast<std::size_t>((in.values[i] - lo) / (hi - lo) * static_cast<float>(in.n_bins[0]));
         out.bins[b].fetch_add(in.weights[i]);
@@ -187,7 +187,7 @@ private:
 
 public:
     WeightedHistogram(float lo, float hi) : lo_{lo}, hi_{hi} {}
-    void setup() override {
+    void declare() override {
         declare_input(inputs.lo, "lo", 1);
         declare_input(inputs.hi, "hi", 1);
         init_input("lo", cs::init::fill(lo_));
@@ -197,7 +197,7 @@ public:
         declare_input(inputs.n_bins, "n_bins", cs::unspecified_shape<1>());  // connected from the NBins producer
         declare_output(outputs.bins, "bins", cs::unspecified_shape<1>());  // a tie_outputs member: the tie's shape hook sets it from NBins' value
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         return create_launch_config(cs::range_desc(inputs.values.shape()));
     }
 };
@@ -211,13 +211,13 @@ public:
     struct Outputs {
         cs::Output<DType::atomic_f32, 1> bins;
     };
-    static void compute_impl(sycl::id<1> i, const Inputs&, const Outputs& out) { out.bins[i].store(0.0f); }
+    static void compute_forward(sycl::id<1> i, const Inputs&, const Outputs& out) { out.bins[i].store(0.0f); }
 
     Inputs  inputs;
     Outputs outputs;
 
-    void setup() override { declare_output(outputs.bins, "bins", cs::unspecified_shape<1>()); }  // shape: the tie alias's
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    void declare() override { declare_output(outputs.bins, "bins", cs::unspecified_shape<1>()); }  // shape: the tie alias's
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         return create_launch_config(cs::range_desc(outputs.bins.shape()));
     }
 };
@@ -233,16 +233,16 @@ public:
     struct Outputs {
         cs::Output<DType::u32, 1> n;
     };
-    static void compute_impl(sycl::id<1> i, const Inputs& in, const Outputs& out) { out.n[i] = in.v[i]; }
+    static void compute_forward(sycl::id<1> i, const Inputs& in, const Outputs& out) { out.n[i] = in.v[i]; }
 
     Inputs  inputs;
     Outputs outputs;
 
-    void setup() override {
+    void declare() override {
         declare_input(inputs.v, "v", 1);
         declare_output(outputs.n, "n", 1);
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         return create_launch_config(cs::range_desc(outputs.n.shape()));
     }
 };
@@ -285,7 +285,7 @@ public:
     struct Outputs {
         cs::Output<DType::f32, 2> out;
     };
-    static void compute_impl(sycl::id<2> ij, const Inputs&, const Outputs& o) { o.out[ij] = static_cast<float>(ij[0] * 1000 + ij[1]); }
+    static void compute_forward(sycl::id<2> ij, const Inputs&, const Outputs& o) { o.out[ij] = static_cast<float>(ij[0] * 1000 + ij[1]); }
 
     Inputs  inputs;
     Outputs outputs;
@@ -295,8 +295,8 @@ private:
 
 public:
     Iota2D(int rows, int cols) : rows_{rows}, cols_{cols} {}
-    void setup() override { declare_output(outputs.out, "out", rows_, cols_); }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    void declare() override { declare_output(outputs.out, "out", rows_, cols_); }
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         return create_launch_config(cs::range_desc(outputs.out.shape()));
     }
 };
@@ -312,7 +312,7 @@ public:
     struct Scratch {
         cs::Local<DType::f32, 2> tile;
     };
-    static void compute_impl(cs::GroupItem<2> it, const Inputs& in, const Outputs& out, Scratch s) {
+    static void compute_forward(cs::GroupItem<2> it, const Inputs& in, const Outputs& out, Scratch s) {
         const auto l = it.get_local_id(), g = it.get_global_id();
         const bool live = g[0] < in.in.shape()[0] && g[1] < in.in.shape()[1];
         if (live) s.tile[{l[0], l[1]}] = in.in[{g[0], g[1]}];
@@ -329,15 +329,15 @@ private:
     static constexpr std::size_t WG = 16;
 
 public:
-    void setup() override {
+    void declare() override {
         declare_input(inputs.in, "in", cs::unspecified_shape<2>());
         declare_output(outputs.out, "out", cs::unspecified_shape<2>());
     }
-    void pre_forward() override {
+    void prepare_forward() override {
         const sycl::range<2> s = shape_of(inputs.in);
         set_shape(outputs.out, s[1], s[0]);  // the transpose
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         Scratch s;
         s.tile.reshape({WG, WG + 1});
         return create_launch_config(cs::range_desc(inputs.in.shape()), cs::wg_desc(sycl::range<2>{WG, WG}), cs::scratch_desc(s));
@@ -361,7 +361,7 @@ public:
     struct Outputs {
         cs::Output<DType::f32, 1> y;
     };
-    static void compute_impl(sycl::id<1> i, const Inputs&, const Outputs& o) { o.y[i] = static_cast<float>(i[0]); }
+    static void compute_forward(sycl::id<1> i, const Inputs&, const Outputs& o) { o.y[i] = static_cast<float>(i[0]); }
 
     Inputs  inputs;
     Outputs outputs;
@@ -371,8 +371,8 @@ private:
 
 public:
     explicit Iota1D(int n) : n_{n} {}
-    void setup() override { declare_output(outputs.y, "y", n_); }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    void declare() override { declare_output(outputs.y, "y", n_); }
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         return create_launch_config(cs::range_desc(outputs.y.shape()));
     }
 };
@@ -385,17 +385,17 @@ public:
     struct Outputs {
         cs::Output<DType::f32, 1> w;
     };
-    static void compute_impl(sycl::id<1> i, const Inputs& in, const Outputs& out) { out.w[i] = in.z[i] + 1.0f; }
+    static void compute_forward(sycl::id<1> i, const Inputs& in, const Outputs& out) { out.w[i] = in.z[i] + 1.0f; }
 
     Inputs  inputs;
     Outputs outputs;
 
-    void setup() override {
+    void declare() override {
         declare_input(inputs.z, "z", cs::unspecified_shape<1>());
         declare_output(outputs.w, "w", cs::unspecified_shape<1>());
     }
-    void pre_forward() override { set_shape(outputs.w, shape_of(inputs.z)[0]); }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    void prepare_forward() override { set_shape(outputs.w, shape_of(inputs.z)[0]); }
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         return create_launch_config(cs::range_desc(inputs.z.shape()));
     }
 };
@@ -403,7 +403,7 @@ public:
 // ---- host component chain -------------------------------------------------------------------------
 // The host body is a sequential prefix sum: z[i] = z[i-1] + y[i].
 
-class PrefixSum : public cs::Component<PrefixSum> {
+class PrefixSum : public cs::HostComponent<PrefixSum> {
 public:
     struct Inputs {
         cs::Input<DType::f32, 1> y;
@@ -411,7 +411,7 @@ public:
     struct Outputs {
         cs::Output<DType::f32, 1> z;
     };
-    static void compute_impl(cs::Host, const Inputs& in, const Outputs& out) {
+    static void compute_forward(const Inputs& in, const Outputs& out) {
         float acc = 0.0f;
         for (std::size_t i = 0; i < in.y.size(); ++i) {
             acc += in.y[i];
@@ -422,14 +422,11 @@ public:
     Inputs  inputs;
     Outputs outputs;
 
-    void setup() override {
+    void declare() override {
         declare_input(inputs.y, "y", cs::unspecified_shape<1>());
         declare_output(outputs.z, "z", cs::unspecified_shape<1>());
     }
-    void pre_forward() override { set_shape(outputs.z, shape_of(inputs.y)[0]); }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config();
-    }
+    void prepare_forward() override { set_shape(outputs.z, shape_of(inputs.y)[0]); }
 };
 
 class TopHostChain : public cs::System {
@@ -449,7 +446,7 @@ public:
 // The pointers the recorder is handed, read by the test.
 std::atomic<const void*> g_in_rec{nullptr}, g_out_rec{nullptr};
 
-class Recorder : public cs::Component<Recorder> {
+class Recorder : public cs::CustomComponent<Recorder> {
 public:
     struct Inputs {
         cs::Input<DType::f32, 1> x;
@@ -457,7 +454,7 @@ public:
     struct Outputs {
         cs::Output<DType::f32, 1> y;
     };
-    static void compute_impl(cs::CustomOp& op, const Inputs& in, const Outputs& out) {
+    static void compute_forward(cs::CustomOp& op, const Inputs& in, const Outputs& out) {
         g_in_rec.store(op.device_ptr(in.x));
         g_out_rec.store(op.device_ptr(out.y));
     }
@@ -465,14 +462,11 @@ public:
     Inputs  inputs;
     Outputs outputs;
 
-    void setup() override {
+    void declare() override {
         declare_input(inputs.x, "x", cs::unspecified_shape<1>());
         declare_output(outputs.y, "y", cs::unspecified_shape<1>());
     }
-    void pre_forward() override { set_shape(outputs.y, shape_of(inputs.x)[0]); }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
-        return create_launch_config();
-    }
+    void prepare_forward() override { set_shape(outputs.y, shape_of(inputs.x)[0]); }
 };
 
 class TopCustomOp : public cs::System {
@@ -502,7 +496,7 @@ public:
     struct Outputs {
         cs::Output<DType::f32, 1> y;
     };
-    static void compute_impl(sycl::id<1> i, const Inputs& in, const Outputs& out) {
+    static void compute_forward(sycl::id<1> i, const Inputs& in, const Outputs& out) {
         out.y[i] = 10.0f * in.x[std::size_t{0}] + in.w[i] + in.v[i] + in.d[i];
     }
 
@@ -513,7 +507,7 @@ private:
     cs::Output<DType::f32, 1> extra_;  // only ever declared by the phase-guard hook
 
 public:
-    void setup() override {
+    void declare() override {
         declare_input(inputs.x, "x", 1);
         declare_input(inputs.w, "w", 4);
         declare_input(inputs.u, "u", 4);
@@ -542,7 +536,7 @@ public:
                                 });
                             }}));
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         return create_launch_config(cs::range_desc(outputs.y.shape()));
     }
 
@@ -567,7 +561,7 @@ public:
     struct Outputs {
         cs::Output<DType::f32, 1> y;
     };
-    static void compute_impl(sycl::id<1> idx, const Inputs& in, const Outputs& out) { out.y[idx] = 2.0f * in.x[idx] + 1.0f; }
+    static void compute_forward(sycl::id<1> idx, const Inputs& in, const Outputs& out) { out.y[idx] = 2.0f * in.x[idx] + 1.0f; }
 
     Inputs  inputs;
     Outputs outputs;
@@ -580,7 +574,7 @@ private:
 public:
     explicit InitAffine(std::optional<cs::InitSpec> init = std::nullopt, int mode = 0, bool tied_x = false)
         : init_{std::move(init)}, mode_{mode}, tied_x_{tied_x} {}
-    void setup() override {
+    void declare() override {
         if (tied_x_)
             declare_input(inputs.x, "x", cs::unspecified_shape<1>());  // a tie_inputs member: the tie alias owns the shape
         else
@@ -594,10 +588,10 @@ public:
         if (mode_ == 1) init_input("y", cs::init::zero());
         if (mode_ == 2) init_input("x", cs::init::fill(3.0f));
     }
-    void pre_forward() override {
+    void prepare_forward() override {
         if (tied_x_) set_shape(outputs.y, shape_of(inputs.x)[0]);
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         return create_launch_config(cs::range_desc(inputs.x.shape()));
     }
 };
@@ -845,19 +839,19 @@ TEST_CASE("initial values: metadata rules (connected, output, duplicates, last d
 TEST_CASE("phase guards: init_input, set_shape and declare outside their phase throw", "[component][init][guards]") {
     auto model = cs::create_model<tc::TopInit>(default_config());
     model.setup();
-    auto& c = dynamic_cast<tc::InitDemo&>((*cs::detail::ModelAccess::subsystem(model, "ini")));
+    auto& c = dynamic_cast<tc::InitDemo&>((*cs::detail::ModelAccess::component(model, "ini")));
 
-    SECTION("init_input outside setup() throws") {
-        tc::expect_throws([&] { c.try_init(); }, "setup() only");
+    SECTION("init_input outside declare() throws") {
+        tc::expect_throws([&] { c.try_init(); }, "declare() only");
     }
-    SECTION("set_shape outside pre_forward() throws") {
-        tc::expect_throws([&] { c.try_reshape(); }, "pre_forward() only");
+    SECTION("set_shape outside prepare_forward() throws") {
+        tc::expect_throws([&] { c.try_reshape(); }, "prepare_forward() only");
     }
-    SECTION("declare outside setup() throws") {
-        tc::expect_throws([&] { c.try_declare(); }, "setup() only");
+    SECTION("declare outside declare() throws") {
+        tc::expect_throws([&] { c.try_declare(); }, "declare() only");
     }
     SECTION("the model is unharmed by the refused calls") {
-        tc::expect_throws([&] { c.try_init(); }, "setup() only");
+        tc::expect_throws([&] { c.try_init(); }, "declare() only");
         auto y = wait_and_view<DType::f32, 1>(model, "ini.y");
         CHECK(to_vector(y) == std::vector<float>({121.0f, 222.0f, 323.0f, 424.0f}));
     }
@@ -869,60 +863,60 @@ TEST_CASE("phase guards: init_input, set_shape and declare outside their phase t
 // =============================================================================================
 namespace tct {
 
-// Two components with the SAME ports and the SAME compute_impl signature.
+// Two components with the SAME ports and the SAME compute_forward signature.
 class PlainA : public cs::Component<PlainA> {
 public:
     struct Inputs { cs::Input<DType::f32, 1> x; };
     struct Outputs { cs::Output<DType::f32, 1> y; };
-    static void compute_impl(sycl::id<1> i, const Inputs& in, const Outputs& out) { out.y[i] = in.x[i]; }
+    static void compute_forward(sycl::id<1> i, const Inputs& in, const Outputs& out) { out.y[i] = in.x[i]; }
     Inputs  inputs;
     Outputs outputs;
-    void setup() override {
+    void declare() override {
         declare_input(inputs.x, "x", 4);
         declare_output(outputs.y, "y", 4);
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(cs::range_desc(inputs.x.shape())); }
+    std::unique_ptr<cs::LaunchDescription> define_forward() override { return create_launch_config(cs::range_desc(inputs.x.shape())); }
 };
 class PlainB : public cs::Component<PlainB> {
 public:
     struct Inputs { cs::Input<DType::f32, 1> x; };
     struct Outputs { cs::Output<DType::f32, 1> y; };
-    static void compute_impl(sycl::id<1> i, const Inputs& in, const Outputs& out) { out.y[i] = in.x[i]; }
+    static void compute_forward(sycl::id<1> i, const Inputs& in, const Outputs& out) { out.y[i] = in.x[i]; }
     Inputs  inputs;
     Outputs outputs;
-    void setup() override {
+    void declare() override {
         declare_input(inputs.x, "x", 4);
         declare_output(outputs.y, "y", 4);
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(cs::range_desc(inputs.x.shape())); }
+    std::unique_ptr<cs::LaunchDescription> define_forward() override { return create_launch_config(cs::range_desc(inputs.x.shape())); }
 };
 
 class Plain3 : public cs::Component<Plain3> {
 public:
     struct Inputs { cs::Input<DType::f32, 3> x; };
     struct Outputs { cs::Output<DType::f32, 3> y; };
-    static void compute_impl(sycl::id<3> i, const Inputs& in, const Outputs& out) { out.y[i] = in.x[i]; }
+    static void compute_forward(sycl::id<3> i, const Inputs& in, const Outputs& out) { out.y[i] = in.x[i]; }
     Inputs  inputs;
     Outputs outputs;
-    void setup() override {
+    void declare() override {
         declare_input(inputs.x, "x", 2, 2, 2);
         declare_output(outputs.y, "y", 2, 2, 2);
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(cs::range_desc(inputs.x.shape())); }
+    std::unique_ptr<cs::LaunchDescription> define_forward() override { return create_launch_config(cs::range_desc(inputs.x.shape())); }
 };
 
 class Grp2 : public cs::Component<Grp2> {
 public:
     struct Inputs { cs::Input<DType::f32, 2> x; };
     struct Outputs { cs::Output<DType::f32, 2> y; };
-    static void compute_impl(cs::GroupItem<2> it, const Inputs& in, const Outputs& out) { out.y[it.get_global_id()] = in.x[it.get_global_id()]; }
+    static void compute_forward(cs::GroupItem<2> it, const Inputs& in, const Outputs& out) { out.y[it.get_global_id()] = in.x[it.get_global_id()]; }
     Inputs  inputs;
     Outputs outputs;
-    void setup() override {
+    void declare() override {
         declare_input(inputs.x, "x", 4, 4);
         declare_output(outputs.y, "y", 4, 4);
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         return create_launch_config(cs::range_desc(inputs.x.shape()), cs::wg_desc(sycl::range<2>{2, 2}));
     }
 };
@@ -932,48 +926,46 @@ public:
     struct Inputs { cs::Input<DType::f32, 1> x; };
     struct Outputs { cs::Output<DType::f32, 1> y; };
     struct Scratch { cs::Local<DType::f32, 1> tile; };
-    static void compute_impl(cs::GroupItem<1> it, const Inputs& in, const Outputs& out, Scratch) {
+    static void compute_forward(cs::GroupItem<1> it, const Inputs& in, const Outputs& out, Scratch) {
         out.y[it.get_global_id()] = in.x[it.get_global_id()];
     }
     Inputs  inputs;
     Outputs outputs;
-    void setup() override {
+    void declare() override {
         declare_input(inputs.x, "x", 4);
         declare_output(outputs.y, "y", 4);
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         Scratch s;
         s.tile.reshape({4});
         return create_launch_config(cs::range_desc(inputs.x.shape()), cs::wg_desc(sycl::range<1>{4}), cs::scratch_desc(s));
     }
 };
 
-class Custom : public cs::Component<Custom> {
+class Custom : public cs::CustomComponent<Custom> {
 public:
     struct Inputs { cs::Input<DType::f32, 1> x; };
     struct Outputs { cs::Output<DType::f32, 1> y; };
-    static void compute_impl(cs::CustomOp&, const Inputs&, const Outputs&) {}
+    static void compute_forward(cs::CustomOp&, const Inputs&, const Outputs&) {}
     Inputs  inputs;
     Outputs outputs;
-    void setup() override {
+    void declare() override {
         declare_input(inputs.x, "x", 4);
         declare_output(outputs.y, "y", 4);
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(); }
 };
 
-class HostC : public cs::Component<HostC> {
+class HostC : public cs::HostComponent<HostC> {
 public:
     struct Inputs { cs::Input<DType::f32, 1> x; };
     struct Outputs { cs::Output<DType::f32, 1> y; };
-    static void compute_impl(cs::Host, const Inputs&, const Outputs&) {}
+    static void compute_forward(const Inputs&, const Outputs&) {}
     Inputs  inputs;
     Outputs outputs;
-    void setup() override {
+    void declare() override {
         declare_input(inputs.x, "x", 4);
         declare_output(outputs.y, "y", 4);
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(); }
 };
 
 /// Whether create_launch_config(Ds...) is accepted for the component X (the constraint of the member).
@@ -997,13 +989,13 @@ TEST_CASE("component form: the synthesized body is trivially copyable, and disti
     STATIC_REQUIRE(std::is_trivially_copyable_v<tct::body_of<tct::GrpScratch>>);
     STATIC_REQUIRE(std::is_trivially_copyable_v<tct::body_of<tct::Custom>>);
     STATIC_REQUIRE(std::is_trivially_copyable_v<tct::body_of<tct::HostC>>);
-    // identical ports and an identical compute_impl signature, yet two body types (one kernel per component, by type)
+    // identical ports and an identical compute_forward signature, yet two body types (one kernel per component, by type)
     STATIC_REQUIRE(std::is_same_v<tct::PlainA::Inputs, tct::PlainA::Inputs>);
     STATIC_REQUIRE(!std::is_same_v<tct::body_of<tct::PlainA>, tct::body_of<tct::PlainB>>);
     STATIC_REQUIRE(!std::is_same_v<tct::PlainA::body_type, tct::PlainB::body_type>);
 }
 
-TEST_CASE("component form: the first parameter of compute_impl fixes the kind and the rank", "[component][traits]") {
+TEST_CASE("component form: the first parameter of compute_forward fixes the kind and the rank", "[component][traits]") {
     STATIC_REQUIRE(cs::PlainBody<tct::body_of<tct::PlainA>>);
     STATIC_REQUIRE(cs::kernel_rank_v<tct::body_of<tct::PlainA>> == 1);
     STATIC_REQUIRE(cs::PlainBody<tct::body_of<tct::Plain3>>);
@@ -1043,8 +1035,6 @@ TEST_CASE("component form: each launch-descriptor misuse is rejected by a detect
     STATIC_REQUIRE(accepts_v<GrpScratch, R1, W1, S_>);
     STATIC_REQUIRE(accepts_v<GrpScratch, S_, W1, R1>);
     STATIC_REQUIRE(accepts_v<GrpScratch, R1, S_>);
-    STATIC_REQUIRE(accepts_v<Custom>);
-    STATIC_REQUIRE(accepts_v<HostC>);
 
     // a missing range, for plain and for group bodies
     STATIC_REQUIRE(!accepts_v<PlainA>);

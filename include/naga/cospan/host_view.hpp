@@ -12,7 +12,7 @@
 //     it, after the producer's launch, like any device copy. (Each live view costs one copy per forward.) When the
 //     last view goes away, the host memory is freed; keep a view alive to avoid reallocating it.
 //   - A view can be made AT ANY TIME (Model::get_input / get_output, the view_* shorthands, and a component's own
-//     view_input in pre_forward). It materializes the variable like any holder: a variable not materialized yet takes
+//     view_input in prepare_forward). It materializes the variable like any holder: a variable not materialized yet takes
 //     its definition and its initializer's shape (an unconnected input shows its initialized values after sync; an
 //     output shows whatever is in memory, zeros) and fails only when the shape cannot be resolved yet. On a variable
 //     that is already materialized it starts as a copy of a live placement and never initializes anything: a view
@@ -56,8 +56,9 @@ struct HostViewAccess {
     }
 };
 
-/// A host view instance of the variable `inst` belongs to: a holder on a host placement on the device with the most
-/// instances (section 5), of the same kind as `inst`. It materializes like any holder: a variable that is not
+/// A host view instance of the variable `inst` belongs to: a holder on a host placement, taking the device of the holder
+/// it is made from (r05: for an alias, the alias's own device), of the same kind as `inst`. The view's host key reuses the
+/// context's host placement through container_for. It materializes like any holder: a variable that is not
 /// materialized yet is sized and (an input with an initializer) initialized here, and throws the shape-not-known error
 /// when the shape cannot be resolved; one that is materialized is only copied into the view (never initialized, even
 /// when stale: a view made after update_input shows the old values until the next run).
@@ -67,8 +68,8 @@ inline std::shared_ptr<Instance> make_view_instance(Runtime& rt, const Instance&
         throw std::invalid_argument("naga::cospan: '" + inst.full_path() +
                                     "' is ragged and has no rectangular host view; use a ragged view (view_ragged_input / "
                                     "view_ragged_output, or the handle's ragged_view)");
-    const sycl::device             dev  = meta->busiest_device();  // counted before the view joins
-    std::shared_ptr<Instance>      view = make_alias_instance(dt, rank, "<host view>", nullptr, inst.kind, Role::host_view,
+    const sycl::device             dev  = inst.device;  // the holder's own device (an alias's, for an alias)
+    std::shared_ptr<Instance>      view = make_alias_instance(dt, rank, "<host view>", std::string{}, nullptr, inst.kind, Role::host_view,
                                                               meta->definition, false, false, meta);
     view->device       = dev;
     view->storage_kind = sk::kind::host;

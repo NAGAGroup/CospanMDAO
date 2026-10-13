@@ -1,32 +1,35 @@
 #pragma once
 
 // =============================================================================
-// naga/cospan/component.hpp — ComponentBase and Component<X>
+// naga/cospan/component.hpp — ComponentBase, Component<X>, CustomComponent<X> and HostComponent<X>
 // =============================================================================
 //
 // A component is the leaf that does work, and it SUBMITS ITSELF (docs/design-review-2026-10-03.md, sections 3 and
 // 4). Its forward is three framework-owned steps that call user hooks:
 //
 //   precompute   (1) every distinct input variable is materialized (shape hooks of the enclosing System have run);
-//                (2) the user's pre_forward() runs: an output is reshaped there with set_shape, within its definition
+//                (2) the user's prepare_forward() runs: an output is reshaped there with set_shape, within its definition
 //                    (a tied output's shape belongs to its tie's System);
 //                (3) every distinct output variable is materialized (an unknown dimension is an error);
 //                (4) every member wrapper is pointed at its data.
 //                Shapes (design review, section 10): a declaration says only specified or unspecified per dimension; every
 //                run-time shape change is checked against the variable's definition (VarMeta::set_dims).
-//   compute      the user's compute_forward() returns the launch (describe); the component submits it on the
+//   compute      the launch is described (define_forward() for a kernel component); the component submits it on the
 //                unordered queue, depending on its variables' events and nothing else (submit), and records
 //                its own event on them.
-//   postcompute  the pushes to the variable's other placements, then the user's post_forward().
+//   postcompute  the pushes to the variable's other placements (VarMeta::push_from).
 //
 // A component OWNS its instances by shared_ptr (section 1) and holds no pointer to its owner's data. It holds no
 // queue and no device of its own: the device of each instance is a field of the instance (section 2), and a
 // Runtime is given for the duration of a forward step.
 //
-// Component<X> adds the typed layer (CRTP). ONE KERNEL BODY PER COMPONENT: X::compute_impl's signature fixes the kind (plain:
-// sycl::id<R>; group: GroupItem<R>; custom-op: CustomOp&; host: Host) and the kernel rank at COMPILE TIME, so there
-// is no run-time branching on rank. Custom-op and host bodies cannot be fused (section 4): the fuse helper enforces
-// it on the traits below.
+// r05: a component is NOT a tree node. A driver (component_driver.hpp) owns it, is the leaf, and calls its three steps.
+//
+// The typed layer is by CRTP, in three types: Component<X> (kernel bodies: sycl::id<R> or GroupItem<R>, launch stated in
+// define_forward()), CustomComponent<X> (static compute_forward(CustomOp&, const Inputs&, const Outputs&)) and HostComponent<X>
+// (static compute_forward(const Inputs&, const Outputs&)). ONE BODY PER COMPONENT: the static compute_forward's signature
+// fixes the kind and the kernel rank at COMPILE TIME, so there is no run-time branching on rank. Custom-op and host
+// components cannot be fused (section 4): the fuse helper refuses them by type.
 
 #include <algorithm>
 #include <array>
@@ -171,23 +174,24 @@ struct RaggedShape {
     }
 };
 
-class ComponentBase : public Subsystem {
+/// What does the work, apart from where it sits in the tree (r05). A component has no name of its own and is never a tree node:
+/// a DRIVER (component_driver.hpp) owns it, is the leaf, and gives it its full name (bind) before declare() runs. The
+/// full name is the driver's for a lone component (`c`), and `<group>.<stage>` for a stage of a fused group.
+class ComponentBase {
 public:
     ComponentBase(const ComponentBase&)            = delete;
     ComponentBase& operator=(const ComponentBase&) = delete;
-    ~ComponentBase() override = default;
+    virtual ~ComponentBase()                       = default;
 
     // ---- HOOKS (user-implemented) ------------------------------------------
     /// Declare I/O. Runs once, during setup. Zero allocation.
-    virtual void setup() = 0;
-    /// There is no init hook: a free input's initial value is declared in setup() with init_input, and outputs are
+    virtual void declare() = 0;
+    /// There is no init hook: a free input's initial value is declared in declare() with init_input, and outputs are
     /// never initialized.
     /// Per-forward shape control: shape_of / set_shape are legal here only.
-    virtual void pre_forward() {}
-    /// At the end of postcompute, after the pushes to the variables' other placements.
-    virtual void post_forward() {}
+    virtual void prepare_forward() {}
 
-    // ---- declaration API (legal inside setup() only) ------------------------
+    // ---- declaration API (legal inside declare() only) ------------------------
     // A declaration says, per dimension, only SPECIFIED (an integer) or UNSPECIFIED (cs::unspecified); it is the
     // component's contract (docs/design-review-2026-10-03.md, section 10). Specified forces that dimension on anything
     // joined to it; unspecified places no constraint. There are no derived specs.
@@ -256,7 +260,7 @@ public:
         declare_output<DT, Rank>(m, std::move(name), counts_of(o));
     }
 
-    // ---- shapes in pre_forward (legal inside pre_forward() only) -------------
+    // ---- shapes in prepare_forward (legal inside prepare_forward() only) -------------
     // Inputs are never reshaped: an input's shape comes from its definition, its initializer, its connection's source, or
     // a hook. An OUTPUT is reshaped only here, by its producing component, within its definition. An output that is a
     // member of a tie_outputs cannot be reshaped by a member: its tie's System sets it with a shape hook.
@@ -329,44 +333,32 @@ public:
         inst.meta->set_ragged_by_producer(*rt_, s, /*set_n=*/true, /*set_counts=*/false, inst.full_path());
     }
 
-    // ---- initial values (legal inside setup() only) -----------------------
+    // ---- initial values (legal inside declare() only) -----------------------
     /// Declare the initial value of one of this Component's OWN inputs, by name. Metadata on the input's variable
     /// (section 1); the last declaration wins (a parent's setup runs after its children's, section 2), it is ignored when
     /// the input ends up with a source, and it is an error to name an output.
     void init_input(std::string_view name, InitSpec init) {
         if (!declaring_)
-            throw std::logic_error("naga::cospan: init_input is legal inside setup() only (" + describe() + ")");
+            throw std::logic_error("naga::cospan: init_input is legal inside declare() only (" + describe() + ")");
         const std::shared_ptr<detail::Instance> inst = find_kind(name, IOKind::input);  // an output throws
         detail::declare_init(detail::WiringSite{describe()}, inst, std::move(init));
     }
 
-    // ---- Subsystem verbs ---------------------------------------------------
-    void run_setup() override {
-        detail::FlagScope             scope{declaring_};
-        detail::ModelMeta::SetupScope setup_scope{meta_};
-        setup();
-    }
-
-    /// A component is a leaf of the model's tree: it has a forward.
-    bool is_leaf() const noexcept override { return true; }
+    /// The full name this component was bound to (empty before bind).
+    const std::string& path() const noexcept { return full_name_; }
 
     /// The last launch's event(s): what depends_on hands on. (Deleting a component waits on nothing: the containers
     /// it held free themselves after their own events.)
-    std::vector<sycl::event> events() const override { return last_events_; }
+    std::vector<sycl::event> events() const { return last_events_; }
 
     /// depends_on: these events are added to this component's submission for ONE forward.
-    void add_dependencies(std::span<const sycl::event> deps) override {
+    void add_dependencies(std::span<const sycl::event> deps) {
         pending_deps_.insert(pending_deps_.end(), deps.begin(), deps.end());
     }
 
     // ---- the forward ---------------------------------------------------------
-    /// ONE forward (r04): the pre steps, the submission, the post steps. A fused group runs the same pieces across its stages
-    /// around its single launch.
-    void forward(detail::Runtime& rt) override {
-        step_pre(rt);
-        step_submit(rt);
-        step_post(rt);
-    }
+    // ONE forward (r04) is the three steps below, called by the component's driver (a lone component: SoloDriver) or, for the
+    // stages of a fused group, in pieces around the group's single launch.
 
     /// The pre steps below; a kernel component that launches by itself (not as a stage of a fused group) then keeps its
     /// argument array and, at the first forward, its launcher's pointer array.
@@ -388,10 +380,10 @@ public:
         for (const auto& inst : order_)
             if (inst->kind == IOKind::input) inst->meta->materialize(rt, inst.get());
 
-        // (2) The user's pre_forward(): where an output is reshaped (set_shape) within its definition.
+        // (2) The user's prepare_forward(): where an output is reshaped (set_shape) within its definition.
         {
-            detail::FlagScope scope{in_pre_forward_};
-            pre_forward();
+            detail::FlagScope scope{in_prepare_forward_};
+            prepare_forward();
         }
 
         // (3) Every distinct output variable is materialized: an unknown dimension is the not-known error, naming who
@@ -416,15 +408,15 @@ public:
             return;
         }
         // Custom-op and host bodies keep their own path.
-        const std::unique_ptr<LaunchDescription> desc = compute_forward_impl();
-        if (!desc) throw std::logic_error("naga::cospan: " + describe() + ": compute_forward returned no launch");
+        const std::unique_ptr<LaunchDescription> desc = describe_launch();
+        if (!desc) throw std::logic_error("naga::cospan: " + describe() + ": the component described no launch");
         const std::vector<sycl::event> ev = desc->submit(rt.uq, device_of(), gather_deps(rt));
         record_launch(ev);
     }
 
     /// Pushes each output variable this component wrote to the variable's OTHER live placements (host views included)
     /// by container assignment, which waits on the output's writes and registers the read, unless the variable's push is
-    /// suppressed. A tied output is pushed by the tie's System (phase 6). Then the user's hook. (The launch's events were
+    /// suppressed (VarMeta::push_from). A tied output is pushed by the tie's System. (The launch's events were
     /// registered on the containers at submit, in record_launch.)
     void step_post(detail::Runtime& rt) {
         (void)rt;
@@ -435,14 +427,9 @@ public:
             if (std::find(seen.begin(), seen.end(), m) != seen.end()) continue;
             seen.push_back(m);
             if (m->is_tied_output() || m->push_suppressed || !inst->data || last_events_.empty()) continue;
-            const std::shared_ptr<detail::DeviceDataBase> own = inst->data;
-            for (const auto& entry : m->data) {
-                const std::shared_ptr<detail::DeviceDataBase> dst = entry.second.lock();
-                if (!dst || dst == own || !dst->bound()) continue;  // a holder not materialized yet fills itself
-                dst->copy_from(*own, std::span<const sycl::event>{});
-            }
+            // a holder not materialized yet fills itself (push_from skips unbound data)
+            (void)m->push_from(inst->data);
         }
-        post_forward();
     }
 
     /// The first instance that is a ragged port (declared RaggedInput / RaggedOutput) or whose variable is ragged, else
@@ -487,9 +474,9 @@ protected:
     ComponentBase() = default;
 
     /// A host view of one of this component's OWN inputs, made with the runtime its precompute received: legal inside
-    /// pre_forward() only. It is a host holder like any other (the host is just another device of the variable): the
+    /// prepare_forward() only. It is a host holder like any other (the host is just another device of the variable): the
     /// variable is pushed to it every forward while it lives, so keep it as a member (an std::optional, made on the first
-    /// forward) and call sync() before reading. The typical use is to read values in pre_forward and set_shape an
+    /// forward) and call sync() before reading. The typical use is to read values in prepare_forward and set_shape an
     /// output from them. There is no equivalent for outputs. The input is already materialized here (precompute step 1).
     template <DType DT, int Rank>
     HostView<DT, Rank> view_input(const Input<DT, Rank>& m) {
@@ -508,10 +495,11 @@ protected:
     /// The storage kind of this Component's I/O: device, or host for a host body.
     virtual sk::kind default_storage_kind() const { return sk::kind::device; }
 
-    /// The launch of this forward (describe): implemented by Component<X> from the user's compute_forward().
-    virtual std::unique_ptr<LaunchDescription> compute_forward_impl() = 0;
+    /// The launch of this forward: implemented by Component<X> (from define_forward()), CustomComponent<X> and HostComponent<X>.
+    virtual std::unique_ptr<LaunchDescription> describe_launch() = 0;
 
-    std::string describe() const { return path().empty() ? std::string{"component"} : "'" + path() + "'"; }
+    /// "'<full name>'": the prefix of every error.
+    std::string describe() const { return "'" + full_name_ + "'"; }
 
     /// What a submission of this component must come after: each input container's read_deps (its writes), each output
     /// container's write_deps (its reads) together with its variable's pending resize events (VarMeta::resize_events: a
@@ -565,6 +553,22 @@ protected:
 private:
     friend struct detail::ComponentAccess;
 
+    /// Gives the component its full name, its driver (the leaf in the tree: holders answer to its node) and the model's
+    /// metadata. Called by the driver (ComponentAccess) before declare() runs.
+    void bind(detail::ModelMeta* m, std::string full_name, const Subsystem* driver) {
+        meta_      = m;
+        full_name_ = std::move(full_name);
+        driver_    = driver;
+        if (m != nullptr) m->components[full_name_] = this;
+    }
+
+    /// Runs declare() with the declaring flag and the metadata's setup flag up.
+    void run_declare() {
+        detail::FlagScope             scope{declaring_};
+        detail::ModelMeta::SetupScope setup_scope{meta_};
+        declare();
+    }
+
     /// Sets a pointer for a scope, clears it on every exit.
     struct PtrScope {
         PtrScope(detail::Runtime*& p, detail::Runtime* v) : p_{p} { p_ = v; }
@@ -610,33 +614,33 @@ private:
     template <DType DT, int Rank>
     void add_input(Input<DT, Rank>& m, std::string name,
                    const std::array<detail::DimRecord, Rank>& dims) {
-        register_instance(detail::make_input<DT, Rank>(std::move(name), this, dims, &m), &m, "declare_input", false);
+        register_instance(detail::make_input<DT, Rank>(std::move(name), full_name_, driver_, dims, &m), &m, "declare_input", false);
     }
     template <DType DT, int Rank>
     void add_output(Output<DT, Rank>& m, std::string name,
                     const std::array<detail::DimRecord, Rank>& dims) {
-        register_instance(detail::make_output<DT, Rank>(std::move(name), this, dims, &m), &m, "declare_output", false);
+        register_instance(detail::make_output<DT, Rank>(std::move(name), full_name_, driver_, dims, &m), &m, "declare_output", false);
     }
     template <DType DT, int Rank>
     void add_ragged_input(RaggedInput<DT, Rank>& m, std::string name, const std::array<detail::DimRecord, Rank>& dims,
                           std::optional<std::vector<std::size_t>> counts) {
         static_assert(Rank == 2, "cospan: a ragged port is rank 2");
-        register_instance(detail::make_ragged_input<DT, Rank>(std::move(name), this, dims, &m, std::move(counts)), &m,
+        register_instance(detail::make_ragged_input<DT, Rank>(std::move(name), full_name_, driver_, dims, &m, std::move(counts)), &m,
                           "declare_input", true);
     }
     template <DType DT, int Rank>
     void add_ragged_output(RaggedOutput<DT, Rank>& m, std::string name, const std::array<detail::DimRecord, Rank>& dims,
                            std::optional<std::vector<std::size_t>> counts) {
         static_assert(Rank == 2, "cospan: a ragged port is rank 2");
-        register_instance(detail::make_ragged_output<DT, Rank>(std::move(name), this, dims, &m, std::move(counts)), &m,
+        register_instance(detail::make_ragged_output<DT, Rank>(std::move(name), full_name_, driver_, dims, &m, std::move(counts)), &m,
                           "declare_output", true);
     }
 
-    // ---- shapes in pre_forward ---------------------------------------------
-    /// The declared instance of a member, inside pre_forward only.
+    // ---- shapes in prepare_forward -----------------------------------------
+    /// The declared instance of a member, inside prepare_forward only.
     detail::Instance& member_instance(const void* member, const char* what) const {
-        if (!in_pre_forward_)
-            throw std::logic_error(std::string{"naga::cospan: "} + what + " is legal inside pre_forward() only (" + describe() + ")");
+        if (!in_prepare_forward_)
+            throw std::logic_error(std::string{"naga::cospan: "} + what + " is legal inside prepare_forward() only (" + describe() + ")");
         const auto it = by_member_.find(member);
         if (it == by_member_.end())
             throw std::invalid_argument("naga::cospan: " + describe() + ": " + what + " of a member that was never declared");
@@ -674,7 +678,7 @@ private:
     /// The component owns its instances (section 1); their device is the default until set_device says otherwise.
     void register_instance(std::shared_ptr<detail::Instance> inst, const void* member, const char* what, bool ragged) {
         if (!declaring_)
-            throw std::logic_error(std::string{"naga::cospan: "} + what + " is legal inside setup() only");
+            throw std::logic_error(std::string{"naga::cospan: "} + what + " is legal inside declare() only (" + describe() + ")");
         const std::string key = inst->name;
         if (by_name_.contains(key))
             throw std::invalid_argument("naga::cospan: " + describe() + ": '" + key + "' is declared twice");
@@ -685,9 +689,9 @@ private:
             throw std::logic_error("naga::cospan: " + describe() + " is not part of a model yet (it is registered by add_subsystem)");
         inst->storage_kind = default_storage_kind();
         inst->refresh_container();  // the container of its placement, empty until the first materialization
-        // The holder is registered in the model-wide map under the component's full name + "." + its own name (the node of
-        // a fused group's stage is the group's).
-        meta_->register_holder(detail::ModelMeta::child_name(path(), key), inst, meta_->node_for(this), describe());
+        // The holder is registered in the model-wide map under the component's full name + "." + its own name, and answers to
+        // its driver's node (a fused group's stage: the group's).
+        meta_->register_holder(detail::ModelMeta::child_name(full_name_, key), inst, meta_->node_for(driver_), describe());
         if (ragged) ragged_ports_.insert(inst.get());
         order_.push_back(inst);
         by_member_.emplace(member, inst.get());
@@ -738,16 +742,23 @@ private:
     std::vector<std::shared_ptr<detail::Instance>>                     order_;  // declaration order
     std::unordered_set<const detail::Instance*>                        ragged_ports_;
 
-    bool                declaring_      = false;
-    bool                in_pre_forward_ = false;
-    detail::Runtime*    rt_             = nullptr;  ///< set during the pre steps of a forward only
+    detail::ModelMeta*  meta_           = nullptr;  ///< the model's metadata (null before bind)
+    std::string         full_name_;                     ///< bound by the driver; the owner_path of this component's holders
+    const Subsystem*    driver_         = nullptr;      ///< the leaf node this component belongs to
+    bool                declaring_         = false;
+    bool                in_prepare_forward_ = false;
+    detail::Runtime*    rt_                = nullptr;  ///< set during the pre steps of a forward only
 };
 
 namespace detail {
 
 /// INTERNAL: what a fused owner (phase 7) calls to get a stage's complete launch without submitting it.
 struct ComponentAccess {
-    static std::unique_ptr<LaunchDescription> describe(ComponentBase& c) { return c.compute_forward_impl(); }
+    static std::unique_ptr<LaunchDescription> describe(ComponentBase& c) { return c.describe_launch(); }
+    static void bind(ComponentBase& c, ModelMeta* m, std::string full_name, const Subsystem* driver) {
+        c.bind(m, std::move(full_name), driver);
+    }
+    static void run_declare(ComponentBase& c) { c.run_declare(); }
     static std::vector<sycl::event>            gather_deps(ComponentBase& c, Runtime& rt) { return c.gather_deps(rt); }
     static void                                record_launch(ComponentBase& c, const std::vector<sycl::event>& ev) { c.record_launch(ev); }
     static sycl::device                        device_of(const ComponentBase& c) { return c.device_of(); }
@@ -1153,7 +1164,8 @@ constexpr bool scratch_desc_type_ok() {
 }
 
 /// Whether the descriptors `Ds...` are a valid launch for the body KB: a range (of the body's rank) for plain and group bodies,
-/// at most one of each descriptor, a scratch_desc only for a body with Scratch (of its type), none at all for custom-op and host.
+/// at most one of each descriptor, a scratch_desc only for a body with Scratch (of its type). Only a Component calls
+/// create_launch_config (custom-op and host components build their launch themselves).
 template <class KB, class... Ds>
 constexpr bool launch_descs_ok() {
     if constexpr (!((desc_info<Ds>::kind >= 0) && ...)) {
@@ -1162,9 +1174,7 @@ constexpr bool launch_descs_ok() {
         constexpr int nr = ((desc_info<Ds>::kind == 0 ? 1 : 0) + ... + 0);
         constexpr int nw = ((desc_info<Ds>::kind == 1 ? 1 : 0) + ... + 0);
         constexpr int ns = ((desc_info<Ds>::kind == 2 ? 1 : 0) + ... + 0);
-        if constexpr (CustomOpBody<KB> || HostBody<KB>) {
-            return sizeof...(Ds) == 0;
-        } else if constexpr (PlainBody<KB> || GroupBody<KB>) {
+        if constexpr (PlainBody<KB> || GroupBody<KB>) {
             constexpr int  R        = kernel_rank_v<KB>;
             constexpr bool ranks_ok = ((desc_info<Ds>::kind == 2 || desc_info<Ds>::rank == R) && ...);
             constexpr bool types_ok = (scratch_desc_type_ok<KB, Ds>() && ...);
@@ -1181,7 +1191,7 @@ inline constexpr bool launch_descs_ok_v = launch_descs_ok<KB, Ds...>();
 template <class T, class... Ds>
 inline constexpr bool has_desc_v = (std::is_same_v<T, Ds> || ...);
 
-/// The call signature of X::compute_impl (a static member function): its first four parameters.
+/// The call signature of X::compute_forward (a static member function): its first four parameters.
 template <class F>
 struct impl_call {
     static constexpr bool        valid = false;
@@ -1203,7 +1213,12 @@ struct impl_call<R (*)(A...) noexcept> : impl_call<R (*)(A...)> {};
 template <class X, class = void>
 struct impl_traits : impl_call<void> {};
 template <class X>
-struct impl_traits<X, std::void_t<decltype(&X::compute_impl)>> : impl_call<decltype(&X::compute_impl)> {};
+struct impl_traits<X, std::void_t<decltype(&X::compute_forward)>> : impl_call<decltype(&X::compute_forward)> {};
+
+/// The body kind of X (the numbering of first_traits): 0 plain, 1 group, 2 custom op, 3 host. A host body is the one with no
+/// tag: compute_forward(const Inputs&, const Outputs&), two parameters.
+template <class X>
+inline constexpr int body_kind_v = impl_traits<X>::nargs == 2 ? 3 : first_traits<typename impl_traits<X>::a0>::kind;
 
 /// The Inputs and Outputs a synthesized body carries (a copy of the component's `inputs` and `outputs`).
 template <class X>
@@ -1218,11 +1233,12 @@ struct SynthData {
 };
 
 /// The kernel body of a component X: ONE distinct type per component, trivially copyable. Its call operator has the FIXED
-/// signature the KernelBody concepts read (first argument, Inputs, Outputs[, Scratch]) and forwards to X::compute_impl; the
-/// signature is chosen by specialization on the kind (the first parameter of compute_impl) and on Scratch.
+/// signature the KernelBody concepts read (first argument, Inputs, Outputs[, Scratch]) and forwards to X::compute_forward; the
+/// signature is chosen by specialization on the kind (the first parameter of compute_forward; none for a host body) and on
+/// Scratch. A host body keeps the `Host` tag HERE, in the operator, and drops it for the user.
 template <class X, int Kind, bool WithScratch>
 struct SynthImpl : SynthData<X> {
-    using SynthData<X>::SynthData;  // no call operator: not a body (the concepts fail, Component's static_assert says why)
+    using SynthData<X>::SynthData;  // no call operator: not a body (the concepts fail, so the component's constructor is unavailable)
 };
 
 template <class X>
@@ -1230,7 +1246,7 @@ struct SynthImpl<X, 0, false> : SynthData<X> {
     using SynthData<X>::SynthData;
     void operator()(sycl::id<first_traits<typename impl_traits<X>::a0>::rank> i, typename X::Inputs in,
                     typename X::Outputs out) const {
-        X::compute_impl(i, in, out);
+        X::compute_forward(i, in, out);
     }
 };
 
@@ -1239,7 +1255,7 @@ struct SynthImpl<X, 1, false> : SynthData<X> {
     using SynthData<X>::SynthData;
     void operator()(GroupItem<first_traits<typename impl_traits<X>::a0>::rank> it, typename X::Inputs in,
                     typename X::Outputs out) const {
-        X::compute_impl(it, in, out);
+        X::compute_forward(it, in, out);
     }
 };
 
@@ -1249,27 +1265,27 @@ struct SynthImpl<X, 1, true> : SynthData<X> {
     using Scratch = typename X::Scratch;
     void operator()(GroupItem<first_traits<typename impl_traits<X>::a0>::rank> it, typename X::Inputs in,
                     typename X::Outputs out, Scratch scratch) const {
-        X::compute_impl(it, in, out, scratch);
+        X::compute_forward(it, in, out, scratch);
     }
 };
 
 template <class X>
 struct SynthImpl<X, 2, false> : SynthData<X> {
     using SynthData<X>::SynthData;
-    void operator()(CustomOp& op, typename X::Inputs in, typename X::Outputs out) const { X::compute_impl(op, in, out); }
+    void operator()(CustomOp& op, typename X::Inputs in, typename X::Outputs out) const { X::compute_forward(op, in, out); }
 };
 
 template <class X>
 struct SynthImpl<X, 3, false> : SynthData<X> {
     using SynthData<X>::SynthData;
-    void operator()(Host h, typename X::Inputs in, typename X::Outputs out) const { X::compute_impl(h, in, out); }
+    void operator()(Host, typename X::Inputs in, typename X::Outputs out) const { X::compute_forward(in, out); }
 };
 
-/// The name Component<X> uses. Its base (which reads X::compute_impl) is chosen when SynthBody<X> is instantiated, not when it
+/// The name Component<X> uses. Its base (which reads X::compute_forward) is chosen when SynthBody<X> is instantiated, not when it
 /// is named: Component<X> names it while X is still incomplete.
 template <class X>
-struct SynthBody : SynthImpl<X, first_traits<typename impl_traits<X>::a0>::kind, (impl_traits<X>::nargs == 4)> {
-    using Base = SynthImpl<X, first_traits<typename impl_traits<X>::a0>::kind, (impl_traits<X>::nargs == 4)>;
+struct SynthBody : SynthImpl<X, body_kind_v<X>, (impl_traits<X>::nargs == 4)> {
+    using Base = SynthImpl<X, body_kind_v<X>, (impl_traits<X>::nargs == 4)>;
     SynthBody(const typename X::Inputs& i, const typename X::Outputs& o) : Base{i, o} {}
 };
 
@@ -1279,23 +1295,25 @@ struct SynthBody : SynthImpl<X, first_traits<typename impl_traits<X>::a0>::kind,
 // Component<X>
 // -----------------------------------------------------------------------------
 
-/// The typed layer, by CRTP: `class Axpb : public cs::Component<Axpb>`. The component declares nested `Inputs` and `Outputs`
-/// structs of ports, a static `compute_impl` (its first parameter fixes the kind and rank: sycl::id<R> plain, GroupItem<R>
-/// group, CustomOp& custom-op, Host host; a group body with a nested `Scratch` takes it as the 4th) and PUBLIC members `inputs`
-/// and `outputs`. create_launch_config(descriptors...) makes the launch from them. ONE KERNEL BODY PER COMPONENT, by type.
+/// The body concepts the component types constrain their default constructor with. X is complete where they are evaluated (the
+/// constructor of the user's class), so SynthBody<X> can read X::compute_forward.
+namespace detail {
+template <class KB>
+concept KernelStageBody = KernelBodyC<KB> && (PlainBody<KB> || GroupBody<KB>);
+template <class KB>
+concept CustomStageBody = KernelBodyC<KB> && CustomOpBody<KB>;
+template <class KB>
+concept HostStageBody = KernelBodyC<KB> && HostBody<KB>;
+
+/// The typed layer common to the three component types (CRTP on the user's class X): the facts read off the body's signature
+/// and the stage interface of a group launcher. Not the user path: derive Component, CustomComponent or HostComponent.
 ///
-/// CRTP rule: the members of X (Inputs, Outputs, Scratch, compute_impl, inputs, outputs) are named only inside member-function
+/// CRTP rule: the members of X (Inputs, Outputs, Scratch, compute_forward, inputs, outputs) are named only inside member-function
 /// bodies and lazily instantiated templates here, never at class scope: X is incomplete while this class is instantiated.
 template <class X>
-class Component : public ComponentBase {
+class TypedComponent : public ComponentBase {
 public:
-    using body_type = detail::SynthBody<X>;
-
-    Component() { static_assert(KernelBodyC<body_type>, "naga::cospan: X::compute_impl is not a valid kernel body: it must be a static function (sycl::id<R> | GroupItem<R> | CustomOp& | Host, const Inputs&, const Outputs&[, Scratch]) with trivially copyable Inputs, Outputs and Scratch"); }
-
-    /// USER, every forward: state the launch with create_launch_config(descriptors...). Returns the description the component
-    /// submits (section 3).
-    virtual std::unique_ptr<LaunchDescription> compute_forward() = 0;
+    using body_type = SynthBody<X>;
 
     // ---- read off the body's signature, for a fused owner --------------------
     int  kernel_rank() const override { return kernel_rank_v<body_type>; }
@@ -1304,19 +1322,18 @@ public:
     bool is_custom_op() const override { return CustomOpBody<body_type>; }
     bool is_host() const override { return HostBody<body_type>; }
     bool is_kernel_stage() const override { return PlainBody<body_type> || GroupBody<body_type>; }
-    detail::JitId definition_id() const override {
+    JitId definition_id() const override {
         if constexpr (CustomOpBody<body_type> || HostBody<body_type>)
-            throw std::logic_error("naga::cospan: " + describe() +
-                                   " is a custom-op or host body: it has no stage function");
+            throw std::logic_error("naga::cospan: " + describe() + " is a custom-op or host body: it has no stage function");
         else
-            return detail::stage_definition_id<body_type>();  // a function-local static, one per body type
+            return stage_definition_id<body_type>();  // a function-local static, one per body type
     }
 
     // ---- the stage interface (plain and group bodies) ------------------------------
-    void stage_args_ensure(detail::Runtime& rt) override {
+    void stage_args_ensure(Runtime& rt) override {
         if constexpr (PlainBody<body_type> || GroupBody<body_type>) {
             if (!args_) {
-                auto v = std::make_shared<ArgsVec>(rt.allocator_for<detail::StageArgs<body_type>>(this->device_of(), sk::kind::device));
+                auto v = std::make_shared<ArgsVec>(rt.allocator_for<StageArgs<body_type>>(this->device_of(), sk::kind::device));
                 v->reserve(1);  // capacity 1 from the start: the address the pointer array holds is final
                 args_ = std::move(v);
             }
@@ -1346,12 +1363,12 @@ public:
             this->throw_no_stage();
         }
     }
-    sycl::range<3> stage_upload([[maybe_unused]] detail::Runtime& rt, [[maybe_unused]] LaunchDescription& d,
+    sycl::range<3> stage_upload([[maybe_unused]] Runtime& rt, [[maybe_unused]] LaunchDescription& d,
                                 [[maybe_unused]] const sycl::range<3>& wg) override {
         if constexpr (PlainBody<body_type> || GroupBody<body_type>) {
-            auto&                                kl = dynamic_cast<detail::KernelLaunch<body_type>&>(d);
-            const detail::StageArgs<body_type>& a  = kl.finalize(wg);
-            args()->from_host(std::span<const detail::StageArgs<body_type>>{&a, 1});  // the host member into the array: a container write
+            auto&                     kl = dynamic_cast<KernelLaunch<body_type>&>(d);
+            const StageArgs<body_type>& a  = kl.finalize(wg);
+            args()->from_host(std::span<const StageArgs<body_type>>{&a, 1});  // the host member into the array: a container write
             return kl.group_range();
         } else {
             this->throw_no_stage();
@@ -1359,44 +1376,96 @@ public:
     }
 
 protected:
-    std::unique_ptr<LaunchDescription> compute_forward_impl() override { return compute_forward(); }
+    sk::kind default_storage_kind() const override { return HostBody<body_type> ? sk::kind::host : sk::kind::device; }
+
+private:
+    /// The component's argument array (plain and group bodies only), type-erased: this class is instantiated while X is still
+    /// incomplete, so its type cannot be named in a member declaration.
+    using ArgsVec = sk::usm_vector<StageArgs<SynthBody<X>>>;
+    std::shared_ptr<void> args_;
+    ArgsVec*              args() const { return static_cast<ArgsVec*>(args_.get()); }
+};
+
+}  // namespace detail
+
+/// A KERNEL component, by CRTP: `class Axpb : public cs::Component<Axpb>`. The component declares nested `Inputs` and `Outputs`
+/// structs of ports, a STATIC `compute_forward` (its first parameter fixes the kind and rank: sycl::id<R> plain, GroupItem<R>
+/// group; a group body with a nested `Scratch` takes it as the 4th) and PUBLIC members `inputs` and `outputs`. The hooks are
+/// `declare()` (ports), `prepare_forward()` (per-forward shapes) and `define_forward()`, which returns
+/// create_launch_config(descriptors...) made from the members. ONE KERNEL BODY PER COMPONENT, by type. A custom-op or host
+/// body is not a Component: derive CustomComponent or HostComponent.
+template <class X>
+class Component : public detail::TypedComponent<X> {
+public:
+    /// The constructor is a template over X (`Self`) so that its constraint is checked when a derived class constructs it, with X
+    /// complete, and never while Component<X> is being instantiated as the base of the still-incomplete X.
+    template <class Self = X>
+        requires detail::KernelStageBody<detail::SynthBody<Self>>
+    Component() {}
+
+    /// USER, every forward: state the launch with create_launch_config(descriptors...). Returns the description the component
+    /// submits.
+    virtual std::unique_ptr<LaunchDescription> define_forward() = 0;
+
+protected:
+    std::unique_ptr<LaunchDescription> describe_launch() override { return define_forward(); }
 
     /// The launch of this component, from its `inputs` and `outputs` members and the descriptors, in any order:
-    /// plain and group bodies: range_desc(range) (required), wg_desc(range) (optional), scratch_desc(value) (optional, a body
-    /// with Scratch only); custom-op and host bodies: none.
+    /// range_desc(range) (required), wg_desc(range) (optional), scratch_desc(value) (optional, a body with Scratch only).
     template <class... Ds>
         requires(detail::launch_descs_ok_v<detail::SynthBody<X>, Ds...>)
     std::unique_ptr<LaunchDescription> create_launch_config(Ds... ds) {
         using KB   = detail::SynthBody<X>;
         X&   self  = static_cast<X&>(*this);
         KB   body{self.inputs, self.outputs};
-        if constexpr (CustomOpBody<KB>) {
-            return std::make_unique<detail::CustomOpLaunch<KB>>(self.inputs, self.outputs, body);
-        } else if constexpr (HostBody<KB>) {
-            return std::make_unique<detail::HostLaunch<KB>>(self.inputs, self.outputs, body);
-        } else {
-            constexpr int LR = launch_rank_v<KB>;
-            const std::tuple<Ds...> t{ds...};
-            const sycl::range<LR>   range = std::get<RangeDesc<LR>>(t).value;
-            std::optional<sycl::range<LR>> wg;
-            if constexpr (detail::has_desc_v<WgDesc<LR>, Ds...>) wg = std::get<WgDesc<LR>>(t).value;
-            detail::scratch_t<KB> scratch = detail::NoScratchValue<KB>();
-            if constexpr (detail::has_desc_v<ScratchDesc<detail::scratch_t<KB>>, Ds...>)
-                scratch = std::get<ScratchDesc<detail::scratch_t<KB>>>(t).value;
-            return std::make_unique<detail::KernelLaunch<KB>>(range, wg, self.inputs, self.outputs, body, scratch);
-        }
+        constexpr int LR = launch_rank_v<KB>;
+        const std::tuple<Ds...> t{ds...};
+        const sycl::range<LR>   range = std::get<RangeDesc<LR>>(t).value;
+        std::optional<sycl::range<LR>> wg;
+        if constexpr (detail::has_desc_v<WgDesc<LR>, Ds...>) wg = std::get<WgDesc<LR>>(t).value;
+        detail::scratch_t<KB> scratch = detail::NoScratchValue<KB>();
+        if constexpr (detail::has_desc_v<ScratchDesc<detail::scratch_t<KB>>, Ds...>)
+            scratch = std::get<ScratchDesc<detail::scratch_t<KB>>>(t).value;
+        return std::make_unique<detail::KernelLaunch<KB>>(range, wg, self.inputs, self.outputs, body, scratch);
     }
+};
 
-    sk::kind default_storage_kind() const override {
-        return HostBody<body_type> ? sk::kind::host : sk::kind::device;
+/// A CUSTOM-OP component: the body gets a CustomOp (the native interop handle) and enqueues native backend work.
+/// `static void compute_forward(CustomOp&, const Inputs&, const Outputs&)`. There is no define_forward: the launch is built from
+/// the members. Not fusible.
+template <class X>
+class CustomComponent : public detail::TypedComponent<X> {
+public:
+    template <class Self = X>
+        requires detail::CustomStageBody<detail::SynthBody<Self>>
+    CustomComponent() {}
+
+protected:
+    std::unique_ptr<LaunchDescription> describe_launch() override {
+        using KB  = detail::SynthBody<X>;
+        X&   self = static_cast<X&>(*this);
+        KB   body{self.inputs, self.outputs};
+        return std::make_unique<detail::CustomOpLaunch<KB>>(self.inputs, self.outputs, body);
     }
+};
 
-private:
-    /// The component's argument array (plain and group bodies only), type-erased: this class is instantiated while X is still
-    /// incomplete, so its type cannot be named in a member declaration.
-    using ArgsVec = sk::usm_vector<detail::StageArgs<detail::SynthBody<X>>>;
-    std::shared_ptr<void> args_;
-    ArgsVec*              args() const { return static_cast<ArgsVec*>(args_.get()); }
+/// A HOST component: the body runs on the host as a host task, over host USM (the ports are host-kind). The type fixes the
+/// kind, so the body takes no tag: `static void compute_forward(const Inputs&, const Outputs&)`. There is no define_forward.
+/// Not fusible.
+template <class X>
+class HostComponent : public detail::TypedComponent<X> {
+public:
+    template <class Self = X>
+        requires detail::HostStageBody<detail::SynthBody<Self>>
+    HostComponent() {}
+
+protected:
+    std::unique_ptr<LaunchDescription> describe_launch() override {
+        using KB  = detail::SynthBody<X>;
+        X&   self = static_cast<X&>(*this);
+        KB   body{self.inputs, self.outputs};
+        return std::make_unique<detail::HostLaunch<KB>>(self.inputs, self.outputs, body);
+    }
 };
 
 }  // namespace naga::cospan

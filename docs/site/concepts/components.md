@@ -16,51 +16,57 @@ public:
     struct Outputs { cs::Output<DType::f32, 1> y; };
 
     // The kernel. It is static and sees only its inputs and outputs.
-    static void compute_impl(sycl::id<1> i, const Inputs& in, const Outputs& out) { out.y[i] = 2.0f * in.x[i] + 1.0f; }
+    static void compute_forward(sycl::id<1> i, const Inputs& in, const Outputs& out) { out.y[i] = 2.0f * in.x[i] + 1.0f; }
 
     // The component's inputs and outputs.
     Inputs  inputs;
     Outputs outputs;
 
     // Runs once: declare each input and output, with a name and a shape (or leave the shape unspecified).
-    void setup() override {
+    void declare() override {
         declare_input(inputs.x, "x", cs::unspecified);
         declare_output(outputs.y, "y", cs::unspecified);
     }
 
     // Runs before every forward.
-    void pre_forward() override { set_shape(outputs.y, shape_of(inputs.x)[0]); }
+    void prepare_forward() override { set_shape(outputs.y, shape_of(inputs.x)[0]); }
 
     // Describes the launch: the range to run over.
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         return create_launch_config(cs::range_desc(inputs.x.shape()));
     }
 };
 ```
 
 - **`Inputs` and `Outputs`** describe the component's inputs and outputs: their types and ranks.
-- **`compute_impl`** is the kernel. It is static: it has no access to the component object, only to the inputs and outputs it is given.
+- **`compute_forward`** is the kernel. It is static: it has no access to the component object, only to the inputs and outputs it is given.
 - **`inputs` and `outputs`** hold the component's inputs and outputs.
-- **`setup()`** runs once, when the model is set up. It declares each input and output with a name, and with a shape or `cs::unspecified`. Declaring allocates nothing.
-- **`pre_forward()`** runs before every forward. It is optional. It is typically where an output takes its shape, often from an input as here, but it is the component's own hook to use as it needs.
-- **`compute_forward()`** describes the launch of this forward. Its arguments are descriptors: `cs::range_desc` (the range), and optionally `cs::wg_desc` (the work-group shape) and `cs::scratch_desc` (local memory).
-- **`post_forward()`**, not shown, runs after every forward and is also optional. We have not needed it ourselves yet. If you find yourself reaching for it, check that it is really necessary.
+- **`declare()`** runs once, when the model is set up. It declares each input and output with a name, and with a shape or `cs::unspecified`. Declaring allocates nothing. (A system keeps `setup()`; a component declares.)
+- **`prepare_forward()`** runs before every forward. It is optional. It is typically where an output takes its shape, often from an input as here, but it is the component's own hook to use as it needs.
+- **`define_forward()`** describes the launch of this forward. Its arguments are descriptors: `cs::range_desc` (the range), and optionally `cs::wg_desc` (the work-group shape) and `cs::scratch_desc` (local memory).
 
-## The four kinds of kernel
+## The three component types
 
-The first parameter of `compute_impl` decides what kind of kernel a component has:
+A component derives one of three CRTP types, and its static `compute_forward` is the body:
 
 ```cpp
-static void compute_impl(sycl::id<R> i,       const Inputs& in, const Outputs& out);  // plain
-static void compute_impl(cs::GroupItem<R> it, const Inputs& in, const Outputs& out);  // group
-static void compute_impl(cs::CustomOp& op,    const Inputs& in, const Outputs& out);  // custom operation
-static void compute_impl(cs::Host,            const Inputs& in, const Outputs& out);  // host
+// cs::Component<X>: a kernel (plain or group). Its launch is stated in define_forward().
+static void compute_forward(sycl::id<R> i,       const Inputs& in, const Outputs& out);  // plain
+static void compute_forward(cs::GroupItem<R> it, const Inputs& in, const Outputs& out);  // group
+
+// cs::CustomComponent<X>: native backend work. There is no define_forward().
+static void compute_forward(cs::CustomOp& op, const Inputs& in, const Outputs& out);
+
+// cs::HostComponent<X>: runs on the host. The type fixes the kind, so the body takes no tag. There is no define_forward().
+static void compute_forward(const Inputs& in, const Outputs& out);
 ```
 
-- **Plain.** One work-item per index of the range.
-- **Group.** Work-items cooperate in work-groups, with local memory, group barriers and group algorithms.
-- **Custom operation.** CoSpan's form of AdaptiveCpp's [custom operation extension](https://adaptivecpp.github.io/AdaptiveCpp/enqueue-custom-operation/): native backend work, enqueued on the backend queue.
-- **Host.** The kernel runs on the host, as an asynchronous task. Like every other kind it is ordered by the framework: it runs only once its inputs are written and while nothing else writes its outputs. Submitting it does not block.
+- **`Component<X>`, plain.** One work-item per index of the range.
+- **`Component<X>`, group.** Work-items cooperate in work-groups, with local memory, group barriers and group algorithms.
+- **`CustomComponent<X>`.** CoSpan's form of AdaptiveCpp's [custom operation extension](https://adaptivecpp.github.io/AdaptiveCpp/enqueue-custom-operation/): native backend work, enqueued on the backend queue.
+- **`HostComponent<X>`.** The body runs on the host, as an asynchronous task, over host memory. Like every other kind it is ordered by the framework: it runs only once its inputs are written and while nothing else writes its outputs. Submitting it does not block.
+
+The hooks are the same for all three: `declare()` (ports), `prepare_forward()` (optional, per-forward shapes) and, for a kernel `Component` only, `define_forward()`. A component is not a node of the model's tree: it sits in a leaf that CoSpan creates for it, so a lone component `c` has ports `c.x`. A custom-operation or host component cannot be fused.
 
 ## The functional model
 

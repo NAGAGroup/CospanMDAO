@@ -22,7 +22,7 @@ formalism for composing open systems along shared boundaries, and *MDAO* credits
 - **Variable.** Everything joined by wiring is one variable. Its metadata is shared by all of its ports, and its memory lives
   while some port on that device holds it. A connection costs nothing at run time.
 - **Shapes.** A component says per dimension only "specified" or `cs::unspecified`. A shape comes from a connection, an
-  initializer, a producer's `pre_forward()` (`set_shape`), or a System's `shape_hook`.
+  initializer, a producer's `prepare_forward()` (`set_shape`), or a System's `shape_hook`.
 - **Run.** `Model::run()` enqueues one run and returns. Kernels are ordered by events, never by queue order, so
   independent work overlaps. Run policy (`run_n`, `do_once`, `transient`) is set on a subsystem; a finished
   subsystem goes out of scope and releases its data, and `Model::rearm_subsystem` brings it back.
@@ -45,17 +45,17 @@ public:
     struct Inputs  { cs::Input<DType::f32, 1> x; };
     struct Outputs { cs::Output<DType::f32, 1> y; };
     // the kernel: one work-item per element (its first parameter makes this a plain, rank-1 body)
-    static void compute_impl(sycl::id<1> i, const Inputs& in, const Outputs& out) { out.y[i] = 2.0f * in.x[i]; }
+    static void compute_forward(sycl::id<1> i, const Inputs& in, const Outputs& out) { out.y[i] = 2.0f * in.x[i]; }
 
     Inputs  inputs;
     Outputs outputs;
 
-    void setup() override {                                  // declare I/O; allocates nothing
+    void declare() override {                                  // declare I/O; allocates nothing
         declare_input(inputs.x, "x", cs::unspecified);
         declare_output(outputs.y, "y", cs::unspecified);
     }
-    void pre_forward() override { set_shape(outputs.y, shape_of(inputs.x)[0]); }   // the output follows the input
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    void prepare_forward() override { set_shape(outputs.y, shape_of(inputs.x)[0]); }   // the output follows the input
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         return create_launch_config(cs::range_desc(inputs.x.shape()));
     }
 };

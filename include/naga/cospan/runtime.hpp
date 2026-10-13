@@ -38,14 +38,13 @@ struct Runtime {
 
     /// The allocator for `dev` and `k`. Device-kind memory comes from the device's pool when it has one (SlabKit
     /// falls back to the OS itself when the pool is full or too fragmented); everything else is a direct
-    /// allocation. A host-kind allocation names no device.
+    /// allocation. A host-kind allocation is made in `dev`'s context (r05: host memory belongs to a context).
     template <class T>
     sk::allocator<T> allocator_for(const sycl::device& dev, sk::kind k) const {
         if (k == sk::kind::device) {
             const auto it = pools.find(dev);
             if (it != pools.end()) return sk::allocator<T>{q, it->second};
         }
-        if (k == sk::kind::host) return sk::allocator<T>{q, k};
         return sk::allocator<T>{q, k, dev};
     }
 };

@@ -49,13 +49,13 @@ public:
     struct Outputs {
         cs::Output<DType::f32, 1> y;
     };
-    static void compute_impl(sycl::id<1> i, const Inputs&, const Outputs& o) { o.y[i] = static_cast<float>(i[0] + 1); }
+    static void compute_forward(sycl::id<1> i, const Inputs&, const Outputs& o) { o.y[i] = static_cast<float>(i[0] + 1); }
 
     Inputs  inputs;
     Outputs outputs;
 
-    void setup() override { declare_output(outputs.y, "y", kN); }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(cs::range_desc(outputs.y.shape())); }
+    void declare() override { declare_output(outputs.y, "y", kN); }
+    std::unique_ptr<cs::LaunchDescription> define_forward() override { return create_launch_config(cs::range_desc(outputs.y.shape())); }
 };
 
 /// Rd: z = 2 x.
@@ -68,17 +68,17 @@ public:
     struct Outputs {
         cs::Output<DType::f32, 1> z;
     };
-    static void compute_impl(sycl::id<1> i, const Inputs& a, const Outputs& o) { o.z[i] = 2.0f * a.x[i]; }
+    static void compute_forward(sycl::id<1> i, const Inputs& a, const Outputs& o) { o.z[i] = 2.0f * a.x[i]; }
 
     Inputs  inputs;
     Outputs outputs;
 
-    void setup() override {
+    void declare() override {
         declare_input(inputs.x, "x", cs::unspecified);
         declare_output(outputs.z, "z", cs::unspecified_shape<1>());
     }
-    void pre_forward() override { set_shape(outputs.z, shape_of(inputs.x)[0]); }  // the output follows the input (section 10: no derived dims)
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(cs::range_desc(outputs.z.shape())); }
+    void prepare_forward() override { set_shape(outputs.z, shape_of(inputs.x)[0]); }  // the output follows the input (section 10: no derived dims)
+    std::unique_ptr<cs::LaunchDescription> define_forward() override { return create_launch_config(cs::range_desc(outputs.z.shape())); }
 };
 
 /// Tied members: zero (t = 0) and accumulate (t += i + 1), plain (TieOutputsPolicy::allow_plain).
@@ -90,7 +90,7 @@ public:
     struct Outputs {
         cs::Output<DType::f32, 1> t;
     };
-    static void compute_impl(sycl::id<1> i, const Inputs&, const Outputs& o) {
+    static void compute_forward(sycl::id<1> i, const Inputs&, const Outputs& o) {
         if constexpr (Zero)
             o.t[i] = 0.0f;
         else
@@ -100,8 +100,8 @@ public:
     Inputs  inputs;
     Outputs outputs;
 
-    void setup() override { this->declare_output(outputs.t, "t", cs::unspecified_shape<1>()); }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    void declare() override { this->declare_output(outputs.t, "t", cs::unspecified_shape<1>()); }
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         return this->create_launch_config(cs::range_desc(outputs.t.shape()));
     }
 };
@@ -116,7 +116,7 @@ public:
     struct Outputs {
         cs::Output<DType::f32, 1> y;
     };
-    static void compute_impl(sycl::id<1> i, const Inputs& a, const Outputs& o) { o.y[i] = a.x[i]; }
+    static void compute_forward(sycl::id<1> i, const Inputs& a, const Outputs& o) { o.y[i] = a.x[i]; }
 
     Inputs  inputs;
     Outputs outputs;
@@ -126,7 +126,7 @@ private:
 
 public:
     explicit Fin(int kind) : kind_{kind} {}
-    void setup() override {
+    void declare() override {
         declare_input(inputs.x, "x", kN);
         declare_output(outputs.y, "y", kN);
         if (kind_ == 0) init_input("x", cs::init::fill(3.0f));
@@ -137,12 +137,12 @@ public:
                                     for (std::size_t k = 0; k < h.size(); ++k) h[k] = 5.0f;
                                 }}));
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(cs::range_desc(outputs.y.shape())); }
+    std::unique_ptr<cs::LaunchDescription> define_forward() override { return create_launch_config(cs::range_desc(outputs.y.shape())); }
 };
 
 /// RGen: a free u32 input `counts` [n] drives the ragged output r [n, counts[i]]; r block i = 1000 i + q.
 /// Section 10: ragged is rank 2 (was [n, counts[i], 3]); a component cannot read values, so RGenTop hooks the free ragged input
-/// `layout` with counts_from(g.counts) and r copies its shape in pre_forward.
+/// `layout` with counts_from(g.counts) and r copies its shape in prepare_forward.
 /// The same device as Fill in test_ragged.cpp: it tests a hook (counts_from) on a ragged INPUT.
 
 class RGen : public cs::Component<RGen> {
@@ -154,7 +154,7 @@ public:
     struct Outputs {
         cs::RaggedOutput<DType::f32, 2> r;
     };
-    static void compute_impl(sycl::id<1> id, const Inputs&, const Outputs& o) {
+    static void compute_forward(sycl::id<1> id, const Inputs&, const Outputs& o) {
         auto b = o.r.block(id[0]);
         for (std::size_t q = 0; q < b.size(); ++q) b[q] = static_cast<float>(id[0] * 1000 + q);
     }
@@ -167,14 +167,14 @@ private:
 
 public:
     explicit RGen(std::vector<std::uint32_t> init) : init_{std::move(init)} {}
-    void setup() override {
+    void declare() override {
         declare_input(inputs.counts, "counts", init_.size());
         init_input("counts", cs::init::from_host(init_));
         declare_input(inputs.layout, "layout");
         declare_output(outputs.r, "r");
     }
-    void pre_forward() override { set_shape(outputs.r, shape_of(inputs.layout)); }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    void prepare_forward() override { set_shape(outputs.r, shape_of(inputs.layout)); }
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         return create_launch_config(cs::range_desc(inputs.counts.shape()));
     }
 };

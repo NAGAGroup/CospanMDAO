@@ -3,7 +3,7 @@
 //   1. handles       Model::get_input<DT, Rank>(path) (view, update) and get_output (view); the kind-mismatch errors
 //   2. views         a view can be made at any time: before the first forward an unconnected input shows its initialized
 //                    values after sync; a view made before the first forward shows the computed values after a forward
-//   3. view_input    a component reads one of its own inputs through a host view in pre_forward and sizes its output
+//   3. view_input    a component reads one of its own inputs through a host view in prepare_forward and sizes its output
 //
 // Every fixture is prefixed Ha (all test files are one binary).
 
@@ -75,20 +75,20 @@ public:
     struct Outputs {
         cs::Output<DType::f32, 1> y;
     };
-    static void compute_impl(sycl::id<1> i, const Inputs& in, const Outputs& out) { out.y[i] = 2.0f * in.x[i]; }
+    static void compute_forward(sycl::id<1> i, const Inputs& in, const Outputs& out) { out.y[i] = 2.0f * in.x[i]; }
 
     Inputs  inputs;
     Outputs outputs;
 
-    void setup() override {
+    void declare() override {
         declare_input(inputs.x, "x", 4);
         declare_output(outputs.y, "y", 4);
         init_input("x", cs::init::from_host(Floats{1, 2, 3, 4}));
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(cs::range_desc(inputs.x.shape())); }
+    std::unique_ptr<cs::LaunchDescription> define_forward() override { return create_launch_config(cs::range_desc(inputs.x.shape())); }
 };
 
-// ---- HaMaxSize: y[i] = i + 1, with max(v) elements: v is read through view_input in pre_forward ------------------------------
+// ---- HaMaxSize: y[i] = i + 1, with max(v) elements: v is read through view_input in prepare_forward ------------------------------
 
 class HaMaxSize : public cs::Component<HaMaxSize> {
 public:
@@ -98,7 +98,7 @@ public:
     struct Outputs {
         cs::Output<DType::f32, 1> y;
     };
-    static void compute_impl(sycl::id<1> i, const Inputs&, const Outputs& out) { out.y[i] = static_cast<float>(i[0] + 1); }
+    static void compute_forward(sycl::id<1> i, const Inputs&, const Outputs& out) { out.y[i] = static_cast<float>(i[0] + 1); }
 
     Inputs  inputs;
     Outputs outputs;
@@ -107,18 +107,18 @@ private:
     std::optional<cs::HostView<DType::u32, 1>>    view_;  // made on the first forward, kept: it is a holder on the host
 
 public:
-    void setup() override {
+    void declare() override {
         declare_input(inputs.v, "v", 5);
         declare_output(outputs.y, "y", cs::unspecified);
         init_input("v", cs::init::from_host(std::vector<std::uint32_t>{3, 1, 2, 3, 2}));
     }
-    void pre_forward() override {
+    void prepare_forward() override {
         if (!view_) view_ = view_input(inputs.v);
         view_->sync();
         const auto s = view_->span();
         set_shape(outputs.y, static_cast<std::size_t>(*std::max_element(s.begin(), s.end())));
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(cs::range_desc(outputs.y.shape())); }
+    std::unique_ptr<cs::LaunchDescription> define_forward() override { return create_launch_config(cs::range_desc(outputs.y.shape())); }
 };
 
 }  // namespace tha
@@ -192,14 +192,14 @@ TEST_CASE("views any time: a view whose shape cannot be resolved yet throws and 
     auto m = tha::ha_make([](cs::System& s) { s.add_subsystem(cs::subsystem_desc<tha::HaMaxSize>("p")); });
     m.setup();
     m.finalize();  // r04: views are available after finalize
-    // p.y's size is set by its producer in pre_forward: before a run it is unknown
+    // p.y's size is set by its producer in prepare_forward: before a run it is unknown
     tha::ha_throws([&] { (void)m.get_output<DType::f32, 1>("p.y").view(); }, {"p.y"});
     m.run();
     m.wait();
     CHECK(tha::ha_values(m.get_output<DType::f32, 1>("p.y").view()) == tha::Floats{1, 2, 3});
 }
 
-TEST_CASE("view_input: a component sizes its output from the max of an input read in pre_forward, over two forwards", "[host_access][component]") {
+TEST_CASE("view_input: a component sizes its output from the max of an input read in prepare_forward, over two forwards", "[host_access][component]") {
     auto m = tha::ha_make([](cs::System& s) { s.add_subsystem(cs::subsystem_desc<tha::HaMaxSize>("p")); });
     m.setup();
     auto y = m.get_output<DType::f32, 1>("p.y");

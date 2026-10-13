@@ -45,21 +45,21 @@ public:
     struct Outputs {
         cs::Output<DType::f32, 1> y;
     };
-    static void compute_impl(sycl::id<1> i, const Inputs& in, const Outputs& out) { out.y[i] = in.x[i]; }
+    static void compute_forward(sycl::id<1> i, const Inputs& in, const Outputs& out) { out.y[i] = in.x[i]; }
 
     Inputs  inputs;
     Outputs outputs;
 
-    void setup() override {
+    void declare() override {
         declare_input(inputs.x, "x", static_cast<int>(kN));
         declare_output(outputs.y, "y", static_cast<int>(kN));
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(cs::range_desc(outputs.y.shape())); }
+    std::unique_ptr<cs::LaunchDescription> define_forward() override { return create_launch_config(cs::range_desc(outputs.y.shape())); }
 };
 
 // ---- TrThrow: a HOST body that throws -------------------------------------------------------------------------------------
 
-class TrThrow : public cs::Component<TrThrow> {
+class TrThrow : public cs::HostComponent<TrThrow> {
 public:
     struct Inputs {
         cs::Input<DType::f32, 1> x;
@@ -67,17 +67,16 @@ public:
     struct Outputs {
         cs::Output<DType::f32, 1> y;
     };
-    static void compute_impl(cs::Host, const Inputs&, const Outputs&) { throw std::runtime_error("trework: thrown inside a host body"); }
+    static void compute_forward(const Inputs&, const Outputs&) { throw std::runtime_error("trework: thrown inside a host body"); }
 
     Inputs  inputs;
     Outputs outputs;
 
-    void setup() override {
+    void declare() override {
         declare_input(inputs.x, "x", static_cast<int>(kN));
         declare_output(outputs.y, "y", static_cast<int>(kN));
         init_input("x", cs::init::fill(1.0f));
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(); }
 };
 
 template <class C>

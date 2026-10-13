@@ -47,6 +47,7 @@
 namespace naga::cospan {
 
 class System;
+class ComponentBase;  // component.hpp
 
 /// One mark, by absolute path, collected as the marks are declared. The instance is held weakly: a mark on a holder
 /// that is gone expires.
@@ -135,6 +136,9 @@ struct ModelMeta {
     std::unordered_map<const Subsystem*, Node*>              node_of_sub;  ///< a node's object, and a fused group's stage objects
     std::unordered_map<std::string, std::weak_ptr<Instance>> holders;
     std::unordered_set<std::string>                          stage_names;  ///< a fused group's stages: objects, not tree nodes
+    /// Every bound component (a lone component and a fused group's stage) by full name, filled by ComponentBase::bind. Raw: the
+    /// component's driver owns it.
+    std::unordered_map<std::string, ComponentBase*>          components;
     std::size_t                                              next_ordinal = 0;
 
     // ---- records for finalize --------------------------------------------------------
@@ -169,7 +173,7 @@ struct ModelMeta {
     }
 
     bool name_taken(const std::string& full) const {
-        return nodes.contains(full) || holders.contains(full) || stage_names.contains(full);
+        return nodes.contains(full) || holders.contains(full) || stage_names.contains(full) || components.contains(full);
     }
 
     // ---- registration ----------------------------------------------------------------

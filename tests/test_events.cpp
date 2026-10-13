@@ -43,17 +43,17 @@ public:
     struct Outputs {
         cs::Output<DType::f32, 1> y;
     };
-    static void compute_impl(sycl::id<1> i, const Inputs&, const Outputs& out) { out.y[i] = 1.0f; }
+    static void compute_forward(sycl::id<1> i, const Inputs&, const Outputs& out) { out.y[i] = 1.0f; }
 
     Inputs  inputs;
     Outputs outputs;
 
-    void setup() override { declare_output(outputs.y, "y", static_cast<int>(kN)); }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(cs::range_desc(outputs.y.shape())); }
+    void declare() override { declare_output(outputs.y, "y", static_cast<int>(kN)); }
+    std::unique_ptr<cs::LaunchDescription> define_forward() override { return create_launch_config(cs::range_desc(outputs.y.shape())); }
 };
 
 /// y = x + 1; y has kN elements, x takes the shape of what it is connected to or tied into. `on_pre`, when given, runs
-/// at the start of pre_forward, after this component's inputs have been materialized.
+/// at the start of prepare_forward, after this component's inputs have been materialized.
 class Plus : public cs::Component<Plus> {
 public:
     struct Inputs {
@@ -62,7 +62,7 @@ public:
     struct Outputs {
         cs::Output<DType::f32, 1> y;
     };
-    static void compute_impl(sycl::id<1> i, const Inputs& in, const Outputs& out) { out.y[i] = in.x[i] + 1.0f; }
+    static void compute_forward(sycl::id<1> i, const Inputs& in, const Outputs& out) { out.y[i] = in.x[i] + 1.0f; }
 
     Inputs  inputs;
     Outputs outputs;
@@ -72,14 +72,14 @@ private:
 
 public:
     explicit Plus(std::function<void()> on_pre = {}) : on_pre_{std::move(on_pre)} {}
-    void setup() override {
+    void declare() override {
         declare_input(inputs.x, "x", cs::unspecified_shape<1>());
         declare_output(outputs.y, "y", static_cast<int>(kN));
     }
-    void pre_forward() override {
+    void prepare_forward() override {
         if (on_pre_) on_pre_();
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(cs::range_desc(inputs.x.shape())); }
+    std::unique_ptr<cs::LaunchDescription> define_forward() override { return create_launch_config(cs::range_desc(inputs.x.shape())); }
 };
 
 /// A root System whose setup() runs a callable.
@@ -146,7 +146,7 @@ TEST_CASE("a second holder on a new placement gets its own container, a copy of 
 TEST_CASE("the first materialization, asked by an input, is global and initializes", "[events][materialize]") {
     cs::Model* mp       = nullptr;
     int        observed = 0;
-    // Runs inside a's pre_forward: a's inputs are materialized, b has not run. b's holder of the shared variable already
+    // Runs inside a's prepare_forward: a's inputs are materialized, b has not run. b's holder of the shared variable already
     // has its container, bound and sized, because the first materialization is global.
     auto observe = [&] {
         ++observed;

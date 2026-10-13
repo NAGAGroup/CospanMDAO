@@ -94,7 +94,7 @@ public:
     struct Outputs {
         cs::Output<DType::f32, R> y;
     };
-    static void compute_impl(cs::GroupItem<R> it, const Inputs&, const Outputs& out) {
+    static void compute_forward(cs::GroupItem<R> it, const Inputs&, const Outputs& out) {
         out.y[it.get_global_id()] = static_cast<float>(Seg * 1000000 + static_cast<int>(it.get_group_linear_id()));
     }
 
@@ -106,7 +106,7 @@ private:
 
 public:
     explicit IdStage(sycl::range<R> groups) : groups_{groups} {}
-    void setup() override {
+    void declare() override {
         const sycl::range<R> wg = wg_of<R>();
         if constexpr (R == 1)
             this->declare_output(outputs.y, "y", static_cast<int>(groups_[0] * wg[0]));
@@ -116,7 +116,7 @@ public:
             this->declare_output(outputs.y, "y", static_cast<int>(groups_[0] * wg[0]), static_cast<int>(groups_[1] * wg[1]),
                                  static_cast<int>(groups_[2] * wg[2]));
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         sycl::range<R> r = groups_;
         for (int d = 0; d < R; ++d) r[d] *= wg_of<R>()[d];
         return this->create_launch_config(cs::range_desc(r), cs::wg_desc(wg_of<R>()));
@@ -132,7 +132,7 @@ public:
     struct Outputs {
         cs::Output<DType::f32, 2> f;
     };
-    static void compute_impl(cs::GroupItem<2> it, const Inputs&, const Outputs& out) {
+    static void compute_forward(cs::GroupItem<2> it, const Inputs&, const Outputs& out) {
         if (it.get_local_linear_id() != 0) return;
         if constexpr (Fill)
             out.f[it.get_group_id()] = 0.0f;
@@ -148,8 +148,8 @@ private:
 
 public:
     explicit FlagStage(sycl::range<2> groups) : groups_{groups} {}
-    void setup() override { this->declare_output(outputs.f, "f", cs::unspecified_shape<2>()); }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    void declare() override { this->declare_output(outputs.f, "f", cs::unspecified_shape<2>()); }
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         return this->create_launch_config(cs::range_desc(sycl::range<2>{groups_[0] * 4, groups_[1] * 4}), cs::wg_desc(wg_of<2>()));
     }
 };
@@ -162,7 +162,7 @@ public:
     struct Outputs {
         cs::Output<DType::f32, 2> y;
     };
-    static void compute_impl(cs::GroupItem<2> it, const Inputs&, const Outputs& out) {
+    static void compute_forward(cs::GroupItem<2> it, const Inputs&, const Outputs& out) {
         out.y[it.get_global_id()] = static_cast<float>(it.get_group_linear_id() * 16 + it.get_local_linear_id());
     }
 
@@ -174,8 +174,8 @@ private:
 
 public:
     explicit WriteStage2(sycl::range<2> groups) : groups_{groups} {}
-    void setup() override { declare_output(outputs.y, "y", static_cast<int>(groups_[0] * 4), static_cast<int>(groups_[1] * 4)); }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    void declare() override { declare_output(outputs.y, "y", static_cast<int>(groups_[0] * 4), static_cast<int>(groups_[1] * 4)); }
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         return create_launch_config(cs::range_desc(sycl::range<2>{groups_[0] * 4, groups_[1] * 4}), cs::wg_desc(wg_of<2>()));
     }
 };
@@ -190,7 +190,7 @@ public:
     struct Outputs {
         cs::Output<DType::f32, 2> z;
     };
-    static void compute_impl(cs::GroupItem<2> it, const Inputs& in, const Outputs& out) {
+    static void compute_forward(cs::GroupItem<2> it, const Inputs& in, const Outputs& out) {
         const sycl::range<2> gr = it.get_group_range();
         const sycl::id<2>    g  = it.get_group_id();
         const sycl::id<2>    ng{(g[0] + 1) % gr[0], (g[1] + 1) % gr[1]};
@@ -208,11 +208,11 @@ private:
 
 public:
     explicit ReadNb(sycl::range<2> groups) : groups_{groups} {}
-    void setup() override {
+    void declare() override {
         this->declare_input(inputs.x, "x", static_cast<int>(groups_[0] * 4), static_cast<int>(groups_[1] * 4));
         this->declare_output(outputs.z, "z", static_cast<int>(groups_[0] * 4), static_cast<int>(groups_[1] * 4));
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         return this->create_launch_config(cs::range_desc(sycl::range<2>{groups_[0] * 4, groups_[1] * 4}), cs::wg_desc(wg_of<2>()));
     }
 };
@@ -225,7 +225,7 @@ public:
     struct Outputs {
         cs::Output<DType::f32, 2> y;
     };
-    static void compute_impl(sycl::id<2> i, const Inputs&, const Outputs& out) { out.y[i] = static_cast<float>(i[0] * out.y.shape()[1] + i[1]); }
+    static void compute_forward(sycl::id<2> i, const Inputs&, const Outputs& out) { out.y[i] = static_cast<float>(i[0] * out.y.shape()[1] + i[1]); }
 
     Inputs  inputs;
     Outputs outputs;
@@ -235,8 +235,8 @@ private:
 
 public:
     explicit PlainId(sycl::range<2> r) : r_{r} {}
-    void setup() override { declare_output(outputs.y, "y", static_cast<int>(r_[0]), static_cast<int>(r_[1])); }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(cs::range_desc(r_)); }
+    void declare() override { declare_output(outputs.y, "y", static_cast<int>(r_[0]), static_cast<int>(r_[1])); }
+    std::unique_ptr<cs::LaunchDescription> define_forward() override { return create_launch_config(cs::range_desc(r_)); }
 };
 
 // ---- RawStage<K>: 1 when the PHYSICAL group coordinates of the item are the ones kind K promises --------------------------------
@@ -252,7 +252,7 @@ public:
     struct Outputs {
         cs::Output<DType::f32, 2> y;
     };
-    static void compute_impl(cs::GroupItem<2> it, const Inputs&, const Outputs& out) {
+    static void compute_forward(cs::GroupItem<2> it, const Inputs&, const Outputs& out) {
         const sycl::nd_item<3> raw = it;  // the implicit conversion
         const sycl::id<2>      g   = it.get_group_id();
         bool                   ok  = false;
@@ -275,8 +275,8 @@ private:
 
 public:
     explicit RawStage(sycl::range<2> groups) : groups_{groups} {}
-    void setup() override { this->declare_output(outputs.y, "y", static_cast<int>(groups_[0] * 4), static_cast<int>(groups_[1] * 4)); }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    void declare() override { this->declare_output(outputs.y, "y", static_cast<int>(groups_[0] * 4), static_cast<int>(groups_[1] * 4)); }
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         return this->create_launch_config(cs::range_desc(sycl::range<2>{groups_[0] * 4, groups_[1] * 4}), cs::wg_desc(wg_of<2>()));
     }
 };
@@ -290,7 +290,7 @@ public:
     struct Outputs {
         cs::Output<DType::f32, 1> r;
     };
-    static void compute_impl(cs::GroupItem<2> it, const Inputs&, const Outputs& out) {
+    static void compute_forward(cs::GroupItem<2> it, const Inputs&, const Outputs& out) {
         auto              g   = it.get_group();
         float*            L   = it.local<float>(32);
         const std::size_t t   = it.get_local_linear_id();
@@ -348,8 +348,8 @@ public:
     Inputs  inputs;
     Outputs outputs;
 
-    void setup() override { declare_output(outputs.r, "r", 128); }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    void declare() override { declare_output(outputs.r, "r", 128); }
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         auto d = create_launch_config(cs::range_desc(sycl::range<2>{4, 4}), cs::wg_desc(wg_of<2>()));
         d->request_local_bytes(32 * sizeof(float));
         return d;
@@ -364,7 +364,7 @@ public:
     struct Outputs {
         cs::Output<DType::f32, 1> r;
     };
-    static void compute_impl(cs::GroupItem<2> it, const Inputs&, const Outputs& out) {
+    static void compute_forward(cs::GroupItem<2> it, const Inputs&, const Outputs& out) {
         const float x = static_cast<float>(it.get_local_linear_id() + 1);
         sycl::group<3> g3 = it.get_group();          // the implicit conversion
         sycl::group_barrier(g3);                       // raw SYCL on the physical group
@@ -379,8 +379,8 @@ public:
     Inputs  inputs;
     Outputs outputs;
 
-    void setup() override { declare_output(outputs.r, "r", 2); }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    void declare() override { declare_output(outputs.r, "r", 2); }
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         return create_launch_config(cs::range_desc(sycl::range<2>{4, 4}), cs::wg_desc(wg_of<2>()));
     }
 };

@@ -90,7 +90,7 @@ public:
     struct Outputs {
         cs::Output<DType::f32, 1> y;
     };
-    static void compute_impl(sycl::id<1> i, const Inputs& in, const Outputs& o) { o.y[i] = in.v[std::size_t{0}]; }
+    static void compute_forward(sycl::id<1> i, const Inputs& in, const Outputs& o) { o.y[i] = in.v[std::size_t{0}]; }
 
     Inputs  inputs;
     Outputs outputs;
@@ -100,12 +100,12 @@ private:
 
 public:
     explicit Gen(float v) : v_{v} {}
-    void setup() override {
+    void declare() override {
         declare_input(inputs.v, "v", 1);
         init_input("v", cs::init::fill(v_));
         declare_output(outputs.y, "y", static_cast<int>(kN));
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(cs::range_desc(outputs.y.shape())); }
+    std::unique_ptr<cs::LaunchDescription> define_forward() override { return create_launch_config(cs::range_desc(outputs.y.shape())); }
 };
 
 /// y = x + 1; x has kN elements (optionally with an initializer).
@@ -117,7 +117,7 @@ public:
     struct Outputs {
         cs::Output<DType::f32, 1> y;
     };
-    static void compute_impl(sycl::id<1> i, const Inputs& in, const Outputs& o) { o.y[i] = in.x[i] + 1.0f; }
+    static void compute_forward(sycl::id<1> i, const Inputs& in, const Outputs& o) { o.y[i] = in.x[i] + 1.0f; }
 
     Inputs  inputs;
     Outputs outputs;
@@ -127,12 +127,12 @@ private:
 
 public:
     explicit Inc(std::optional<float> x0 = std::nullopt) : x0_{x0} {}
-    void setup() override {
+    void declare() override {
         declare_input(inputs.x, "x", static_cast<int>(kN));
         declare_output(outputs.y, "y", static_cast<int>(kN));
         if (x0_) init_input("x", cs::init::fill(*x0_));
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(cs::range_desc(inputs.x.shape())); }
+    std::unique_ptr<cs::LaunchDescription> define_forward() override { return create_launch_config(cs::range_desc(inputs.x.shape())); }
 };
 
 /// y = x; both dimensions unspecified: x takes its shape from a connection or a hook, y follows x.
@@ -144,17 +144,17 @@ public:
     struct Outputs {
         cs::Output<DType::f32, 1> y;
     };
-    static void compute_impl(sycl::id<1> i, const Inputs& in, const Outputs& o) { o.y[i] = in.x[i]; }
+    static void compute_forward(sycl::id<1> i, const Inputs& in, const Outputs& o) { o.y[i] = in.x[i]; }
 
     Inputs  inputs;
     Outputs outputs;
 
-    void setup() override {
+    void declare() override {
         declare_input(inputs.x, "x", cs::unspecified_shape<1>());
         declare_output(outputs.y, "y", cs::unspecified_shape<1>());
     }
-    void pre_forward() override { set_shape(outputs.y, shape_of(inputs.x)[0]); }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(cs::range_desc(inputs.x.shape())); }
+    void prepare_forward() override { set_shape(outputs.y, shape_of(inputs.x)[0]); }
+    std::unique_ptr<cs::LaunchDescription> define_forward() override { return create_launch_config(cs::range_desc(inputs.x.shape())); }
 };
 
 /// Writes y[i] = i + 1 for i in [lo, hi) and nothing else; two of them tied together make the whole 1..kN.
@@ -166,7 +166,7 @@ public:
     struct Outputs {
         cs::Output<DType::f32, 1> y;
     };
-    static void compute_impl(sycl::id<1> i, const Inputs& in, const Outputs& o) {
+    static void compute_forward(sycl::id<1> i, const Inputs& in, const Outputs& o) {
         if (i[0] >= in.lo[std::size_t{0}] && i[0] < in.hi[std::size_t{0}]) o.y[i] = static_cast<float>(i[0] + 1);
     }
 
@@ -178,14 +178,14 @@ private:
 
 public:
     Half(unsigned lo, unsigned hi) : lo_{lo}, hi_{hi} {}
-    void setup() override {
+    void declare() override {
         declare_input(inputs.lo, "lo", 1);
         init_input("lo", cs::init::fill(lo_));
         declare_input(inputs.hi, "hi", 1);
         init_input("hi", cs::init::fill(hi_));
         declare_output(outputs.y, "y", static_cast<int>(kN));
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(cs::range_desc(outputs.y.shape())); }
+    std::unique_ptr<cs::LaunchDescription> define_forward() override { return create_launch_config(cs::range_desc(outputs.y.shape())); }
 };
 
 // ---- systems -------------------------------------------------------------------------------------

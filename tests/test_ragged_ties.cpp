@@ -78,7 +78,7 @@ public:
     struct Outputs {
         cs::Output<DType::u32, 1> counts;
     };
-    static void compute_impl(sycl::id<1> i, const Inputs& a, const Outputs& o) { o.counts[i] = a.raw[i]; }
+    static void compute_forward(sycl::id<1> i, const Inputs& a, const Outputs& o) { o.counts[i] = a.raw[i]; }
 
     Inputs  inputs;
     Outputs outputs;
@@ -88,12 +88,12 @@ private:
 
 public:
     explicit CProd(Counts init) : init_{std::move(init)} {}
-    void setup() override {
+    void declare() override {
         declare_input(inputs.raw, "raw", init_.size());
         init_input("raw", cs::init::from_host(init_));
         declare_output(outputs.counts, "counts", init_.size());
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         return create_launch_config(cs::range_desc(outputs.counts.shape()));
     }
 };
@@ -111,7 +111,7 @@ public:
     struct Outputs {
         cs::RaggedOutput<DType::f32, 2> pts;
     };
-    static void compute_impl(sycl::id<1> id, const Inputs&, const Outputs& o) {
+    static void compute_forward(sycl::id<1> id, const Inputs&, const Outputs& o) {
         auto b = o.pts.block(id[0]);
         for (std::size_t q = 0; q < b.size(); ++q) b[q] = static_cast<float>(id[0] * 1000 + q);
     }
@@ -124,15 +124,15 @@ private:
 
 public:
     explicit Gen(int mode = 0) : mode_{mode} {}
-    void setup() override {
+    void declare() override {
         declare_input(inputs.counts, "counts", cs::unspecified);
         declare_input(inputs.layout, "layout");
         declare_output(outputs.pts, "pts");
     }
-    void pre_forward() override {
+    void prepare_forward() override {
         if (mode_ != 1) set_shape(outputs.pts, shape_of(inputs.layout));
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         return create_launch_config(cs::range_desc(sycl::range<1>{inputs.layout.size()}));
     }
 };
@@ -146,7 +146,7 @@ public:
     struct Outputs {
         cs::RaggedOutput<DType::f32, 2> t;
     };
-    static void compute_impl(sycl::id<1> id, const Inputs&, const Outputs& o) {
+    static void compute_forward(sycl::id<1> id, const Inputs&, const Outputs& o) {
         auto        b    = o.t.block(id[0]);
         const float base = static_cast<float>(id[0] + 1);
         for (std::size_t q = 0; q < b.size(); ++q) {
@@ -160,15 +160,15 @@ public:
     Inputs  inputs;
     Outputs outputs;
 
-    void setup() override { this->declare_output(outputs.t, "t"); }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    void declare() override { this->declare_output(outputs.t, "t"); }
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         return this->create_launch_config(cs::range_desc(sycl::range<1>{outputs.t.size()}));
     }
 };
 /// A member that declares its leading dimension (N = 4): it meets the alias's definition at the tie.
 class TieMemberLead : public TieMember<0> {
 public:
-    void setup() override { declare_output(outputs.t, "t", 4); }
+    void declare() override { declare_output(outputs.t, "t", 4); }
 };
 // ---- atomic ragged members: zero (store), accumulate (fetch_add) ------------------------------------------------
 
@@ -179,7 +179,7 @@ public:
     struct Outputs {
         cs::RaggedOutput<DType::atomic_f32, 2> t;
     };
-    static void compute_impl(sycl::id<1> id, const Inputs&, const Outputs& o) {
+    static void compute_forward(sycl::id<1> id, const Inputs&, const Outputs& o) {
         auto        b    = o.t.block(id[0]);
         const float base = static_cast<float>(id[0] + 1);
         for (std::size_t q = 0; q < b.size(); ++q) {
@@ -191,8 +191,8 @@ public:
     Inputs  inputs;
     Outputs outputs;
 
-    void setup() override { this->declare_output(outputs.t, "t"); }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    void declare() override { this->declare_output(outputs.t, "t"); }
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         return this->create_launch_config(cs::range_desc(sycl::range<1>{outputs.t.size()}));
     }
 };
@@ -214,7 +214,7 @@ public:
     struct Outputs {
         cs::Output<DType::f32, 1> sums;
     };
-    static void compute_impl(sycl::id<1> id, const Inputs& in, const Outputs& out) {
+    static void compute_forward(sycl::id<1> id, const Inputs& in, const Outputs& out) {
         auto  b = in.pts.block(id[0]);
         float s = 0.0f;
         for (std::size_t q = 0; q < b.size(); ++q) s += b[q];
@@ -224,12 +224,12 @@ public:
     Inputs  inputs;
     Outputs outputs;
 
-    void setup() override {
+    void declare() override {
         declare_input(inputs.pts, "pts");
         declare_output(outputs.sums, "sums", cs::unspecified);
     }
-    void pre_forward() override { set_shape(outputs.sums, shape_of(inputs.pts).n); }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    void prepare_forward() override { set_shape(outputs.sums, shape_of(inputs.pts).n); }
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         return create_launch_config(cs::range_desc(outputs.sums.shape()));
     }
 };
@@ -313,7 +313,7 @@ public:
     struct Outputs {
         cs::Output<DType::f32, 1> sums;
     };
-    static void compute_impl(sycl::id<1> id, const Inputs& in, const Outputs& out) {
+    static void compute_forward(sycl::id<1> id, const Inputs& in, const Outputs& out) {
         auto  b = in.pts.block(id[0]);
         float s = 0.0f;
         for (std::size_t q = 0; q < b.size(); ++q) s += b[q];
@@ -323,12 +323,12 @@ public:
     Inputs  inputs;
     Outputs outputs;
 
-    void setup() override {
+    void declare() override {
         this->declare_input(inputs.pts, "pts");
         this->declare_output(outputs.sums, "sums", cs::unspecified);
     }
-    void pre_forward() override { this->set_shape(outputs.sums, this->shape_of(inputs.pts).n); }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    void prepare_forward() override { this->set_shape(outputs.sums, this->shape_of(inputs.pts).n); }
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         return this->create_launch_config(cs::range_desc(outputs.sums.shape()));
     }
 };
@@ -381,7 +381,7 @@ public:
     struct Outputs {
         cs::Output<DType::f32, 1> x;
     };
-    static void compute_impl(sycl::id<1> i, const Inputs&, const Outputs& o) { o.x[i] = 0.5f * static_cast<float>(i[0]) + 1.0f; }
+    static void compute_forward(sycl::id<1> i, const Inputs&, const Outputs& o) { o.x[i] = 0.5f * static_cast<float>(i[0]) + 1.0f; }
 
     Inputs  inputs;
     Outputs outputs;
@@ -391,8 +391,8 @@ private:
 
 public:
     explicit Src(std::size_t n) : n_{n} {}
-    void setup() override { declare_output(outputs.x, "x", n_); }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    void declare() override { declare_output(outputs.x, "x", n_); }
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         return create_launch_config(cs::range_desc(outputs.x.shape()));
     }
 };
@@ -407,7 +407,7 @@ public:
     struct Outputs {
         cs::RaggedOutput<DType::f32, 2> t;
     };
-    static void compute_impl(sycl::id<1> id, const Inputs& a, const Outputs& o) {
+    static void compute_forward(sycl::id<1> id, const Inputs& a, const Outputs& o) {
         auto b = o.t.block(id[0]);
         for (std::size_t q = 0; q < b.size(); ++q) b[q] = a.in[id] * static_cast<float>(q + 1);
     }
@@ -415,11 +415,11 @@ public:
     Inputs  inputs;
     Outputs outputs;
 
-    void setup() override {
+    void declare() override {
         declare_input(inputs.in, "in", cs::unspecified);
         declare_output(outputs.t, "t");
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         return create_launch_config(cs::range_desc(sycl::range<1>{outputs.t.size()}));
     }
 };
@@ -432,17 +432,17 @@ public:
     struct Outputs {
         cs::Output<DType::f32, 1> out;
     };
-    static void compute_impl(sycl::id<1> i, const Inputs& a, const Outputs& o) { o.out[i] = 2.0f * a.in[i] + 1.0f; }
+    static void compute_forward(sycl::id<1> i, const Inputs& a, const Outputs& o) { o.out[i] = 2.0f * a.in[i] + 1.0f; }
 
     Inputs  inputs;
     Outputs outputs;
 
-    void setup() override {
+    void declare() override {
         declare_input(inputs.in, "in", cs::unspecified);
         declare_output(outputs.out, "out", cs::unspecified);
     }
-    void pre_forward() override { set_shape(outputs.out, shape_of(inputs.in)[0]); }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    void prepare_forward() override { set_shape(outputs.out, shape_of(inputs.in)[0]); }
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         return create_launch_config(cs::range_desc(outputs.out.shape()));
     }
 };
@@ -519,7 +519,7 @@ public:
     struct Outputs {
         cs::RaggedOutput<DType::f32, 2> t;
     };
-    static void compute_impl(sycl::id<1> id, const Inputs& a, const Outputs& o) {
+    static void compute_forward(sycl::id<1> id, const Inputs& a, const Outputs& o) {
         auto b = o.t.block(id[0]);
         for (std::size_t q = 0; q < b.size(); ++q) b[q] = a.in[id] * static_cast<float>(q + 1);
     }
@@ -527,12 +527,12 @@ public:
     Inputs  inputs;
     Outputs outputs;
 
-    void setup() override {
+    void declare() override {
         declare_input(inputs.in, "in", cs::unspecified);
         declare_input(inputs.sizes, "sizes", cs::unspecified);
         declare_output(outputs.t, "t");
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         return create_launch_config(cs::range_desc(sycl::range<1>{outputs.t.size()}));
     }
 };
@@ -547,7 +547,7 @@ public:
     struct Outputs {
         cs::RaggedOutput<DType::atomic_f32, 2> t;
     };
-    static void compute_impl(sycl::id<1> id, const Inputs& a, const Outputs& o) {
+    static void compute_forward(sycl::id<1> id, const Inputs& a, const Outputs& o) {
         auto b = o.t.block(id[0]);
         for (std::size_t q = 0; q < b.size(); ++q) b[q].fetch_add(a.in[id] * static_cast<float>(q + 1));
     }
@@ -555,11 +555,11 @@ public:
     Inputs  inputs;
     Outputs outputs;
 
-    void setup() override {
+    void declare() override {
         declare_input(inputs.in, "in", cs::unspecified);
         declare_output(outputs.t, "t");
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         return create_launch_config(cs::range_desc(sycl::range<1>{outputs.t.size()}));
     }
 };
@@ -697,7 +697,7 @@ public:
     struct Outputs {
         cs::RaggedOutput<DType::f32, 2> t;
     };
-    static void compute_impl(sycl::id<1> id, const Inputs& a, const Outputs& o) {
+    static void compute_forward(sycl::id<1> id, const Inputs& a, const Outputs& o) {
         auto b = o.t.block(id[0]);
         for (std::size_t q = 0; q < b.size(); ++q) b[q] += a.in[id] * static_cast<float>(q + 1);
     }
@@ -705,11 +705,11 @@ public:
     Inputs  inputs;
     Outputs outputs;
 
-    void setup() override {
+    void declare() override {
         declare_input(inputs.in, "in", cs::unspecified);
         declare_output(outputs.t, "t");
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         return create_launch_config(cs::range_desc(sycl::range<1>{outputs.t.size()}));
     }
 };

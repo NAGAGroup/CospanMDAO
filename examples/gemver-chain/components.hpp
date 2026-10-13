@@ -17,7 +17,7 @@
 //   - SIZES COME FROM THE PORTS. A kernel reads n, the strip height and the block count from the shapes of its ports
 //     (`in.B.shape()`, `out.Ps.shape()`, ...), and a launch range comes from the shapes of the ports too. Every data port is
 //     declared with an unspecified shape: the owning System (systems.hpp) gives the free inputs and the partial-sum outputs
-//     their shapes with shape hooks, every other output takes its shape in pre_forward from the shapes of its inputs.
+//     their shapes with shape hooks, every other output takes its shape in prepare_forward from the shapes of its inputs.
 //     The one value no shape carries is Rank2Update's strip height R: it is a constructor argument (the host launch range)
 //     and a u32 input of extent 1 that Rank2Update initializes itself from that argument.
 //   - `scale` is an f32 input of extent 1; the System ties the users of one value into an alias and initializes it.
@@ -78,7 +78,7 @@ public:
     struct Outputs {
         cs::Output<DType::f32, 2> B;
     };
-    static void compute_impl(cs::GroupItem<1> it, const Inputs& in, const Outputs& out) {
+    static void compute_forward(cs::GroupItem<1> it, const Inputs& in, const Outputs& out) {
         const std::uint32_t n = u32(in.A.shape()[1]), R = first(in.R), total = (n / R) * n;
         const std::uint32_t stride = static_cast<std::uint32_t>(it.get_group_range(0) * it.get_local_range(0));
         for (std::uint32_t t = static_cast<std::uint32_t>(it.get_global_id(0)); t < total; t += stride) {
@@ -100,7 +100,7 @@ private:
 
 public:
     explicit Rank2Update(int R) : R_{R} {}
-    void setup() override {
+    void declare() override {
         declare_input(inputs.A, "A", cs::unspecified_shape<2>());
         declare_input(inputs.u1, "u1", cs::unspecified_shape<1>());
         declare_input(inputs.v1, "v1", cs::unspecified_shape<1>());
@@ -110,11 +110,11 @@ public:
         init_input("R", cs::init::fill(u32(R_)));
         declare_output(outputs.B, "B", cs::unspecified_shape<2>());
     }
-    void pre_forward() override {
+    void prepare_forward() override {
         const sycl::range<2> a = shape_of(inputs.A);
         set_shape(outputs.B, a[0], a[1]);
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         const std::size_t n    = inputs.A.shape()[1];
         const std::size_t work = (n / static_cast<std::size_t>(R_)) * n;
         return create_launch_config(cs::range_desc(sycl::range<1>{work}), cs::wg_desc(sycl::range<1>{kWg}));
@@ -135,7 +135,7 @@ public:
     struct Outputs {
         cs::Output<DType::f32, 2> P;
     };
-    static void compute_impl(cs::GroupItem<1> it, const Inputs& in, const Outputs& out) {
+    static void compute_forward(cs::GroupItem<1> it, const Inputs& in, const Outputs& out) {
         const std::uint32_t n = u32(in.B.shape()[1]), R = u32(in.B.shape()[0] / out.P.shape()[0]), total = (n / R) * n;
         const std::uint32_t stride = static_cast<std::uint32_t>(it.get_group_range(0) * it.get_local_range(0));
         for (std::uint32_t t = static_cast<std::uint32_t>(it.get_global_id(0)); t < total; t += stride) {
@@ -152,12 +152,12 @@ public:
     Inputs  inputs;
     Outputs outputs;
 
-    void setup() override {
+    void declare() override {
         declare_input(inputs.B, "B", cs::unspecified_shape<2>());
         declare_input(inputs.y, "y", cs::unspecified_shape<1>());
         declare_output(outputs.P, "P", cs::unspecified_shape<2>());  // hooked by the owning System: (n / R, n)
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         const std::size_t range = outputs.P.shape()[0] * outputs.P.shape()[1];  // (n / R) * n
         return create_launch_config(cs::range_desc(sycl::range<1>{range}), cs::wg_desc(sycl::range<1>{kWg}));
     }
@@ -185,7 +185,7 @@ public:
     struct Outputs {
         cs::Output<DType::f32, 1> x;
     };
-    static void compute_impl(cs::GroupItem<1> it, const Inputs& in, const Outputs& out) {
+    static void compute_forward(cs::GroupItem<1> it, const Inputs& in, const Outputs& out) {
         const std::uint32_t n = u32(in.P.shape()[1]), strips = u32(in.P.shape()[0]);
         const float         scale  = first(in.scale);
         const std::uint32_t stride = static_cast<std::uint32_t>(it.get_group_range(0) * it.get_local_range(0));
@@ -202,14 +202,14 @@ public:
     Inputs  inputs;
     Outputs outputs;
 
-    void setup() override {
+    void declare() override {
         this->declare_input(inputs.P, "P", cs::unspecified_shape<2>());
         if constexpr (Z) this->declare_input(inputs.z, "z", cs::unspecified_shape<1>());  // only declared when Z
         this->declare_input(inputs.scale, "scale", cs::unspecified_shape<1>());  // a tie_inputs member; the System sets the alias
         this->declare_output(outputs.x, "x", cs::unspecified_shape<1>());
     }
-    void pre_forward() override { this->set_shape(outputs.x, this->shape_of(inputs.P)[1]); }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    void prepare_forward() override { this->set_shape(outputs.x, this->shape_of(inputs.P)[1]); }
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         const std::size_t range = inputs.P.shape()[1];
         return this->create_launch_config(cs::range_desc(sycl::range<1>{range}), cs::wg_desc(sycl::range<1>{kWg}));
     }
@@ -230,7 +230,7 @@ public:
     struct Outputs {
         cs::Output<DType::f32, 1> y;
     };
-    static void compute_impl(cs::GroupItem<1> it, const Inputs& in, const Outputs& out) {
+    static void compute_forward(cs::GroupItem<1> it, const Inputs& in, const Outputs& out) {
         const std::uint32_t n = u32(in.B.shape()[0]);
         const float         scale = first(in.scale);
         const std::uint32_t l = static_cast<std::uint32_t>(it.get_local_id(0));
@@ -248,14 +248,14 @@ public:
     Inputs  inputs;
     Outputs outputs;
 
-    void setup() override {
+    void declare() override {
         declare_input(inputs.B, "B", cs::unspecified_shape<2>());  // the rank-only B of a tie_inputs member, or connected
         declare_input(inputs.x, "x", cs::unspecified_shape<1>());
         declare_input(inputs.scale, "scale", cs::unspecified_shape<1>());  // a tie_inputs member; the System sets the alias
         declare_output(outputs.y, "y", cs::unspecified_shape<1>());
     }
-    void pre_forward() override { set_shape(outputs.y, shape_of(inputs.B)[0]); }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    void prepare_forward() override { set_shape(outputs.y, shape_of(inputs.B)[0]); }
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         const std::size_t range = inputs.B.shape()[0] * kWg;  // a group per row
         return create_launch_config(cs::range_desc(sycl::range<1>{range}), cs::wg_desc(sycl::range<1>{kWg}));
     }
@@ -279,7 +279,7 @@ public:
     struct Outputs {
         cs::Output<DType::f32, 2> Ps, Pq;
     };
-    static void compute_impl(cs::GroupItem<1> it, const Inputs& in, const Outputs& out) {
+    static void compute_forward(cs::GroupItem<1> it, const Inputs& in, const Outputs& out) {
         const std::uint32_t n = u32(in.B.shape()[0]), R = u32(in.B.shape()[0] / out.Ps.shape()[0]);
         const std::uint32_t blocks = n / static_cast<std::uint32_t>(it.get_local_range(0)), total_groups = (n / R) * blocks;
         const std::uint32_t l  = static_cast<std::uint32_t>(it.get_local_id(0));
@@ -303,18 +303,18 @@ public:
     Inputs  inputs;
     Outputs outputs;
 
-    void setup() override {
+    void declare() override {
         declare_input(inputs.B, "B", cs::unspecified_shape<2>());
         declare_input(inputs.p, "p", cs::unspecified_shape<1>());
         declare_input(inputs.r, "r", cs::unspecified_shape<1>());
         declare_output(outputs.Ps, "Ps", cs::unspecified_shape<2>());  // hooked by the owning System: (n / R, n)
         declare_output(outputs.Pq, "Pq", cs::unspecified_shape<2>());
     }
-    void pre_forward() override {
+    void prepare_forward() override {
         const sycl::range<2> b = shape_of(inputs.B);
         set_shape(outputs.Pq, b[0], b[0] / kWg);
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         const std::size_t blocks = inputs.B.shape()[0] / kWg;
         const std::size_t groups = outputs.Ps.shape()[0] * blocks;  // (n / R) * blocks
         return create_launch_config(cs::range_desc(sycl::range<1>{groups * kWg}), cs::wg_desc(sycl::range<1>{kWg}));
@@ -331,7 +331,7 @@ public:
     struct Outputs {
         cs::Output<DType::f32, 1> q;
     };
-    static void compute_impl(cs::GroupItem<1> it, const Inputs& in, const Outputs& out) {
+    static void compute_forward(cs::GroupItem<1> it, const Inputs& in, const Outputs& out) {
         const std::uint32_t n = u32(in.Pq.shape()[0]), blocks = u32(in.Pq.shape()[1]);
         const std::uint32_t stride = static_cast<std::uint32_t>(it.get_group_range(0) * it.get_local_range(0));
         for (std::uint32_t i = static_cast<std::uint32_t>(it.get_global_id(0)); i < n; i += stride) {
@@ -344,12 +344,12 @@ public:
     Inputs  inputs;
     Outputs outputs;
 
-    void setup() override {
+    void declare() override {
         declare_input(inputs.Pq, "Pq", cs::unspecified_shape<2>());
         declare_output(outputs.q, "q", cs::unspecified_shape<1>());
     }
-    void pre_forward() override { set_shape(outputs.q, shape_of(inputs.Pq)[0]); }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    void prepare_forward() override { set_shape(outputs.q, shape_of(inputs.Pq)[0]); }
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         const std::size_t range = inputs.Pq.shape()[0];
         return create_launch_config(cs::range_desc(sycl::range<1>{range}), cs::wg_desc(sycl::range<1>{kWg}));
     }
@@ -376,7 +376,7 @@ public:
     struct Outputs {
         cs::Output<DType::f32, 2> B;
     };
-    static void compute_impl(cs::GroupItem<1> it, const Inputs& in, const Outputs& out) {
+    static void compute_forward(cs::GroupItem<1> it, const Inputs& in, const Outputs& out) {
         float*              tile = it.local<float>(static_cast<std::size_t>(kRt) * kWg);
         const std::uint32_t l    = static_cast<std::uint32_t>(it.get_local_id(0));
         const std::uint32_t g    = static_cast<std::uint32_t>(it.get_group(0));
@@ -395,7 +395,7 @@ public:
     Inputs  inputs;
     Outputs outputs;
 
-    void setup() override {
+    void declare() override {
         declare_input(inputs.A, "A", cs::unspecified_shape<2>());
         declare_input(inputs.u1, "u1", cs::unspecified_shape<1>());
         declare_input(inputs.v1, "v1", cs::unspecified_shape<1>());
@@ -403,11 +403,11 @@ public:
         declare_input(inputs.v2, "v2", cs::unspecified_shape<1>());
         declare_output(outputs.B, "B", cs::unspecified_shape<2>());
     }
-    void pre_forward() override {
+    void prepare_forward() override {
         const sycl::range<2> a = shape_of(inputs.A);
         set_shape(outputs.B, a[0], a[1]);
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         const std::size_t n      = inputs.A.shape()[0];
         const std::size_t blocks = n / kWg;
         const std::size_t groups = (n / kRt) * blocks;
@@ -428,7 +428,7 @@ public:
     struct Outputs {
         cs::Output<DType::f32, 2> P;
     };
-    static void compute_impl(cs::GroupItem<1> it, const Inputs& in, const Outputs& out) {
+    static void compute_forward(cs::GroupItem<1> it, const Inputs& in, const Outputs& out) {
         float*              tile = it.local<float>(static_cast<std::size_t>(kRt) * kWg);  // the same block as Rank2UpdateLocal's
         const std::uint32_t l    = static_cast<std::uint32_t>(it.get_local_id(0));
         const std::uint32_t g    = static_cast<std::uint32_t>(it.get_group(0));
@@ -444,11 +444,11 @@ public:
     Inputs  inputs;
     Outputs outputs;
 
-    void setup() override {
+    void declare() override {
         declare_input(inputs.y, "y", cs::unspecified_shape<1>());
         declare_output(outputs.P, "P", cs::unspecified_shape<2>());  // hooked by the owning System
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         const std::size_t n      = inputs.y.shape()[0];
         const std::size_t blocks = n / kWg;
         const std::size_t groups = (n / kRt) * blocks;
@@ -471,7 +471,7 @@ public:
     struct Outputs {
         cs::Output<DType::f32, 2> Ps, Pq;
     };
-    static void compute_impl(cs::GroupItem<1> it, const Inputs& in, const Outputs& out) {
+    static void compute_forward(cs::GroupItem<1> it, const Inputs& in, const Outputs& out) {
         float*              tile = it.local<float>(static_cast<std::size_t>(kRt) * kWg);
         const std::uint32_t l    = static_cast<std::uint32_t>(it.get_local_id(0));
         const std::uint32_t g    = static_cast<std::uint32_t>(it.get_group(0));
@@ -494,18 +494,18 @@ public:
     Inputs  inputs;
     Outputs outputs;
 
-    void setup() override {
+    void declare() override {
         declare_input(inputs.B, "B", cs::unspecified_shape<2>());
         declare_input(inputs.p, "p", cs::unspecified_shape<1>());
         declare_input(inputs.r, "r", cs::unspecified_shape<1>());
         declare_output(outputs.Ps, "Ps", cs::unspecified_shape<2>());  // hooked by the owning System
         declare_output(outputs.Pq, "Pq", cs::unspecified_shape<2>());
     }
-    void pre_forward() override {
+    void prepare_forward() override {
         const sycl::range<2> b = shape_of(inputs.B);
         set_shape(outputs.Pq, b[0], b[0] / kWg);
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         const std::size_t n      = inputs.B.shape()[0];
         const std::size_t blocks = n / kWg;
         const std::size_t groups = (n / kRt) * blocks;
@@ -526,7 +526,7 @@ public:
     struct Outputs {
         cs::Output<DType::f32, 2> B;
     };
-    static void compute_impl(cs::GroupItem<1> it, const Inputs& in, const Outputs& out) {
+    static void compute_forward(cs::GroupItem<1> it, const Inputs& in, const Outputs& out) {
         float*              tile = it.local<float>(static_cast<std::size_t>(kRt) * kWg);
         const std::uint32_t l    = static_cast<std::uint32_t>(it.get_local_id(0));
         const std::uint32_t g    = static_cast<std::uint32_t>(it.get_group(0));
@@ -544,18 +544,18 @@ public:
     Inputs  inputs;
     Outputs outputs;
 
-    void setup() override {
+    void declare() override {
         declare_input(inputs.u1, "u1", cs::unspecified_shape<1>());
         declare_input(inputs.v1, "v1", cs::unspecified_shape<1>());
         declare_input(inputs.u2, "u2", cs::unspecified_shape<1>());
         declare_input(inputs.v2, "v2", cs::unspecified_shape<1>());
         declare_output(outputs.B, "B", cs::unspecified_shape<2>());
     }
-    void pre_forward() override {
+    void prepare_forward() override {
         const std::size_t n = shape_of(inputs.u1)[0];
         set_shape(outputs.B, n, n);
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         const std::size_t n      = inputs.u1.shape()[0];
         const std::size_t blocks = n / kWg;
         const std::size_t groups = (n / kRt) * blocks;

@@ -841,11 +841,9 @@ private:
                 if (!any) return;  // no member runs this turn: nothing was written
                 const std::shared_ptr<detail::Instance> a = wa.lock();
                 if (!a || !a->data || !a->data->bound()) return;
-                for (const auto& entry : a->meta->data) {
-                    const std::shared_ptr<detail::DeviceDataBase> dst = entry.second.lock();
-                    if (!dst || dst == a->data || !dst->bound()) continue;  // a holder not materialized yet fills itself
-                    host->extra_events.push_back(dst->copy_from(*a->data, std::span<const sycl::event>{}));
-                }
+                // a holder not materialized yet fills itself (push_from skips unbound data)
+                const std::vector<sycl::event> evs = a->meta->push_from(a->data);
+                host->extra_events.insert(host->extra_events.end(), evs.begin(), evs.end());
             }});
         }
     }
@@ -951,10 +949,16 @@ struct ModelAccess {
     static ModelMeta& meta(Model& m) { return *m.ready("ModelAccess::meta").meta; }
     /// The holder with the full name `full`, else null.
     static std::shared_ptr<Instance> instance(Model& m, std::string_view full) { return meta(m).find_holder(full); }
-    /// The subsystem object at the full name `full`, else null ("" is the root).
+    /// The subsystem object at the full name `full`, else null ("" is the root). A lone component's node is its DRIVER.
     static Subsystem* subsystem(Model& m, std::string_view full) {
         Node* n = meta(m).find_node(full);
         return n == nullptr ? nullptr : n->sub.get();
+    }
+    /// The component with the full name `full` (a lone component or a fused group's stage), else null.
+    static ComponentBase* component(Model& m, std::string_view full) {
+        const auto& all = meta(m).components;
+        const auto  it  = all.find(std::string{full});
+        return it == all.end() ? nullptr : it->second;
     }
     /// The node at the full name, else null.
     static Node* node(Model& m, std::string_view full) { return meta(m).find_node(full); }

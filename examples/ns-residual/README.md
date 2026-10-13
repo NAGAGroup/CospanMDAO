@@ -51,7 +51,7 @@ rank-2 work-group stage, work-group 16×16, one work-group per tile.
 | 3 | **deterministic reductions**, `segment<partitioned, range_mode::own>` | `DetNorm` (4 groups, one per variable), `DetMin` (1 group), `DetMax` (1 group) | `range_mode::own`: the one-group stages skip the other groups in any dimension; reductions of the per-tile partials in a fixed order |
 | 4 | **error**, one group | `ErrorStage<true>`: six values, each atomic − deterministic | `wait_group` on exactly the segment-3 groups it compares (groups 0–3) |
 
-Every component is `class X : public cs::Component<X>` with a static `compute_impl`; nothing is passed to a kernel except through
+Every component is `class X : public cs::Component<X>` with a static `compute_forward`; nothing is passed to a kernel except through
 its ports. The grid (nx, ny, tx, ty) is one i32 input `geo` of extent 4 on the components that need it; the system ties those
 inputs into one alias and the driver sets it with `update_input`. The fused and unfused versions of a stage are different
 component types (`ConvDivergence<true>` waits on the tile-pipeline groups, `ConvDivergence<false>` does not), as are the two directions.

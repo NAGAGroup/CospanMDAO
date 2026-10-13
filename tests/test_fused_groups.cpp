@@ -72,7 +72,7 @@ public:
     struct Outputs {
         cs::Output<DType::f32, 1> y;
     };
-    static void compute_impl(sycl::id<1> i, const Inputs&, const Outputs& out) { out.y[i] = static_cast<float>(i[0] + 1); }
+    static void compute_forward(sycl::id<1> i, const Inputs&, const Outputs& out) { out.y[i] = static_cast<float>(i[0] + 1); }
 
     Inputs  inputs;
     Outputs outputs;
@@ -82,8 +82,8 @@ private:
 
 public:
     explicit Src(int n) : n_{n} {}
-    void setup() override { declare_output(outputs.y, "y", n_); }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(cs::range_desc(outputs.y.shape())); }
+    void declare() override { declare_output(outputs.y, "y", n_); }
+    std::unique_ptr<cs::LaunchDescription> define_forward() override { return create_launch_config(cs::range_desc(outputs.y.shape())); }
 
 private:
 };
@@ -98,17 +98,17 @@ public:
     struct Outputs {
         cs::Output<DType::f32, 1> y;
     };
-    static void compute_impl(sycl::id<1> i, const Inputs& in, const Outputs& out) { out.y[i] = in.x[i] + 1.0f; }
+    static void compute_forward(sycl::id<1> i, const Inputs& in, const Outputs& out) { out.y[i] = in.x[i] + 1.0f; }
 
     Inputs  inputs;
     Outputs outputs;
 
-    void setup() override {
+    void declare() override {
         declare_input(inputs.x, "x", cs::unspecified_shape<1>());
         declare_output(outputs.y, "y", cs::unspecified_shape<1>());
     }
-    void pre_forward() override { set_shape(outputs.y, shape_of(inputs.x)[0]); }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(cs::range_desc(inputs.x.shape())); }
+    void prepare_forward() override { set_shape(outputs.y, shape_of(inputs.x)[0]); }
+    std::unique_ptr<cs::LaunchDescription> define_forward() override { return create_launch_config(cs::range_desc(inputs.x.shape())); }
 };
 
 // ---- group stages ---------------------------------------------------------------------------------
@@ -142,7 +142,7 @@ public:
     struct Outputs {
         cs::Output<DType::f32, 1> y;
     };
-    static void compute_impl(cs::GroupItem<1> it, const Inputs& in, const Outputs& out) {
+    static void compute_forward(cs::GroupItem<1> it, const Inputs& in, const Outputs& out) {
         const std::size_t g = it.get_global_id(0);
         if constexpr (Kind == kTag) {
             if (g >= in.x.shape()[0]) return;
@@ -185,12 +185,12 @@ private:
 
 public:
     explicit GStage(std::size_t wg = kWg, std::size_t local_bytes = 0) : wg_{wg}, local_bytes_{local_bytes} {}
-    void setup() override {
+    void declare() override {
         this->declare_input(inputs.x, "x", cs::unspecified_shape<1>());
         this->declare_output(outputs.y, "y", cs::unspecified_shape<1>());
     }
-    void pre_forward() override { this->set_shape(outputs.y, this->shape_of(inputs.x)[0]); }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    void prepare_forward() override { this->set_shape(outputs.y, this->shape_of(inputs.x)[0]); }
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         auto d = this->create_launch_config(cs::range_desc(inputs.x.shape()), cs::wg_desc(sycl::range<1>{wg_}));
         if (local_bytes_ != 0) d->request_local_bytes(local_bytes_);
         return d;
@@ -438,7 +438,7 @@ TEST_CASE("fused groups: group_waits_enabled gives the launch its wait state and
         CHECK(tfg::out_of(model, "f.a.y") == tfg::filled(200, 422));  // the (segment, group) indices are unchanged
         CHECK(tfg::out_of(model, "f.b.y") == tfg::filled(100, 1422));
     }
-    auto* f = dynamic_cast<cs::detail::FusedBase*>(cs::detail::ModelAccess::subsystem(model, "f"));
+    auto* f = dynamic_cast<cs::detail::FusedDriver*>(cs::detail::ModelAccess::subsystem(model, "f"));
     REQUIRE(f != nullptr);
     CHECK(f->has_wait_state());
 }
@@ -458,7 +458,7 @@ TEST_CASE("fused groups: a group with neither group_waits_enabled nor a global_b
         CHECK(tfg::out_of(model, "f.a.y") == tfg::filled(200, 422));
         CHECK(tfg::out_of(model, "f.b.y") == tfg::filled(100, 1422));
     }
-    auto* f = dynamic_cast<cs::detail::FusedBase*>(cs::detail::ModelAccess::subsystem(model, "f"));
+    auto* f = dynamic_cast<cs::detail::FusedDriver*>(cs::detail::ModelAccess::subsystem(model, "f"));
     REQUIRE(f != nullptr);
     CHECK_FALSE(f->has_wait_state());
 }
@@ -573,7 +573,7 @@ public:
     struct Outputs {
         cs::Output<DType::atomic_f32, 1> y;
     };
-    static void compute_impl(sycl::id<1> i, const Inputs& in, const Outputs& out) { out.y[i].fetch_add(in.v[std::size_t{0}]); }
+    static void compute_forward(sycl::id<1> i, const Inputs& in, const Outputs& out) { out.y[i].fetch_add(in.v[std::size_t{0}]); }
 
     Inputs  inputs;
     Outputs outputs;
@@ -583,10 +583,10 @@ private:
 
 public:
     explicit TAdder(float v) : v_{v} {}
-    void setup() override {
+    void declare() override {
         declare_input(inputs.v, "v", 1);
         init_input("v", cs::init::fill(v_)); declare_output(outputs.y, "y", cs::unspecified_shape<1>()); }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(cs::range_desc(outputs.y.shape())); }
+    std::unique_ptr<cs::LaunchDescription> define_forward() override { return create_launch_config(cs::range_desc(outputs.y.shape())); }
 };
 
 class TZero : public cs::Component<TZero> {
@@ -595,13 +595,13 @@ public:
     struct Outputs {
         cs::Output<DType::atomic_f32, 1> y;
     };
-    static void compute_impl(sycl::id<1> i, const Inputs&, const Outputs& out) { out.y[i].store(0.0f); }
+    static void compute_forward(sycl::id<1> i, const Inputs&, const Outputs& out) { out.y[i].store(0.0f); }
 
     Inputs  inputs;
     Outputs outputs;
 
-    void setup() override { declare_output(outputs.y, "y", cs::unspecified_shape<1>()); }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override { return create_launch_config(cs::range_desc(outputs.y.shape())); }
+    void declare() override { declare_output(outputs.y, "y", cs::unspecified_shape<1>()); }
+    std::unique_ptr<cs::LaunchDescription> define_forward() override { return create_launch_config(cs::range_desc(outputs.y.shape())); }
 };
 
 // TGAdder / TGZero: the same as TAdder / TZero as WORK-GROUP stages (a global_barrier needs group-body stages), work-group kWg.
@@ -614,7 +614,7 @@ public:
     struct Outputs {
         cs::Output<DType::atomic_f32, 1> y;
     };
-    static void compute_impl(cs::GroupItem<1> it, const Inputs& in, const Outputs& out) {
+    static void compute_forward(cs::GroupItem<1> it, const Inputs& in, const Outputs& out) {
         const std::size_t g = it.get_global_id(0);
         if (g < out.y.shape()[0]) out.y[g].fetch_add(in.v[std::size_t{0}]);
     }
@@ -627,10 +627,10 @@ private:
 
 public:
     explicit TGAdder(float v) : v_{v} {}
-    void setup() override {
+    void declare() override {
         declare_input(inputs.v, "v", 1);
         init_input("v", cs::init::fill(v_)); declare_output(outputs.y, "y", cs::unspecified_shape<1>()); }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         return create_launch_config(cs::range_desc(outputs.y.shape()), cs::wg_desc(sycl::range<1>{kWg}));
     }
 };
@@ -641,7 +641,7 @@ public:
     struct Outputs {
         cs::Output<DType::atomic_f32, 1> y;
     };
-    static void compute_impl(cs::GroupItem<1> it, const Inputs&, const Outputs& out) {
+    static void compute_forward(cs::GroupItem<1> it, const Inputs&, const Outputs& out) {
         const std::size_t g = it.get_global_id(0);
         if (g < out.y.shape()[0]) out.y[g].store(0.0f);
     }
@@ -649,14 +649,14 @@ public:
     Inputs  inputs;
     Outputs outputs;
 
-    void setup() override { declare_output(outputs.y, "y", cs::unspecified_shape<1>()); }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    void declare() override { declare_output(outputs.y, "y", cs::unspecified_shape<1>()); }
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         return create_launch_config(cs::range_desc(outputs.y.shape()), cs::wg_desc(sycl::range<1>{kWg}));
     }
 };
 
 // TSlice: y[i] = v for lo <= i < hi and nothing else, a PLAIN output (disjoint slices of one tie). `reshape`: its
-// pre_forward calls set_shape on the output, which a tied member may not do.
+// prepare_forward calls set_shape on the output, which a tied member may not do.
 
 class TSlice : public cs::Component<TSlice> {
 public:
@@ -666,7 +666,7 @@ public:
     struct Outputs {
         cs::Output<DType::f32, 1> y;
     };
-    static void compute_impl(sycl::id<1> i, const Inputs& in, const Outputs& out) {
+    static void compute_forward(sycl::id<1> i, const Inputs& in, const Outputs& out) {
         const float k = static_cast<float>(i[0]);
         if (k >= in.lo[std::size_t{0}] && k < in.hi[std::size_t{0}]) out.y[i] = in.v[std::size_t{0}];
     }
@@ -680,17 +680,17 @@ private:
 
 public:
     TSlice(float lo, float hi, float v, bool reshape = false) : lo_{lo}, hi_{hi}, v_{v}, reshape_{reshape} {}
-    void setup() override {
+    void declare() override {
         declare_input(inputs.lo, "lo", 1);
         init_input("lo", cs::init::fill(lo_));
         declare_input(inputs.hi, "hi", 1);
         init_input("hi", cs::init::fill(hi_));
         declare_input(inputs.v, "v", 1);
         init_input("v", cs::init::fill(v_)); declare_output(outputs.y, "y", cs::unspecified_shape<1>()); }
-    void pre_forward() override {
+    void prepare_forward() override {
         if (reshape_) set_shape(outputs.y, 12);
     }
-    std::unique_ptr<cs::LaunchDescription> compute_forward() override {
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
         return create_launch_config(cs::range_desc(outputs.y.shape()));
     }
 };

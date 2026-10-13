@@ -67,4 +67,4 @@ More: [Connect, promote and tie](connect-promote-tie.md).
 
 ## No forward of its own
 
-A system does no work and has no `pre_forward()` or `post_forward()`: it only groups subsystems and declares wiring. Work belongs to components. To bring a finished subsystem back into play, call `model.rearm_subsystem(path)` from `main` between runs.
+A system does no work and has no `prepare_forward()`: it only groups subsystems and declares wiring. Work belongs to components. To bring a finished subsystem back into play, call `model.rearm_subsystem(path)` from `main` between runs.

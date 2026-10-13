@@ -23,7 +23,7 @@
 //     connection exclude each other.
 //   - Gemver and Bicgk (and Chain, for the crafted chain) give each partial-sum OUTPUT (GemvTPartial's P, BicgkOnePass's Ps,
 //     the crafted components' P and Ps) its shape with shape_hook(.., fixed_at_run(n / R), fixed_at_run(n)).
-//   - Every other output takes its shape in the component's pre_forward from the shapes of its inputs.
+//   - Every other output takes its shape in the component's prepare_forward from the shapes of its inputs.
 //   - R: no shape carries it for Rank2Update, which takes R as its constructor argument and initializes its own `R` input.
 //   - scale: one tied alias per System (GEMVER: cred and gemv, 1/sqrt(n); BiCGK: gemv_q and cred_s, 1), initialized by that
 //     System (BiCGK's onepass and naive styles have one user, cred_s: a tie needs two members, so they promote it). In the

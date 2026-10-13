@@ -56,11 +56,11 @@ inline ConnectsDesc connects_desc(std::initializer_list<std::pair<std::string_vi
 }
 
 namespace detail {
-class FusedBase;
+class FusedDriver;
 }  // namespace detail
 
 /// One tie declared in a group: cs::tie_outputs<DT, R>(...) or cs::tie_inputs<DT, R>(...), applied to the group in setup().
-using TieEntry = std::function<void(detail::FusedBase&)>;
+using TieEntry = std::function<void(detail::FusedDriver&)>;
 
 /// The ties of a helper-built group, in order: ties_desc({cs::tie_outputs<DType::f32, 1>({"a.y", "b.y"}, "y"), ...}). Each
 /// entry takes the parameters of System::tie_outputs / System::tie_inputs (member paths relative to the group: stage name,
@@ -105,36 +105,42 @@ inline constexpr bool split_supports_rank_v = Sp != Split::padded || Rank <= 2;
 /// groups and how (range mode, local memory); they cover the stages in order. `group_waits`: the group has the
 /// group_waits_enabled property or contains a global_barrier, so its launch carries the wait state.
 ///
-/// A fused group is a LEAF of the model's tree (is_leaf): one forward, one launch. It keeps System's declaration calls for
-/// its own setup (stages, ties, connections), but its stages are objects it owns (children_are_stages), not tree nodes: their
-/// ports are registered as `<group>.<stage>.<port>` and answer to the group's node.
-class FusedBase : public System {
+/// A fused group is a LEAF of the model's tree (r05: a ComponentDriver): one forward, one launch. It OWNS its stages, which are
+/// components (ComponentBase), not tree nodes: their ports are registered as `<group>.<stage>.<port>` and answer to the group's
+/// node. Its own declarations (ties, connections) go through a declaration SCOPE, a private System bound to the group's path
+/// and mapped to the group's node, so the System rules apply unchanged.
+class FusedDriver : public ComponentDriver {
 public:
-    FusedBase(std::vector<SegmentSpec> segments, bool group_waits, Split split)
+    FusedDriver(std::vector<SegmentSpec> segments, bool group_waits, Split split)
         : segments_{std::move(segments)}, group_waits_{group_waits}, split_{split} {}
-    ~FusedBase() override = default;
+    ~FusedDriver() override = default;
 
-    /// A fused group is a leaf of the tree.
-    bool is_leaf() const noexcept override { return true; }
+    /// The group's declaration hook: its stages, ties and connections (implemented by FusedGroup).
+    virtual void setup() = 0;
 
-    /// Setup, then the setup-end check: no ragged ports.
+    /// Binds the declaration scope to this group, maps it to this group's node, then runs setup() and the setup-end check: no
+    /// ragged ports.
     void run_setup() override {
-        System::run_setup();
-        check_no_ragged_ports(stages());
+        SubsystemAccess::bind(scope_, path(), meta_);
+        meta_->adopt_sub(&scope_, *meta_->node_for(this));
+        {
+            ModelMeta::SetupScope setup_scope{meta_};
+            setup();
+        }
+        check_no_ragged_ports(parts_);
     }
 
     /// ONE forward for the group: every stage's pre steps, the single launch, every stage's post steps. The group's own tied
     /// outputs are pushed by the after-operation finalize placed on this leaf (the same as for any leaf).
     void forward(Runtime& rt) override {
-        const std::vector<ComponentBase*> st = stages();
-        if (st.empty()) throw std::invalid_argument("naga::cospan: " + describe() + ": a fused group has no stages");
-        for (ComponentBase* s : st) {
+        if (parts_.empty()) throw std::invalid_argument("naga::cospan: " + describe() + ": a fused group has no stages");
+        for (ComponentBase* s : parts_) {
             s->precompute_steps(rt);
             s->stage_args_ensure(rt);
         }
-        launcher_.prepare(rt, st);  // once, at the first forward
-        (void)launcher_.launch(rt, st, segments_, describe(), group_waits_, split_);
-        for (ComponentBase* s : st) s->step_post(rt);
+        launcher_.prepare(rt, parts_);  // once, at the first forward
+        (void)launcher_.launch(rt, parts_, segments_, describe(), group_waits_, split_);
+        for (ComponentBase* s : parts_) s->step_post(rt);
     }
 
     /// The launch's events.
@@ -145,35 +151,58 @@ public:
     template <DType DT, int Rank>
     void group_tie_inputs(const std::vector<std::string>& members, std::string name, ShapeSpec shape) {
         const std::vector<std::string_view> v(members.begin(), members.end());
-        this->template tie_inputs_of<DT, Rank>(std::span<const std::string_view>{v}, std::move(name), std::move(shape));
+        scope_.template tie_inputs_of<DT, Rank>(std::span<const std::string_view>{v}, std::move(name), std::move(shape));
     }
     template <DType DT, int Rank>
     void group_tie_outputs(const std::vector<std::string>& members, std::string name, ShapeSpec shape, TieOutputsPolicy policy) {
         const std::vector<std::string_view> v(members.begin(), members.end());
-        this->template tie_outputs_of<DT, Rank>(std::span<const std::string_view>{v}, std::move(name), std::move(shape), policy);
+        scope_.template tie_outputs_of<DT, Rank>(std::span<const std::string_view>{v}, std::move(name), std::move(shape), policy);
     }
 
     /// Whether the group has allocated its wait state (group_waits_enabled or a global_barrier, after a forward).
     bool has_wait_state() const { return launcher_.has_wait_state(); }
 
-    /// depends_on: every stage's submission (all of it is one launch) adds them for one forward.
-    void add_dependencies(std::span<const sycl::event> deps) override {
-        for (ComponentBase* s : stages()) s->add_dependencies(deps);
-    }
-
 protected:
-    bool children_are_stages() const noexcept override { return true; }
-    void adopt_stage(std::unique_ptr<Subsystem> stage) override {
-        auto* c = dynamic_cast<ComponentBase*>(stage.get());
-        if (c == nullptr)
-            throw std::invalid_argument("naga::cospan: " + describe() + ": child '" + stage->path() + "' is not a Component");
-        stage_ptrs_.push_back(c);
+    /// "System 'path'": the prefix of the group's errors (the scope's, as before).
+    std::string describe() const { return scope_.describe(); }
+
+    /// connect / instance_at in the group's namespace.
+    void connect(std::string_view src, std::string_view dst) { scope_.connect(src, dst); }
+    std::shared_ptr<Instance> instance_at(std::string_view rel) { return scope_.instance_at(rel); }
+
+    /// Adds a stage: a component the group owns (not a tree node). Its full name is `<group>.<name>`; it takes no device and no
+    /// run policy (the group has them). Its declare() runs before this returns.
+    template <class T, class... A>
+        requires std::derived_from<T, ComponentBase>
+    void add_stage(SubsystemDesc<T, A...>& desc) {
+        ModelMeta& m = *meta_;
+        m.require_in_setup("add_subsystem", describe());
+        ModelMeta::check_local_name(desc.name, describe(), "subsystem");
+        const std::string full = ModelMeta::child_name(path(), desc.name);
+        if (m.name_taken(full))
+            throw std::invalid_argument("naga::cospan: " + describe() + ": '" + full + "' is already a subsystem or alias name in this model");
+        std::unique_ptr<ComponentBase> stage =
+            std::apply([](auto&... a) -> std::unique_ptr<ComponentBase> { return std::make_unique<T>(a...); }, desc.args);
+        ComponentBase* raw = stage.get();
+        ComponentAccess::bind(*raw, meta_, full, this);
+        m.stage_names.insert(full);
         stage_objs_.push_back(std::move(stage));
+        parts_.push_back(raw);
+        ComponentAccess::run_declare(*raw);
     }
 
 private:
-    /// The stages, as components, in order: a fused group's children are components only.
-    std::vector<ComponentBase*> stages() const { return stage_ptrs_; }
+    /// The declaration scope: a System that exists to carry the group's connect, tie and resolution calls. Bound to the group's
+    /// path and mapped to the group's node when the group is set up.
+    class Scope final : public System {
+    public:
+        void setup() override {}
+        using System::connect;
+        using System::describe;
+        using System::instance_at;
+        using System::tie_inputs_of;
+        using System::tie_outputs_of;
+    };
 
     /// A child with any ragged port (RaggedInput / RaggedOutput, or a per-index dimension) is a setup error.
     void check_no_ragged_ports(const std::vector<ComponentBase*>& st) const {
@@ -187,8 +216,8 @@ private:
     bool                     group_waits_ = false;
     Split                    split_       = Split::flatten;
     GroupLauncher            launcher_;
-    std::vector<std::unique_ptr<Subsystem>> stage_objs_;  ///< the group owns its stages
-    std::vector<ComponentBase*>             stage_ptrs_;  ///< the same objects, as components
+    Scope                                   scope_;
+    std::vector<std::unique_ptr<ComponentBase>> stage_objs_;  ///< the group owns its stages (parts_ holds the same objects raw)
 };
 
 /// The component type of a SubsystemDesc.
@@ -284,7 +313,8 @@ struct stage_checks;
 template <class... Ds>
 struct stage_checks<std::tuple<Ds...>> {
     static constexpr bool nonempty   = sizeof...(Ds) >= 1;
-    static constexpr bool components = (std::derived_from<desc_component_t<Ds>, ComponentBase> && ...);
+    // plain kernel Components only: a CustomComponent or HostComponent is refused by type
+    static constexpr bool components = (std::derived_from<desc_component_t<Ds>, Component<desc_component_t<Ds>>> && ...);
     static constexpr bool fusible    = ((!CustomOpBody<desc_body_t<Ds>> && !HostBody<desc_body_t<Ds>>) && ...);
     static constexpr bool one_kind   = (GroupBody<desc_body_t<Ds>> && ...) || (!GroupBody<desc_body_t<Ds>> && ...);
     static constexpr bool all_group  = (GroupBody<desc_body_t<Ds>> && ...);
@@ -340,7 +370,7 @@ private:
 /// added and their variables are marked `internal`; they are allowed in either range mode. Tied outputs of its stages
 /// follow the ordinary tie policy (section 9).
 template <bool Waits, detail::Split Sp, class... Items>
-class FusedGroup final : public detail::FusedBase {
+class FusedGroup final : public detail::FusedDriver {
     using Checks = detail::stage_checks<detail::all_stage_descs_t<Items...>>;
     static_assert(Checks::nonempty, "naga::cospan: a fused group needs at least one stage");
     static_assert(Checks::components,
@@ -363,7 +393,7 @@ class FusedGroup final : public detail::FusedBase {
 
 public:
     FusedGroup(ConnectsDesc c, TiesDesc t, Items... items)
-        : detail::FusedBase{detail::segment_specs<Items...>(), Waits || detail::has_boundary_v<Items...>, Sp}, connects_{std::move(c)}, ties_{std::move(t)}, items_{std::move(items)...} {}
+        : detail::FusedDriver{detail::segment_specs<Items...>(), Waits || detail::has_boundary_v<Items...>, Sp}, connects_{std::move(c)}, ties_{std::move(t)}, items_{std::move(items)...} {}
 
     void setup() override {
         std::apply([this](auto&... it) { (this->add_item(it), ...); }, items_);
@@ -396,7 +426,7 @@ private:
     template <class D>
     void add_stage(D& d) {
         names_.push_back(d.name);  // the stage order, for the connect check
-        this->add_subsystem(d);
+        this->detail::FusedDriver::add_stage(d);
     }
 
     /// A connect inside the group runs forward in item order: the source stage comes before the target stage. A connect from
@@ -474,7 +504,7 @@ TieEntry tie_outputs(std::initializer_list<std::string_view> members, std::strin
                      TieOutputsPolicy policy = TieOutputsPolicy::require_atomic) {
     std::vector<std::string> ms;
     for (const std::string_view m : members) ms.emplace_back(m);
-    return [ms = std::move(ms), name = std::move(name), shape = std::move(shape), policy](detail::FusedBase& g) {
+    return [ms = std::move(ms), name = std::move(name), shape = std::move(shape), policy](detail::FusedDriver& g) {
         g.template group_tie_outputs<DT, Rank>(ms, name, shape, policy);
     };
 }
@@ -483,7 +513,7 @@ template <DType DT, int Rank>
 TieEntry tie_inputs(std::initializer_list<std::string_view> members, std::string name, ShapeSpec shape = {}) {
     std::vector<std::string> ms;
     for (const std::string_view m : members) ms.emplace_back(m);
-    return [ms = std::move(ms), name = std::move(name), shape = std::move(shape)](detail::FusedBase& g) {
+    return [ms = std::move(ms), name = std::move(name), shape = std::move(shape)](detail::FusedDriver& g) {
         g.template group_tie_inputs<DT, Rank>(ms, name, shape);
     };
 }

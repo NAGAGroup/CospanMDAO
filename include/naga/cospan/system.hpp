@@ -5,7 +5,7 @@
 // =============================================================================
 //
 // A System never does work and never runs: it GROUPS leaves and DECLARES wiring. It has only setup() (run_setup below)
-// plus the declaration calls; there is no pre_forward / post_forward and no forward (docs/spec/revisions/r04-...). The run
+// plus the declaration calls; there is no prepare_forward and no forward (docs/spec/revisions/r04-...). The run
 // walks the model's tree (model.hpp); everything a System declares is recorded in the model-wide metadata
 // (model_meta.hpp) and nothing is replayed.
 //
@@ -39,6 +39,8 @@
 
 #include <sycl/sycl.hpp>
 
+#include "naga/cospan/component.hpp"
+#include "naga/cospan/component_driver.hpp"
 #include "naga/cospan/init.hpp"
 #include "naga/cospan/instance.hpp"
 #include "naga/cospan/metadata.hpp"
@@ -62,18 +64,31 @@ struct SubsystemDesc {
     std::tuple<std::decay_t<Args>...> args;
 };
 
-/// subsystem_desc<T>("name", ctor args...): a descriptor of a Component or a user-defined System.
+/// What a descriptor can build: a Subsystem (a user-defined System, a fused group) or a component of any of the three types.
+template <class T>
+concept SubsystemOrComponent = std::derived_from<T, Subsystem> || std::derived_from<T, ComponentBase>;
+
+/// subsystem_desc<T>("name", ctor args...): a descriptor of a Component (or CustomComponent / HostComponent) or a user-defined
+/// System.
 template <class T, class... Args>
-    requires std::derived_from<T, Subsystem>
+    requires SubsystemOrComponent<T>
 SubsystemDesc<T, Args...> subsystem_desc(std::string name, Args&&... args) {
     return SubsystemDesc<T, Args...>{std::move(name), std::tuple<std::decay_t<Args>...>{std::forward<Args>(args)...}};
 }
 
 namespace detail {
-/// A fresh T from copies of the descriptor's arguments.
+/// A fresh node object from copies of the descriptor's arguments: a component goes into a SoloDriver (the leaf), anything else
+/// is the node itself.
 template <class T, class Tuple>
 std::unique_ptr<Subsystem> make_subsystem(Tuple& args) {
-    return std::apply([](auto&... a) -> std::unique_ptr<Subsystem> { return std::make_unique<T>(a...); }, args);
+    return std::apply(
+        [](auto&... a) -> std::unique_ptr<Subsystem> {
+            if constexpr (std::derived_from<T, ComponentBase>)
+                return std::make_unique<SoloDriver>(std::make_unique<T>(a...));
+            else
+                return std::make_unique<T>(a...);
+        },
+        args);
 }
 }  // namespace detail
 
@@ -362,13 +377,6 @@ protected:
         throw std::invalid_argument(std::string{"naga::cospan: "} + describe() + ": " + what + ": " + why);
     }
 
-    /// A fused group holds its children as STAGES: objects it owns, not tree nodes. They answer to the group's node.
-    virtual bool children_are_stages() const noexcept { return false; }
-    virtual void adopt_stage(std::unique_ptr<Subsystem> stage) {
-        (void)stage;
-        throw std::logic_error("naga::cospan: " + describe() + " does not hold stages");
-    }
-
     detail::ModelMeta& meta() const {
         if (meta_ == nullptr)
             throw std::logic_error("naga::cospan: " + describe() + " is not part of a model yet (it is registered by add_subsystem)");
@@ -413,21 +421,6 @@ private:
         detail::ModelMeta& m = meta();
         detail::ModelMeta::check_local_name(name, describe(), "subsystem");
         const std::string full = detail::ModelMeta::child_name(path(), name);
-        if (children_are_stages()) {
-            // A stage of a fused group: an object the group owns, not a tree node.
-            if (m.name_taken(full))
-                throw std::invalid_argument("naga::cospan: " + describe() + ": '" + full + "' is already a subsystem or alias name in this model");
-            if (dev) fail("add_subsystem", "a stage of a fused group takes no device: place the group");
-            if (detail::make_run_policy(props, describe()) != nullptr) fail("add_subsystem", "a stage of a fused group takes no run policy: give it to the group");
-            detail::Node& group = self_node();
-            Subsystem*    raw   = child.get();
-            detail::SubsystemAccess::bind(*raw, full, &m);
-            m.stage_names.insert(full);
-            m.adopt_sub(raw, group);
-            adopt_stage(std::move(child));
-            raw->run_setup();
-            return;
-        }
         std::shared_ptr<detail::RunPolicy> policy = detail::make_run_policy(props, describe() + ": add_subsystem('" + name + "')");
         System*                            sys    = dynamic_cast<System*>(child.get());
         const detail::NodeKind             kind   = child->is_leaf() ? detail::NodeKind::leaf : detail::NodeKind::system;

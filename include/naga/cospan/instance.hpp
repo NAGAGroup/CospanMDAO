@@ -82,9 +82,10 @@ struct WrapperAccess {
 
 class Instance : public std::enable_shared_from_this<Instance> {
 public:
-    Instance(std::string n, const Subsystem* decl, IOKind k, Role r, std::vector<DimRecord> d, bool can_source,
-             bool can_target)
+    Instance(std::string n, std::string owner, const Subsystem* decl, IOKind k, Role r, std::vector<DimRecord> d,
+             bool can_source, bool can_target)
         : name{std::move(n)}
+        , owner_path{std::move(owner)}
         , declarer{decl}
         , kind{k}
         , role{r}
@@ -97,7 +98,11 @@ public:
     virtual ~Instance()                  = default;
 
     std::string            name;
-    const Subsystem*       declarer;  ///< the component or System that owns this instance
+    /// The full name of the component (or the System's path) that owns this instance: the first part of full_path().
+    std::string            owner_path;
+    /// The NODE object this instance answers to: for a component's holders the driver (the leaf in the tree), for a System's
+    /// aliases the System, for a host view null.
+    const Subsystem*       declarer;
     IOKind                 kind;
     Role                   role;
     std::vector<DimRecord> dims;  ///< as declared HERE; the variable's own definition is on the metadata
@@ -124,11 +129,8 @@ public:
     std::shared_ptr<VarMeta>         meta;  ///< shared by every instance of the variable
     std::shared_ptr<DeviceDataBase>  data;  ///< the data of THIS instance's placement: empty until materialized (a holder)
 
-    /// The instance's dotted path from the root System: its declarer's path plus its name, or the name alone
-    /// at the root.
-    std::string full_path() const {
-        return (declarer == nullptr || declarer->path().empty()) ? name : declarer->path() + "." + name;
-    }
+    /// The instance's dotted path from the root System: its owner's full name plus its name, or the name alone at the root.
+    std::string full_path() const { return owner_path.empty() ? name : owner_path + "." + name; }
 
     /// Where this instance's data lives.
     DataKey key() const { return DataKey{device, storage_kind}; }
@@ -222,9 +224,9 @@ template <DType DT, int Rank>
     requires(!is_atomic_v<DT>)
 class InputInstance final : public TypedInstance<DT, Rank> {
 public:
-    InputInstance(std::string name, const Subsystem* declarer, const std::array<DimRecord, Rank>& dims,
+    InputInstance(std::string name, std::string owner_path, const Subsystem* declarer, const std::array<DimRecord, Rank>& dims,
                   Input<DT, Rank>* member)
-        : TypedInstance<DT, Rank>{std::move(name), declarer, IOKind::input, Role::port,
+        : TypedInstance<DT, Rank>{std::move(name), std::move(owner_path), declarer, IOKind::input, Role::port,
                                   std::vector<DimRecord>(dims.begin(), dims.end()), false, true}
         , member_{member} {}
 
@@ -242,9 +244,9 @@ private:
 template <DType DT, int Rank>
 class OutputInstance final : public TypedInstance<DT, Rank> {
 public:
-    OutputInstance(std::string name, const Subsystem* declarer, const std::array<DimRecord, Rank>& dims,
+    OutputInstance(std::string name, std::string owner_path, const Subsystem* declarer, const std::array<DimRecord, Rank>& dims,
                    Output<DT, Rank>* member)
-        : TypedInstance<DT, Rank>{std::move(name), declarer, IOKind::output, Role::port,
+        : TypedInstance<DT, Rank>{std::move(name), std::move(owner_path), declarer, IOKind::output, Role::port,
                                   std::vector<DimRecord>(dims.begin(), dims.end()), true, false}
         , member_{member} {}
 
@@ -261,9 +263,9 @@ template <DType DT, int Rank>
     requires(!is_atomic_v<DT>)
 class RaggedInputInstance final : public TypedInstance<DT, Rank> {
 public:
-    RaggedInputInstance(std::string name, const Subsystem* declarer, const std::array<DimRecord, Rank>& dims,
+    RaggedInputInstance(std::string name, std::string owner_path, const Subsystem* declarer, const std::array<DimRecord, Rank>& dims,
                         RaggedInput<DT, Rank>* member)
-        : TypedInstance<DT, Rank>{std::move(name), declarer, IOKind::input, Role::port,
+        : TypedInstance<DT, Rank>{std::move(name), std::move(owner_path), declarer, IOKind::input, Role::port,
                                   std::vector<DimRecord>(dims.begin(), dims.end()), false, true}
         , member_{member} {}
 
@@ -278,9 +280,9 @@ private:
 template <DType DT, int Rank>
 class RaggedOutputInstance final : public TypedInstance<DT, Rank> {
 public:
-    RaggedOutputInstance(std::string name, const Subsystem* declarer, const std::array<DimRecord, Rank>& dims,
+    RaggedOutputInstance(std::string name, std::string owner_path, const Subsystem* declarer, const std::array<DimRecord, Rank>& dims,
                          RaggedOutput<DT, Rank>* member)
-        : TypedInstance<DT, Rank>{std::move(name), declarer, IOKind::output, Role::port,
+        : TypedInstance<DT, Rank>{std::move(name), std::move(owner_path), declarer, IOKind::output, Role::port,
                                   std::vector<DimRecord>(dims.begin(), dims.end()), true, false}
         , member_{member} {}
 
@@ -296,9 +298,9 @@ private:
 template <DType DT, int Rank>
 class AliasInstance final : public TypedInstance<DT, Rank> {
 public:
-    AliasInstance(std::string name, const Subsystem* declarer, IOKind k, Role role, std::vector<DimRecord> dims,
+    AliasInstance(std::string name, std::string owner_path, const Subsystem* declarer, IOKind k, Role role, std::vector<DimRecord> dims,
                   bool can_source, bool can_target)
-        : TypedInstance<DT, Rank>{std::move(name), declarer, k, role, std::move(dims), can_source, can_target} {}
+        : TypedInstance<DT, Rank>{std::move(name), std::move(owner_path), declarer, k, role, std::move(dims), can_source, can_target} {}
 };
 
 // -----------------------------------------------------------------------------
@@ -319,51 +321,51 @@ inline void adopt_new_meta(const std::shared_ptr<Instance>& inst, DType dt, int 
 /// The caller owns the returned instance (a component keeps its ports; a System its aliases).
 template <DType DT, int Rank>
     requires(!is_atomic_v<DT>)
-std::shared_ptr<Instance> make_input(std::string name, const Subsystem* declarer, const std::array<DimRecord, Rank>& dims,
+std::shared_ptr<Instance> make_input(std::string name, std::string owner_path, const Subsystem* declarer, const std::array<DimRecord, Rank>& dims,
                                      Input<DT, Rank>* member) {
-    std::shared_ptr<Instance> inst = std::make_shared<InputInstance<DT, Rank>>(std::move(name), declarer, dims, member);
+    std::shared_ptr<Instance> inst = std::make_shared<InputInstance<DT, Rank>>(std::move(name), std::move(owner_path), declarer, dims, member);
     adopt_new_meta(inst, DT, Rank, false);
     return inst;
 }
 
 template <DType DT, int Rank>
-std::shared_ptr<Instance> make_output(std::string name, const Subsystem* declarer, const std::array<DimRecord, Rank>& dims,
+std::shared_ptr<Instance> make_output(std::string name, std::string owner_path, const Subsystem* declarer, const std::array<DimRecord, Rank>& dims,
                                       Output<DT, Rank>* member) {
-    std::shared_ptr<Instance> inst = std::make_shared<OutputInstance<DT, Rank>>(std::move(name), declarer, dims, member);
+    std::shared_ptr<Instance> inst = std::make_shared<OutputInstance<DT, Rank>>(std::move(name), std::move(owner_path), declarer, dims, member);
     adopt_new_meta(inst, DT, Rank, false);
     return inst;
 }
 
 template <DType DT, int Rank>
     requires(!is_atomic_v<DT>)
-std::shared_ptr<Instance> make_ragged_input(std::string name, const Subsystem* declarer,
+std::shared_ptr<Instance> make_ragged_input(std::string name, std::string owner_path, const Subsystem* declarer,
                                             const std::array<DimRecord, Rank>& dims, RaggedInput<DT, Rank>* member,
                                             std::optional<std::vector<std::size_t>> counts = std::nullopt) {
-    std::shared_ptr<Instance> inst = std::make_shared<RaggedInputInstance<DT, Rank>>(std::move(name), declarer, dims, member);
+    std::shared_ptr<Instance> inst = std::make_shared<RaggedInputInstance<DT, Rank>>(std::move(name), std::move(owner_path), declarer, dims, member);
     inst->def_counts               = std::move(counts);
     adopt_new_meta(inst, DT, Rank, true);
     return inst;
 }
 
 template <DType DT, int Rank>
-std::shared_ptr<Instance> make_ragged_output(std::string name, const Subsystem* declarer,
+std::shared_ptr<Instance> make_ragged_output(std::string name, std::string owner_path, const Subsystem* declarer,
                                              const std::array<DimRecord, Rank>& dims, RaggedOutput<DT, Rank>* member,
                                              std::optional<std::vector<std::size_t>> counts = std::nullopt) {
-    std::shared_ptr<Instance> inst = std::make_shared<RaggedOutputInstance<DT, Rank>>(std::move(name), declarer, dims, member);
+    std::shared_ptr<Instance> inst = std::make_shared<RaggedOutputInstance<DT, Rank>>(std::move(name), std::move(owner_path), declarer, dims, member);
     inst->def_counts               = std::move(counts);
     adopt_new_meta(inst, DT, Rank, true);
     return inst;
 }
 
 /// An alias instance of run-time dtype and rank, joining `meta` (a fresh variable of its own when null).
-inline std::shared_ptr<Instance> make_alias_instance(DType dt, int rank, std::string name, const Subsystem* declarer,
+inline std::shared_ptr<Instance> make_alias_instance(DType dt, int rank, std::string name, std::string owner_path, const Subsystem* declarer,
                                                      IOKind kind, Role role, std::vector<DimRecord> dims, bool can_source,
                                                      bool can_target, std::shared_ptr<VarMeta> meta) {
     std::shared_ptr<Instance> inst;
     dispatch_dtype_rank(dt, rank, [&](auto dtc, auto rc) {
         constexpr DType DT = decltype(dtc)::value;
         constexpr int   R  = decltype(rc)::value;
-        inst = std::make_shared<AliasInstance<DT, R>>(std::move(name), declarer, kind, role, std::move(dims), can_source,
+        inst = std::make_shared<AliasInstance<DT, R>>(std::move(name), std::move(owner_path), declarer, kind, role, std::move(dims), can_source,
                                                       can_target);
     });
     if (meta) {

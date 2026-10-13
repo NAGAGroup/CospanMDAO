@@ -69,12 +69,13 @@ Each type checks its body with a constraint on its default constructor: a requir
 
 ## 5. The SlabKit rule (cross-context copies)
 
-SlabKit commit `e3ec700` ("copies: a SYCL command touches only its own context's USM; OpenMP is an ordinary backend"). CoSpan relies on it, so every copy `copy_from` issues is legal.
-- An operand is **host-side** when it is a pointer no context knows, or `kind::host`. Everything else is **device-side**, including **shared** memory and OpenMP device memory (there is no OpenMP special case).
-- Host ↔ host (host USM or plain memory, any contexts) is a `std::memcpy` in a host task.
+SlabKit commit `6cc1d7e` (after `e3ec700`; "copies: host and shared memory copy on the host in any context; fills of shared go through SYCL"). CoSpan relies on it, so every copy `copy_from` issues is legal.
+- An operand is **host-side** when it is a pointer no context knows, `kind::host` or `kind::shared`. Device memory, OpenMP device memory included, is **device-side** (there is no OpenMP special case).
+- Both operands host-side (host USM, shared USM or plain memory, in any context): a `std::memcpy` in a host task. Never staged.
 - One device-side and one host-side operand: a single `memcpy` issued on the device side's device, only when the host side is plain memory or USM of that device's context; otherwise one host task stages it through a pageable `std::vector` (device leg on the device's own context, host leg a `std::memcpy`).
 - Both device-side: unchanged (a direct copy when a route exists, otherwise staged through a host intermediate).
-- **Shared memory is device-side because host access to it is unsafe on devices without concurrent managed access (CUDA on WSL2 and Windows).** The host must not touch any shared allocation while any kernel runs on that device; the restriction covers the whole device, so per-allocation event ordering cannot make a host-task access safe. Shared memory is therefore accessed only through SYCL commands, including `set` and `fill`.
+- `set` and `fill` take the host path only for host-side, non-shared memory. **Fills of shared memory go through SYCL**, because a host loop migrates every page to the host and back.
+- **WARNING (WSL2/Windows):** copies that touch shared memory from the host assume the device supports concurrent access to shared allocations. CUDA on Windows and WSL2 is the canonical case where that guarantee does not hold: there the host must not touch shared memory while any kernel runs on that device, and such a copy can fault. Know your platform, and either wait for the device first or use device memory.
 
 ## 6. Ports
 

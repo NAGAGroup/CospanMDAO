@@ -69,10 +69,22 @@ namespace detail {
 
 /// Where one copy of a variable's data lives: a device and a USM kind. A host component's port is
 /// (its device, host); its producer's is (the same device, device). Two keys on one device are two storages.
+/// r05: HOST memory belongs to a CONTEXT, not a device, so two host keys are equal when their contexts are; `dev` on a
+/// host key is the device of the holder that created it (used for allocation, and as the initializer's device preference).
+/// Every other kind is per device.
 struct DataKey {
-    sycl::device dev;
-    sk::kind     kind = sk::kind::device;
-    friend bool operator==(const DataKey& a, const DataKey& b) { return a.dev == b.dev && a.kind == b.kind; }
+    sycl::device  dev;
+    sk::kind      kind = sk::kind::device;
+    sycl::context ctx;  ///< the platform's default context of `dev`
+
+    DataKey(sycl::device d, sk::kind k) : dev{std::move(d)}, kind{k}, ctx{dev.get_platform().khr_get_default_context()} {}
+
+    DataKey() = default;  // the default device and its platform's default context (a placeholder: DeviceColumn::key)
+
+    friend bool operator==(const DataKey& a, const DataKey& b) {
+        if (a.kind != b.kind) return false;
+        return a.kind == sk::kind::host ? a.ctx == b.ctx : a.dev == b.dev;
+    }
 };
 
 /// One placement's data of a variable, type-erased: the container (a SlabKit usm_vector) and, through it, the
@@ -353,7 +365,7 @@ inline std::shared_ptr<VarMeta> meta_of(const Instance& i);  // the instance's v
 inline void check_init_shape(const VarMeta& v, const ResolvedShape& r, const InitShape& s);
 
 /// Who sets a dimension (design review, 11.5). The definition sets a specified dimension, a shape hook the dimensions it owns
-/// (`hook` is its owner id), a producer (a component's pre_forward) or a free input's initializer an unspecified one.
+/// (`hook` is its owner id), a producer (a component's prepare_forward) or a free input's initializer an unspecified one.
 /// `who` names the setter in errors.
 struct SetterId {
     enum class Kind : uint8_t { producer, initializer, hook, definition };
@@ -502,31 +514,6 @@ public:
         return n;
     }
 
-    /// The device with the most live instances of this variable; ties go to the earliest in the list.
-    /// Counted from the instance list, so it also works before materialization. It is the device host views
-    /// will use for their copy (section 5).
-    sycl::device busiest_device() const {
-        std::vector<std::pair<sycl::device, std::size_t>> counts;
-        for (const auto& w : instances) {
-            const std::shared_ptr<Instance> s = w.lock();
-            if (!s) continue;
-            const sycl::device& d  = device_of(*s);
-            bool                hit = false;
-            for (auto& c : counts)
-                if (c.first == d) {
-                    ++c.second;
-                    hit = true;
-                    break;
-                }
-            if (!hit) counts.emplace_back(d, 1);
-        }
-        if (counts.empty()) return default_device();
-        const std::pair<sycl::device, std::size_t>* best = &counts.front();
-        for (const auto& c : counts)
-            if (c.second > best->second) best = &c;
-        return best->first;
-    }
-
     /// Where this variable's initializer runs: `init_device`. A tie alias gets it from the tie call (the device passed, else the
     /// default device); a free input port gets it at its declaration (its own device, kept in step with set_device; a
     /// promotion shares the variable and changes nothing). The members' devices say nothing about a tie's. No fallbacks: a
@@ -549,6 +536,67 @@ public:
         std::shared_ptr<DeviceDataBase> fresh = new_container(key);
         data.emplace_back(key, fresh);
         return fresh;
+    }
+
+    /// Pushes `src`'s contents to every OTHER live, bound placement of this variable, in an order that crosses each context
+    /// once (r05, docs/spec/revisions/r05-*.md section 4). Every copy is a copy_from (SlabKit makes each one legal). Targets
+    /// are grouped by context:
+    ///   1. `src` is copied into every target in its own context; a host target there becomes `hostSrc`.
+    ///   2. For each other context C, in data order: with a host placement H in C, `hostSrc` (else `src`, which then becomes
+    ///      `hostSrc` = H) is copied into H, then H into C's device placements; without one, `src` is copied into C's first
+    ///      device placement D, then D into C's other device placements.
+    /// Returns the copies' events. With `register_reads`, each is also registered as a READ on its target, so that a later
+    /// kernel writer of the target waits for the copy (a copy is a write, and writes never wait on writes).
+    std::vector<sycl::event> push_from(const std::shared_ptr<DeviceDataBase>& src, bool register_reads = false) {
+        std::vector<sycl::event> evs;
+        if (!src) return evs;
+        std::vector<std::shared_ptr<DeviceDataBase>> targets;
+        for (const auto& p : data) {
+            std::shared_ptr<DeviceDataBase> d = p.second.lock();
+            if (!d || d == src || !d->bound()) continue;
+            targets.push_back(std::move(d));
+        }
+        const auto copy = [&](DeviceDataBase& dst, DeviceDataBase& from) {
+            const sycl::event e = dst.copy_from(from, std::span<const sycl::event>{});
+            if (register_reads) dst.register_read(e);
+            evs.push_back(e);
+        };
+
+        std::vector<bool>               done(targets.size(), false);
+        std::shared_ptr<DeviceDataBase> host_src;
+        // 1. src's own context
+        for (std::size_t i = 0; i < targets.size(); ++i) {
+            if (!(targets[i]->key.ctx == src->key.ctx)) continue;
+            copy(*targets[i], *src);
+            done[i] = true;
+            if (targets[i]->key.kind == sk::kind::host) host_src = targets[i];
+        }
+        // 2. every other context, in data order
+        for (std::size_t i = 0; i < targets.size(); ++i) {
+            if (done[i]) continue;
+            const sycl::context ctx = targets[i]->key.ctx;
+            std::shared_ptr<DeviceDataBase> host;
+            std::vector<std::shared_ptr<DeviceDataBase>> devices;
+            for (std::size_t j = i; j < targets.size(); ++j) {
+                if (done[j] || !(targets[j]->key.ctx == ctx)) continue;
+                done[j] = true;
+                if (targets[j]->key.kind == sk::kind::host) host = targets[j];
+                else devices.push_back(targets[j]);
+            }
+            if (host) {
+                if (host_src) {
+                    copy(*host, *host_src);
+                } else {
+                    copy(*host, *src);
+                    host_src = host;
+                }
+                for (const auto& d : devices) copy(*d, *host);
+            } else {
+                copy(*devices.front(), *src);
+                for (std::size_t k = 1; k < devices.size(); ++k) copy(*devices[k], *devices.front());
+            }
+        }
+        return evs;
     }
 
     /// A merge: this variable survives and takes the live data of `other`'s keys it has none for (of the same kind:
@@ -625,7 +673,7 @@ public:
             if (definition[u].how == DimRecord::How::hook)
                 who = "a shape hook, which has not run";
             else if (has_producer())
-                who = "its producer, in pre_forward (set_shape)";
+                who = "its producer, in prepare_forward (set_shape)";
             else
                 who = "an initializer with a shape, a connection, or a tie";
             unknown += std::string{unknown.empty() ? "" : "; "} + "dimension " + std::to_string(d) + " (" + declared_rule(d) +
@@ -1052,11 +1100,8 @@ private:
         }
         d->register_write(e);
         d->register_read(e);
-        for (const auto& o : live) {
-            if (o == d) continue;
-            const sycl::event c = o->copy_from(*d, std::span<const sycl::event>{});  // waits on d's writes, incl. e
-            o->register_read(c);
-        }
+        // The copy to the other placements waits on d's writes (incl. e); a read is registered on each target.
+        (void)this->push_from(d, /*register_reads=*/true);
     }
 
     /// Where the initializer runs: the tie's device, else the device the free input was declared on (init_home), a

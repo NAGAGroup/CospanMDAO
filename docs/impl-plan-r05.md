@@ -10,19 +10,18 @@ One pass of edits, then one gate.
 
 1. **The `host_side` rule** (src/queue.cpp, `locate`, line 210). An operand is host-side when it is:
    - a pointer no context knows; or
-   - `kind::host`.
-
-   Shared memory is device-side (ruling 2026-10-13): it is accessed only through SYCL commands, because host access to shared memory is unsafe while any kernel runs on a device without concurrent managed access (CUDA on WSL2 and Windows), and that restriction covers the whole device.
+   - `kind::host`; or
+   - `kind::shared`.
 
    Delete the OMP special case: drop `|| is_host_backend(d)` and the now-unused `is_host_backend`, if nothing else uses it. OpenMP device memory is device-side like any other backend's.
 2. **`copy_on`** (line 247):
    - (a) Both operands host-side: `std::memcpy` in a host task. Unchanged, legal across contexts.
-   - (b) One device-side (device or shared kind) and one host-side: a single `h.memcpy` issued on the device side's device, only when the host side is a pointer no context knows, or USM whose context is `context_of(device-side dev)`. Otherwise stage it inside one host task:
+   - (b) One device-side (device kind) and one host-side: a single `h.memcpy` issued on the device side's device, only when the host side is a pointer no context knows, or USM whose context is `context_of(device-side dev)`. Otherwise stage it inside one host task:
      - device side to host side: device leg `memcpy` into a pageable `std::vector`, on the device's context via `legs` + `AdaptiveCpp_retarget{ctx, dev}`, `.wait()`; then `std::memcpy` into the host USM.
      - host side to device side: the reverse.
    - (c) Both device-side: unchanged.
    - The operand needs its context, so `locate` records the backend index or context. `strongest_answer` already returns the index.
-3. **`set_on` and `fill_on`** follow the new `host_side`. OMP device memory now goes through SYCL memset or fill.
+3. **`set_on` and `fill_on`** take the host path only when `host_side && kind != shared` (final ruling 2026-10-13): shared memory is filled and zeroed through SYCL, because a host loop migrates every page to the host and back. OMP device memory goes through SYCL memset or fill. Docs warn: copies that touch shared memory from the host assume concurrent access to shared allocations, which CUDA on Windows and WSL2 lacks.
 4. **Comments.** Update the comments at queue.cpp:192–206 and the header docs that describe the old rule.
 5. **Tests.** Add them in tests/test_cross_device.cpp. Each skips when fewer than two backends are visible:
    - device ↔ host USM of another platform's context, both directions;
