@@ -76,7 +76,7 @@ A system's setup doesn't tell you everything about what it holds. Documentation 
 
 The calls above are the core of a system's setup. **`tie_inputs`** and **`tie_outputs`** work like `promote`, on several at once: `tie_inputs` promotes several inputs to one promotion, and `tie_outputs` several outputs to one promotion. More: [Connect, promote and tie](connect-promote-tie.md).
 
-A system can do more in its setup, such as setting shapes and initial values, devices, and when its subsystems run. More: [Shapes and initialization](shapes-and-initialization.md), [Devices and placement](devices-and-placement.md), [Lifetime](lifetime.md).
+A system can do more in its setup, such as setting shapes and initial values, devices, and when its subsystems run. More: [Shapes and initialization](shapes-and-initialization.md), [Advanced](advanced.md).
 
 ## Helpers
 
