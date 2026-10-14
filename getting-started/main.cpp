@@ -26,14 +26,9 @@ public:
     }
 };
 
-// The model's root: a system holding the one component.
-class App : public cs::System {
-public:
-    void setup() override { add_subsystem(cs::subsystem_desc<Axpb>("axpb")); }
-};
-
 int main() {
-    cs::Model model = cs::create_model<App>();
+    cs::Model model = cs::create_model<cs::System>();
+    model.add_subsystem(cs::subsystem_desc<Axpb>("axpb"));
     model.setup();
 
     model.update_input("axpb.x", cs::init::from_host(std::vector<float>{1, 2, 3, 4}));

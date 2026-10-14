@@ -1,14 +1,14 @@
 # Getting started
 
-**CoSpan** (CospanMDAO) is a C++20 framework for building GPU-native numerical applications out of small, composable parts.
+**CoSpan** (CospanMDAO) is a C++20 framework for heterogeneous numerical applications, built on [AdaptiveCpp](https://github.com/AdaptiveCpp/AdaptiveCpp)'s SYCL.
 
-You write **components**: each one declares typed inputs and outputs and runs one SYCL kernel. You put components together in **systems**, connecting outputs to inputs. CoSpan takes care of the rest: memory on each device, the order kernels must run in, overlapping independent work, and moving data where it needs to be. You never write synchronization yourself. The same code runs on a GPU, or on the CPU when there isn't one, through SYCL and [AdaptiveCpp](https://github.com/AdaptiveCpp/AdaptiveCpp).
+You build an application out of small, composable parts called **components**. You compose them into **systems**, and connections say how data flows between them. From that description, CoSpan runs the whole application on whatever hardware you have, so you write the numerics and not the plumbing.
 
 This page builds the smallest complete CoSpan application: one component that computes `y = a·x + b`, run once, with its result printed. Along the way it shows the three files every CoSpan project has: a pixi manifest, a CMake file and the source.
 
 ## What you need
 
-[pixi](https://pixi.sh), on Linux (x86-64). Nothing else: pixi brings the compiler, CMake and CoSpan itself.
+[pixi](https://pixi.sh). That's all: pixi brings the compiler, CMake and CoSpan itself.
 
 ## 1. The pixi manifest
 
@@ -79,9 +79,8 @@ install(TARGETS getting-started)
 
 A complete model in one file:
 
-- **The component** is one class: its nested `Inputs` and `Outputs` are its ports, the static `compute_forward` is the kernel (what one work-item computes), and the public members `inputs` and `outputs` hold the ports. It declares them in `setup()`, says its output has the shape of its input, and launches `compute_forward` over the input's range.
-- **The system** is the model's root. Here it holds just the one component.
-- **`main`** builds the model, gives it an input, runs it once and reads the output back on the host.
+- **The component** is one class. Its nested `Inputs` and `Outputs` are its inputs and outputs, the static `compute_forward` is the kernel (what one work-item computes), and the public members `inputs` and `outputs` hold them. It declares them in `declare()`. In `prepare_forward()` it gives its output the shape of its input. In `define_forward()` it launches over the input's range.
+- **`main`** builds the model from a plain root, adds the component to it, gives it an input, runs it once and reads the output back on the host.
 
 ```cpp
 #include <iostream>
@@ -112,14 +111,9 @@ public:
     }
 };
 
-// The model's root: a system holding the one component.
-class App : public cs::System {
-public:
-    void setup() override { add_subsystem(cs::subsystem_desc<Axpb>("axpb")); }
-};
-
 int main() {
-    cs::Model model = cs::create_model<App>();
+    cs::Model model = cs::create_model<cs::System>();
+    model.add_subsystem(cs::subsystem_desc<Axpb>("axpb"));
     model.setup();
 
     model.update_input("axpb.x", cs::init::from_host(std::vector<float>{1, 2, 3, 4}));

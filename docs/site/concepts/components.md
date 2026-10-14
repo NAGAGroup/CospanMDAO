@@ -1,8 +1,6 @@
 # Components
 
-A **component** is the unit of work in CoSpan. It is a leaf of the model: it does one kind of work, written as a single kernel.
-
-A component talks to the rest of the model only through the inputs and outputs it declares. It never knows who produces its inputs or who reads its outputs: wiring components together is the job of [systems](systems.md).
+A **component** is a unit of work in CoSpan. It has inputs and outputs, much like the parameters and results of a free function, and it computes its outputs from its inputs.
 
 ## Reading a component
 
@@ -11,72 +9,39 @@ This is the component from [Getting started](../getting-started.md):
 ```cpp
 class Axpb : public cs::Component<Axpb> {
 public:
-    // Typed inputs and outputs, grouped in two nested structs.
     struct Inputs  { cs::Input<DType::f32, 1> x; };
     struct Outputs { cs::Output<DType::f32, 1> y; };
 
-    // The kernel. It is static and sees only its inputs and outputs.
     static void compute_forward(sycl::id<1> i, const Inputs& in, const Outputs& out) { out.y[i] = 2.0f * in.x[i] + 1.0f; }
 
-    // The component's inputs and outputs.
     Inputs  inputs;
     Outputs outputs;
 
-    // Runs once: declare each input and output, with a name and a shape (or leave the shape unspecified).
     void declare() override {
         declare_input(inputs.x, "x", cs::unspecified);
         declare_output(outputs.y, "y", cs::unspecified);
     }
-
-    // Runs before every forward.
     void prepare_forward() override { set_shape(outputs.y, shape_of(inputs.x)[0]); }
-
-    // Describes the launch: the range to run over.
     std::unique_ptr<cs::LaunchDescription> define_forward() override {
         return create_launch_config(cs::range_desc(inputs.x.shape()));
     }
 };
 ```
 
-- **`Inputs` and `Outputs`** describe the component's inputs and outputs: their types and ranks.
-- **`compute_forward`** is the kernel. It is static: it has no access to the component object, only to the inputs and outputs it is given.
-- **`inputs` and `outputs`** hold the component's inputs and outputs.
-- **`declare()`** runs once, when the model is set up. It declares each input and output with a name, and with a shape or `cs::unspecified`. Declaring allocates nothing. (A system keeps `setup()`; a component declares.)
-- **`prepare_forward()`** runs before every forward. It is optional. It is typically where an output takes its shape, often from an input as here, but it is the component's own hook to use as it needs.
-- **`define_forward()`** describes the launch of this forward. Its arguments are descriptors: `cs::range_desc` (the range), and optionally `cs::wg_desc` (the work-group shape) and `cs::scratch_desc` (local memory).
+- **`Inputs` and `Outputs`** describe the inputs and outputs: their types and ranks.
+- **`compute_forward`** implements the work. Here, each index of the range computes one element of `y` from one element of `x`.
+- **`inputs` and `outputs`** hold the inputs and outputs.
+- **`declare()`** runs once, when the model is set up. It declares each input and output with a name, and with a shape or `cs::unspecified`.
+- **`prepare_forward()`** runs before every forward, and is optional. Here it sets the shape of `y` from the shape of `x`. The shape of `x` comes from outside the component: see [Setting shapes](todo/setting-shapes.md).
+- **`define_forward()`** describes the forward's launch. Here it gives a range, the shape of `x`, much like the range of a SYCL `parallel_for`.
 
-## The three component types
+## A map from inputs to outputs
 
-A component derives one of three CRTP types, and its static `compute_forward` is the body:
+A component is very nearly a pure function. On every forward, its outputs are computed fresh from its inputs; they are never initialized.
 
-```cpp
-// cs::Component<X>: a kernel (plain or group). Its launch is stated in define_forward().
-static void compute_forward(sycl::id<R> i,       const Inputs& in, const Outputs& out);  // plain
-static void compute_forward(cs::GroupItem<R> it, const Inputs& in, const Outputs& out);  // group
+## Other component types
 
-// cs::CustomComponent<X>: native backend work. There is no define_forward().
-static void compute_forward(cs::CustomOp& op, const Inputs& in, const Outputs& out);
+There are two other component types:
 
-// cs::HostComponent<X>: runs on the host. The type fixes the kind, so the body takes no tag. There is no define_forward().
-static void compute_forward(const Inputs& in, const Outputs& out);
-```
-
-- **`Component<X>`, plain.** One work-item per index of the range.
-- **`Component<X>`, group.** Work-items cooperate in work-groups, with local memory, group barriers and group algorithms.
-- **`CustomComponent<X>`.** CoSpan's form of AdaptiveCpp's [custom operation extension](https://adaptivecpp.github.io/AdaptiveCpp/enqueue-custom-operation/): native backend work, enqueued on the backend queue.
-- **`HostComponent<X>`.** The body runs on the host, as an asynchronous task, over host memory. Like every other kind it is ordered by the framework: it runs only once its inputs are written and while nothing else writes its outputs. Submitting it does not block.
-
-The hooks are the same for all three: `declare()` (ports), `prepare_forward()` (optional, per-forward shapes) and, for a kernel `Component` only, `define_forward()`. A component is not a node of the model's tree: it sits in a leaf that CoSpan creates for it, so a lone component `c` has ports `c.x`. A custom-operation or host component cannot be fused.
-
-## The functional model
-
-- **Outputs are computed fresh on every forward, and are never initialized.** A component writes every element of its outputs it is responsible for.
-- **A component keeps no data of its own between forwards.** Everything it reads comes in through its inputs.
-- **Multi-step work is several components,** each one's outputs feeding the next one's inputs, not one component with hidden state.
-
-## What a component does not do
-
-- **It does not synchronize.** Ordering is the framework's job.
-- **It does not allocate.** The memory behind its inputs and outputs is managed for it.
-- **It does not know its neighbours.** Wiring belongs to systems.
-- **It does not decide where it runs.** Placement belongs to systems.
+- **[`cs::CustomComponent<X>`](todo/custom-components.md)**: native backend work, through AdaptiveCpp's [custom operation extension](https://adaptivecpp.github.io/AdaptiveCpp/enqueue-custom-operation/).
+- **[`cs::HostComponent<X>`](todo/host-components.md)**: a body that runs on the host, over host memory.

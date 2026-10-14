@@ -1,6 +1,6 @@
 # Systems
 
-A **system** puts components together. It holds **subsystems**, which can be components or other systems, and it decides how they relate. A system does no work of its own: it has no kernel and declares no inputs or outputs of its own. Everything is computed by components. How those components relate is decided by systems.
+A **system** puts components together. It holds **subsystems**, which can be components or other systems, and wires them together.
 
 ## A small system
 
@@ -16,55 +16,68 @@ public:
 ```
 
 - **`setup()`** is where a system builds itself: it adds its subsystems and wires them together. It runs once.
-- **`add_subsystem`** adds a subsystem from a descriptor: its type, its name, and any arguments for its constructor, as in `cs::subsystem_desc<T>("name", args...)`. The subsystem is built and set up right away.
+- **`add_subsystem`** adds a subsystem from a descriptor: its type, its name, and any arguments for its constructor, as in `cs::subsystem_desc<T>("name", args...)`.
 - **`connect`** feeds an input from an output: here, `second` reads what `first` writes.
 
-## Systems of systems
+## Something more complex
 
-A system can hold other systems, and `cs::system_from` builds a system from a list of subsystems and their connections, without writing a class for it:
+Consider the following system:
 
 ```cpp
 class Pipeline : public cs::System {
 public:
     void setup() override {
-        add_subsystem(cs::subsystem_desc<Source>("source"));           // output: data
+        add_subsystem(cs::subsystem_desc<Source>("source"));
+        add_subsystem(cs::subsystem_desc<Filter>("filter"));
+        add_subsystem(cs::subsystem_desc<Report>("report"));
 
-        add_subsystem(cs::system_from(
-            "process", cs::connects_desc({{"filter.y", "post.scale.x"}}),
-            cs::subsystem_desc<Filter>("filter"),                       // input: x, output: y
-            cs::system_from(
-                "post", cs::connects_desc({{"scale.y", "clamp.x"}}),
-                cs::subsystem_desc<Scale>("scale"),                     // input: x, output: y
-                cs::subsystem_desc<Clamp>("clamp"))));                  // input: x, output: y
+        connect("source.y", "filter.smooth.x");
 
-        connect("source.data", "process.filter.x");
-        promote<DType::f32, 1>("process.post.clamp.y", "result");
+        promote<DType::f64, 3>("filter.smooth.y", "smoothed");
+        promote<DType::f64, 3>("report.stats.x", "stats");
+        connect("smoothed", "stats");
     }
 };
 ```
 
-`process` is a system holding a component (`filter`) and another system (`post`), which itself holds two components.
+Let's walk through it.
 
-## Names and paths
+### Adding subsystems
 
-Every subsystem has a name, unique within the system that holds it. An input or output is reached by its **path**: the names from the current system down to it, joined by dots. Inside `process`, the scale's input is `post.scale.x`. Inside `Pipeline`, the same input is `process.post.scale.x`.
+The three `add_subsystem` calls we've seen before.
 
-Each system is its own namespace. Two systems can each have a subsystem named `scale` without conflict.
+### A nested connect
 
-## Wiring
+This `connect` looks a little different.
 
-- **`connect`** feeds an input from an output.
-- **`promote`** promotes an input or output into the current system's namespace. Above, `Pipeline` promotes the clamp's output to `result`, so it can be reached as `result` instead of `process.post.clamp.y`. Promotion is often used to make a value easy to reach when inspecting a model, or to define a system's "public interface".
-- **`tie_inputs` and `tie_outputs`** make several inputs, or several outputs, share one value under one name.
+- **`source.y`** reads as before: the output `y` of a component, `source`.
+- **`filter.smooth.x`** has one level more: the input `x` of a subsystem `smooth`, inside `filter`. So `filter` is a system.
 
-More: [Connect, promote and tie](connect-promote-tie.md).
+### Promote
 
-## What else a system decides
+`promote` is new. It gives `filter.smooth.y` the name `smoothed`, and `report.stats.x` the name `stats`, in `Pipeline`.
 
-- **Shapes and values.** Shape hooks can be used to size inputs and outputs, and input initializers to give free inputs their starting values. More: [Shapes and initialization](shapes-and-initialization.md).
-- **Order.** Subsystems are added producers first. A consumer added before its producer is read as a cycle, and a warning is printed. Which subsystems can run at the same time follows from the data. More: [Execution and synchronization](execution-and-synchronization.md).
-- **When and where subsystems run.** Run policies, rearming a subsystem, and which device a subsystem runs on. More: [Advanced](advanced.md).
+### Connecting promotions
 
-## No forward of its own
+- Promoted names connect like any others.
+- This `connect` also tells us that `smoothed` is an output and `stats` an input.
 
-A system does no work and has no `prepare_forward()`: it only groups subsystems and declares wiring. Work belongs to components. To bring a finished subsystem back into play, call `model.rearm_subsystem(path)` from `main` between runs.
+## We lied: why you need to document your system
+
+- **Lie 1: `source` is a component.** It could just as well be a system that promoted something inside it as `y`, the way `Pipeline` promotes `smoothed` and `stats`.
+- **Lie 2: `filter` is a system.** A component may declare an input named `smooth.x`. In practice, `filter` is a system, but the code alone doesn't settle it. The same goes for `report`.
+- **Lie 3: `filter` holds `smooth`, and `report` holds `stats`.** They do, but they may hold more that this setup never mentions.
+
+### Why these lies matter
+
+A system's setup doesn't tell you everything about what it holds. Documentation is how anyone using your system, whether you, other maintainers or another project, knows what it does and how it works.
+
+## In a system's setup
+
+The calls above are the core of a system's setup. **`tie_inputs`** and **`tie_outputs`** work like `promote`, on several at once: `tie_inputs` promotes several inputs to one promotion, and `tie_outputs` several outputs to one promotion. More: [Connect, promote and tie](connect-promote-tie.md).
+
+A system can do more in its setup, such as setting shapes and initial values, devices, and when its subsystems run. More: [Shapes and initialization](shapes-and-initialization.md), [Devices and placement](devices-and-placement.md), [Lifetime](lifetime.md).
+
+## Helpers
+
+Helpers build common subsystems without writing a class. For example, `cs::system_from` builds a system from a list of subsystems and their connections. More: [Helpers](todo/helpers.md).
