@@ -86,6 +86,8 @@ cospanmdao-tests = { path = "tests" }
 [feature.dev.dependencies]
 nushell         = { workspace = true }
 naga-acpp-tools = { workspace = true }
+naga-acpp-lldb  = "==2026.10.15"  # our toolchain's debugger
+python          = "3.14.*"  # workaround: naga-acpp-lldb links libpython3.14 but declares only python >=3.8; drop when the recipe pins it
 
 [environments.dev]
 features = ["dev"]
