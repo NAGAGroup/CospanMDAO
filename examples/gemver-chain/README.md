@@ -224,5 +224,5 @@ b. **Compiler flags.** Check whether AdaptiveCpp enables fast-math or similar by
 c. **Small n.** At n = 2048 the old fused variant was much slower than unfused (about 1.7 ms vs
    0.25 ms). The packing buffers suspected then are gone; whether the new launch path (argument and
    geometry arrays, one kernel) still loses at small n is not measured.
-e. **parallel brings no gain over unfused.** Both products still read the matrix, and nothing was
+d. **parallel brings no gain over unfused.** Both products still read the matrix, and nothing was
    profiled to see whether the two kernels actually overlap.
