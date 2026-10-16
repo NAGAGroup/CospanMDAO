@@ -4,11 +4,12 @@
 // naga/cospan/wrappers.hpp — the device-side data handles (r02 section 4)
 // =============================================================================
 //
-// Input, Output, Initializer and Local are pure device payload: {shape,
-// stride, data}, trivially copyable, no identity. Their fields are private and
-// written only by detail::WrapperAccess (friendship): user code never sees a pointer.
-// Indexing is by sycl::id<Rank> or by a flat row-major index over shape();
-// stride() is the element step per dimension in the OWNING allocation.
+// Input, Output and Initializer are pure device payload: {shape, stride, data},
+// trivially copyable, no identity. Their fields are private and written only by
+// detail::WrapperAccess (friendship): user code never sees a pointer. Indexing is by
+// sycl::id<Rank> or by a flat row-major index over shape(); stride() is the element
+// step per dimension in the OWNING allocation. LocalArray declares an array of a
+// group-range stage's local memory and LocalView is the stage's view of it.
 
 #include <array>
 #include <cstddef>
@@ -28,7 +29,6 @@ namespace detail {
 struct WrapperAccess;
 template <class T, int Rank>
 struct RaggedAccess;
-struct ScratchLayout;
 struct ItemFixup;
 
 /// A range of rank R taken from the first R entries of a 1-padded triple.
@@ -198,32 +198,40 @@ private:
     friend struct CustomOp;
 };
 
-/// Local<DT, Rank> — group-local memory with wrapper ergonomics. Plain dtypes
-/// only in v1. The storage is group-local and the wrapper carries a byte
-/// OFFSET instead of a pointer; the device function fixes up the pointer as
-/// local_base + offset before the body runs. Contiguous row-major over shape.
+/// LocalView<DT, Rank> — a stage's view of one LocalArray in group-local memory: a pointer and the array's shape, contiguous
+/// row-major. Trivially copyable; made by LocalMem::get.
 template <DType DT, int Rank>
     requires(!is_atomic_v<DT>)
-struct Local {
+struct LocalView {
     static_assert(Rank >= 1 && Rank <= 3, "cospan: rank is 1..3");
     using value_type = cpp_type_t<DT>;
 
-    void reshape(sycl::range<Rank> shape) { shape_ = shape; }  // host, compute_forward
+    LocalView(value_type* data, sycl::range<Rank> shape) : data_{data}, shape_{shape} {}
 
-    value_type& operator[](sycl::id<Rank> idx) const {  // device, post-fixup
+    value_type& operator[](sycl::id<Rank> idx) const {
         std::size_t flat = 0;
         for (int d = 0; d < Rank; ++d) flat = flat * shape_[d] + idx[d];
-        return ptr_[flat];
+        return data_[flat];
     }
-    value_type&       operator[](std::size_t flat) const { return ptr_[flat]; }
+    value_type&       operator[](std::size_t flat) const { return data_[flat]; }
     sycl::range<Rank> shape() const { return shape_; }
     std::size_t       size() const { return detail::range_size<Rank>(shape_); }
 
 private:
-    sycl::range<Rank> shape_  = detail::filled_range<Rank>(0);
-    std::size_t       offset_ = 0;        // into the launch's local allocation
-    value_type*       ptr_    = nullptr;  // null until device-side fixup
-    friend struct detail::ScratchLayout;
+    value_type*       data_;
+    sycl::range<Rank> shape_;
+};
+
+/// LocalArray<DT, Rank> — the declaration of one array of a group-range stage's local memory (a template argument of
+/// LocalMem): non-atomic dtypes only. It holds no data; LocalMem::get hands out the LocalView of it.
+template <DType DT, int Rank>
+    requires(!is_atomic_v<DT>)
+struct LocalArray {
+    static_assert(Rank >= 1 && Rank <= 3, "cospan: rank is 1..3");
+    using value_type = cpp_type_t<DT>;
+    using view_type  = LocalView<DT, Rank>;
+    static constexpr DType dtype = DT;
+    static constexpr int   rank  = Rank;
 };
 
 // ---- ragged wrappers -------------------------------------------------------------
@@ -354,6 +362,6 @@ static_assert(std::is_trivially_copyable_v<AtomicBlock<float, 1>>);
 static_assert(std::is_trivially_copyable_v<Input<DType::f32, 2>>);
 static_assert(std::is_trivially_copyable_v<Output<DType::atomic_f32, 1>>);
 static_assert(std::is_trivially_copyable_v<Initializer<DType::f32, 1>>);
-static_assert(std::is_trivially_copyable_v<Local<DType::f32, 2>>);
+static_assert(std::is_trivially_copyable_v<LocalView<DType::f32, 2>>);
 
 }  // namespace naga::cospan

@@ -4,7 +4,7 @@
 // naga/cospan/group_launch.hpp — the launcher of a group of stages (design review, 11.6)
 // =============================================================================
 //
-// EVERY plain-body and group-body component launches through a GroupLauncher: a fused group owns one for its stages, and a
+// EVERY index-range and group-range component launches through a GroupLauncher: a fused group owns one for its stages, and a
 // bare component owns one for itself (a group of one stage in one default segment). It owns the two device arrays the
 // kernel reads besides the stages' own argument arrays:
 //   - the POINTER ARRAY: one pointer per stage, to that stage's one-element argument array. Allocated, filled and
@@ -14,15 +14,16 @@
 //     forward with the container's event ordering.
 // The class is declared here; its methods are defined in component.hpp, after ComponentBase.
 //
-// SEGMENTS. A segment is a run of consecutive stages sharing groups: it has its own block of groups, the largest group
-// count any of its stages asked for, and the launch is the sum of the blocks. Range mode (own: a stage runs for its first
-// N groups of the block; whole: for every group of the block) and local memory (partitioned: each stage its own slice,
-// the segment's size is the sum; shared: one block, the size is the max) are per segment. The launch's local block is the
-// largest segment size. THERE ARE NO FRAMEWORK BARRIERS: a stage that reads across work-items what an earlier stage wrote
+// SEGMENTS. A segment is a run of consecutive stages sharing launch units (work-groups for group-range stages, indices for
+// index-range stages): it has its own block of units, the largest count any of its stages asked for, and the launch is the
+// sum of the blocks. Range mode (own: a stage runs for its first N units of the block; whole: for every unit of the block)
+// and local memory (group-range stages only; partitioned: each stage its own slice, aligned for its arrays, the segment's
+// size is the sum; shared: one block, the size is the max) are per segment. The launch's local block is the largest segment
+// size. THERE ARE NO FRAMEWORK BARRIERS: a stage that reads across work-items what an earlier stage wrote
 // calls its own group barrier; across groups nothing is ordered.
 //
 // GROUP WAITS (the fuse_components option cs::group_waits_enabled, or a cs::global_barrier() between two segments, of a
-// group of group-body stages): either puts the WHOLE launch in ticket mode. The group then owns a small device array, the TICKET STATE (kernel.hpp), reset
+// group of group-range stages): either puts the WHOLE launch in ticket mode. The group then owns a small device array, the TICKET STATE (kernel.hpp), reset
 // with a container fill before every launch; the launch is an outside writer of it. Each work-group takes a ticket at its
 // start and the ticket, not the hardware group id, says which segment and group it is, so a group only ever waits for
 // earlier tickets and no co-residency is needed. A global_barrier makes every group of the segment after it wait for every

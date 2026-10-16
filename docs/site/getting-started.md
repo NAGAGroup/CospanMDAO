@@ -79,7 +79,7 @@ install(TARGETS getting-started)
 
 A complete model in one file:
 
-- **The component** is one class. Its nested `Inputs` and `Outputs` are its inputs and outputs, the static `compute_forward` is the kernel (what one work-item computes), and the public members `inputs` and `outputs` hold them. It declares them in `declare()`. In `prepare_forward()` it gives its output the shape of its input. In `define_forward()` it launches over the input's range.
+- **The component** is one class. Its nested `Inputs` and `Outputs` are its inputs and outputs, the static `compute_forward` is the kernel (what one work-item computes; a first parameter of `sycl::id<R>` makes it an *index-range* component), and the public members `inputs` and `outputs` hold them. It declares them in `declare()`. In `prepare_forward()` it gives its output the shape of its input. In `define_forward()` it launches over the input's range. The other kind, the group-range component, works in work-groups and must also state their shape; see [Components](concepts/components.md).
 - **`main`** builds the model from a plain root, adds the component to it, gives it an input, runs it once and reads the output back on the host.
 
 ```cpp

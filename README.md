@@ -16,7 +16,9 @@ formalism for composing open systems along shared boundaries, and *MDAO* credits
 ## Core concepts
 
 - **Component.** A leaf that does work. It declares typed inputs and outputs (`cs::Input`, `cs::Output`), and its kernel
-  body is one function whose signature fixes its kind: plain, group (work-groups, local memory), custom-op or host.
+  body is one function whose signature fixes its kind: index-range (one call per index), group-range (work-groups, group functions, `LocalMem` local memory), custom-op or host.
+  A group-range component always states its work-group shape (`wg_desc`), and its range must be a multiple of that shape:
+  you round it up and guard the tail, and CoSpan throws if you do not.
 - **System.** A node that orders work. It adds children with `add_subsystem`, wires them with `connect`, `promote`,
   `tie_inputs` and `tie_outputs`, and has no I/O of its own beyond those aliases.
 - **Variable.** Everything joined by wiring is one variable. Its metadata is shared by all of its ports, and its memory lives
@@ -44,7 +46,7 @@ class Double : public cs::Component<Double> {
 public:
     struct Inputs  { cs::Input<DType::f32, 1> x; };
     struct Outputs { cs::Output<DType::f32, 1> y; };
-    // the kernel: one work-item per element (its first parameter makes this a plain, rank-1 body)
+    // the kernel: one work-item per element (its first parameter makes this an index-range, rank-1 body)
     static void compute_forward(sycl::id<1> i, const Inputs& in, const Outputs& out) { out.y[i] = 2.0f * in.x[i]; }
 
     Inputs  inputs;
@@ -93,10 +95,10 @@ shape_hook("c.x", cs::dim::from_shape("p.y", 0));
 
 ### Fused groups
 
-Components with plain or work-group bodies can run as the stages of ONE kernel launch. A *segment* is a run of consecutive
+Components with index-range or group-range bodies can run as the stages of ONE kernel launch. A *segment* is a run of consecutive
 stages that share work-groups; a bare component is a one-stage segment. Segment options pick the range
 (`range_mode::own`, the default: a stage runs for its own groups; `whole`: every stage runs for every group of the
-segment) and the local memory (`local_mem::partitioned`, the default: each stage its own slice; `shared`: one block):
+segment) and the local memory (`local_mem::partitioned`, the default: each stage its own slice; `shared`: one block; group-range only, as are `global_barrier` and group waits):
 
 ```cpp
 add_subsystem(cs::fuse_components(

@@ -8,7 +8,7 @@
 // Reading results (docs/design-review-2026-10-03.md, section 5): forward() only enqueues; a host view is obtained
 // after the first forward and sync()ed before it is read (cst::wait_and_view / synced_input do all three).
 //
-//   plain body, rank 1/2/3        y = 2x + 1, ragged sizes (1000, 40x30, 7x9x11)
+//   index-range body, rank 1/2/3       y = 2x + 1, ragged sizes (1000, 40x30, 7x9x11)
 //   WeightedHistogram             atomic output, unspecified dims; ZeroBins + tie_outputs whose shape is a
 //                                 System shape hook (cs::dim::from_value of NBins' output); two forwards,
 //                                 n_bins changed by update_input between them
@@ -62,7 +62,7 @@ void expect_throws(F&& f, const std::string& needle) {
     CHECK_THAT(what, Catch::Matchers::ContainsSubstring(needle));
 }
 
-// ---- plain body, rank 1..3 ---------------------------------------------------------------
+// ---- index-range body, rank 1..3 ---------------------------------------------------------------
 template <int R>
 class Affine : public cs::Component<Affine<R>> {
 public:
@@ -309,17 +309,16 @@ public:
     struct Outputs {
         cs::Output<DType::f32, 2> out;
     };
-    struct Scratch {
-        cs::Local<DType::f32, 2> tile;
-    };
-    static void compute_forward(cs::GroupItem<2> it, const Inputs& in, const Outputs& out, Scratch s) {
+    using TileMem = cs::LocalMem<cs::LocalArray<DType::f32, 2>>;
+    static void compute_forward(cs::GroupItem<2> it, const Inputs& in, const Outputs& out, TileMem lm) {
+        auto [tile] = lm.get(it);
         const auto l = it.get_local_id(), g = it.get_global_id();
         const bool live = g[0] < in.in.shape()[0] && g[1] < in.in.shape()[1];
-        if (live) s.tile[{l[0], l[1]}] = in.in[{g[0], g[1]}];
+        if (live) tile[sycl::id<2>{l[0], l[1]}] = in.in[{g[0], g[1]}];
         cs::group_barrier(it.get_group());
         const auto gt = sycl::id<2>{it.get_group(1) * it.get_local_range(1) + l[0],
                                     it.get_group(0) * it.get_local_range(0) + l[1]};
-        if (gt[0] < out.out.shape()[0] && gt[1] < out.out.shape()[1]) out.out[gt] = s.tile[{l[1], l[0]}];
+        if (gt[0] < out.out.shape()[0] && gt[1] < out.out.shape()[1]) out.out[gt] = tile[sycl::id<2>{l[1], l[0]}];
     }
 
     Inputs  inputs;
@@ -338,10 +337,61 @@ public:
         set_shape(outputs.out, s[1], s[0]);  // the transpose
     }
     std::unique_ptr<cs::LaunchDescription> define_forward() override {
-        Scratch s;
-        s.tile.reshape({WG, WG + 1});
-        return create_launch_config(cs::range_desc(inputs.in.shape()), cs::wg_desc(sycl::range<2>{WG, WG}), cs::scratch_desc(s));
+        const sycl::range<2> s = inputs.in.shape();  // rounded up to whole work-groups; the body guards the tail
+        const sycl::range<2> r{(s[0] + WG - 1) / WG * WG, (s[1] + WG - 1) / WG * WG};
+        return create_launch_config(cs::range_desc(r), cs::wg_desc(sycl::range<2>{WG, WG}),
+                                    cs::local_desc(sycl::range<2>{WG, WG + 1}));
     }
+};
+
+// A group-range component whose range (5) is not a multiple of its work-group shape (2): launching it throws.
+class GrpBad : public cs::Component<GrpBad> {
+public:
+    struct Inputs {};
+    struct Outputs { cs::Output<DType::f32, 1> y; };
+    static void compute_forward(cs::GroupItem<1> it, const Inputs&, const Outputs& out) {
+        if (it.get_global_id(0) < out.y.shape()[0]) out.y[it.get_global_id(0)] = 1.0f;
+    }
+    Inputs  inputs;
+    Outputs outputs;
+    void declare() override { declare_output(outputs.y, "y", 5); }
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
+        return create_launch_config(cs::range_desc(sycl::range<1>{5}), cs::wg_desc(sycl::range<1>{2}));
+    }
+};
+
+class TopBad : public cs::System {
+public:
+    void setup() override { add_subsystem(cs::subsystem_desc<GrpBad>("bad")); }
+};
+
+// Three arrays of different element types and odd shapes: u8 {3}, f64 {5}, i32 {3, 2}; work-group 4, two groups.
+class LocalMixed : public cs::Component<LocalMixed> {
+public:
+    struct Inputs {};
+    struct Outputs { cs::Output<DType::f32, 1> y; };
+    using Mem = cs::LocalMem<cs::LocalArray<DType::u8, 1>, cs::LocalArray<DType::f64, 1>, cs::LocalArray<DType::i32, 2>>;
+    static void compute_forward(cs::GroupItem<1> it, const Inputs&, const Outputs& out, Mem lm) {
+        auto [a, b, c] = lm.get(it);
+        const std::size_t l = it.get_local_linear_id();
+        if (l < 3) a[l] = static_cast<unsigned char>(l + 1);
+        if (l < 5) b[l] = 0.5 * static_cast<double>(l);
+        if (l < 6) c[sycl::id<2>{l / 2, l % 2}] = static_cast<int>(10 * l);
+        cs::group_barrier(it.get_group());
+        out.y[it.get_global_id(0)] = static_cast<float>(a[l % 3] + b[l % 5] + c[sycl::id<2>{(l % 6) / 2, (l % 6) % 2}]);
+    }
+    Inputs  inputs;
+    Outputs outputs;
+    void declare() override { declare_output(outputs.y, "y", 8); }
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
+        return create_launch_config(cs::range_desc(sycl::range<1>{8}), cs::wg_desc(sycl::range<1>{4}),
+                                    cs::local_desc(sycl::range<1>{3}, sycl::range<1>{5}, sycl::range<2>{3, 2}));
+    }
+};
+
+class TopLocalMixed : public cs::System {
+public:
+    void setup() override { add_subsystem(cs::subsystem_desc<LocalMixed>("lm")); }
 };
 
 class TopTranspose : public cs::System {
@@ -608,15 +658,15 @@ public:
 }  // namespace tc
 
 // =============================================================================================
-// Plain bodies
+// Index-range bodies
 // =============================================================================================
-TEST_CASE("plain body: y = 2x + 1 at ranks 1, 2 and 3", "[component][plain]") {
+TEST_CASE("index-range body: y = 2x + 1 at ranks 1, 2 and 3", "[component][index-range]") {
     SECTION("rank 1, 1000") { tc::check_affine<1>(sycl::range<1>{1000}); }
     SECTION("rank 2, 40 x 30") { tc::check_affine<2>(sycl::range<2>{40, 30}); }
     SECTION("rank 3, 7 x 9 x 11") { tc::check_affine<3>(sycl::range<3>{7, 9, 11}); }
 }
 
-TEST_CASE("a launch's event is registered on the container of every port it touched", "[component][plain][events]") {
+TEST_CASE("a launch's event is registered on the container of every port it touched", "[component][index-range][events]") {
     auto model = cs::create_model<tc::TopAffine<1>>(default_config(), sycl::range<1>{1000});
     model.setup();
 
@@ -697,7 +747,7 @@ TEST_CASE("WeightedHistogram: atomic output, unspecified dims, tie shape set by 
 // =============================================================================================
 // TiledTranspose
 // =============================================================================================
-TEST_CASE("TiledTranspose: group body, Local scratch, work-group override, 37 x 53", "[component][transpose]") {
+TEST_CASE("TiledTranspose: group-range body, local memory, work-group override, 37 x 53", "[component][transpose]") {
     auto model = cs::create_model<tc::TopTranspose>(default_config());
     model.setup();
     auto out = wait_and_view<DType::f32, 2>(model, "tr.out");
@@ -707,6 +757,48 @@ TEST_CASE("TiledTranspose: group body, Local scratch, work-group override, 37 x 
     for (std::size_t j = 0; j < 53 && good; ++j)
         for (std::size_t i = 0; i < 37 && good; ++i) good = out(j, i) == static_cast<float>(i * 1000 + j);
     CHECK(good);  // out[j][i] == in[i][j]
+}
+
+TEST_CASE("group-range range that is not a multiple of the work-group shape throws, naming the component, range and shape",
+          "[component][errors]") {
+    tc::expect_throws(
+        [] {
+            auto model = cs::create_model<tc::TopBad>(default_config());
+            model.setup();
+            model.run();
+            model.wait();
+        },
+        "is not a multiple of the work-group shape (2)");
+    tc::expect_throws(
+        [] {
+            auto model = cs::create_model<tc::TopBad>(default_config());
+            model.setup();
+            model.run();
+            model.wait();
+        },
+        "the range (5)");
+    tc::expect_throws(
+        [] {
+            auto model = cs::create_model<tc::TopBad>(default_config());
+            model.setup();
+            model.run();
+            model.wait();
+        },
+        "bad");
+}
+
+TEST_CASE("local memory: three arrays of different element types and odd shapes", "[component][local]") {
+    auto model = cs::create_model<tc::TopLocalMixed>(default_config());
+    model.setup();
+    auto y = wait_and_view<DType::f32, 1>(model, "lm.y");
+    REQUIRE(y.shape()[0] == 8);
+    bool good = true;
+    for (std::size_t g = 0; g < 2; ++g)
+        for (std::size_t l = 0; l < 4; ++l) {
+            const float want = static_cast<float>((l % 3 + 1) + 0.5 * static_cast<double>(l) + 10 * l);
+            good = good && y(g * 4 + l) == want;
+        }
+    CHECK(good);
 }
 
 // =============================================================================================
@@ -864,7 +956,7 @@ TEST_CASE("phase guards: init_input, set_shape and declare outside their phase t
 namespace tct {
 
 // Two components with the SAME ports and the SAME compute_forward signature.
-class PlainA : public cs::Component<PlainA> {
+class IndexA : public cs::Component<IndexA> {
 public:
     struct Inputs { cs::Input<DType::f32, 1> x; };
     struct Outputs { cs::Output<DType::f32, 1> y; };
@@ -877,7 +969,7 @@ public:
     }
     std::unique_ptr<cs::LaunchDescription> define_forward() override { return create_launch_config(cs::range_desc(inputs.x.shape())); }
 };
-class PlainB : public cs::Component<PlainB> {
+class IndexB : public cs::Component<IndexB> {
 public:
     struct Inputs { cs::Input<DType::f32, 1> x; };
     struct Outputs { cs::Output<DType::f32, 1> y; };
@@ -891,7 +983,7 @@ public:
     std::unique_ptr<cs::LaunchDescription> define_forward() override { return create_launch_config(cs::range_desc(inputs.x.shape())); }
 };
 
-class Plain3 : public cs::Component<Plain3> {
+class Index3 : public cs::Component<Index3> {
 public:
     struct Inputs { cs::Input<DType::f32, 3> x; };
     struct Outputs { cs::Output<DType::f32, 3> y; };
@@ -921,12 +1013,12 @@ public:
     }
 };
 
-class GrpScratch : public cs::Component<GrpScratch> {
+class GrpLocal : public cs::Component<GrpLocal> {
 public:
     struct Inputs { cs::Input<DType::f32, 1> x; };
     struct Outputs { cs::Output<DType::f32, 1> y; };
-    struct Scratch { cs::Local<DType::f32, 1> tile; };
-    static void compute_forward(cs::GroupItem<1> it, const Inputs& in, const Outputs& out, Scratch) {
+    using Mem = cs::LocalMem<cs::LocalArray<DType::f32, 1>>;
+    static void compute_forward(cs::GroupItem<1> it, const Inputs& in, const Outputs& out, Mem) {
         out.y[it.get_global_id()] = in.x[it.get_global_id()];
     }
     Inputs  inputs;
@@ -936,9 +1028,7 @@ public:
         declare_output(outputs.y, "y", 4);
     }
     std::unique_ptr<cs::LaunchDescription> define_forward() override {
-        Scratch s;
-        s.tile.reshape({4});
-        return create_launch_config(cs::range_desc(inputs.x.shape()), cs::wg_desc(sycl::range<1>{4}), cs::scratch_desc(s));
+        return create_launch_config(cs::range_desc(inputs.x.shape()), cs::wg_desc(sycl::range<1>{4}), cs::local_desc(sycl::range<1>{4}));
     }
 };
 
@@ -979,37 +1069,39 @@ using R1 = cs::RangeDesc<1>;
 using R2 = cs::RangeDesc<2>;
 using W1 = cs::WgDesc<1>;
 using W2 = cs::WgDesc<2>;
-using S_ = cs::ScratchDesc<GrpScratch::Scratch>;
+using L1  = cs::LocalDesc<1>;
+using L2  = cs::LocalDesc<2>;
+using L11 = cs::LocalDesc<1, 1>;
 
 }  // namespace tct
 
 TEST_CASE("component form: the synthesized body is trivially copyable, and distinct per component", "[component][traits]") {
-    STATIC_REQUIRE(std::is_trivially_copyable_v<tct::body_of<tct::PlainA>>);
+    STATIC_REQUIRE(std::is_trivially_copyable_v<tct::body_of<tct::IndexA>>);
     STATIC_REQUIRE(std::is_trivially_copyable_v<tct::body_of<tct::Grp2>>);
-    STATIC_REQUIRE(std::is_trivially_copyable_v<tct::body_of<tct::GrpScratch>>);
+    STATIC_REQUIRE(std::is_trivially_copyable_v<tct::body_of<tct::GrpLocal>>);
     STATIC_REQUIRE(std::is_trivially_copyable_v<tct::body_of<tct::Custom>>);
     STATIC_REQUIRE(std::is_trivially_copyable_v<tct::body_of<tct::HostC>>);
     // identical ports and an identical compute_forward signature, yet two body types (one kernel per component, by type)
-    STATIC_REQUIRE(std::is_same_v<tct::PlainA::Inputs, tct::PlainA::Inputs>);
-    STATIC_REQUIRE(!std::is_same_v<tct::body_of<tct::PlainA>, tct::body_of<tct::PlainB>>);
-    STATIC_REQUIRE(!std::is_same_v<tct::PlainA::body_type, tct::PlainB::body_type>);
+    STATIC_REQUIRE(std::is_same_v<tct::IndexA::Inputs, tct::IndexA::Inputs>);
+    STATIC_REQUIRE(!std::is_same_v<tct::body_of<tct::IndexA>, tct::body_of<tct::IndexB>>);
+    STATIC_REQUIRE(!std::is_same_v<tct::IndexA::body_type, tct::IndexB::body_type>);
 }
 
 TEST_CASE("component form: the first parameter of compute_forward fixes the kind and the rank", "[component][traits]") {
-    STATIC_REQUIRE(cs::PlainBody<tct::body_of<tct::PlainA>>);
-    STATIC_REQUIRE(cs::kernel_rank_v<tct::body_of<tct::PlainA>> == 1);
-    STATIC_REQUIRE(cs::PlainBody<tct::body_of<tct::Plain3>>);
-    STATIC_REQUIRE(cs::kernel_rank_v<tct::body_of<tct::Plain3>> == 3);
+    STATIC_REQUIRE(cs::IndexRangeBody<tct::body_of<tct::IndexA>>);
+    STATIC_REQUIRE(cs::kernel_rank_v<tct::body_of<tct::IndexA>> == 1);
+    STATIC_REQUIRE(cs::IndexRangeBody<tct::body_of<tct::Index3>>);
+    STATIC_REQUIRE(cs::kernel_rank_v<tct::body_of<tct::Index3>> == 3);
 
-    STATIC_REQUIRE(cs::GroupBody<tct::body_of<tct::Grp2>>);
-    STATIC_REQUIRE(!cs::PlainBody<tct::body_of<tct::Grp2>>);
+    STATIC_REQUIRE(cs::GroupRangeBody<tct::body_of<tct::Grp2>>);
+    STATIC_REQUIRE(!cs::IndexRangeBody<tct::body_of<tct::Grp2>>);
     STATIC_REQUIRE(cs::kernel_rank_v<tct::body_of<tct::Grp2>> == 2);
-    STATIC_REQUIRE(cs::GroupBody<tct::body_of<tct::GrpScratch>>);
-    STATIC_REQUIRE(cs::HasScratch<tct::body_of<tct::GrpScratch>>);
-    STATIC_REQUIRE(!cs::HasScratch<tct::body_of<tct::Grp2>>);
+    STATIC_REQUIRE(cs::GroupRangeBody<tct::body_of<tct::GrpLocal>>);
+    STATIC_REQUIRE(cs::HasLocalMem<tct::body_of<tct::GrpLocal>>);
+    STATIC_REQUIRE(!cs::HasLocalMem<tct::body_of<tct::Grp2>>);
 
     STATIC_REQUIRE(cs::CustomOpBody<tct::body_of<tct::Custom>>);
-    STATIC_REQUIRE(!cs::PlainBody<tct::body_of<tct::Custom>>);
+    STATIC_REQUIRE(!cs::IndexRangeBody<tct::body_of<tct::Custom>>);
     STATIC_REQUIRE(cs::kernel_rank_v<tct::body_of<tct::Custom>> == 0);
     STATIC_REQUIRE(cs::launch_rank_v<tct::body_of<tct::Custom>> == 1);
 
@@ -1017,9 +1109,9 @@ TEST_CASE("component form: the first parameter of compute_forward fixes the kind
     STATIC_REQUIRE(!cs::CustomOpBody<tct::body_of<tct::HostC>>);
     STATIC_REQUIRE(cs::kernel_rank_v<tct::body_of<tct::HostC>> == 0);
 
-    STATIC_REQUIRE(cs::KernelBodyC<tct::body_of<tct::PlainA>>);
+    STATIC_REQUIRE(cs::KernelBodyC<tct::body_of<tct::IndexA>>);
     STATIC_REQUIRE(cs::KernelBodyC<tct::body_of<tct::Grp2>>);
-    STATIC_REQUIRE(cs::KernelBodyC<tct::body_of<tct::GrpScratch>>);
+    STATIC_REQUIRE(cs::KernelBodyC<tct::body_of<tct::GrpLocal>>);
     STATIC_REQUIRE(cs::KernelBodyC<tct::body_of<tct::Custom>>);
     STATIC_REQUIRE(cs::KernelBodyC<tct::body_of<tct::HostC>>);
 }
@@ -1027,31 +1119,38 @@ TEST_CASE("component form: the first parameter of compute_forward fixes the kind
 TEST_CASE("component form: each launch-descriptor misuse is rejected by a detection trait", "[component][traits]") {
     using namespace tct;
     // accepted forms, in any order
-    STATIC_REQUIRE(accepts_v<PlainA, R1>);
-    STATIC_REQUIRE(accepts_v<PlainA, R1, W1>);
-    STATIC_REQUIRE(accepts_v<PlainA, W1, R1>);
-    STATIC_REQUIRE(accepts_v<Grp2, R2>);
+    STATIC_REQUIRE(accepts_v<IndexA, R1>);
     STATIC_REQUIRE(accepts_v<Grp2, W2, R2>);
-    STATIC_REQUIRE(accepts_v<GrpScratch, R1, W1, S_>);
-    STATIC_REQUIRE(accepts_v<GrpScratch, S_, W1, R1>);
-    STATIC_REQUIRE(accepts_v<GrpScratch, R1, S_>);
+    STATIC_REQUIRE(accepts_v<GrpLocal, R1, W1, L1>);
+    STATIC_REQUIRE(accepts_v<GrpLocal, L1, W1, R1>);
 
-    // a missing range, for plain and for group bodies
-    STATIC_REQUIRE(!accepts_v<PlainA>);
-    STATIC_REQUIRE(!accepts_v<PlainA, W1>);
+    // a group-range body with a range_desc but no wg_desc (the work-group shape is required), with and without local_desc
+    STATIC_REQUIRE(!accepts_v<Grp2, R2>);
+    STATIC_REQUIRE(!accepts_v<GrpLocal, R1>);
+    STATIC_REQUIRE(!accepts_v<GrpLocal, R1, L1>);
+    // wg_desc on an index-range body
+    STATIC_REQUIRE(!accepts_v<IndexA, R1, W1>);
+    STATIC_REQUIRE(!accepts_v<IndexA, W1, R1>);
+    // local_desc on an index-range body
+    STATIC_REQUIRE(!accepts_v<IndexA, R1, L1>);
+    // local_desc on a group-range body without local memory
+    STATIC_REQUIRE(!accepts_v<Grp2, R2, L1>);
+    // local_desc whose count or ranks differ from the body's LocalMem
+    STATIC_REQUIRE(!accepts_v<GrpLocal, R1, W1, L11>);
+    STATIC_REQUIRE(!accepts_v<GrpLocal, R1, W1, L2>);
+
+    // a missing range, for index-range and for group-range bodies
+    STATIC_REQUIRE(!accepts_v<IndexA>);
+    STATIC_REQUIRE(!accepts_v<IndexA, W1>);
     STATIC_REQUIRE(!accepts_v<Grp2>);
     STATIC_REQUIRE(!accepts_v<Grp2, W2>);
-    STATIC_REQUIRE(!accepts_v<GrpScratch, W1, S_>);
+    STATIC_REQUIRE(!accepts_v<GrpLocal, W1, L1>);
     // a range of the wrong rank
-    STATIC_REQUIRE(!accepts_v<PlainA, R2>);
+    STATIC_REQUIRE(!accepts_v<IndexA, R2>);
     STATIC_REQUIRE(!accepts_v<Grp2, R1>);
     // a repeated descriptor
-    STATIC_REQUIRE(!accepts_v<PlainA, R1, R1>);
-    STATIC_REQUIRE(!accepts_v<PlainA, R1, W1, W1>);
-    // scratch_desc without a Scratch (plain, and group without one), and with the wrong type
-    STATIC_REQUIRE(!accepts_v<PlainA, R1, S_>);
-    STATIC_REQUIRE(!accepts_v<Grp2, R2, S_>);
-    STATIC_REQUIRE(!accepts_v<GrpScratch, R1, cs::ScratchDesc<int>>);
+    STATIC_REQUIRE(!accepts_v<IndexA, R1, R1>);
+    STATIC_REQUIRE(!accepts_v<Grp2, R2, W2, W2>);
     // wg_desc or range_desc (or anything) on a custom-op or host component
     STATIC_REQUIRE(!accepts_v<Custom, W1>);
     STATIC_REQUIRE(!accepts_v<Custom, R1>);
@@ -1060,5 +1159,5 @@ TEST_CASE("component form: each launch-descriptor misuse is rejected by a detect
     STATIC_REQUIRE(!accepts_v<HostC, R1>);
     STATIC_REQUIRE(!accepts_v<HostC, R1, W1>);
     // not a descriptor at all
-    STATIC_REQUIRE(!accepts_v<PlainA, R1, int>);
+    STATIC_REQUIRE(!accepts_v<IndexA, R1, int>);
 }

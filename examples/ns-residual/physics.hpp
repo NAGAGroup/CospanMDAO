@@ -52,7 +52,6 @@ constexpr int fW = 0;   // primitives rho u v p            (converted in place f
 constexpr int fG = 4;   // gradients ux uy vx vy Tx Ty     (cell-centred)
 constexpr int fS = 10;  // slopes: x-slopes of rho u v p, then y-slopes
 constexpr int kNLoc = 18;
-constexpr std::size_t kLocalBytes = static_cast<std::size_t>(kNLoc) * kLocCells * sizeof(float);
 
 template <class T> inline T tmin(T a, T b) { return a < b ? a : b; }
 template <class T> inline T tmax(T a, T b) { return a > b ? a : b; }

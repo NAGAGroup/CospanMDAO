@@ -3,7 +3,7 @@
 //   shapes        three segments of different group ranges, per strategy: every item holds its group's linear id
 //   own / whole   a stage skips groups outside its OWN range in any dimension (own) or sees the whole segment range (whole)
 //   tickets       wait_group on a rank-2 neighbour (group_waits_enabled) and a global_barrier, per strategy, several forwards
-//   many groups   more than 65535 groups in rank 2: a fused group, a bare group component, a bare plain component
+//   many groups   more than 65535 groups in rank 2: a fused group, a bare group-range component, a bare index-range component
 //   rank 3        stages of rank 3 under flatten_and_split and pad_and_split
 //   native        a bare component's physical launch is its declared range; the strategies' physical group coordinates
 //   group fns     one case per family of the cs:: group functions, and to_sycl() / the implicit conversions into raw SYCL
@@ -217,9 +217,9 @@ public:
     }
 };
 
-// ---- a plain rank-2 stage: y[i][j] = i * width + j ------------------------------------------------------------------------
+// ---- an index-range rank-2 stage: y[i][j] = i * width + j ------------------------------------------------------------------------
 
-class PlainId : public cs::Component<PlainId> {
+class IndexId : public cs::Component<IndexId> {
 public:
     struct Inputs {};
     struct Outputs {
@@ -234,7 +234,7 @@ private:
     sycl::range<2>            r_;
 
 public:
-    explicit PlainId(sycl::range<2> r) : r_{r} {}
+    explicit IndexId(sycl::range<2> r) : r_{r} {}
     void declare() override { declare_output(outputs.y, "y", static_cast<int>(r_[0]), static_cast<int>(r_[1])); }
     std::unique_ptr<cs::LaunchDescription> define_forward() override { return create_launch_config(cs::range_desc(r_)); }
 };
@@ -284,15 +284,19 @@ public:
 // ---- the group functions, one group of 4 x 4 = 16 work-items ------------------------------------------------------------------
 // r[0..31]: the group-wide results (written by the leader); r[32 + 6 * t + k]: item t's scan results.
 
+/// The local memory of FamStage: 32 floats.
+using FamMem = cs::LocalMem<cs::LocalArray<DType::f32, 1>>;
+
 class FamStage : public cs::Component<FamStage> {
 public:
     struct Inputs {};
     struct Outputs {
         cs::Output<DType::f32, 1> r;
     };
-    static void compute_forward(cs::GroupItem<2> it, const Inputs&, const Outputs& out) {
+    static void compute_forward(cs::GroupItem<2> it, const Inputs&, const Outputs& out, FamMem lm) {
         auto              g   = it.get_group();
-        float*            L   = it.local<float>(32);
+        auto [Lv]             = lm.get(it);
+        float*            L   = &Lv[std::size_t{0}];
         const std::size_t t   = it.get_local_linear_id();
         const float       x   = static_cast<float>(t + 1);
         const auto        pls = sycl::plus<float>();
@@ -350,9 +354,7 @@ public:
 
     void declare() override { declare_output(outputs.r, "r", 128); }
     std::unique_ptr<cs::LaunchDescription> define_forward() override {
-        auto d = create_launch_config(cs::range_desc(sycl::range<2>{4, 4}), cs::wg_desc(wg_of<2>()));
-        d->request_local_bytes(32 * sizeof(float));
-        return d;
+        return create_launch_config(cs::range_desc(sycl::range<2>{4, 4}), cs::wg_desc(wg_of<2>()), cs::local_desc(sycl::range<1>{32}));
     }
 };
 
@@ -449,6 +451,84 @@ TEMPLATE_TEST_CASE("range_split: whole runs every stage over the segment's range
     own_whole_case<cs::range_mode::whole, TestType>(true);
 }
 
+// ---- index-range stages ---------------------------------------------------------------------------------------------------
+namespace trs {
+/// An index-range rank-2 stage: y[i][j] = Seg * 1e6 + i * 100 + j. The output has the shape of the whole segment (`out`), the
+/// launch range (`range`) may be smaller: under range_mode::own only the indices inside `range` are written, under whole
+/// every index of the segment's range is.
+template <int Seg>
+class IdxMark : public cs::Component<IdxMark<Seg>> {
+public:
+    struct Inputs {};
+    struct Outputs {
+        cs::Output<DType::f32, 2> y;
+    };
+    static void compute_forward(sycl::id<2> i, const Inputs&, const Outputs& out) {
+        out.y[i] = static_cast<float>(Seg * 1000000 + static_cast<int>(i[0]) * 100 + static_cast<int>(i[1]));
+    }
+
+    Inputs  inputs;
+    Outputs outputs;
+
+private:
+    sycl::range<2> range_, out_;
+
+public:
+    IdxMark(sycl::range<2> range, sycl::range<2> out) : range_{range}, out_{out} {}
+    void declare() override {
+        this->declare_output(outputs.y, "y", static_cast<int>(out_[0]), static_cast<int>(out_[1]));
+    }
+    std::unique_ptr<cs::LaunchDescription> define_forward() override { return this->create_launch_config(cs::range_desc(range_)); }
+};
+
+/// Checks the cells [0, inside) of the output at `path` (shape `out`) against Seg * 1e6 + i * 100 + j.
+inline void check_idx(cs::Model& m, const char* path, int seg, sycl::range<2> out, sycl::range<2> inside) {
+    const std::vector<float> got = out_of<2>(m, path);
+    REQUIRE(got.size() == out[0] * out[1]);
+    for (std::size_t i = 0; i < inside[0]; ++i)
+        for (std::size_t j = 0; j < inside[1]; ++j) {
+            INFO(path << " cell (" << i << ", " << j << ")");
+            CHECK(got[i * out[1] + j] == static_cast<float>(seg * 1000000 + static_cast<int>(i) * 100 + static_cast<int>(j)));
+        }
+}
+}  // namespace trs
+
+TEST_CASE("range_split: an index-range component alone", "[range_split][index]") {
+    cs::Model m = trs::make([](cs::System& s) { s.add_subsystem(cs::subsystem_desc<trs::IdxMark<3>>("a", sycl::range<2>{5, 9}, sycl::range<2>{5, 9})); });
+    m.setup();
+    m.run();
+    m.wait();
+    trs::check_idx(m, "a.y", 3, {5, 9}, {5, 9});
+}
+
+/// Segment 1: a over {3, 5} and b over {2, 7} (the segment's range is {3, 7}); segment 2: c over {1, 7}. Outputs are {3, 7}
+/// (c: {1, 7}). Own: each stage writes its own range. Whole: every stage writes the whole segment range.
+template <class Mode, class... Opts>
+void index_segments_case(bool whole) {
+    cs::Model m = trs::make([](cs::System& s) {
+        s.add_subsystem(cs::fuse_components<Opts...>(
+            "f",
+            cs::segment<Mode>(cs::subsystem_desc<trs::IdxMark<0>>("a", sycl::range<2>{3, 5}, sycl::range<2>{3, 7}),
+                              cs::subsystem_desc<trs::IdxMark<1>>("b", sycl::range<2>{2, 7}, sycl::range<2>{3, 7})),
+            cs::segment(cs::subsystem_desc<trs::IdxMark<2>>("c", sycl::range<2>{1, 7}, sycl::range<2>{1, 7}))));
+    });
+    m.setup();
+    for (int fwd = 0; fwd < 2; ++fwd) {
+        m.run();
+        m.wait();
+        trs::check_idx(m, "f.a.y", 0, {3, 7}, whole ? sycl::range<2>{3, 7} : sycl::range<2>{3, 5});
+        trs::check_idx(m, "f.b.y", 1, {3, 7}, whole ? sycl::range<2>{3, 7} : sycl::range<2>{2, 7});
+        trs::check_idx(m, "f.c.y", 2, {1, 7}, {1, 7});
+    }
+}
+
+TEMPLATE_TEST_CASE("range_split: index-range stages, two segments, own", "[range_split][index]", Flatten, Pad, Padded) {
+    index_segments_case<cs::range_mode::own, TestType>(false);
+}
+TEMPLATE_TEST_CASE("range_split: index-range stages, two segments, whole", "[range_split][index]", Flatten, Pad, Padded) {
+    index_segments_case<cs::range_mode::whole, TestType>(true);
+}
+
 // ---- tickets ----------------------------------------------------------------------------------------------------------------
 /// Kind 0: wait_group on the neighbour, group_waits_enabled, no barrier. Kind 1: a global_barrier, no wait_group.
 template <int Kind, class Split>
@@ -498,10 +578,10 @@ TEMPLATE_TEST_CASE("range_split: 260 x 260 = 67600 groups per stage in a fused g
     CHECK(trs::out_of<2>(m, "f.b.y") == trs::expected_ids<2>(sycl::range<2>{260, 260}, 1));
 }
 
-TEST_CASE("range_split: 67600 groups in a bare rank-2 group component and a bare plain component", "[range_split][many]") {
+TEST_CASE("range_split: 67600 groups in a bare rank-2 group-range component and a bare index-range component", "[range_split][many]") {
     cs::Model m = trs::make([](cs::System& s) {
         s.add_subsystem(cs::subsystem_desc<trs::IdStage<2, 0>>("a", sycl::range<2>{260, 260}));
-        s.add_subsystem(cs::subsystem_desc<trs::PlainId>("p", sycl::range<2>{2080, 2080}));  // default 8 x 8: 260 x 260 groups
+        s.add_subsystem(cs::subsystem_desc<trs::IndexId>("p", sycl::range<2>{2080, 2080}));  // default 8 x 8: 260 x 260 groups
     });
     m.setup();
     m.run();

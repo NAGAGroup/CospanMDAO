@@ -32,7 +32,7 @@
 //
 // Styles (Style):
 //   unfused   every component is its own kernel
-//   parallel  as unfused, but BiCGK's gemv_q and gtp_s are a system_from group: a plain System, TWO launches (the two
+//   parallel  as unfused, but BiCGK's gemv_q and gtp_s are a system_from group: an ordinary System, TWO launches (the two
 //             stages are independent, so they overlap through data dependencies alone; no fused group is involved)
 //   fused     GEMVER: fuse_components(connects, segment<range_mode::whole>(r2u, gtp)), then cred, gemv;
 //             BiCGK : fuse_components(gemv_q, gtp_s), each stage its own segment, no boundary: ONE launch, then cred_s
@@ -185,7 +185,7 @@ public:
         }
         std::string pre;  // the path prefix of gemv_q and gtp_s
         if (style_ == Style::parallel) {
-            // A plain group of the two children: they share no variable, so nothing orders them and they overlap.
+            // An ordinary group of the two children: they share no variable, so nothing orders them and they overlap.
             add_subsystem(cs::system_from("par", cs::subsystem_desc<Gemv>("gemv_q"), cs::subsystem_desc<GemvTPartial>("gtp_s")));
             pre = "par.";
         } else if (style_ == Style::fused) {

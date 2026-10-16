@@ -45,3 +45,45 @@ There are two other component types:
 
 - **[`cs::CustomComponent<X>`](todo/custom-components.md)**: native backend work, through AdaptiveCpp's [custom operation extension](https://adaptivecpp.github.io/AdaptiveCpp/enqueue-custom-operation/).
 - **[`cs::HostComponent<X>`](todo/host-components.md)**: a body that runs on the host, over host memory.
+
+
+## Two kinds of kernel component
+
+The first parameter of `compute_forward` fixes the kind of a kernel component.
+
+- **Index-range** (`sycl::id<R>` first): the kernel runs once per index of the range. The launch description is
+  `create_launch_config(range_desc(r))`. There is no work-group shape, no group functions and no local memory:
+  `wg_desc` and `local_desc` are rejected at compile time.
+- **Group-range** (`cs::GroupItem<R>` first): the range counts work-items and is split into work-groups of the shape given
+  by `wg_desc`. The work-group shape is **required**, the way an `nd_range` always states its local range: a group-range
+  component without a `wg_desc` does not compile. The range **must be a multiple of the work-group shape in every
+  dimension**: you round it up in the component and guard the tail in the body; CoSpan does not round for you, and
+  `create_launch_config` throws `std::invalid_argument` naming the component path, the range and the shape when it is not a
+  multiple. An empty range is an empty stage.
+
+```cpp
+std::unique_ptr<cs::LaunchDescription> define_forward() override {
+    const std::size_t n = (inputs.x.shape()[0] + 63) / 64 * 64;       // whole work-groups
+    return create_launch_config(cs::range_desc(sycl::range<1>{n}), cs::wg_desc(sycl::range<1>{64}));
+}
+// in the body: if (it.get_global_id(0) >= inputs.x.shape()[0]) return;   (after any group barrier)
+```
+
+### Local memory
+
+A group-range body that needs work-group local memory takes a `cs::LocalMem` as its fourth parameter, one
+`cs::LocalArray<DType, Rank>` per array, and the component gives the shapes with `local_desc`:
+
+```cpp
+using Mem = cs::LocalMem<cs::LocalArray<DType::f32, 1>, cs::LocalArray<DType::i32, 2>>;
+static void compute_forward(cs::GroupItem<1> it, const Inputs& in, const Outputs& out, Mem lm) {
+    auto [tile, counts] = lm.get(it);          // views: tile[l], counts[sycl::id<2>{i, j}]
+    ...
+}
+// define_forward: create_launch_config(range_desc(r), wg_desc(wg), local_desc(sycl::range<1>{64}, sycl::range<2>{4, 3}))
+```
+
+Each array starts at an offset aligned to its element type. The number and ranks of the `local_desc` shapes must match the
+arrays (a mismatch does not compile). In a fused component, `segment<local_mem::shared>` gives every stage of the segment
+the same block and `partitioned` gives each stage its own slice; segment local-memory options, `global_barrier` and group
+waits apply to group-range components only.

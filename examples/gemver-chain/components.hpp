@@ -5,15 +5,16 @@
 // =============================================================================
 //
 // Rules every component follows:
-//   - Every kernel is rank-1 with work-group size 256 (kWg). All bodies are GROUP
-//     bodies (they take a cs::GroupItem<1>), because a plain body cannot ask for a
-//     work-group size and an unfused launch would then use the framework default (128).
+//   - Every kernel is rank-1 with work-group size 256 (kWg). All bodies are GROUP-RANGE
+//     bodies (they take a cs::GroupItem<1>), because an index-range body has no work-group
+//     size and an unfused launch would then use the framework default (128).
 //   - Matrices are Input/Output<f32, 2> and are indexed ONLY by sycl::id<2>{i, j}
 //     (the flat operator does a div/mod on every access). Vectors use sycl::id<1>
 //     for the same reason.
 //   - Every element-wise body is grid-stride: `for (t = id; t < total; t += stride)`,
 //     `stride` being the launch size, read from the item.
-//   - The launch range is the full work.
+//   - The launch range is the full work, rounded up to whole work-groups (a group-range range is a multiple of kWg); the
+//     bodies guard their own tails with the sizes they read from their ports.
 //   - SIZES COME FROM THE PORTS. A kernel reads n, the strip height and the block count from the shapes of its ports
 //     (`in.B.shape()`, `out.Ps.shape()`, ...), and a launch range comes from the shapes of the ports too. Every data port is
 //     declared with an unspecified shape: the owning System (systems.hpp) gives the free inputs and the partial-sum outputs
@@ -31,7 +32,7 @@
 //
 // The "crafted" components (bottom of this file) are written to be fused: a work-group owns a TILE of kRt rows by 256
 // columns of B and keeps it in local memory between the stages of one segment (local_mem::shared), so B is read from
-// global memory once where the plain components read it twice:
+// global memory once where the other components read it twice:
 //   Rank2UpdateLocal      B tile = A + u1 v1^T + u2 v2^T; writes it to global B AND leaves it in local memory
 //   GemvTPartialLocal     P[c][j] = sum_k tile[k][j] y[c kRt + k], reading the tile from local memory
 //   BicgkTileLocal        loads the B1 tile into local memory; the q and s partials of BicgkOnePass from it
@@ -56,6 +57,9 @@ namespace sk = naga::slabkit;
 using cs::DType;
 
 constexpr std::size_t kWg = 256;  // the work-group size of every kernel
+
+/// `v` rounded up to a multiple of `m`: a group-range launch range is a whole number of work-groups.
+inline std::size_t round_up(std::size_t v, std::size_t m) { return (v + m - 1) / m * m; }
 
 inline std::uint32_t u32(std::size_t v) { return static_cast<std::uint32_t>(v); }
 
@@ -117,7 +121,7 @@ public:
     std::unique_ptr<cs::LaunchDescription> define_forward() override {
         const std::size_t n    = inputs.A.shape()[1];
         const std::size_t work = (n / static_cast<std::size_t>(R_)) * n;
-        return create_launch_config(cs::range_desc(sycl::range<1>{work}), cs::wg_desc(sycl::range<1>{kWg}));
+        return create_launch_config(cs::range_desc(sycl::range<1>{round_up(work, kWg)}), cs::wg_desc(sycl::range<1>{kWg}));
     }
 };
 
@@ -159,7 +163,7 @@ public:
     }
     std::unique_ptr<cs::LaunchDescription> define_forward() override {
         const std::size_t range = outputs.P.shape()[0] * outputs.P.shape()[1];  // (n / R) * n
-        return create_launch_config(cs::range_desc(sycl::range<1>{range}), cs::wg_desc(sycl::range<1>{kWg}));
+        return create_launch_config(cs::range_desc(sycl::range<1>{round_up(range, kWg)}), cs::wg_desc(sycl::range<1>{kWg}));
     }
 };
 
@@ -211,7 +215,7 @@ public:
     void prepare_forward() override { this->set_shape(outputs.x, this->shape_of(inputs.P)[1]); }
     std::unique_ptr<cs::LaunchDescription> define_forward() override {
         const std::size_t range = inputs.P.shape()[1];
-        return this->create_launch_config(cs::range_desc(sycl::range<1>{range}), cs::wg_desc(sycl::range<1>{kWg}));
+        return this->create_launch_config(cs::range_desc(sycl::range<1>{round_up(range, kWg)}), cs::wg_desc(sycl::range<1>{kWg}));
     }
 };
 
@@ -351,7 +355,7 @@ public:
     void prepare_forward() override { set_shape(outputs.q, shape_of(inputs.Pq)[0]); }
     std::unique_ptr<cs::LaunchDescription> define_forward() override {
         const std::size_t range = inputs.Pq.shape()[0];
-        return create_launch_config(cs::range_desc(sycl::range<1>{range}), cs::wg_desc(sycl::range<1>{kWg}));
+        return create_launch_config(cs::range_desc(sycl::range<1>{round_up(range, kWg)}), cs::wg_desc(sycl::range<1>{kWg}));
     }
 };
 
@@ -362,7 +366,10 @@ public:
 // column block blk = g % blocks (columns blk 256 .. blk 256 + 255); work-item l owns column j = blk 256 + l. The tile is
 // tile[k * 256 + l] = B[c kRt + k][j]. 32 rows * 256 columns * 4 B = 32 KB, inside the 48 KB of local memory.
 constexpr std::uint32_t kRt        = 32;
-constexpr std::size_t   kTileBytes = static_cast<std::size_t>(kRt) * kWg * sizeof(float);
+constexpr std::size_t   kTileElems = static_cast<std::size_t>(kRt) * kWg;
+
+/// Every crafted stage declares the same one-array local memory, so the stages of a local_mem::shared segment see one tile.
+using TileMem = cs::LocalMem<cs::LocalArray<DType::f32, 1>>;
 
 /// Rank2UpdateLocal: B = A + u1 v1^T + u2 v2^T for the tile; B goes to global memory (B1 is an output) and stays in the tile.
 /// n = A's rows.
@@ -376,8 +383,8 @@ public:
     struct Outputs {
         cs::Output<DType::f32, 2> B;
     };
-    static void compute_forward(cs::GroupItem<1> it, const Inputs& in, const Outputs& out) {
-        float*              tile = it.local<float>(static_cast<std::size_t>(kRt) * kWg);
+    static void compute_forward(cs::GroupItem<1> it, const Inputs& in, const Outputs& out, TileMem lm) {
+        auto [tile]              = lm.get(it);
         const std::uint32_t l    = static_cast<std::uint32_t>(it.get_local_id(0));
         const std::uint32_t g    = static_cast<std::uint32_t>(it.get_group(0));
         const std::uint32_t blocks = u32(in.A.shape()[0]) / static_cast<std::uint32_t>(kWg);
@@ -411,9 +418,8 @@ public:
         const std::size_t n      = inputs.A.shape()[0];
         const std::size_t blocks = n / kWg;
         const std::size_t groups = (n / kRt) * blocks;
-        auto              d      = create_launch_config(cs::range_desc(sycl::range<1>{groups * kWg}), cs::wg_desc(sycl::range<1>{kWg}));
-        d->request_local_bytes(kTileBytes);
-        return d;
+        return create_launch_config(cs::range_desc(sycl::range<1>{groups * kWg}), cs::wg_desc(sycl::range<1>{kWg}),
+                                    cs::local_desc(sycl::range<1>{kTileElems}));
     }
 };
 
@@ -428,8 +434,8 @@ public:
     struct Outputs {
         cs::Output<DType::f32, 2> P;
     };
-    static void compute_forward(cs::GroupItem<1> it, const Inputs& in, const Outputs& out) {
-        float*              tile = it.local<float>(static_cast<std::size_t>(kRt) * kWg);  // the same block as Rank2UpdateLocal's
+    static void compute_forward(cs::GroupItem<1> it, const Inputs& in, const Outputs& out, TileMem lm) {
+        auto [tile]              = lm.get(it);  // the same block as Rank2UpdateLocal's
         const std::uint32_t l    = static_cast<std::uint32_t>(it.get_local_id(0));
         const std::uint32_t g    = static_cast<std::uint32_t>(it.get_group(0));
         const std::uint32_t blocks = u32(in.y.shape()[0]) / static_cast<std::uint32_t>(kWg);
@@ -452,9 +458,8 @@ public:
         const std::size_t n      = inputs.y.shape()[0];
         const std::size_t blocks = n / kWg;
         const std::size_t groups = (n / kRt) * blocks;
-        auto              d      = create_launch_config(cs::range_desc(sycl::range<1>{groups * kWg}), cs::wg_desc(sycl::range<1>{kWg}));
-        d->request_local_bytes(kTileBytes);
-        return d;
+        return create_launch_config(cs::range_desc(sycl::range<1>{groups * kWg}), cs::wg_desc(sycl::range<1>{kWg}),
+                                    cs::local_desc(sycl::range<1>{kTileElems}));
     }
 };
 
@@ -471,8 +476,8 @@ public:
     struct Outputs {
         cs::Output<DType::f32, 2> Ps, Pq;
     };
-    static void compute_forward(cs::GroupItem<1> it, const Inputs& in, const Outputs& out) {
-        float*              tile = it.local<float>(static_cast<std::size_t>(kRt) * kWg);
+    static void compute_forward(cs::GroupItem<1> it, const Inputs& in, const Outputs& out, TileMem lm) {
+        auto [tile]              = lm.get(it);
         const std::uint32_t l    = static_cast<std::uint32_t>(it.get_local_id(0));
         const std::uint32_t g    = static_cast<std::uint32_t>(it.get_group(0));
         const std::uint32_t blocks = u32(in.B.shape()[0]) / static_cast<std::uint32_t>(kWg);
@@ -509,9 +514,8 @@ public:
         const std::size_t n      = inputs.B.shape()[0];
         const std::size_t blocks = n / kWg;
         const std::size_t groups = (n / kRt) * blocks;
-        auto              d      = create_launch_config(cs::range_desc(sycl::range<1>{groups * kWg}), cs::wg_desc(sycl::range<1>{kWg}));
-        d->request_local_bytes(kTileBytes);
-        return d;
+        return create_launch_config(cs::range_desc(sycl::range<1>{groups * kWg}), cs::wg_desc(sycl::range<1>{kWg}),
+                                    cs::local_desc(sycl::range<1>{kTileElems}));
     }
 };
 
@@ -526,8 +530,8 @@ public:
     struct Outputs {
         cs::Output<DType::f32, 2> B;
     };
-    static void compute_forward(cs::GroupItem<1> it, const Inputs& in, const Outputs& out) {
-        float*              tile = it.local<float>(static_cast<std::size_t>(kRt) * kWg);
+    static void compute_forward(cs::GroupItem<1> it, const Inputs& in, const Outputs& out, TileMem lm) {
+        auto [tile]              = lm.get(it);
         const std::uint32_t l    = static_cast<std::uint32_t>(it.get_local_id(0));
         const std::uint32_t g    = static_cast<std::uint32_t>(it.get_group(0));
         const std::uint32_t blocks = u32(in.u1.shape()[0]) / static_cast<std::uint32_t>(kWg);
@@ -559,9 +563,8 @@ public:
         const std::size_t n      = inputs.u1.shape()[0];
         const std::size_t blocks = n / kWg;
         const std::size_t groups = (n / kRt) * blocks;
-        auto              d      = create_launch_config(cs::range_desc(sycl::range<1>{groups * kWg}), cs::wg_desc(sycl::range<1>{kWg}));
-        d->request_local_bytes(kTileBytes);
-        return d;
+        return create_launch_config(cs::range_desc(sycl::range<1>{groups * kWg}), cs::wg_desc(sycl::range<1>{kWg}),
+                                    cs::local_desc(sycl::range<1>{kTileElems}));
     }
 };
 

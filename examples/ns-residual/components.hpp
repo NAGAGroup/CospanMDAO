@@ -18,7 +18,7 @@
 //     WaveSpeed<true>, ResidualSquares<true> (wait_group on the init group right before their atomic)
 //   Init: InitDiagnostics.  Deterministic reductions: DetNorm, DetMin, DetMax.  Error: ErrorStage<true>.
 //   The Fused template parameter of a stage switches its wait_group calls on. The unfused variant (Fused = false) is a
-//   different component type: the same logic as a plain launch (no wait state there, the data dependencies between the
+//   different component type: the same logic as an ordinary launch (no wait state there, the data dependencies between the
 //   kernels order the launches).
 //
 // UNFUSED counterparts of the local-memory stages (the tile lives in padded global arrays): PadBoundary<Bc>,
@@ -78,10 +78,19 @@ inline Th make_th(const cs::GroupItem<2>& it) {
 /// The segments of the fused group (indices used by wait_group).
 constexpr std::size_t kSegInit = 0, kSegTile = 1, kSegDiv = 2, kSegDet = 3, kSegErr = 4;
 
+/// The launch range of a tile stage: a whole number of kTile x kTile work-groups, one per tile.
 inline sycl::range<2> tile_range(const Geo& g) {
-    return sycl::range<2>{static_cast<std::size_t>(g.ny), static_cast<std::size_t>(g.nx)};
+    return sycl::range<2>{static_cast<std::size_t>(g.ty) * kTile, static_cast<std::size_t>(g.tx) * kTile};
 }
 inline sycl::range<2> tile_wg() { return sycl::range<2>{kTile, kTile}; }
+
+/// The local memory of every tile stage: the same one array of kNLoc fields of kLocCells floats, so the stages of the
+/// local_mem::shared tile pipeline see one tile.
+using TileMem = cs::LocalMem<cs::LocalArray<DType::f32, 1>>;
+inline sycl::range<1> tile_mem_shape() { return sycl::range<1>{static_cast<std::size_t>(kNLoc) * kLocCells}; }
+
+/// The tile kernels in tile.hpp work on a raw pointer to the first field.
+inline float* tile_ptr(const cs::LocalView<DType::f32, 1>& v) { return &v[std::size_t{0}]; }
 
 // =============================================================================
 // FUSED: the tile pipeline
@@ -92,8 +101,9 @@ class LoadTile : public cs::Component<LoadTile> {
 public:
     struct Inputs { In3 U; GeoIn geo; };
     struct Outputs {};
-    static void compute_forward(cs::GroupItem<2> it, const Inputs& in, const Outputs&) {
-        float* L = it.local<float>(static_cast<std::size_t>(kNLoc) * kLocCells);
+    static void compute_forward(cs::GroupItem<2> it, const Inputs& in, const Outputs&, TileMem lm) {
+        auto [tile] = lm.get(it);
+        float* L    = tile_ptr(tile);
         tile_load(make_th(it), geo_of(in.geo), L, [&](int v, int j, int i) { return in.U[id3(v, j, i)]; });
     }
 
@@ -106,9 +116,7 @@ public:
         declare_input(inputs.geo, "geo", cs::unspecified_shape<1>());  // tied
     }
     std::unique_ptr<cs::LaunchDescription> define_forward() override {
-        auto d = create_launch_config(cs::range_desc(tile_range(geo_)), cs::wg_desc(tile_wg()));
-        d->request_local_bytes(kLocalBytes);
-        return d;
+        return create_launch_config(cs::range_desc(tile_range(geo_)), cs::wg_desc(tile_wg()), cs::local_desc(tile_mem_shape()));
     }
 
 private:
@@ -121,8 +129,9 @@ class ApplyBoundary : public cs::Component<ApplyBoundary<Bc>> {
 public:
     struct Inputs { In3 U; GeoIn geo; };
     struct Outputs {};
-    static void compute_forward(cs::GroupItem<2> it, const Inputs& in, const Outputs&) {
-        float* L = it.local<float>(static_cast<std::size_t>(kNLoc) * kLocCells);
+    static void compute_forward(cs::GroupItem<2> it, const Inputs& in, const Outputs&, TileMem lm) {
+        auto [tile] = lm.get(it);
+        float* L    = tile_ptr(tile);
         tile_boundary<Bc>(make_th(it), geo_of(in.geo), L, [&](int v, int j, int i) { return in.U[id3(v, j, i)]; });
     }
 
@@ -135,9 +144,7 @@ public:
         this->declare_input(inputs.geo, "geo", cs::unspecified_shape<1>());  // tied
     }
     std::unique_ptr<cs::LaunchDescription> define_forward() override {
-        auto d = this->create_launch_config(cs::range_desc(tile_range(geo_)), cs::wg_desc(tile_wg()));
-        d->request_local_bytes(kLocalBytes);
-        return d;
+        return this->create_launch_config(cs::range_desc(tile_range(geo_)), cs::wg_desc(tile_wg()), cs::local_desc(tile_mem_shape()));
     }
 
 private:
@@ -149,8 +156,9 @@ class ToPrimitive : public cs::Component<ToPrimitive> {
 public:
     struct Inputs {};
     struct Outputs {};
-    static void compute_forward(cs::GroupItem<2> it, const Inputs&, const Outputs&) {
-        float* L = it.local<float>(static_cast<std::size_t>(kNLoc) * kLocCells);
+    static void compute_forward(cs::GroupItem<2> it, const Inputs&, const Outputs&, TileMem lm) {
+        auto [tile] = lm.get(it);
+        float* L    = tile_ptr(tile);
         tile_to_primitive(make_th(it), L);
     }
 
@@ -160,9 +168,7 @@ public:
     ToPrimitive(int nx, int ny) : geo_{make_geo(nx, ny)} {}
     void declare() override {}
     std::unique_ptr<cs::LaunchDescription> define_forward() override {
-        auto d = create_launch_config(cs::range_desc(tile_range(geo_)), cs::wg_desc(tile_wg()));
-        d->request_local_bytes(kLocalBytes);
-        return d;
+        return create_launch_config(cs::range_desc(tile_range(geo_)), cs::wg_desc(tile_wg()), cs::local_desc(tile_mem_shape()));
     }
 
 private:
@@ -173,8 +179,9 @@ class Gradients : public cs::Component<Gradients> {
 public:
     struct Inputs {};
     struct Outputs {};
-    static void compute_forward(cs::GroupItem<2> it, const Inputs&, const Outputs&) {
-        float* L = it.local<float>(static_cast<std::size_t>(kNLoc) * kLocCells);
+    static void compute_forward(cs::GroupItem<2> it, const Inputs&, const Outputs&, TileMem lm) {
+        auto [tile] = lm.get(it);
+        float* L    = tile_ptr(tile);
         tile_gradients(make_th(it), L);
     }
 
@@ -184,9 +191,7 @@ public:
     Gradients(int nx, int ny) : geo_{make_geo(nx, ny)} {}
     void declare() override {}
     std::unique_ptr<cs::LaunchDescription> define_forward() override {
-        auto d = create_launch_config(cs::range_desc(tile_range(geo_)), cs::wg_desc(tile_wg()));
-        d->request_local_bytes(kLocalBytes);
-        return d;
+        return create_launch_config(cs::range_desc(tile_range(geo_)), cs::wg_desc(tile_wg()), cs::local_desc(tile_mem_shape()));
     }
 
 private:
@@ -199,8 +204,9 @@ class Reconstruct : public cs::Component<Reconstruct<Lim>> {
 public:
     struct Inputs {};
     struct Outputs {};
-    static void compute_forward(cs::GroupItem<2> it, const Inputs&, const Outputs&) {
-        float* L = it.local<float>(static_cast<std::size_t>(kNLoc) * kLocCells);
+    static void compute_forward(cs::GroupItem<2> it, const Inputs&, const Outputs&, TileMem lm) {
+        auto [tile] = lm.get(it);
+        float* L    = tile_ptr(tile);
         tile_reconstruct<Lim>(make_th(it), L);
     }
 
@@ -210,9 +216,7 @@ public:
     Reconstruct(int nx, int ny) : geo_{make_geo(nx, ny)} {}
     void declare() override {}
     std::unique_ptr<cs::LaunchDescription> define_forward() override {
-        auto d = this->create_launch_config(cs::range_desc(tile_range(geo_)), cs::wg_desc(tile_wg()));
-        d->request_local_bytes(kLocalBytes);
-        return d;
+        return this->create_launch_config(cs::range_desc(tile_range(geo_)), cs::wg_desc(tile_wg()), cs::local_desc(tile_mem_shape()));
     }
 
 private:
@@ -226,8 +230,9 @@ class ConvFlux : public cs::Component<ConvFlux<Dir>> {
 public:
     struct Inputs { GeoIn geo; };
     struct Outputs { Out3 F; };
-    static void compute_forward(cs::GroupItem<2> it, const Inputs& in, const Outputs& out) {
-        const float* L = it.local<float>(static_cast<std::size_t>(kNLoc) * kLocCells);
+    static void compute_forward(cs::GroupItem<2> it, const Inputs& in, const Outputs& out, TileMem lm) {
+        auto [tile]    = lm.get(it);
+        const float* L = tile_ptr(tile);
         tile_conv_flux(make_th(it), geo_of(in.geo), L, Dir, [&](int v, int j, int i, float x) { out.F[id3(v, j, i)] = x; });
     }
 
@@ -240,9 +245,7 @@ public:
         this->declare_output(outputs.F, "F", 4, geo_.ny + (Dir == 1 ? 1 : 0), geo_.nx + (Dir == 0 ? 1 : 0));
     }
     std::unique_ptr<cs::LaunchDescription> define_forward() override {
-        auto d = this->create_launch_config(cs::range_desc(tile_range(geo_)), cs::wg_desc(tile_wg()));
-        d->request_local_bytes(kLocalBytes);
-        return d;
+        return this->create_launch_config(cs::range_desc(tile_range(geo_)), cs::wg_desc(tile_wg()), cs::local_desc(tile_mem_shape()));
     }
 
 private:
@@ -254,8 +257,9 @@ class ViscFlux : public cs::Component<ViscFlux<Dir>> {
 public:
     struct Inputs { GeoIn geo; };
     struct Outputs { Out3 F; };
-    static void compute_forward(cs::GroupItem<2> it, const Inputs& in, const Outputs& out) {
-        const float* L = it.local<float>(static_cast<std::size_t>(kNLoc) * kLocCells);
+    static void compute_forward(cs::GroupItem<2> it, const Inputs& in, const Outputs& out, TileMem lm) {
+        auto [tile]    = lm.get(it);
+        const float* L = tile_ptr(tile);
         tile_visc_flux(make_th(it), geo_of(in.geo), L, Dir, [&](int v, int j, int i, float x) { out.F[id3(v, j, i)] = x; });
     }
 
@@ -268,9 +272,7 @@ public:
         this->declare_output(outputs.F, "F", 4, geo_.ny + (Dir == 1 ? 1 : 0), geo_.nx + (Dir == 0 ? 1 : 0));
     }
     std::unique_ptr<cs::LaunchDescription> define_forward() override {
-        auto d = this->create_launch_config(cs::range_desc(tile_range(geo_)), cs::wg_desc(tile_wg()));
-        d->request_local_bytes(kLocalBytes);
-        return d;
+        return this->create_launch_config(cs::range_desc(tile_range(geo_)), cs::wg_desc(tile_wg()), cs::local_desc(tile_mem_shape()));
     }
 
 private:
@@ -770,7 +772,7 @@ private:
     Geo geo_;
 };
 
-/// The face fluxes from the padded arrays; one plain launch over the faces. Dir 0: x-faces (ny, nx+1), 1: y-faces (ny+1, nx).
+/// The face fluxes from the padded arrays; one index-range launch over the faces. Dir 0: x-faces (ny, nx+1), 1: y-faces (ny+1, nx).
 inline sycl::range<2> face_range(const Geo& g, int dir) {
     return sycl::range<2>{static_cast<std::size_t>(g.ny + (dir == 1 ? 1 : 0)), static_cast<std::size_t>(g.nx + (dir == 0 ? 1 : 0))};
 }

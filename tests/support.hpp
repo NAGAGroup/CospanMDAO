@@ -64,13 +64,14 @@ constexpr std::size_t group_launch_bytes(std::size_t stages) { return (stages + 
 
 // ---- the removed fuse strategies, as a test helper -------------------------------
 /// What cs::fuse_components<seq|par> was, spelled with the segment API (P7a): seq = ONE segment holding every stage, range
-/// mode whole; par = every stage its own segment (a bare descriptor is a one-stage segment).
+/// mode own (each stage runs over its own range, so stages of different sizes are safe); par = every stage its own segment (a
+/// bare descriptor is a one-stage segment).
 enum class FuseMode { seq, par };
 
 template <FuseMode S, class... D>
 auto fuse(std::string name, cs::ConnectsDesc c, D... d) {
     if constexpr (S == FuseMode::seq)
-        return cs::fuse_components(std::move(name), std::move(c), cs::segment<cs::range_mode::whole>(std::move(d)...));
+        return cs::fuse_components(std::move(name), std::move(c), cs::segment<cs::range_mode::own>(std::move(d)...));
     else
         return cs::fuse_components(std::move(name), std::move(c), std::move(d)...);
 }

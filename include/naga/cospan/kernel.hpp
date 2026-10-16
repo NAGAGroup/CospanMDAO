@@ -4,21 +4,31 @@
 // naga/cospan/kernel.hpp — kernel machinery (design review, sections 4 and 11.6)
 // =============================================================================
 //
-// The KernelBody contract (concepts read off the call operator's signature), GroupItem, the Local layout, the
-// per-component argument struct (StageArgs) and the per-stage geometry entry (StageGeometry), the STAGE FUNCTION
-// stage_fn<KB> (one per body type), the placeholder run_stages the JIT replaces, and the group launch helper.
+// The KernelBody contract (concepts read off the call operator's signature), GroupItem, LocalMem, the per-component
+// argument struct (StageArgs) and the per-stage geometry entry (StageGeometry), the STAGE FUNCTION stage_fn<KB> (one per
+// body type), the two placeholders the JIT replaces (run_stages for group-range stages, run_index_stages for index-range
+// stages) and the two launch helpers (launch_group, launch_range).
 // All header-only: placeholders, outer kernels and stage functions instantiate in the consumer's translation unit.
 //
-// THE LAUNCH PATH (every plain-body and group-body component, bare or in a fused group; custom-op and host bodies keep
+// TWO KINDS OF KERNEL BODY. An INDEX-RANGE body takes a sycl::id<R> and runs once per index of its range. A GROUP-RANGE
+// body takes a GroupItem<R> and runs once per work-item of its range, which is a whole number of work-groups (a multiple of
+// the work-group shape in every dimension; the stage's group range is range / shape); it may take a LocalMem as its fourth
+// parameter.
+//
+// THE LAUNCH PATH (every index-range and group-range component, bare or in a fused group; custom-op and host bodies keep
 // their own). ONE generic rank-3 kernel calls the declared dynamic function
-//     run_stages(StageItem, const StageGeometry* geometry, const void* const* args, int stage)
+//     run_stages(StageItem, const StageGeometry* geometry, const void* const* args, int stage)         (group-range)
+//     run_index_stages(IndexStageItem, const StageGeometry* geometry, const void* const* args, int stage)  (index-range)
 // whose definition is an INDEXED CALL SEQUENCE of stage functions: stage k of the sequence is called with the same
 // arguments and `stage` = k (fork: define_as_indexed_call_sequence(&run_stages, {ids...}, 3)). A stage function reads
 // geometry[k] and args[k] (its own StageArgs, a one-element device array every component keeps), builds the item
-// wrapper (GroupItem) and calls the user's body. The configuration of a sequence lives in a process-wide cache
-// (group_config), created once per distinct sequence and never destroyed: the runtime reads a configuration on a worker
-// thread after the submission, and a transient group can be deleted before its kernel has even been compiled.
+// wrapper (GroupItem for a group-range stage) and calls the user's body. A group-range launch is an nd_range<3> of
+// work-groups; an index-range launch is a range<3> of single indices (a launch unit of one index). The configuration of a
+// sequence lives in a process-wide cache (group_config), created once per distinct sequence and never destroyed: the
+// runtime reads a configuration on a worker thread after the submission, and a transient group can be deleted before its
+// kernel has even been compiled.
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -29,6 +39,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -67,15 +78,15 @@ struct Host {};
 // Segment options: cs::segment<cs::local_mem::shared, cs::range_mode::whole>(descs...)
 // -----------------------------------------------------------------------------
 
-/// Local memory of a segment. partitioned (the default): every stage gets its own slice, the segment's size is the sum.
-/// shared: every stage gets the same block, the size is the max.
+/// Local memory of a segment (group-range stages only). partitioned (the default): every stage gets its own slice, the
+/// segment's size is the sum. shared: every stage gets the same block, the size is the max.
 namespace local_mem {
 struct partitioned {};
 struct shared {};
 }  // namespace local_mem
 
-/// Range of a segment. own (the default): a stage runs only for its first N groups of the segment's block and skips the
-/// rest. whole: every stage runs for every group of the block.
+/// Range of a segment. own (the default): a stage runs only for its first N units (work-groups, or indices for an
+/// index-range stage) of the segment's block and skips the rest. whole: every stage runs for every unit of the block.
 namespace range_mode {
 struct own {};
 struct whole {};
@@ -165,14 +176,22 @@ sycl::range<3> lift_range(const sycl::range<R>& v) {
         return v;
 }
 
-/// The native item of a stage function: the physical (rank-3) nd_item, the launch's local block (the one thing a stage
-/// function cannot obtain by itself), and where the work-group sits LOGICALLY: its segment and its group coordinate in that
-/// segment's range (rank 3, the stage's rank-R id is the trailing part).
+/// The native item of a group-range stage function: the physical (rank-3) nd_item, the launch's local block (the one thing a
+/// stage function cannot obtain by itself), and where the work-group sits LOGICALLY: its segment and its group coordinate in
+/// that segment's range (rank 3, the stage's rank-R id is the trailing part).
 struct StageItem {
     sycl::nd_item<3> item;
     std::byte*       local;
     std::uint32_t    segment;
     sycl::id<3>      coord;
+};
+
+/// The native item of an index-range stage function: where the work-item sits LOGICALLY, its segment and its index in that
+/// segment's range (rank 3, the stage's rank-R id is the trailing part). An index-range launch has no work-group, no nd_item
+/// and no local memory.
+struct IndexStageItem {
+    std::uint32_t segment;
+    sycl::id<3>   coord;
 };
 
 // ---- ticket state ---------------------------------------------------------------------------------------------
@@ -239,14 +258,15 @@ inline LogicalGroup locate_linear(const SegmentInfo* tbl, std::size_t segments, 
     return r;
 }
 
-/// The hardware-direct mapping (no ticket): flatten_and_split reads the group number along the last dimension; pad_and_split
-/// finds the segment by its offset along the last dimension; padded takes the segment from dimension 0. A group outside its
-/// segment's range (padding) is not valid.
-inline LogicalGroup locate_physical(const StageGeometry& g0, const SegmentInfo* tbl, const sycl::nd_item<3>& it) {
+/// The hardware-direct mapping (no ticket): flatten_and_split reads the unit number along the last dimension; pad_and_split
+/// finds the segment by its offset along the last dimension; padded takes the segment from dimension 0. A unit outside its
+/// segment's range (padding) is not valid. `phys` is the unit's physical id: a work-group's id in a group-range launch, an
+/// item's id in an index-range launch (whose unit is one index).
+inline LogicalGroup locate_physical(const StageGeometry& g0, const SegmentInfo* tbl, const sycl::id<3>& phys) {
     const std::size_t S = g0.segments;
-    if (g0.split == static_cast<std::uint32_t>(Split::flatten)) return locate_linear(tbl, S, it.get_group(2), g0.total_groups);
+    const std::uint64_t d0 = phys[0], d1 = phys[1], d2 = phys[2];
+    if (g0.split == static_cast<std::uint32_t>(Split::flatten)) return locate_linear(tbl, S, d2, g0.total_groups);
     LogicalGroup r;
-    const std::uint64_t d0 = it.get_group(0), d1 = it.get_group(1), d2 = it.get_group(2);
     if (g0.split == static_cast<std::uint32_t>(Split::pad)) {
         for (std::size_t s = 0; s < S; ++s) {
             if (d2 >= tbl[s].offset && d2 < tbl[s].offset + tbl[s].range[2]) {
@@ -268,11 +288,19 @@ inline LogicalGroup locate_physical(const StageGeometry& g0, const SegmentInfo* 
     return r;
 }
 
+/// The same for a work-group of a group-range launch: its physical group id.
+inline LogicalGroup locate_physical(const StageGeometry& g0, const SegmentInfo* tbl, const sycl::nd_item<3>& it) {
+    return locate_physical(g0, tbl, sycl::id<3>{it.get_group(0), it.get_group(1), it.get_group(2)});
+}
+
 struct ItemFixup;
 }  // namespace detail
 
 template <int R>
 struct GroupItem;
+
+template <class... Arrays>
+struct LocalMem;
 
 /// The sub-group of the physical work-group: the SYCL type itself (it has no group coordinate to translate).
 using sub_group = sycl::sub_group;
@@ -379,19 +407,6 @@ struct GroupItem {
         return detail::tail_range<R>(sycl::range<3>{table_[s].range[0], table_[s].range[1], table_[s].range[2]});
     }
 
-    /// `n` elements of T from this stage's slice of the launch's local memory (a typed bump allocator: each call hands out
-    /// the next aligned bytes, after the stage's Scratch). nullptr when the slice, as the stage requested it in its launch
-    /// config (request_local_bytes), is exhausted. In a `shared` segment every stage's slice is the same block, so stages
-    /// that allocate the same way see the same memory.
-    template <class T>
-    T* local(std::size_t n) {
-        const std::size_t off = (used_ + alignof(T) - 1) / alignof(T) * alignof(T);
-        const std::size_t end = off + n * sizeof(T);
-        if (end > cap_) return nullptr;
-        used_ = static_cast<std::uint32_t>(end);
-        return reinterpret_cast<T*>(base_ + off);
-    }
-
     /// COLLECTIVE (every work-item of the group calls it): wait until group `g` (its rank-R group id in segment `s`) has
     /// finished all its stages. Needs a group with the cs::group_waits_enabled property or a cs::global_barrier(), and `s`
     /// EARLIER than this stage's segment; with no wait state the pointer is null and the behavior is undefined (no checks, as
@@ -413,10 +428,9 @@ struct GroupItem {
 
 private:
     GroupItem(const sycl::nd_item<3>& it, const sycl::id<R>& gid, const sycl::range<R>& grange, std::uint32_t segment,
-              std::uint32_t segments, const detail::SegmentInfo* table, std::uint32_t* ticket_state, std::byte* base,
-              std::uint32_t used, std::uint32_t cap)
+              std::uint32_t segments, const detail::SegmentInfo* table, std::uint32_t* ticket_state, std::byte* base)
         : it_{it}, group_id_{gid}, group_range_{grange}, segment_{segment}, segments_{segments}, table_{table},
-          ticket_state_{ticket_state}, base_{base}, used_{used}, cap_{cap} {}
+          ticket_state_{ticket_state}, base_{base} {}
 
     sycl::nd_item<3>           it_;
     sycl::id<R>                group_id_;     // within the segment
@@ -425,11 +439,137 @@ private:
     std::uint32_t              segments_;
     const detail::SegmentInfo* table_;        // the segment table
     std::uint32_t*             ticket_state_; // null: not in ticket mode
-    std::byte*                 base_;         // this stage's slice of the local block
-    std::uint32_t              used_;
-    std::uint32_t              cap_;
+    std::byte*                 base_;         // this stage's slice of the launch's local block
     friend struct detail::ItemFixup;
+    template <class... Arrays>
+    friend struct LocalMem;
 };
+
+// -----------------------------------------------------------------------------
+// LocalMem: a group-range stage's local memory
+// -----------------------------------------------------------------------------
+
+namespace detail {
+
+template <class T>
+struct is_local_array : std::false_type {};
+template <DType DT, int R>
+struct is_local_array<LocalArray<DT, R>> : std::true_type {};
+
+constexpr std::size_t align_up(std::size_t v, std::size_t a) { return (v + a - 1) / a * a; }
+
+/// The aggregate of views that LocalMem::get returns, one member per array (v0, v1, ...), so that
+/// `auto [a, b] = lm.get(it);` works. One to six arrays.
+template <class... Vs>
+struct LocalViews;
+template <class A>
+struct LocalViews<A> {
+    A v0;
+};
+template <class A, class B>
+struct LocalViews<A, B> {
+    A v0;
+    B v1;
+};
+template <class A, class B, class C>
+struct LocalViews<A, B, C> {
+    A v0;
+    B v1;
+    C v2;
+};
+template <class A, class B, class C, class D>
+struct LocalViews<A, B, C, D> {
+    A v0;
+    B v1;
+    C v2;
+    D v3;
+};
+template <class A, class B, class C, class D, class E>
+struct LocalViews<A, B, C, D, E> {
+    A v0;
+    B v1;
+    C v2;
+    D v3;
+    E v4;
+};
+template <class A, class B, class C, class D, class E, class F>
+struct LocalViews<A, B, C, D, E, F> {
+    A v0;
+    B v1;
+    C v2;
+    D v3;
+    E v4;
+    F v5;
+};
+
+}  // namespace detail
+
+/// The local memory of a group-range stage, declared by the arrays' dtypes and ranks and carrying their shapes (one
+/// sycl::range per array, given by cs::local_desc in define_forward). It is the fourth parameter of compute_forward:
+///     static void compute_forward(cs::GroupItem<1> it, const Inputs&, const Outputs&,
+///                                 cs::LocalMem<cs::LocalArray<cs::DType::f32, 1>, cs::LocalArray<cs::DType::i32, 2>> lm) {
+///         auto [a, b] = lm.get(it);
+///     }
+/// The arrays sit one after the other in declaration order in the stage's slice of the launch's local block; each starts at
+/// a multiple of the alignment of its element type, and the slice is exactly as large as the arrays need. Trivially copyable.
+template <class... Arrays>
+struct LocalMem {
+    static_assert(sizeof...(Arrays) >= 1 && sizeof...(Arrays) <= 6, "cospan: a LocalMem holds one to six arrays");
+    static_assert((detail::is_local_array<Arrays>::value && ...), "cospan: a LocalMem holds cs::LocalArray types");
+    static_assert(std::max({alignof(typename Arrays::value_type)...}) <= 16, "cospan: a LocalArray element is at most 16-byte aligned");
+
+    static constexpr std::size_t count = sizeof...(Arrays);
+
+    /// The declaration of array `I`.
+    template <std::size_t I>
+    using array_t = std::tuple_element_t<I, std::tuple<Arrays...>>;
+
+    /// Every array empty.
+    LocalMem() : LocalMem(detail::filled_range<Arrays::rank>(0)...) {}
+    /// One shape per array, in declaration order.
+    explicit LocalMem(sycl::range<Arrays::rank>... shapes) : shapes_{detail::lift_range<Arrays::rank>(shapes)...} {}
+
+    /// The shape of array `I`.
+    template <std::size_t I>
+    sycl::range<array_t<I>::rank> shape() const {
+        return detail::tail_range<array_t<I>::rank>(shapes_[I]);
+    }
+
+    /// The bytes of the stage's slice: the arrays' offsets rounded up to their element alignment, plus their sizes.
+    std::size_t bytes() const {
+        std::size_t cur = 0;
+        [&]<std::size_t... I>(std::index_sequence<I...>) {
+            ((cur = detail::align_up(cur, alignof(typename array_t<I>::value_type)) +
+                    detail::range_size<array_t<I>::rank>(shape<I>()) * sizeof(typename array_t<I>::value_type)),
+             ...);
+        }(std::make_index_sequence<count>{});
+        return cur;
+    }
+
+    /// The strictest alignment of the arrays' element types.
+    static constexpr std::size_t alignment() { return std::max({alignof(typename Arrays::value_type)...}); }
+
+    /// COLLECTIVE-FREE, per work-item: the views of the arrays in this stage's slice of the launch's local block, as an
+    /// aggregate of typed views (LocalView) in declaration order. The offsets are recomputed from the carried shapes.
+    template <int R>
+    auto get(const GroupItem<R>& it) const {
+        std::byte* const base = it.base_;
+        return [&]<std::size_t... I>(std::index_sequence<I...>) {
+            std::array<std::size_t, count> off{};
+            std::size_t                    cur = 0;
+            ((cur = detail::align_up(cur, alignof(typename array_t<I>::value_type)), off[I] = cur,
+              cur += detail::range_size<array_t<I>::rank>(shape<I>()) * sizeof(typename array_t<I>::value_type)),
+             ...);
+            return detail::LocalViews<typename array_t<I>::view_type...>{typename array_t<I>::view_type{
+                reinterpret_cast<typename array_t<I>::value_type*>(base + off[I]), shape<I>()}...};
+        }(std::make_index_sequence<count>{});
+    }
+
+private:
+    std::array<sycl::range<3>, count> shapes_;
+};
+
+static_assert(std::is_trivially_copyable_v<LocalMem<LocalArray<DType::f32, 1>>>);
 
 // -----------------------------------------------------------------------------
 // The SYCL 2020 group functions over Group<R>
@@ -560,10 +700,11 @@ T select_from_group(sub_group g, T x, sub_group::id_type remote_local_id) {
 /// What a group launcher reads off a kernel description.
 struct KernelParts {
     int                           rank        = 0;
-    bool                          group_body  = false;
-    std::size_t                   flat_extent = 0;  ///< the stage's iteration space (0: nothing to run)
-    std::size_t                   local_bytes = 0;  ///< the stage's slice: its Scratch plus the bytes it requested, each rounded to 16
-    std::optional<sycl::range<3>> wg;               ///< the work-group shape the stage asked for, if any
+    bool                          group_range = false;  ///< a group-range stage (else index-range)
+    std::size_t                   flat_extent = 0;      ///< the stage's iteration space (0: nothing to run)
+    std::size_t                   local_bytes = 0;      ///< the stage's slice: exactly what its LocalMem arrays need
+    std::size_t                   local_align = 1;      ///< the strictest alignment among its LocalMem arrays
+    std::optional<sycl::range<3>> wg;                   ///< the work-group shape of a group-range stage (set for every one)
 };
 
 // -----------------------------------------------------------------------------
@@ -607,7 +748,7 @@ template <class KB>
     requires requires { &KB::operator(); }
 struct body_traits<KB> : call_traits<decltype(&KB::operator())> {};
 
-/// kind: 0 plain (id<R>), 1 group (GroupItem<R>), 2 custom op, 3 host.
+/// kind: 0 index-range (id<R>), 1 group-range (GroupItem<R>), 2 custom op, 3 host.
 template <class T>
 struct first_traits {
     static constexpr int kind = -1;
@@ -649,22 +790,32 @@ constexpr bool io_args_match() {
 
 }  // namespace detail
 
-template <class KB>
-concept PlainBody = detail::HasIO<KB> && detail::body_traits<KB>::valid &&
-                    detail::first_traits<typename detail::body_traits<KB>::a0>::kind == 0 &&
-                    detail::body_traits<KB>::nargs == 3 && detail::io_args_match<KB>();
+namespace detail {
+template <class T>
+struct is_local_mem : std::false_type {};
+template <class... As>
+struct is_local_mem<::naga::cospan::LocalMem<As...>> : std::true_type {};
+}  // namespace detail
 
+/// An index-range body: `void operator()(sycl::id<R>, Inputs, Outputs) const`.
 template <class KB>
-concept GroupBody = detail::HasIO<KB> && detail::body_traits<KB>::valid &&
-                    detail::first_traits<typename detail::body_traits<KB>::a0>::kind == 1 &&
-                    (detail::body_traits<KB>::nargs == 3 || detail::body_traits<KB>::nargs == 4) &&
-                    detail::io_args_match<KB>();
+concept IndexRangeBody = detail::HasIO<KB> && detail::body_traits<KB>::valid &&
+                         detail::first_traits<typename detail::body_traits<KB>::a0>::kind == 0 &&
+                         detail::body_traits<KB>::nargs == 3 && detail::io_args_match<KB>();
 
+/// A group-range body: `void operator()(GroupItem<R>, Inputs, Outputs[, LocalMem<...>]) const`.
 template <class KB>
-concept HasScratch = GroupBody<KB> && detail::body_traits<KB>::nargs == 4 &&
-                     requires { typename KB::Scratch; } &&
-                     std::is_same_v<std::remove_cvref_t<typename detail::body_traits<KB>::a3>,
-                                    typename KB::Scratch>;
+concept GroupRangeBody =
+    detail::HasIO<KB> && detail::body_traits<KB>::valid &&
+    detail::first_traits<typename detail::body_traits<KB>::a0>::kind == 1 &&
+    (detail::body_traits<KB>::nargs == 3 ||
+     (detail::body_traits<KB>::nargs == 4 &&
+      detail::is_local_mem<std::remove_cvref_t<typename detail::body_traits<KB>::a3>>::value)) &&
+    detail::io_args_match<KB>();
+
+/// A group-range body with a trailing LocalMem parameter.
+template <class KB>
+concept HasLocalMem = GroupRangeBody<KB> && detail::body_traits<KB>::nargs == 4;
 
 template <class KB>
 concept CustomOpBody = detail::HasIO<KB> && detail::body_traits<KB>::valid &&
@@ -676,22 +827,12 @@ concept HostBody = detail::HasIO<KB> && detail::body_traits<KB>::valid &&
                    detail::first_traits<typename detail::body_traits<KB>::a0>::kind == 3 &&
                    detail::body_traits<KB>::nargs == 3 && detail::io_args_match<KB>();
 
-namespace detail {
-template <class KB>
-constexpr bool scratch_trivial() {
-    if constexpr (HasScratch<KB>)
-        return std::is_trivially_copyable_v<typename KB::Scratch>;
-    else
-        return true;
-}
-}  // namespace detail
-
 template <class KB>
 concept KernelBodyC =
     std::is_trivially_copyable_v<KB> && detail::HasIO<KB> &&
     std::is_trivially_copyable_v<typename KB::Inputs> &&
-    std::is_trivially_copyable_v<typename KB::Outputs> && detail::scratch_trivial<KB>() &&
-    (int(PlainBody<KB>) + int(GroupBody<KB>) + int(CustomOpBody<KB>) + int(HostBody<KB>) == 1);
+    std::is_trivially_copyable_v<typename KB::Outputs> &&
+    (int(IndexRangeBody<KB>) + int(GroupRangeBody<KB>) + int(CustomOpBody<KB>) + int(HostBody<KB>) == 1);
 
 /// The kernel rank, from the signature; 0 for custom-op and host bodies.
 template <class KB>
@@ -702,99 +843,10 @@ template <class KB>
 inline constexpr int launch_rank_v = kernel_rank_v<KB> > 0 ? kernel_rank_v<KB> : 1;
 
 // -----------------------------------------------------------------------------
-// Local layout (r02 section 4.1)
+// StageArgs: the argument struct of a component (body, inputs, outputs, local memory, launch parameters)
 // -----------------------------------------------------------------------------
 
 namespace detail {
-
-template <class T>
-struct is_local : std::false_type {};
-template <DType DT, int R>
-struct is_local<Local<DT, R>> : std::true_type {};
-
-struct AnyRef {
-    template <class T>
-    operator T&() const;
-};
-
-template <class S, std::size_t... I>
-constexpr bool init_with_n(std::index_sequence<I...>) {
-    return requires { S{((void)I, AnyRef{})...}; };
-}
-
-/// The number of members of an aggregate (at most 8).
-template <class S>
-constexpr std::size_t field_count() {
-    std::size_t best = 0;
-    [&]<std::size_t... N>(std::index_sequence<N...>) {
-        ((init_with_n<S>(std::make_index_sequence<N>{}) ? (best = N, 0) : 0), ...);
-    }(std::make_index_sequence<9>{});
-    return best;
-}
-
-template <class S, class F>
-constexpr void for_each_member(S& s, F&& f) {
-    constexpr std::size_t N = field_count<S>();
-    static_assert(N <= 6, "cospan: a Scratch holds at most 6 Local members");
-    if constexpr (N == 1) {
-        auto& [a] = s;
-        f(a);
-    } else if constexpr (N == 2) {
-        auto& [a, b] = s;
-        f(a); f(b);
-    } else if constexpr (N == 3) {
-        auto& [a, b, c] = s;
-        f(a); f(b); f(c);
-    } else if constexpr (N == 4) {
-        auto& [a, b, c, d] = s;
-        f(a); f(b); f(c); f(d);
-    } else if constexpr (N == 5) {
-        auto& [a, b, c, d, e] = s;
-        f(a); f(b); f(c); f(d); f(e);
-    } else if constexpr (N == 6) {
-        auto& [a, b, c, d, e, g] = s;
-        f(a); f(b); f(c); f(d); f(e); f(g);
-    }
-}
-
-/// The sole writer of Local's offset and pointer (friendship).
-struct ScratchLayout {
-    /// Host: lay every Local of `s` out (aligned, summed); returns the total
-    /// bytes, rounded up to 16.
-    template <class S>
-    static uint32_t layout(S& s) {
-        std::size_t cur = 0;
-        for_each_member(s, [&](auto& l) {
-            using L = std::remove_cvref_t<decltype(l)>;
-            static_assert(is_local<L>::value, "cospan: a Scratch may hold only Local members");
-            using V = typename L::value_type;
-            cur     = (cur + alignof(V) - 1) / alignof(V) * alignof(V);
-            l.offset_ = cur;
-            cur += l.size() * sizeof(V);
-        });
-        return static_cast<uint32_t>((cur + 15) / 16 * 16);
-    }
-
-    /// Device: Local.ptr_ = local_base + offset_.
-    template <class S>
-    static void fixup(S& s, std::byte* local_base) {
-        for_each_member(s, [&](auto& l) {
-            using L = std::remove_cvref_t<decltype(l)>;
-            using V = typename L::value_type;
-            l.ptr_  = reinterpret_cast<V*>(local_base + l.offset_);
-        });
-    }
-};
-
-template <class S>
-uint32_t layout_scratch(S& s) {
-    return ScratchLayout::layout(s);
-}
-
-template <class S>
-void fixup_scratch(S& s, std::byte* local_base) {
-    ScratchLayout::fixup(s, local_base);
-}
 
 /// A rank-R range in the TRAILING dimensions of a rank-3 range (leading 1s).
 template <int R>
@@ -802,82 +854,78 @@ sycl::range<3> pad3(const sycl::range<R>& r) {
     return lift_range<R>(r);
 }
 
-// -----------------------------------------------------------------------------
-// StageArgs: the argument struct of a component (body, inputs, outputs, scratch, launch parameters)
-// -----------------------------------------------------------------------------
-
-struct NoScratch {};
+/// The LocalMem value of a body that has none.
+struct NoLocalMem {};
 
 template <class KB>
-struct scratch_of {
-    using type = NoScratch;
+struct local_mem_of {
+    using type = NoLocalMem;
 };
 template <class KB>
-    requires HasScratch<KB>
-struct scratch_of<KB> {
-    using type = typename KB::Scratch;
+    requires HasLocalMem<KB>
+struct local_mem_of<KB> {
+    using type = std::remove_cvref_t<typename body_traits<KB>::a3>;
 };
 template <class KB>
-using scratch_t = typename scratch_of<KB>::type;
-
-/// The Scratch argument of a body that has none.
-template <class KB>
-scratch_t<KB> NoScratchValue() {
-    return scratch_t<KB>{};
-}
+using local_mem_t = typename local_mem_of<KB>::type;
 
 /// Everything a stage function reads of its component: trivially copyable, one element in a device array the component
-/// keeps, copied in from a host member every forward. `group_range` (the stage's own group range, rank 3, leading 1s) is set
-/// by the group launcher once the group's work-group shape is known; 0 in every dimension: the stage is empty.
+/// keeps, copied in from a host member every forward. `units` is the stage's own range in launch units (rank 3, leading 1s):
+/// work-groups for a group-range stage, indices for an index-range stage; 0 in every dimension: the stage is empty.
 template <class KB>
 struct StageArgs {
-    StageArgs(typename KB::Inputs i, typename KB::Outputs o, KB b, scratch_t<KB> s) : in{i}, out{o}, body{b}, scratch{s} {}
+    StageArgs(typename KB::Inputs i, typename KB::Outputs o, KB b, local_mem_t<KB> l) : in{i}, out{o}, body{b}, local{l} {}
 
-    sycl::range<3> range{1, 1, 1};        ///< the logical iteration space, in the trailing dimensions
-    sycl::range<3> group_range{1, 1, 1};  ///< the stage's own group range
-    std::uint64_t  flat_extent   = 0;     ///< the product of range
-    std::uint32_t  scratch_bytes = 0;     ///< the laid-out Scratch, rounded to 16
+    sycl::range<3> range{1, 1, 1};  ///< the logical iteration space, in the trailing dimensions
+    sycl::range<3> units{1, 1, 1};  ///< the stage's own range in launch units
+    std::uint64_t  flat_extent = 0; ///< the product of range
     typename KB::Inputs  in;
     typename KB::Outputs out;
     KB                   body;
-    scratch_t<KB>        scratch;
+    local_mem_t<KB>      local;
 };
+
+/// The item a stage function receives: the group-range item (nd_item, local block, segment, group) or the index-range item
+/// (segment, index).
+template <class KB>
+using stage_item_t = std::conditional_t<IndexRangeBody<KB>, IndexStageItem, StageItem>;
 
 /// The stage-local view of the physical item: the logical group coordinate comes with the StageItem.
 struct ItemFixup {
     template <int R>
-    static GroupItem<R> make(const StageItem& si, const StageGeometry& g, const SegmentInfo* tbl, const sycl::range<3>& own,
-                             std::uint32_t free_off) {
+    static GroupItem<R> make(const StageItem& si, const StageGeometry& g, const SegmentInfo* tbl, const sycl::range<3>& own) {
         sycl::range<3> gr = own;
         if (g.range_mode == static_cast<std::uint32_t>(RangeMode::whole))
             gr = sycl::range<3>{tbl[g.segment].range[0], tbl[g.segment].range[1], tbl[g.segment].range[2]};
         return GroupItem<R>{si.item, tail_id<R>(si.coord), tail_range<R>(gr), g.segment, g.segments, tbl,
-                            static_cast<std::uint32_t*>(g.ticket_state), si.local + g.local_offset, free_off, g.local_bytes};
+                            static_cast<std::uint32_t*>(g.ticket_state), si.local + g.local_offset};
     }
 };
 
 }  // namespace detail
 
 // -----------------------------------------------------------------------------
-// The placeholder, the stage function and the launch (design review, 11.6)
+// The placeholders, the stage function and the launches
 // -----------------------------------------------------------------------------
 
-/// The placeholder: ONE for every launch (the launch is rank 3); a declaration only, the JIT replaces it with the indexed call
-/// sequence.
+/// The placeholders: ONE per kind of launch (the launch is rank 3); declarations only, the JIT replaces each with the indexed
+/// call sequence of its stages.
 [[clang::noinline]] SYCL_EXTERNAL void run_stages(detail::StageItem, const detail::StageGeometry*, const void* const*, int);
+[[clang::noinline]] SYCL_EXTERNAL void run_index_stages(detail::IndexStageItem, const detail::StageGeometry*, const void* const*, int);
 
-/// ONE stage function per KernelBody type, at the physical rank 3. Every instantiation has the same signature: (the native
-/// item, the geometry array, the argument-pointer array, the stage index). All the conditions below are group-uniform.
+/// ONE stage function per KernelBody type, at the physical rank 3. Every instantiation of a kind has the same signature: (the
+/// native item, the geometry array, the argument-pointer array, the stage index). All the conditions below are
+/// group-uniform (index-range stages: uniform per index).
 template <class KB>
-SYCL_EXTERNAL void stage_fn(detail::StageItem si, const detail::StageGeometry* geometry, const void* const* args, int k) {
+SYCL_EXTERNAL void stage_fn(detail::stage_item_t<KB> si, const detail::StageGeometry* geometry, const void* const* args, int k) {
     constexpr int R = kernel_rank_v<KB>;
     const detail::StageGeometry& g = geometry[k];
     const auto&                  a = *static_cast<const detail::StageArgs<KB>*>(args[k]);
 
-    // This stage's groups: those of its segment; an empty stage runs nothing; range_mode::own also stops at the stage's own
+    // This stage's units: those of its segment; an empty stage runs nothing; range_mode::own also stops at the stage's own
     // range in ANY dimension.
     if (si.segment != g.segment) return;
-    const sycl::range<3>& mine = a.group_range;
+    const sycl::range<3>& mine = a.units;
     if (mine[0] * mine[1] * mine[2] == 0) return;
     if (g.range_mode == static_cast<std::uint32_t>(detail::RangeMode::own))
         for (int d = 0; d < 3; ++d)
@@ -887,23 +935,16 @@ SYCL_EXTERNAL void stage_fn(detail::StageItem si, const detail::StageGeometry* g
     auto out  = a.out;
     auto body = a.body;
 
-    if constexpr (PlainBody<KB>) {
-        // The stage's global index per dimension; the tail mask is here, the body sees only its range.
-        sycl::id<3> gid;
-        for (int d = 0; d < 3; ++d) {
-            gid[d] = si.coord[d] * si.item.get_local_range(d) + si.item.get_local_id(d);
-            if (gid[d] >= a.range[d]) return;
-        }
-        body(detail::tail_id<R>(gid), in, out);
-    } else if constexpr (HasScratch<KB>) {
+    if constexpr (IndexRangeBody<KB>) {
+        body(detail::tail_id<R>(si.coord), in, out);
+    } else if constexpr (HasLocalMem<KB>) {
         const detail::SegmentInfo* tbl = detail::segment_table(geometry);
-        GroupItem<R>               gi  = detail::ItemFixup::make<R>(si, g, tbl, mine, a.scratch_bytes);
-        auto                       s   = a.scratch;
-        detail::fixup_scratch(s, si.local + g.local_offset);  // this stage's own slice of the local block
-        body(gi, in, out, s);
+        GroupItem<R>               gi  = detail::ItemFixup::make<R>(si, g, tbl, mine);
+        auto                       lm  = a.local;
+        body(gi, in, out, lm);
     } else {
         const detail::SegmentInfo* tbl = detail::segment_table(geometry);
-        GroupItem<R>               gi  = detail::ItemFixup::make<R>(si, g, tbl, mine, a.scratch_bytes);
+        GroupItem<R>               gi  = detail::ItemFixup::make<R>(si, g, tbl, mine);
         body(gi, in, out);
     }
 }
@@ -912,27 +953,36 @@ namespace detail {
 
 using JitId = sycl::AdaptiveCpp_jit::dynamic_function_id;
 
-/// The signature of the placeholder and of every stage function, as the type-erased id types need it.
-using run_stages_fn_t = sycl::AdaptiveCpp_jit::dynamic_function<void, StageItem, const StageGeometry*, const void* const*, int>;
-using stage_def_t     = sycl::AdaptiveCpp_jit::dynamic_function_definition<void, StageItem, const StageGeometry*, const void* const*, int>;
+/// The signatures of the placeholders and of the stage functions, as the type-erased id types need them.
+using run_stages_fn_t       = sycl::AdaptiveCpp_jit::dynamic_function<void, StageItem, const StageGeometry*, const void* const*, int>;
+using stage_def_t           = sycl::AdaptiveCpp_jit::dynamic_function_definition<void, StageItem, const StageGeometry*, const void* const*, int>;
+using run_index_stages_fn_t = sycl::AdaptiveCpp_jit::dynamic_function<void, IndexStageItem, const StageGeometry*, const void* const*, int>;
+using index_stage_def_t     = sycl::AdaptiveCpp_jit::dynamic_function_definition<void, IndexStageItem, const StageGeometry*, const void* const*, int>;
 
 /// The id of stage_fn<KB>: what a group puts in its call sequence. Obtained once per body type, through a function-local
 /// static; the component reaches it through a virtual.
 template <class KB>
 JitId stage_definition_id() {
-    static const JitId id = stage_def_t{&stage_fn<KB>}.id();
-    return id;
+    if constexpr (IndexRangeBody<KB>) {
+        static const JitId id = index_stage_def_t{&stage_fn<KB>}.id();
+        return id;
+    } else {
+        static const JitId id = stage_def_t{&stage_fn<KB>}.id();
+        return id;
+    }
 }
 
-/// The id of the placeholder.
+/// The ids of the placeholders.
 inline JitId run_stages_id() { return run_stages_fn_t{&run_stages}.id(); }
+inline JitId run_index_stages_id() { return run_index_stages_fn_t{&run_index_stages}.id(); }
 
 /// The dynamic_function_config of a stage sequence: ONE per distinct sequence of stage definitions, created the first time
 /// and NEVER destroyed. A config must outlive every kernel that uses it (the runtime reads it on a worker thread after the
 /// submission, possibly before the kernel has been compiled), and a transient group that used it can be deleted at any
 /// moment, so the cache is process-wide and leaked on purpose. The key is the definitions' symbol names (an id's handle is
-/// its name).
-inline sycl::AdaptiveCpp_jit::dynamic_function_config& group_config(const std::vector<JitId>& defs) {
+/// its name); `placeholder` is the id of the placeholder the sequence replaces (run_stages_id() or run_index_stages_id(); the
+/// definitions of one kind never share a name with the other kind's).
+inline sycl::AdaptiveCpp_jit::dynamic_function_config& group_config(const std::vector<JitId>& defs, const JitId& placeholder) {
     using Config = sycl::AdaptiveCpp_jit::dynamic_function_config;
     struct Cache {
         std::mutex                                                  mu;
@@ -948,32 +998,28 @@ inline sycl::AdaptiveCpp_jit::dynamic_function_config& group_config(const std::v
     std::unique_ptr<Config>&          slot = cache->map[std::move(names)];
     if (!slot) {
         slot = std::make_unique<Config>();
-        slot->define_as_indexed_call_sequence(run_stages_id(), defs, /*index_param=*/3);
+        slot->define_as_indexed_call_sequence(placeholder, defs, /*index_param=*/3);
     }
     return *slot;
 }
 
-/// Default work-group shape per rank, in the trailing dimensions (implementation-tunable, r02 section 4.2).
-template <int R>
-sycl::range<3> default_wg() {
-    if constexpr (R == 1)
-        return sycl::range<3>{1, 1, 128};
-    else if constexpr (R == 2)
-        return sycl::range<3>{1, 8, 8};
-    else
-        return sycl::range<3>{4, 4, 4};
-}
+/// The element of a launch's local block: 16-byte aligned, so the block starts aligned for every element type a LocalMem holds.
+struct alignas(16) LocalBlock {
+    std::byte bytes[16];
+};
 
-/// Submit the ONE kernel of a group on the unordered queue `q` for `dev`: ordered ONLY by `deps` (section 3). The launch is
-/// always an nd_range<3>. `geometry` and `args` are device arrays the group owns; the kernel passes stage 0 as the index
-/// placeholder, the configuration replaces it by each stage's position. Returns its event.
+/// Submit the ONE kernel of a group-range group on the unordered queue `q` for `dev`: ordered ONLY by `deps` (section 3). The
+/// launch is an nd_range<3>. `geometry` and `args` are device arrays the group owns; the kernel passes stage 0 as the index
+/// placeholder, the configuration replaces it by each stage's position. `local_bytes` is the size of the local block. Returns
+/// its event.
 inline sycl::event launch_group(sk::unordered_queue& q, const sycl::device& dev, const std::vector<sycl::event>& deps,
                                 sycl::AdaptiveCpp_jit::dynamic_function_config& cfg, const sycl::nd_range<3>& nd,
                                 const StageGeometry* geometry, const void* const* args, std::size_t local_bytes) {
     auto cgf = [&](sycl::handler& h) {
-        sycl::local_accessor<std::byte, 1> local{sycl::range<1>{local_bytes ? local_bytes : 1}, h};
+        const std::size_t                  blocks = (local_bytes + sizeof(LocalBlock) - 1) / sizeof(LocalBlock);
+        sycl::local_accessor<LocalBlock, 1> local{sycl::range<1>{blocks ? blocks : 1}, h};
         h.parallel_for(nd, cfg.apply([=](sycl::nd_item<3> it) {
-            std::byte* lb = local.template get_multi_ptr<sycl::access::decorated::no>().get();
+            std::byte* lb = reinterpret_cast<std::byte*>(local.template get_multi_ptr<sycl::access::decorated::no>().get());
 
             // Ticket mode (the group has a boundary or the property): the work-group's leader takes the next ticket and
             // broadcasts it; the ticket, not the hardware id, says which segment and group of the segment this work-group is
@@ -1015,6 +1061,26 @@ inline sycl::event launch_group(sk::unordered_queue& q, const sycl::device& dev,
                     done.fetch_add(1u, sycl::memory_order::release);
                 }
             }
+        }));
+    };
+    return q.submit(dev, deps, cgf);
+}
+
+/// Submit the ONE kernel of an index-range group on the unordered queue `q` for `dev`: ordered ONLY by `deps` (section 3). The
+/// launch is a range<3> of single indices (`phys`, laid out by the range_split strategy); there is no work-group, no local
+/// memory and no ticket state. Each item is located to its segment and index by locate_physical; an item outside every
+/// segment's range returns. `geometry` and `args` are device arrays the group owns. Returns its event.
+inline sycl::event launch_range(sk::unordered_queue& q, const sycl::device& dev, const std::vector<sycl::event>& deps,
+                                sycl::AdaptiveCpp_jit::dynamic_function_config& cfg, const sycl::range<3>& phys,
+                                const StageGeometry* geometry, const void* const* args) {
+    auto cgf = [&](sycl::handler& h) {
+        h.parallel_for(phys, cfg.apply([=](sycl::id<3> idx) {
+            const StageGeometry& g0  = geometry[0];
+            const SegmentInfo*   tbl = segment_table(geometry);
+            const LogicalGroup   lg  = locate_physical(g0, tbl, idx);
+            if (!lg.valid) return;
+            const IndexStageItem si{lg.segment, lg.coord};
+            run_index_stages(si, geometry, args, 0);
         }));
     };
     return q.submit(dev, deps, cgf);

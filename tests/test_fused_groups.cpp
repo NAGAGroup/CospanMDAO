@@ -88,7 +88,7 @@ public:
 private:
 };
 
-// ---- Plus1 (plain): y = x + 1, the output follows the input ----------------------------------------
+// ---- Plus1 (index-range): y = x + 1, the output follows the input ----------------------------------------
 
 class Plus1 : public cs::Component<Plus1> {
 public:
@@ -132,7 +132,11 @@ constexpr int kReadNext = 10 + Mode;
 template <int Base>
 constexpr int kOwn = 1000 + Base;
 
-/// A group stage over its input's shape, with work-group `wg` and `local_bytes` of requested local memory.
+/// The one-array local memory every GStage declares (a tile of kWg floats); a stage asks for it with `local`.
+using TileLocal = cs::LocalMem<cs::LocalArray<DType::f32, 1>>;
+
+/// A group-range stage over its input's shape (rounded up to whole work-groups), with work-group `wg` and, when `local` is
+/// set, a tile of kWg floats of local memory.
 template <int Kind>
 class GStage : public cs::Component<GStage<Kind>> {
 public:
@@ -142,7 +146,7 @@ public:
     struct Outputs {
         cs::Output<DType::f32, 1> y;
     };
-    static void compute_forward(cs::GroupItem<1> it, const Inputs& in, const Outputs& out) {
+    static void compute_forward(cs::GroupItem<1> it, const Inputs& in, const Outputs& out, TileLocal lm) {
         const std::size_t g = it.get_global_id(0);
         if constexpr (Kind == kTag) {
             if (g >= in.x.shape()[0]) return;
@@ -153,19 +157,19 @@ public:
         } else if constexpr (Kind == kRange) {
             if (g < in.x.shape()[0]) out.y[g] = static_cast<float>(it.get_group_range(0));
         } else if constexpr (Kind == kLeave) {
-            float* t = it.template local<float>(kWg);
-            if (t != nullptr) t[it.get_local_linear_id()] = static_cast<float>(it.get_local_linear_id() + 1);
+            auto [t] = lm.get(it);
+            t[it.get_local_linear_id()] = static_cast<float>(it.get_local_linear_id() + 1);
             if (g < in.x.shape()[0]) out.y[g] = in.x[g];
         } else if constexpr (Kind == kTake) {
-            float* t = it.template local<float>(kWg);
+            auto [t] = lm.get(it);
             cs::group_barrier(it.get_group());
-            if (g < in.x.shape()[0]) out.y[g] = t != nullptr ? t[kWg - 1 - it.get_local_linear_id()] : -1.0f;
+            if (g < in.x.shape()[0]) out.y[g] = t[kWg - 1 - it.get_local_linear_id()];
         } else if constexpr (Kind >= 1000) {
             constexpr int Base = Kind - 1000;
-            float*        t    = it.template local<float>(kWg);
-            if (t != nullptr) t[it.get_local_linear_id()] = static_cast<float>(Base + it.get_local_linear_id());
+            auto [t]           = lm.get(it);
+            t[it.get_local_linear_id()] = static_cast<float>(Base + it.get_local_linear_id());
             cs::group_barrier(it.get_group());
-            if (g < in.x.shape()[0]) out.y[g] = t != nullptr ? t[kWg - 1 - it.get_local_linear_id()] : -1.0f;
+            if (g < in.x.shape()[0]) out.y[g] = t[kWg - 1 - it.get_local_linear_id()];
         } else if constexpr (Kind == kWrite) {
             if (g < in.x.shape()[0]) out.y[g] = in.x[g] + 1.0f;
         } else {
@@ -181,23 +185,24 @@ public:
     Outputs outputs;
 
 private:
-    std::size_t wg_, local_bytes_;
+    std::size_t wg_;
+    bool        local_;
 
 public:
-    explicit GStage(std::size_t wg = kWg, std::size_t local_bytes = 0) : wg_{wg}, local_bytes_{local_bytes} {}
+    explicit GStage(std::size_t wg = kWg, bool local = false) : wg_{wg}, local_{local} {}
     void declare() override {
         this->declare_input(inputs.x, "x", cs::unspecified_shape<1>());
         this->declare_output(outputs.y, "y", cs::unspecified_shape<1>());
     }
     void prepare_forward() override { this->set_shape(outputs.y, this->shape_of(inputs.x)[0]); }
     std::unique_ptr<cs::LaunchDescription> define_forward() override {
-        auto d = this->create_launch_config(cs::range_desc(inputs.x.shape()), cs::wg_desc(sycl::range<1>{wg_}));
-        if (local_bytes_ != 0) d->request_local_bytes(local_bytes_);
-        return d;
+        const std::size_t n = (inputs.x.shape()[0] + wg_ - 1) / wg_ * wg_;
+        if (local_)
+            return this->create_launch_config(cs::range_desc(sycl::range<1>{n}), cs::wg_desc(sycl::range<1>{wg_}),
+                                              cs::local_desc(sycl::range<1>{kWg}));
+        return this->create_launch_config(cs::range_desc(sycl::range<1>{n}), cs::wg_desc(sycl::range<1>{wg_}));
     }
 };
-
-constexpr std::size_t kTile = kWg * sizeof(float);
 
 /// y[g] = the neighbor group's value + 1, over `forwards` forwards with new inputs every time (so a stale wait state or a
 /// missed wait shows). Kind: 1 = the group_waits_enabled property, no barrier; 2 = a global_barrier() before segment 2 (the
@@ -306,8 +311,8 @@ TEST_CASE("fused groups: shared local memory carries a stage's values to the nex
         s.add_subsystem(cs::subsystem_desc<tfg::Src>("src", 128));
         s.add_subsystem(cs::fuse_components(
             "f", cs::connects_desc({{"a.y", "b.x"}}),
-            cs::segment<cs::local_mem::shared>(cs::subsystem_desc<tfg::GStage<tfg::kLeave>>("a", tfg::kWg, tfg::kTile),
-                                               cs::subsystem_desc<tfg::GStage<tfg::kTake>>("b", tfg::kWg, tfg::kTile))));
+            cs::segment<cs::local_mem::shared>(cs::subsystem_desc<tfg::GStage<tfg::kLeave>>("a", tfg::kWg, true),
+                                               cs::subsystem_desc<tfg::GStage<tfg::kTake>>("b", tfg::kWg, true))));
         s.connect("src.y", "f.a.x");
     });
     model.setup();
@@ -324,8 +329,8 @@ TEST_CASE("fused groups: partitioned local memory gives each stage its own slice
     cs::Model model = tfg::make([](cs::System& s) {
         s.add_subsystem(cs::subsystem_desc<tfg::Src>("src", 128));
         s.add_subsystem(cs::fuse_components(
-            "f", cs::segment<cs::local_mem::partitioned>(cs::subsystem_desc<tfg::GStage<tfg::kOwn<1>>>("a", tfg::kWg, tfg::kTile),
-                                                         cs::subsystem_desc<tfg::GStage<tfg::kOwn<1000>>>("b", tfg::kWg, tfg::kTile))));
+            "f", cs::segment<cs::local_mem::partitioned>(cs::subsystem_desc<tfg::GStage<tfg::kOwn<1>>>("a", tfg::kWg, true),
+                                                         cs::subsystem_desc<tfg::GStage<tfg::kOwn<1000>>>("b", tfg::kWg, true))));
         s.connect("src.y", "f.a.x");
         s.connect("src.y", "f.b.x");
     });
@@ -494,13 +499,13 @@ TEST_CASE("fused groups: wait_earlier_segments gives the same result as a global
 namespace tfg {
 struct X {};  // a stand-in for a stage item in the placement traits
 using GB = decltype(cs::global_barrier());
-using PlainDesc = decltype(cs::subsystem_desc<Plus1>("p"));
+using IndexDesc = decltype(cs::subsystem_desc<Plus1>("p"));
 using GroupDesc = decltype(cs::subsystem_desc<TagStage>("g"));
 template <class... Ds>
 using Checks = cs::detail::stage_checks<cs::detail::all_stage_descs_t<Ds...>>;
 }  // namespace tfg
 
-// Compile-time rules: the placement of boundaries and boundaries in plain groups are static_asserts of FusedGroup, so a
+// Compile-time rules: the placement of boundaries and boundaries in index-range groups are static_asserts of FusedGroup, so a
 // wrong group does not compile; the conditions they test are the traits checked here.
 static_assert(cs::detail::boundaries_placed_ok<tfg::X, tfg::GB, tfg::X>());
 static_assert(cs::detail::boundaries_placed_ok<tfg::X, tfg::GB, tfg::X, tfg::GB, tfg::X>());
@@ -511,7 +516,7 @@ static_assert(!cs::detail::boundaries_placed_ok<tfg::GB>());
 static_assert(cs::detail::is_fuse_option_v<cs::group_waits_enabled>);
 static_assert(!cs::detail::is_fuse_option_v<cs::local_mem::shared>);
 
-TEST_CASE("fused groups: boundary placement and plain groups are rejected at compile time", "[fused_groups][errors]") {
+TEST_CASE("fused groups: boundary placement and index-range groups are rejected at compile time", "[fused_groups][errors]") {
     using namespace tfg;
     CHECK(cs::detail::boundaries_placed_ok<X, GB, X>());
     CHECK(cs::detail::boundaries_placed_ok<X, GB, X, GB, X>());
@@ -519,14 +524,14 @@ TEST_CASE("fused groups: boundary placement and plain groups are rejected at com
     CHECK_FALSE(cs::detail::boundaries_placed_ok<X, GB>());              // at the end
     CHECK_FALSE(cs::detail::boundaries_placed_ok<X, GB, GB, X>());       // two in a row
     CHECK_FALSE(cs::detail::boundaries_placed_ok<GB>());                 // nothing but a boundary
-    // a global_barrier and the group_waits_enabled property need stages that are all work-group stages: a plain group has
+    // a global_barrier and the group_waits_enabled property need stages that are all group-range stages: an index-range group has
     // no work-group to wait with
     CHECK(Checks<GroupDesc, GroupDesc>::all_group);
-    CHECK_FALSE(Checks<PlainDesc, PlainDesc>::all_group);
+    CHECK_FALSE(Checks<IndexDesc, IndexDesc>::all_group);
     CHECK(cs::detail::has_boundary_v<GroupDesc, GB, GroupDesc>);
     CHECK_FALSE(cs::detail::has_boundary_v<GroupDesc, GroupDesc>);
-    // fuse_components<group_waits_enabled>("f", segment(plain), segment(plain)) fails the static_assert of FusedGroup
-    // (!Waits || Checks::all_group), as does a global_barrier() between plain segments (!has_boundary_v<Items...> ||
+    // fuse_components<group_waits_enabled>("f", segment(index-range), segment(index-range)) fails the static_assert of FusedGroup
+    // (!Waits || Checks::all_group), as does a global_barrier() between index-range segments (!has_boundary_v<Items...> ||
     // Checks::all_group); an option other than group_waits_enabled fails the static_assert of fuse_components
     // (is_fuse_option_v, checked above).
 }
@@ -604,7 +609,7 @@ public:
     std::unique_ptr<cs::LaunchDescription> define_forward() override { return create_launch_config(cs::range_desc(outputs.y.shape())); }
 };
 
-// TGAdder / TGZero: the same as TAdder / TZero as WORK-GROUP stages (a global_barrier needs group-body stages), work-group kWg.
+// TGAdder / TGZero: the same as TAdder / TZero as group-range stages (a global_barrier needs group-range stages), work-group kWg.
 
 class TGAdder : public cs::Component<TGAdder> {
 public:
@@ -631,7 +636,8 @@ public:
         declare_input(inputs.v, "v", 1);
         init_input("v", cs::init::fill(v_)); declare_output(outputs.y, "y", cs::unspecified_shape<1>()); }
     std::unique_ptr<cs::LaunchDescription> define_forward() override {
-        return create_launch_config(cs::range_desc(outputs.y.shape()), cs::wg_desc(sycl::range<1>{kWg}));
+        return create_launch_config(cs::range_desc(sycl::range<1>{(outputs.y.shape()[0] + kWg - 1) / kWg * kWg}),
+                                    cs::wg_desc(sycl::range<1>{kWg}));
     }
 };
 
@@ -651,7 +657,8 @@ public:
 
     void declare() override { declare_output(outputs.y, "y", cs::unspecified_shape<1>()); }
     std::unique_ptr<cs::LaunchDescription> define_forward() override {
-        return create_launch_config(cs::range_desc(outputs.y.shape()), cs::wg_desc(sycl::range<1>{kWg}));
+        return create_launch_config(cs::range_desc(sycl::range<1>{(outputs.y.shape()[0] + kWg - 1) / kWg * kWg}),
+                                    cs::wg_desc(sycl::range<1>{kWg}));
     }
 };
 
@@ -702,7 +709,7 @@ inline auto atomic_stages() {
     return cs::segment<cs::range_mode::whole>(cs::subsystem_desc<TZero>("z"), cs::subsystem_desc<TAdder>("a", 1.0f),
                                               cs::subsystem_desc<TAdder>("b", 2.0f));
 }
-/// The group of the plain cases: a writes [0, 6) = 1, b writes [6, 12) = 2.
+/// The group of the index-range cases: a writes [0, 6) = 1, b writes [6, 12) = 2.
 inline auto slice_stages() {
     return cs::segment<cs::range_mode::whole>(cs::subsystem_desc<TSlice>("a", 0.0f, 6.0f, 1.0f),
                                               cs::subsystem_desc<TSlice>("b", 6.0f, 12.0f, 2.0f));
@@ -718,7 +725,7 @@ inline std::vector<float> halves() {
 TEST_CASE("ties_desc: atomic outputs of three stages tied in the group, the views of the members and the alias agree",
           "[fused_groups][ties]") {
     // The standard initialization pattern: the zeroing stage in its own first segment, a global_barrier, then the segment of
-    // the accumulating stages. All stages are work-group stages (the barrier needs them).
+    // the accumulating stages. All stages are group-range stages (the barrier needs them).
     cs::Model model = tfg::make([](cs::System& s) {
         s.add_subsystem(cs::fuse_components(
             "f", cs::ties_desc({cs::tie_outputs<DType::atomic_f32, 1>({"z.y", "a.y", "b.y"}, "y", cs::shape(12))}),

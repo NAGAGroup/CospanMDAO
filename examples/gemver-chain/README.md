@@ -21,7 +21,7 @@ their shapes with shape hooks (`systems.hpp`).
 
 ## Components (`components.hpp`)
 
-Every kernel is rank 1, work-group 256, a group body, grid-stride. Matrices are
+Every kernel is rank 1, work-group 256, a group-range body, grid-stride. Each component states its work-group shape and rounds its range up to whole work-groups; the body guards the tail. Matrices are
 indexed only by `sycl::id<2>{i, j}`.
 
 | component | work | notes |
@@ -39,10 +39,10 @@ indexed only by `sycl::id<2>{i, j}`.
 variant promotes the same names, so the driver is variant-agnostic.
 
 * **unfused**: every component its own kernel: 4 kernels per GEMVER, 3 for BiCGK (11 launches).
-* **parallel**: as unfused, but BiCGK's `gemv_q` and `gtp_s` are a **`system_from` group** (still a plain System, not a fused group): two launches, independent stages, concurrency comes from data dependencies alone. (11 launches.)
+* **parallel**: as unfused, but BiCGK's `gemv_q` and `gtp_s` are a **`system_from` group** (still an ordinary System, not a fused group): two launches, independent stages, concurrency comes from data dependencies alone. (11 launches.)
 * **fused**: GEMVER = `fuse_components` of ONE segment holding `r2u` and `gtp` with `range_mode::whole`, then `cred`, then `gemv`;
   BiCGK = `fuse_components` of `gemv_q` and `gtp_s`, each its own segment with no boundary (own slices of groups, one launch), then `cred_s`. (8 launches.)
-* **onepass**: GEMVER as in fused, BiCGK in ONE pass over `B`: a group body over (strip, 256-column
+* **onepass**: GEMVER as in fused, BiCGK in ONE pass over `B`: a group-range body over (strip, 256-column
   block) that accumulates `Ps[c][j] = sum_k r[i] B[i][j]` and, per row, `reduce_over_group(B[i][j] p[j])`
   into `Pq[i][block]`, then `RowReduce` (q) and the scale-1 `ColReduce` (s). It reads `B` once for BiCGK
   instead of twice, but sums in a different order, so it is not bitwise equal to the others
@@ -58,10 +58,10 @@ variant promotes the same names, so the driver is variant-agnostic.
 
 ### What `crafted` does differently
 
-The plain components each read `B` from global memory: the rank-2 update writes it, the partial column sums read it back,
+The non-tile components each read `B` from global memory: the rank-2 update writes it, the partial column sums read it back,
 and BiCGK reads it again (and G2's rank-2 update reads B1 a third time). `crafted` gives every work-group a **tile of
 32 rows by 256 columns of `B` (32 KB of local memory)** and keeps it there between the stages of one segment
-(`local_mem::shared`: every stage of the segment sees the same block):
+(`local_mem::shared`: every stage of the segment sees the same block). The tile is declared as a `cs::LocalMem`, sized with `cs::local_desc`, and read with `auto [tile] = lm.get(it)`:
 
 * **G1 launch**: `Rank2UpdateLocal` computes its tile of `B1`, writes it to global `B1` (an output) and leaves it in local
   memory; `GemvTPartialLocal` (after a group barrier) reads the tile from local memory for the partial column sums, so
@@ -229,6 +229,6 @@ c. **Small n.** At n = 2048 the old fused variant was much slower than unfused (
    geometry arrays, one kernel) still loses at small n is not measured.
 d. **onepass gives a wrong `q` on the omp backend** (`q[0]` right, the rest garbage). `s` and every
    other variant are correct. Cause unknown: possibly the backend, possibly `reduce_over_group`
-   inside the per-row loop of a group body. Not confirmed.
+   inside the per-row loop of a group-range body. Not confirmed.
 e. **parallel brings no gain over unfused.** Both products still read the matrix, and nothing was
    profiled to see whether the two kernels actually overlap.

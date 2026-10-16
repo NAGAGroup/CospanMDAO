@@ -73,7 +73,7 @@ inline TiesDesc ties_desc(std::initializer_list<TieEntry> entries) { return Ties
 
 /// A fused-group property, given as a template option of fuse_components: cs::fuse_components<cs::group_waits_enabled>(...).
 /// With it the stages may wait on work-groups of EARLIER segments (GroupItem::wait_group, wait_earlier_segments) without
-/// any co-residency of groups; a cs::global_barrier() in the group implies it. The group's stages must all be work-group
+/// any co-residency of groups; a cs::global_barrier() in the group implies it. The group's stages must all be group-range
 /// stages. Without it (and without a global_barrier) the groups carry no wait state at all.
 struct group_waits_enabled {};
 
@@ -313,11 +313,11 @@ struct stage_checks;
 template <class... Ds>
 struct stage_checks<std::tuple<Ds...>> {
     static constexpr bool nonempty   = sizeof...(Ds) >= 1;
-    // plain kernel Components only: a CustomComponent or HostComponent is refused by type
+    // kernel Components only: a CustomComponent or HostComponent is refused by type
     static constexpr bool components = (std::derived_from<desc_component_t<Ds>, Component<desc_component_t<Ds>>> && ...);
     static constexpr bool fusible    = ((!CustomOpBody<desc_body_t<Ds>> && !HostBody<desc_body_t<Ds>>) && ...);
-    static constexpr bool one_kind   = (GroupBody<desc_body_t<Ds>> && ...) || (!GroupBody<desc_body_t<Ds>> && ...);
-    static constexpr bool all_group  = (GroupBody<desc_body_t<Ds>> && ...);
+    static constexpr bool one_kind   = (GroupRangeBody<desc_body_t<Ds>> && ...) || (!GroupRangeBody<desc_body_t<Ds>> && ...);
+    static constexpr bool all_group  = (GroupRangeBody<desc_body_t<Ds>> && ...);
     static constexpr int  rank       = kernel_rank_v<desc_body_t<std::tuple_element_t<0, std::tuple<Ds...>>>>;
     static constexpr bool one_rank   = ((kernel_rank_v<desc_body_t<Ds>> == kernel_rank_v<desc_body_t<std::tuple_element_t<0, std::tuple<Ds...>>>>) && ...);
 };
@@ -376,19 +376,19 @@ class FusedGroup final : public detail::FusedDriver {
     static_assert(Checks::components,
                   "naga::cospan: the stages of a fused group are components (subsystem_desc<T> with T a Component)");
     static_assert(Checks::fusible, "naga::cospan: custom-op and host bodies cannot be fused");
-    static_assert(Checks::one_kind, "naga::cospan: a fused group's stages are all work-group components or all plain");
+    static_assert(Checks::one_kind, "naga::cospan: a fused group's stages are all group-range components or all index-range components");
     static_assert(Checks::one_rank, "naga::cospan: the stages of a fused group share one kernel rank");
     static_assert(detail::boundaries_placed_ok<Items...>(),
                   "naga::cospan: a cs::global_barrier() goes between two segments: not first, not last, and not next to "
                   "another barrier");
     static_assert(!detail::has_boundary_v<Items...> || Checks::all_group,
-                  "naga::cospan: cs::global_barrier() is for groups of work-group stages: a plain-body group has no "
+                  "naga::cospan: cs::global_barrier() is for groups of group-range stages: an index-range group has no "
                   "work-group to cooperate with");
     static_assert(detail::split_supports_rank_v<Sp, Checks::rank>,
                   "naga::cospan: cs::range_split::padded needs stages of rank 2 or lower (its first physical dimension is the "
                   "segment index); use flatten_and_split or pad_and_split for rank-3 stages");
     static_assert(!Waits || Checks::all_group,
-                  "naga::cospan: cs::group_waits_enabled is for groups of work-group stages: a plain-body group has no "
+                  "naga::cospan: cs::group_waits_enabled is for groups of group-range stages: an index-range group has no "
                   "work-group to wait with");
 
 public:
@@ -456,7 +456,7 @@ private:
 
 /// A segment of consecutive stages that share groups: cs::segment(descs...) takes the defaults (local_mem::partitioned,
 /// range_mode::own); cs::segment<cs::local_mem::shared, cs::range_mode::whole>(descs...) names options (at most one of
-/// each kind).
+/// each kind). The local_mem options are for segments of group-range stages only.
 template <class... Opts, class... Descs>
 auto segment(Descs... d) {
     static_assert(sizeof...(Descs) >= 1, "naga::cospan: a segment needs at least one stage");
@@ -466,6 +466,10 @@ auto segment(Descs... d) {
                   "naga::cospan: a segment takes at most one local-memory option");
     static_assert(detail::option_count_v<range_mode::own, Opts...> + detail::option_count_v<range_mode::whole, Opts...> <= 1,
                   "naga::cospan: a segment takes at most one range-mode option");
+    static_assert(detail::option_count_v<local_mem::partitioned, Opts...> + detail::option_count_v<local_mem::shared, Opts...> == 0 ||
+                      (GroupRangeBody<detail::desc_body_t<Descs>> && ...),
+                  "naga::cospan: the cs::local_mem options are for segments of group-range stages: an index-range stage has no "
+                  "local memory");
     constexpr detail::LocalMem  lm = detail::option_count_v<local_mem::shared, Opts...> ? detail::LocalMem::shared : detail::LocalMem::partitioned;
     constexpr detail::RangeMode rm = detail::option_count_v<range_mode::whole, Opts...> ? detail::RangeMode::whole : detail::RangeMode::own;
     return detail::SegmentDesc<lm, rm, Descs...>{std::tuple<Descs...>{std::move(d)...}};

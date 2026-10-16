@@ -86,8 +86,6 @@ public:
                                             const std::vector<sycl::event>& deps) const = 0;
     /// Null for custom-op and host descriptions.
     virtual const KernelParts* kernel() const { return nullptr; }
-    /// Asks for `bytes` of local memory in this stage's slice, for GroupItem::local<T> (kernel launches only).
-    virtual void request_local_bytes(std::size_t) { throw std::logic_error("naga::cospan: request_local_bytes is for plain and group bodies"); }
 };
 
 namespace detail {
@@ -403,7 +401,7 @@ public:
     /// submitted alone.
     void step_submit(detail::Runtime& rt) {
         if (is_kernel_stage()) {
-            // A plain or group body launches through the one path: a group of one stage in one default segment.
+            // An index-range or group-range body launches through the one path: a group of one stage in one default segment.
             (void)solo_.launch(rt, std::vector<ComponentBase*>{this}, std::vector<detail::SegmentSpec>{detail::SegmentSpec{}}, describe());
             return;
         }
@@ -444,11 +442,11 @@ public:
     // Answered by Component<X> from its body's signature. An owner reads
     // these; nothing here knows what fusing is.
     virtual int  kernel_rank() const { return 0; }       ///< 0 for custom-op and host bodies
-    virtual bool is_group_body() const { return false; }
-    virtual bool has_scratch() const { return false; }
+    virtual bool is_group_range() const { return false; }
+    virtual bool has_local_mem() const { return false; }
     virtual bool is_custom_op() const { return false; }
     virtual bool is_host() const { return false; }
-    /// A plain or group body: it launches through a GroupLauncher (alone, or as a stage of a fused group).
+    /// An index-range or group-range body: it launches through a GroupLauncher (alone, or as a stage of a fused group).
     virtual bool is_kernel_stage() const { return false; }
     /// The type-erased id of this body's stage function (stage_fn<KB>), for a
     /// call sequence. Throws for a custom-op or host body (nothing is compiled).
@@ -465,10 +463,10 @@ public:
     /// What a launch reading the array must wait on (its write list), and the hand-over of that launch's event.
     virtual std::vector<sycl::event> stage_args_deps() const { throw_no_stage(); }
     virtual void                     stage_args_register_read(const sycl::event&) { throw_no_stage(); }
-    /// Finishes this forward's description for the group's work-group shape `wg`, copies its arguments into the array
-    /// (a container write) and returns the stage's group range: per dimension (trailing dimensions, leading 1s) the groups it
-    /// needs, all 0 when the stage is empty.
-    virtual sycl::range<3> stage_upload(detail::Runtime&, LaunchDescription&, const sycl::range<3>&) { throw_no_stage(); }
+    /// Copies this forward's description's arguments into the array (a container write) and returns the stage's range in launch
+    /// units: per dimension (trailing dimensions, leading 1s) its work-groups (group-range) or indices (index-range), all 0 when
+    /// the stage is empty.
+    virtual sycl::range<3> stage_upload(detail::Runtime&, LaunchDescription&) { throw_no_stage(); }
 
 protected:
     ComponentBase() = default;
@@ -547,7 +545,7 @@ protected:
     std::vector<sycl::event> pending_deps_; ///< depends_on events, for the next submission only
 
     [[noreturn]] void throw_no_stage() const {
-        throw std::logic_error("naga::cospan: " + describe() + " is not a plain or group body: it has no stage interface");
+        throw std::logic_error("naga::cospan: " + describe() + " is not an index-range or group-range body: it has no stage interface");
     }
 
 private:
@@ -810,35 +808,29 @@ inline std::vector<sycl::event> GroupLauncher::launch(Runtime& rt, const std::ve
         ds.push_back(std::move(d));
     }
 
-    // 2. The group's work-group shape: every stage that asks for one must agree (checked here, every forward, before any
-    // launch: a component may choose its shape at run time); none asking, the default for the rank.
-    std::optional<sycl::range<3>> wg_opt;
-    std::size_t                   first = 0;
-    for (std::size_t i = 0; i < n; ++i) {
-        if (!parts[i]->wg) continue;
-        if (!wg_opt) {
-            wg_opt = parts[i]->wg;
-            first  = i;
-        } else if (*wg_opt != *parts[i]->wg) {
-            throw std::invalid_argument("naga::cospan: " + who + ": forward: '" + st[first]->path() + "' and '" + st[i]->path() +
-                                        "' ask for different work-group shapes; the stages of a group share one");
-        }
+    // 2. The launch unit. A group-range stage carries its work-group shape (the one it gave;
+    // its range was checked against it when the stage described itself) and the stages of a group must all carry the same one
+    // (checked here, every forward, before any launch: a component may choose its shape at run time). An index-range stage's
+    // unit is one index.
+    const bool group_range = parts[0]->group_range;
+    for (std::size_t i = 1; i < n; ++i)
+        if (parts[i]->group_range != group_range)
+            throw std::logic_error("naga::cospan: " + who + ": forward: '" + st[i]->path() + "' and '" + st[0]->path() +
+                                   "' are of different kinds; the stages of a group are all index-range or all group-range");
+    sycl::range<3> wg{1, 1, 1};
+    if (group_range) {
+        wg = *parts[0]->wg;
+        for (std::size_t i = 1; i < n; ++i)
+            if (*parts[i]->wg != wg)
+                throw std::invalid_argument("naga::cospan: " + who + ": forward: '" + st[0]->path() + "' and '" + st[i]->path() +
+                                            "' have different work-group shapes ; the stages of a group share one");
     }
-    if (!wg_opt) {
-        switch (rank) {
-            case 1: wg_opt = default_wg<1>(); break;
-            case 2: wg_opt = default_wg<2>(); break;
-            default: wg_opt = default_wg<3>(); break;
-        }
-    }
-    sycl::range<3> wg = *wg_opt;
-    for (int d = 0; d < 3 - rank; ++d) wg[d] = 1;  // the leading dimensions (before the rank's trailing ones) do not exist
     if (split == Split::padded && (rank > 2 || wg[0] != 1))
         throw std::invalid_argument("naga::cospan: " + who + ": cs::range_split::padded needs stages of rank 2 or lower");
 
     // 3. Every stage's arguments into its own array (a container write), and its group count.
     std::vector<sycl::range<3>> counts(n, sycl::range<3>{0, 0, 0});
-    for (std::size_t i = 0; i < n; ++i) counts[i] = st[i]->stage_upload(rt, *ds[i], wg);
+    for (std::size_t i = 0; i < n; ++i) counts[i] = st[i]->stage_upload(rt, *ds[i]);
 
     // 4. The geometry: per segment the block (the largest count), the groups before it, the local slices.
     // The segment table after the n entries: the S block sizes, then the S boundary kinds.
@@ -866,8 +858,9 @@ inline std::vector<sycl::event> GroupLauncher::launch(Runtime& rt, const std::ve
             g.range_mode     = static_cast<std::uint32_t>(sp.range);
             g.local_bytes    = static_cast<std::uint32_t>(parts[j]->local_bytes);
             if (sp.local == LocalMem::partitioned) {
+                seg_local      = align_up(seg_local, parts[j]->local_align);  // the slice starts aligned for its arrays
                 g.local_offset = static_cast<std::uint32_t>(seg_local);
-                seg_local += parts[j]->local_bytes;  // each slice is a multiple of 16
+                seg_local += parts[j]->local_bytes;
             } else {
                 g.local_offset = 0;
                 seg_local      = std::max(seg_local, parts[j]->local_bytes);
@@ -887,13 +880,13 @@ inline std::vector<sycl::event> GroupLauncher::launch(Runtime& rt, const std::ve
     const sycl::device dev         = ComponentAccess::device_of(*st.front());
     const std::size_t  local_limit = dev.get_info<sycl::info::device::local_mem_size>();
     if (local_bytes > local_limit) {
-        std::string scratch_stages;
+        std::string local_stages;
         for (std::size_t i = 0; i < n; ++i)
             if (parts[i]->local_bytes != 0)
-                scratch_stages += (scratch_stages.empty() ? "'" : ", '") + st[i]->path() + "' (" + std::to_string(parts[i]->local_bytes) + " bytes)";
+                local_stages += (local_stages.empty() ? "'" : ", '") + st[i]->path() + "' (" + std::to_string(parts[i]->local_bytes) + " bytes)";
         throw std::invalid_argument("naga::cospan: " + who + ": forward: the launch needs " + std::to_string(local_bytes) +
                                     " bytes of local memory (the largest segment's) but the device offers " + std::to_string(local_limit) +
-                                    "; stages with local memory: " + scratch_stages);
+                                    "; stages with local memory: " + local_stages);
     }
     if (base == 0) {  // every stage is empty: nothing launched, and no stale events are kept
         for (ComponentBase* s : st) {
@@ -935,11 +928,11 @@ inline std::vector<sycl::event> GroupLauncher::launch(Runtime& rt, const std::ve
     std::vector<JitId> defs;
     defs.reserve(n);
     for (const ComponentBase* s : st) defs.push_back(s->definition_id());
-    sycl::AdaptiveCpp_jit::dynamic_function_config& cfg = group_config(defs);
+    sycl::AdaptiveCpp_jit::dynamic_function_config& cfg = group_config(defs, group_range ? run_stages_id() : run_index_stages_id());
     const StageGeometry*                            gp  = geo_->data();
     const void* const*                              ap  = ptrs_->data();
 
-    // The physical launch: always rank 3, the groups laid out by the range_split strategy.
+    // The physical launch: always rank 3, the units (work-groups, or indices) laid out by the range_split strategy.
     std::array<std::uint64_t, 3> phys{1, 1, 1};
     switch (split) {
         case Split::flatten: phys = {1, 1, base}; break;
@@ -959,8 +952,11 @@ inline std::vector<sycl::event> GroupLauncher::launch(Runtime& rt, const std::ve
             }
             break;
     }
-    const sycl::nd_range<3> nd{sycl::range<3>{phys[0] * wg[0], phys[1] * wg[1], phys[2] * wg[2]}, wg};
-    const sycl::event       ev = launch_group(rt.uq, dev, deps, cfg, nd, gp, ap, local_bytes);
+    const sycl::event ev =
+        group_range ? launch_group(rt.uq, dev, deps, cfg,
+                                   sycl::nd_range<3>{sycl::range<3>{phys[0] * wg[0], phys[1] * wg[1], phys[2] * wg[2]}, wg}, gp, ap,
+                                   local_bytes)
+                    : launch_range(rt.uq, dev, deps, cfg, sycl::range<3>{phys[0], phys[1], phys[2]}, gp, ap);
 
     // 7. The launch's event: a read of the geometry, the pointer array and every argument array, and on every stage (its
     // inputs' reads and its outputs' writes), registered here, at submit.
@@ -982,25 +978,37 @@ inline std::vector<sycl::event> GroupLauncher::launch(Runtime& rt, const std::ve
 namespace detail {
 
 /// A kernel-body description of one forward: the stage's argument struct (the HOST MEMBER the component copies into its
-/// argument array) and the facts a group launcher reads (KernelParts). It submits nothing itself: a plain or group body
-/// launches through the group launcher, whose stage function reads the copy.
+/// argument array) and the facts a group launcher reads (KernelParts). It submits nothing itself: an index-range or
+/// group-range body launches through the group launcher, whose stage function reads the copy.
+///
+/// `range` is the iteration space. A group-range body also takes its work-group shape `wg`, which `range` is a multiple of in
+/// every dimension (create_launch_config checks that); the description stores the work-group count, range / wg, at once. An
+/// index-range body takes no `wg`.
 template <class KB>
 class KernelLaunch final : public LaunchDescription {
 public:
     static constexpr int R = kernel_rank_v<KB>;
-    using Scratch          = scratch_t<KB>;
+    using Local            = local_mem_t<KB>;
 
     KernelLaunch(sycl::range<R> range, std::optional<sycl::range<R>> wg,
-                 typename KB::Inputs in, typename KB::Outputs out, KB body, Scratch scratch)
-        : args_{in, out, body, scratch} {
+                 typename KB::Inputs in, typename KB::Outputs out, KB body, Local local)
+        : args_{in, out, body, local} {
         args_.range       = pad3<R>(range);  // in the trailing dimensions
         args_.flat_extent = range.size();
-        if constexpr (HasScratch<KB>) args_.scratch_bytes = layout_scratch(args_.scratch);
         parts_.rank        = R;
-        parts_.group_body  = GroupBody<KB>;
+        parts_.group_range = GroupRangeBody<KB>;
         parts_.flat_extent = args_.flat_extent;
-        parts_.local_bytes = args_.scratch_bytes;
-        if (wg) parts_.wg = pad3<R>(*wg);
+        sycl::range<3> units = args_.range;
+        if constexpr (GroupRangeBody<KB>) {
+            const sycl::range<3> w = pad3<R>(*wg);
+            parts_.wg              = w;
+            units                  = sycl::range<3>{args_.range[0] / w[0], args_.range[1] / w[1], args_.range[2] / w[2]};
+        }
+        if constexpr (HasLocalMem<KB>) {
+            parts_.local_bytes = args_.local.bytes();
+            parts_.local_align = Local::alignment();
+        }
+        args_.units = args_.flat_extent == 0 ? sycl::range<3>{0, 0, 0} : units;  // an empty range is an empty stage
     }
 
     KernelLaunch(const KernelLaunch&)            = delete;
@@ -1010,24 +1018,13 @@ public:
     bool is_host() const override { return false; }
     const KernelParts* kernel() const override { return &parts_; }
 
-    /// The stage's local slice is its Scratch plus these bytes (rounded up to 16), for GroupItem::local<T>.
-    void request_local_bytes(std::size_t bytes) override {
-        parts_.local_bytes = args_.scratch_bytes + (bytes + 15) / 16 * 16;
-    }
-
     std::vector<sycl::event> submit(sk::unordered_queue&, const sycl::device&, const std::vector<sycl::event>&) const override {
-        throw std::logic_error("naga::cospan: a plain or group body launches through its group launcher, not through submit");
+        throw std::logic_error("naga::cospan: an index-range or group-range body launches through its group launcher, not through submit");
     }
 
-    /// This forward's arguments for a group of work-group shape `wg`: the stage's group grid and count.
-    const StageArgs<KB>& finalize(const sycl::range<3>& wg) {
-        // ceil(range / wg) per dimension, for plain and group bodies alike; an empty stage has no groups in any dimension
-        args_.group_range = sycl::range<3>{(args_.range[0] + wg[0] - 1) / wg[0], (args_.range[1] + wg[1] - 1) / wg[1],
-                                           (args_.range[2] + wg[2] - 1) / wg[2]};
-        if (args_.flat_extent == 0) args_.group_range = sycl::range<3>{0, 0, 0};
-        return args_;
-    }
-    sycl::range<3> group_range() const { return args_.group_range; }
+    /// This forward's arguments: the stage's range in launch units is already in them.
+    const StageArgs<KB>& arguments() const { return args_; }
+    sycl::range<3>       units() const { return args_.units; }
 
 private:
     static_assert(std::is_trivially_copyable_v<StageArgs<KB>>);
@@ -1102,9 +1099,10 @@ private:
 // Launch descriptors and the synthesized body (the component form)
 // -----------------------------------------------------------------------------
 
-/// The launch descriptors of create_launch_config: each its own type, in any order. range_desc is required for plain and
-/// group bodies; wg_desc is optional; scratch_desc is optional and only for a body with a Scratch. Custom-op and host bodies
-/// take none.
+/// The launch descriptors of create_launch_config: each its own type, in any order. range_desc is required for index-range and
+/// group-range bodies (a group-range body's range is a multiple of its work-group shape in every dimension). wg_desc is required for group-range bodies (the work-group shape is always stated, as an nd_range states its local range) and rejected for index-range bodies. local_desc is
+/// optional and only for a group-range body with a LocalMem parameter: one shape per array, in declaration order.
+/// Custom-op and host bodies take none.
 template <int R>
 struct RangeDesc {
     sycl::range<R> value;
@@ -1113,9 +1111,9 @@ template <int R>
 struct WgDesc {
     sycl::range<R> value;
 };
-template <class S>
-struct ScratchDesc {
-    S value;
+template <int... Rs>
+struct LocalDesc {
+    std::tuple<sycl::range<Rs>...> shapes;
 };
 
 template <int R>
@@ -1126,14 +1124,16 @@ template <int R>
 WgDesc<R> wg_desc(const sycl::range<R>& r) {
     return WgDesc<R>{r};
 }
-template <class S>
-ScratchDesc<S> scratch_desc(const S& s) {
-    return ScratchDesc<S>{s};
+/// The shapes of a stage's LocalMem arrays, one range per array in declaration order (rank per array as in its LocalArray).
+template <int... Rs>
+    requires(sizeof...(Rs) >= 1)
+LocalDesc<Rs...> local_desc(const sycl::range<Rs>&... shapes) {
+    return LocalDesc<Rs...>{std::tuple<sycl::range<Rs>...>{shapes...}};
 }
 
 namespace detail {
 
-/// kind: 0 range, 1 work-group shape, 2 scratch; -1 not a descriptor.
+/// kind: 0 range, 1 work-group shape, 2 local memory; -1 not a descriptor.
 template <class D>
 struct desc_info {
     static constexpr int kind = -1;
@@ -1149,23 +1149,41 @@ struct desc_info<WgDesc<R>> {
     static constexpr int kind = 1;
     static constexpr int rank = R;
 };
-template <class S>
-struct desc_info<ScratchDesc<S>> {
+template <int... Rs>
+struct desc_info<LocalDesc<Rs...>> {
     static constexpr int kind = 2;
     static constexpr int rank = 0;
 };
 
+/// The ranks of a LocalMem's arrays and of a LocalDesc's shapes, as one comparable type each.
+template <class LM>
+struct local_mem_ranks;
+template <class... As>
+struct local_mem_ranks<::naga::cospan::LocalMem<As...>> {
+    using type = std::integer_sequence<int, As::rank...>;
+};
+template <class D>
+struct local_desc_ranks;
+template <int... Rs>
+struct local_desc_ranks<LocalDesc<Rs...>> {
+    using type = std::integer_sequence<int, Rs...>;
+};
+
+/// A local_desc fits the body when the body has a LocalMem parameter with as many arrays, of the same ranks in the same order.
 template <class KB, class D>
-constexpr bool scratch_desc_type_ok() {
+constexpr bool local_desc_type_ok() {
     if constexpr (desc_info<D>::kind != 2)
         return true;
+    else if constexpr (!HasLocalMem<KB>)
+        return false;
     else
-        return std::is_same_v<D, ScratchDesc<scratch_t<KB>>>;
+        return std::is_same_v<typename local_mem_ranks<local_mem_t<KB>>::type, typename local_desc_ranks<D>::type>;
 }
 
-/// Whether the descriptors `Ds...` are a valid launch for the body KB: a range (of the body's rank) for plain and group bodies,
-/// at most one of each descriptor, a scratch_desc only for a body with Scratch (of its type). Only a Component calls
-/// create_launch_config (custom-op and host components build their launch themselves).
+/// Whether the descriptors `Ds...` are a valid launch for the body KB: a range (of the body's rank), at most one of each
+/// descriptor; a wg_desc only for a group-range body; a local_desc only for a group-range body with a LocalMem parameter, with
+/// a shape per array of the array's rank. Only a Component calls create_launch_config (custom-op and host components build
+/// their launch themselves).
 template <class KB, class... Ds>
 constexpr bool launch_descs_ok() {
     if constexpr (!((desc_info<Ds>::kind >= 0) && ...)) {
@@ -1173,13 +1191,15 @@ constexpr bool launch_descs_ok() {
     } else {
         constexpr int nr = ((desc_info<Ds>::kind == 0 ? 1 : 0) + ... + 0);
         constexpr int nw = ((desc_info<Ds>::kind == 1 ? 1 : 0) + ... + 0);
-        constexpr int ns = ((desc_info<Ds>::kind == 2 ? 1 : 0) + ... + 0);
-        if constexpr (PlainBody<KB> || GroupBody<KB>) {
+        constexpr int nl = ((desc_info<Ds>::kind == 2 ? 1 : 0) + ... + 0);
+        if constexpr (IndexRangeBody<KB> || GroupRangeBody<KB>) {
             constexpr int  R        = kernel_rank_v<KB>;
             constexpr bool ranks_ok = ((desc_info<Ds>::kind == 2 || desc_info<Ds>::rank == R) && ...);
-            constexpr bool types_ok = (scratch_desc_type_ok<KB, Ds>() && ...);
-            constexpr bool scr_ok   = HasScratch<KB> ? (ns <= 1) : (ns == 0);
-            return nr == 1 && nw <= 1 && ranks_ok && types_ok && scr_ok;
+            constexpr bool types_ok = (local_desc_type_ok<KB, Ds>() && ...);
+            if constexpr (IndexRangeBody<KB>)
+                return nr == 1 && nw == 0 && nl == 0 && ranks_ok;
+            else
+                return nr == 1 && nw == 1 && nl <= 1 && ranks_ok && types_ok;
         } else {
             return false;
         }
@@ -1190,6 +1210,35 @@ inline constexpr bool launch_descs_ok_v = launch_descs_ok<KB, Ds...>();
 
 template <class T, class... Ds>
 inline constexpr bool has_desc_v = (std::is_same_v<T, Ds> || ...);
+
+/// "(a, b, c)" for messages.
+template <int R>
+std::string range_text(const sycl::range<R>& r) {
+    std::string s = "(";
+    for (int d = 0; d < R; ++d) s += (d == 0 ? "" : ", ") + std::to_string(r[d]);
+    return s + ")";
+}
+
+/// A group-range component's range counts work-groups: it must be a multiple of the work-group shape in every dimension
+/// (an empty range is an empty stage and is not checked). `who` is the component's "'path'".
+template <int R>
+void check_range_divisible(const std::string& who, const sycl::range<R>& range, const sycl::range<R>& wg) {
+    for (int d = 0; d < R; ++d)
+        if (wg[d] == 0)
+            throw std::invalid_argument("naga::cospan: " + who + ": the work-group shape " + range_text<R>(wg) + " has a zero dimension");
+    if (range.size() == 0) return;
+    for (int d = 0; d < R; ++d)
+        if (range[d] % wg[d] != 0)
+            throw std::invalid_argument("naga::cospan: " + who + ": the range " + range_text<R>(range) +
+                                        " is not a multiple of the work-group shape " + range_text<R>(wg) + " in dimension " +
+                                        std::to_string(d) + "; round the range up to whole work-groups and guard the tail in the body");
+}
+
+/// Sets a LocalMem from a local_desc among the descriptors (any other descriptor is ignored).
+template <class LM, class D>
+void apply_local_desc(LM& lm, const D& d) {
+    if constexpr (desc_info<D>::kind == 2) lm = std::apply([](const auto&... r) { return LM{r...}; }, d.shapes);
+}
 
 /// The call signature of X::compute_forward (a static member function): its first four parameters.
 template <class F>
@@ -1215,8 +1264,8 @@ struct impl_traits : impl_call<void> {};
 template <class X>
 struct impl_traits<X, std::void_t<decltype(&X::compute_forward)>> : impl_call<decltype(&X::compute_forward)> {};
 
-/// The body kind of X (the numbering of first_traits): 0 plain, 1 group, 2 custom op, 3 host. A host body is the one with no
-/// tag: compute_forward(const Inputs&, const Outputs&), two parameters.
+/// The body kind of X (the numbering of first_traits): 0 index-range, 1 group-range, 2 custom op, 3 host. A host body is the one
+/// with no tag: compute_forward(const Inputs&, const Outputs&), two parameters.
 template <class X>
 inline constexpr int body_kind_v = impl_traits<X>::nargs == 2 ? 3 : first_traits<typename impl_traits<X>::a0>::kind;
 
@@ -1233,10 +1282,10 @@ struct SynthData {
 };
 
 /// The kernel body of a component X: ONE distinct type per component, trivially copyable. Its call operator has the FIXED
-/// signature the KernelBody concepts read (first argument, Inputs, Outputs[, Scratch]) and forwards to X::compute_forward; the
+/// signature the KernelBody concepts read (first argument, Inputs, Outputs[, LocalMem]) and forwards to X::compute_forward; the
 /// signature is chosen by specialization on the kind (the first parameter of compute_forward; none for a host body) and on
-/// Scratch. A host body keeps the `Host` tag HERE, in the operator, and drops it for the user.
-template <class X, int Kind, bool WithScratch>
+/// the fourth parameter (a LocalMem). A host body keeps the `Host` tag HERE, in the operator, and drops it for the user.
+template <class X, int Kind, bool WithLocalMem>
 struct SynthImpl : SynthData<X> {
     using SynthData<X>::SynthData;  // no call operator: not a body (the concepts fail, so the component's constructor is unavailable)
 };
@@ -1262,10 +1311,9 @@ struct SynthImpl<X, 1, false> : SynthData<X> {
 template <class X>
 struct SynthImpl<X, 1, true> : SynthData<X> {
     using SynthData<X>::SynthData;
-    using Scratch = typename X::Scratch;
     void operator()(GroupItem<first_traits<typename impl_traits<X>::a0>::rank> it, typename X::Inputs in,
-                    typename X::Outputs out, Scratch scratch) const {
-        X::compute_forward(it, in, out, scratch);
+                    typename X::Outputs out, std::remove_cvref_t<typename impl_traits<X>::a3> lm) const {
+        X::compute_forward(it, in, out, lm);
     }
 };
 
@@ -1299,7 +1347,7 @@ struct SynthBody : SynthImpl<X, body_kind_v<X>, (impl_traits<X>::nargs == 4)> {
 /// constructor of the user's class), so SynthBody<X> can read X::compute_forward.
 namespace detail {
 template <class KB>
-concept KernelStageBody = KernelBodyC<KB> && (PlainBody<KB> || GroupBody<KB>);
+concept KernelStageBody = KernelBodyC<KB> && (IndexRangeBody<KB> || GroupRangeBody<KB>);
 template <class KB>
 concept CustomStageBody = KernelBodyC<KB> && CustomOpBody<KB>;
 template <class KB>
@@ -1308,7 +1356,7 @@ concept HostStageBody = KernelBodyC<KB> && HostBody<KB>;
 /// The typed layer common to the three component types (CRTP on the user's class X): the facts read off the body's signature
 /// and the stage interface of a group launcher. Not the user path: derive Component, CustomComponent or HostComponent.
 ///
-/// CRTP rule: the members of X (Inputs, Outputs, Scratch, compute_forward, inputs, outputs) are named only inside member-function
+/// CRTP rule: the members of X (Inputs, Outputs, compute_forward, inputs, outputs) are named only inside member-function
 /// bodies and lazily instantiated templates here, never at class scope: X is incomplete while this class is instantiated.
 template <class X>
 class TypedComponent : public ComponentBase {
@@ -1317,11 +1365,11 @@ public:
 
     // ---- read off the body's signature, for a fused owner --------------------
     int  kernel_rank() const override { return kernel_rank_v<body_type>; }
-    bool is_group_body() const override { return GroupBody<body_type>; }
-    bool has_scratch() const override { return HasScratch<body_type>; }
+    bool is_group_range() const override { return GroupRangeBody<body_type>; }
+    bool has_local_mem() const override { return HasLocalMem<body_type>; }
     bool is_custom_op() const override { return CustomOpBody<body_type>; }
     bool is_host() const override { return HostBody<body_type>; }
-    bool is_kernel_stage() const override { return PlainBody<body_type> || GroupBody<body_type>; }
+    bool is_kernel_stage() const override { return IndexRangeBody<body_type> || GroupRangeBody<body_type>; }
     JitId definition_id() const override {
         if constexpr (CustomOpBody<body_type> || HostBody<body_type>)
             throw std::logic_error("naga::cospan: " + describe() + " is a custom-op or host body: it has no stage function");
@@ -1329,9 +1377,9 @@ public:
             return stage_definition_id<body_type>();  // a function-local static, one per body type
     }
 
-    // ---- the stage interface (plain and group bodies) ------------------------------
+    // ---- the stage interface (index-range and group-range bodies) -------------------
     void stage_args_ensure(Runtime& rt) override {
-        if constexpr (PlainBody<body_type> || GroupBody<body_type>) {
+        if constexpr (IndexRangeBody<body_type> || GroupRangeBody<body_type>) {
             if (!args_) {
                 auto v = std::make_shared<ArgsVec>(rt.allocator_for<StageArgs<body_type>>(this->device_of(), sk::kind::device));
                 v->reserve(1);  // capacity 1 from the start: the address the pointer array holds is final
@@ -1342,7 +1390,7 @@ public:
         }
     }
     const void* stage_args_ptr() const override {
-        if constexpr (PlainBody<body_type> || GroupBody<body_type>) {
+        if constexpr (IndexRangeBody<body_type> || GroupRangeBody<body_type>) {
             if (!args_) throw std::logic_error("naga::cospan: " + this->describe() + ": the argument array does not exist yet (precompute first)");
             return args()->data();
         } else {
@@ -1350,26 +1398,25 @@ public:
         }
     }
     std::vector<sycl::event> stage_args_deps() const override {
-        if constexpr (PlainBody<body_type> || GroupBody<body_type>) {
+        if constexpr (IndexRangeBody<body_type> || GroupRangeBody<body_type>) {
             return args()->read_deps();
         } else {
             this->throw_no_stage();
         }
     }
     void stage_args_register_read(const sycl::event& e) override {
-        if constexpr (PlainBody<body_type> || GroupBody<body_type>) {
+        if constexpr (IndexRangeBody<body_type> || GroupRangeBody<body_type>) {
             args()->register_read(e);
         } else {
             this->throw_no_stage();
         }
     }
-    sycl::range<3> stage_upload([[maybe_unused]] Runtime& rt, [[maybe_unused]] LaunchDescription& d,
-                                [[maybe_unused]] const sycl::range<3>& wg) override {
-        if constexpr (PlainBody<body_type> || GroupBody<body_type>) {
+    sycl::range<3> stage_upload([[maybe_unused]] Runtime& rt, [[maybe_unused]] LaunchDescription& d) override {
+        if constexpr (IndexRangeBody<body_type> || GroupRangeBody<body_type>) {
             auto&                     kl = dynamic_cast<KernelLaunch<body_type>&>(d);
-            const StageArgs<body_type>& a  = kl.finalize(wg);
+            const StageArgs<body_type>& a  = kl.arguments();
             args()->from_host(std::span<const StageArgs<body_type>>{&a, 1});  // the host member into the array: a container write
-            return kl.group_range();
+            return kl.units();
         } else {
             this->throw_no_stage();
         }
@@ -1379,7 +1426,7 @@ protected:
     sk::kind default_storage_kind() const override { return HostBody<body_type> ? sk::kind::host : sk::kind::device; }
 
 private:
-    /// The component's argument array (plain and group bodies only), type-erased: this class is instantiated while X is still
+    /// The component's argument array (index-range and group-range bodies only), type-erased: this class is instantiated while X is still
     /// incomplete, so its type cannot be named in a member declaration.
     using ArgsVec = sk::usm_vector<StageArgs<SynthBody<X>>>;
     std::shared_ptr<void> args_;
@@ -1389,8 +1436,9 @@ private:
 }  // namespace detail
 
 /// A KERNEL component, by CRTP: `class Axpb : public cs::Component<Axpb>`. The component declares nested `Inputs` and `Outputs`
-/// structs of ports, a STATIC `compute_forward` (its first parameter fixes the kind and rank: sycl::id<R> plain, GroupItem<R>
-/// group; a group body with a nested `Scratch` takes it as the 4th) and PUBLIC members `inputs` and `outputs`. The hooks are
+/// structs of ports, a STATIC `compute_forward` (its first parameter fixes the kind and rank: sycl::id<R> for an index-range
+/// component, GroupItem<R> for a group-range one; a group-range body may take a cs::LocalMem as the 4th) and PUBLIC members
+/// `inputs` and `outputs`. The hooks are
 /// `declare()` (ports), `prepare_forward()` (per-forward shapes) and `define_forward()`, which returns
 /// create_launch_config(descriptors...) made from the members. ONE KERNEL BODY PER COMPONENT, by type. A custom-op or host
 /// body is not a Component: derive CustomComponent or HostComponent.
@@ -1411,7 +1459,11 @@ protected:
     std::unique_ptr<LaunchDescription> describe_launch() override { return define_forward(); }
 
     /// The launch of this component, from its `inputs` and `outputs` members and the descriptors, in any order:
-    /// range_desc(range) (required), wg_desc(range) (optional), scratch_desc(value) (optional, a body with Scratch only).
+    /// range_desc(range) (required),
+    /// wg_desc(range) (required for group-range components, rejected for index-range ones), local_desc(shapes...) (optional, a
+    /// group-range component with a LocalMem parameter only). A group-range component's range must be a multiple of its
+    /// work-group shape (wg_desc) in every dimension; otherwise this throws std::invalid_argument naming the component, the
+    /// range and the shape. An empty range is an empty stage.
     template <class... Ds>
         requires(detail::launch_descs_ok_v<detail::SynthBody<X>, Ds...>)
     std::unique_ptr<LaunchDescription> create_launch_config(Ds... ds) {
@@ -1422,11 +1474,13 @@ protected:
         const std::tuple<Ds...> t{ds...};
         const sycl::range<LR>   range = std::get<RangeDesc<LR>>(t).value;
         std::optional<sycl::range<LR>> wg;
-        if constexpr (detail::has_desc_v<WgDesc<LR>, Ds...>) wg = std::get<WgDesc<LR>>(t).value;
-        detail::scratch_t<KB> scratch = detail::NoScratchValue<KB>();
-        if constexpr (detail::has_desc_v<ScratchDesc<detail::scratch_t<KB>>, Ds...>)
-            scratch = std::get<ScratchDesc<detail::scratch_t<KB>>>(t).value;
-        return std::make_unique<detail::KernelLaunch<KB>>(range, wg, self.inputs, self.outputs, body, scratch);
+        if constexpr (GroupRangeBody<KB>) {
+            wg = std::get<WgDesc<LR>>(t).value;
+            detail::check_range_divisible<LR>(this->describe(), range, *wg);
+        }
+        detail::local_mem_t<KB> local{};
+        if constexpr (HasLocalMem<KB>) (detail::apply_local_desc(local, ds), ...);
+        return std::make_unique<detail::KernelLaunch<KB>>(range, wg, self.inputs, self.outputs, body, local);
     }
 };
 

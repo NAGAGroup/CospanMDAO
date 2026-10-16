@@ -217,9 +217,12 @@ public:
     }
 };
 
-// ---- group bodies with Scratch: Rev (reverse within the group), Mirror (reads the mirrored element) ---
+// ---- group-range bodies with local memory: Rev (reverse within the group), Mirror (reads the mirrored element) ---
 constexpr int kRev    = 0;
 constexpr int kMirror = 1;
+
+/// The local memory of GroupStage and BigStage: one float array.
+using TileMem = cs::LocalMem<cs::LocalArray<DType::f32, 1>>;
 
 /// One component type per variant (a compile-time template parameter, no run-time branch): Kind picks Rev or Mirror.
 template <int Kind>
@@ -231,18 +234,16 @@ public:
     struct Outputs {
         cs::Output<DType::f32, 1> y;
     };
-    struct Scratch {
-        cs::Local<DType::f32, 1> tile;
-    };
-    static void compute_forward(cs::GroupItem<1> it, const Inputs& in, const Outputs& out, Scratch s) {
+    static void compute_forward(cs::GroupItem<1> it, const Inputs& in, const Outputs& out, TileMem lm) {
         const std::size_t n = it.get_local_range(0), l = it.get_local_linear_id(), g = it.get_global_id(0);
         const std::size_t total = in.x.shape()[0];
+        auto [tile] = lm.get(it);
         if constexpr (Kind == kRev) {
-            s.tile[l] = g < total ? in.x[g] : 0.0f;
+            tile[l] = g < total ? in.x[g] : 0.0f;  // the padding work-items of the last group write 0
             cs::group_barrier(it.get_group());
-            if (g < total) out.y[g] = s.tile[n - 1 - l];
+            if (g < total) out.y[g] = tile[n - 1 - l];
         } else {
-            s.tile[l] = 0.0f;  // touches the local buffer: a scratch stage
+            tile[l] = 0.0f;  // touches the local buffer: a local-memory stage
             // B reads OTHER work-items' writes of stage A: nothing orders them for it, so it calls
             // its own group barrier first (every work-item reaches it, ragged lanes included).
             cs::group_barrier(it.get_group());
@@ -265,9 +266,9 @@ public:
     }
     void prepare_forward() override { this->set_shape(outputs.y, this->shape_of(inputs.x)[0]); }  // the output follows the input (section 10: no derived dims)
     std::unique_ptr<cs::LaunchDescription> define_forward() override {
-        Scratch s;
-        s.tile.reshape(sycl::range<1>{wg_});
-        return this->create_launch_config(cs::range_desc(inputs.x.shape()), cs::wg_desc(sycl::range<1>{wg_}), cs::scratch_desc(s));
+        const std::size_t n = (inputs.x.shape()[0] + wg_ - 1) / wg_ * wg_;  // whole work-groups; the body guards `g < total`
+        return this->create_launch_config(cs::range_desc(sycl::range<1>{n}), cs::wg_desc(sycl::range<1>{wg_}),
+                                          cs::local_desc(sycl::range<1>{wg_}));
     }
 };
 
@@ -442,7 +443,7 @@ inline void hook_bins(cs::System& s, const std::string& path) {
     s.shape_hook(path + ".ref", cs::dim::from_value(path + ".n", 0));
 }
 
-// ---- BigStage: a group stage whose scratch tile has `elems` floats (the work-group is 64) -----------------
+// ---- BigStage: a group-range stage whose local tile has `elems` floats (the work-group is 64) -----------------
 
 class BigStage : public cs::Component<BigStage> {
 public:
@@ -452,14 +453,12 @@ public:
     struct Outputs {
         cs::Output<DType::f32, 1> y;
     };
-    struct Scratch {
-        cs::Local<DType::f32, 1> tile;
-    };
-    static void compute_forward(cs::GroupItem<1> it, const Inputs& in, const Outputs& out, Scratch s) {
+    static void compute_forward(cs::GroupItem<1> it, const Inputs& in, const Outputs& out, TileMem lm) {
         const std::size_t l = it.get_local_linear_id(), g = it.get_global_id(0);
         const bool        ok = g < in.x.shape()[0];
-        s.tile[l]            = ok ? in.x[g] : 0.0f;  // touches the local buffer (own slot): a scratch stage
-        if (ok) out.y[g] = s.tile[l];
+        auto [tile]          = lm.get(it);
+        tile[l]              = ok ? in.x[g] : 0.0f;  // touches the local buffer (own slot): a local-memory stage
+        if (ok) out.y[g] = tile[l];
     }
 
     Inputs  inputs;
@@ -476,9 +475,9 @@ public:
     }
     void prepare_forward() override { set_shape(outputs.y, shape_of(inputs.x)[0]); }  // the output follows the input (section 10: no derived dims)
     std::unique_ptr<cs::LaunchDescription> define_forward() override {
-        Scratch s;
-        s.tile.reshape(sycl::range<1>{elems_});
-        return create_launch_config(cs::range_desc(inputs.x.shape()), cs::wg_desc(sycl::range<1>{64}), cs::scratch_desc(s));
+        const std::size_t n = (inputs.x.shape()[0] + 63) / 64 * 64;
+        return create_launch_config(cs::range_desc(sycl::range<1>{n}), cs::wg_desc(sycl::range<1>{64}),
+                                    cs::local_desc(sycl::range<1>{elems_}));
     }
 };
 
@@ -689,9 +688,8 @@ TEST_CASE("fused sequential: two group+scratch stages, B's own barrier, own loca
     CHECK(want_a[192] == 0.0f);
 }
 
-TEST_CASE("fused sequential: a rank-2 wave and a rank-3 wave (7x9x11), the default work-group shape", "[flavors][fused]") {
-    // The fuse-level work-group override ({8,8}) is gone: group shape belongs to the component (design review, section 4).
-    // The rank-2 section therefore runs with the default shape for its rank.
+TEST_CASE("fused sequential: index-range stages of rank 2 (40 x 30) and rank 3 (7x9x11)", "[flavors][fused]") {
+    // Index-range stages: no work-group shape, one call per index; two fused stages in sequence at ranks 2 and 3.
     SECTION("rank 2, 40 x 30") {
         cs::Model model = tfl::make([](cs::System& s) {
             s.add_subsystem(cs::subsystem_desc<tfl::Src2>("src", std::array<int, 2>{40, 30}, 1.0f, 0.0f));
