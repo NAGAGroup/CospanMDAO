@@ -24,7 +24,7 @@ This page builds the smallest complete CoSpan application: one component that co
 name      = "getting-started"
 version   = "0.1.0"
 channels  = ["https://prefix.dev/jackm97/naga-labs-staging"]
-platforms = ["linux-64"]
+platforms = [{ platform = "linux-64", archspec = "x86_64_v3" }]
 preview   = ["pixi-build"]
 
 [workspace.build-variants]
@@ -53,6 +53,8 @@ getting-started = { path = "." }
 [tasks]
 getting-started = "getting-started"
 ```
+
+The toolchain targets x86-64-v3 (Haswell, Zen and newer), and pixi needs the archspec stated to solve.
 
 ## 2. The CMake file
 
