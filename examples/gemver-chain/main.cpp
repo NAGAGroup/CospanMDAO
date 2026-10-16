@@ -244,10 +244,8 @@ int main(int argc, char** argv) {
             throw std::invalid_argument("--variant must be all|unfused|parallel|fused|onepass|naive|crafted");
 
         // There is no model-wide default device (design review, section 2): the systems add no device, so every instance runs on
-        // AdaptiveCpp's default device. This default_selector_v device is the same one; it is used only to print its name
-        // and to detect the omp backend.
+        // AdaptiveCpp's default device. This default_selector_v device is the same one; it is used only to print its name.
         const sycl::device dev{sycl::default_selector_v};
-        const bool         is_omp = dev.get_backend() == sycl::backend::omp;
         std::printf("gemver-chain: n=%d R=%d iters=%d warmup=%d device=\"%s\"\n", o.n, o.R, o.iters, o.warmup,
                     dev.get_info<sycl::info::device::name>().c_str());
         std::printf("effective GB/s uses a NOMINAL traffic of 8*n^2*4 bytes = %.3f GB per chain (not measured)\n",
@@ -256,24 +254,10 @@ int main(int argc, char** argv) {
         std::vector<Variant> todo;
         const auto           want = [&](const char* nm) { return o.variant == "all" || o.variant == nm; };
         if (want("unfused")) todo.push_back(Variant::unfused);
-        if (want("onepass")) {
-            // Under `all` on omp it is skipped (q comes out wrong there); an explicit
-            // --variant onepass still runs it, so the bug stays reproducible.
-            if (is_omp && o.variant == "all")
-                std::printf("onepass: skipped on omp: q incorrect on this backend, under investigation\n");
-            else
-                todo.push_back(Variant::onepass);
-        }
+        if (want("onepass")) todo.push_back(Variant::onepass);
         if (want("parallel")) todo.push_back(Variant::parallel);
         if (want("fused")) todo.push_back(Variant::fused);
-        if (want("naive")) {
-            // naive contains BicgkOnePass, so under `all` on omp it is skipped for the same reason as onepass; an explicit
-            // --variant naive still runs it.
-            if (is_omp && o.variant == "all")
-                std::printf("naive: skipped on omp: it contains onepass, whose q is incorrect on this backend\n");
-            else
-                todo.push_back(Variant::naive);
-        }
+        if (want("naive")) todo.push_back(Variant::naive);
         if (want("crafted")) todo.push_back(Variant::crafted);
         if (todo.empty()) throw std::invalid_argument("--variant: nothing to run for '" + o.variant + "'");
 

@@ -46,14 +46,12 @@ variant promotes the same names, so the driver is variant-agnostic.
   block) that accumulates `Ps[c][j] = sum_k r[i] B[i][j]` and, per row, `reduce_over_group(B[i][j] p[j])`
   into `Pq[i][block]`, then `RowReduce` (q) and the scale-1 `ColReduce` (s). It reads `B` once for BiCGK
   instead of twice, but sums in a different order, so it is not bitwise equal to the others
-  (relative L2 about 3e-6 against unfused). **Skipped by `--variant all` on omp**, where its `q` is
-  wrong (see the open questions); an explicit `--variant onepass` still runs it there.
+  (relative L2 about 3e-6 against unfused). `--variant all` runs it on every backend.
 * **naive**: the SAME components, fused with global barriers into **three launches for the whole chain** (the
   barrier items make every group of the next segment wait for every group of the earlier ones, in ticket order, so no
   co-residency is needed):
   `G1 = fuse_components(segment<whole>(r2u, gtp), global_barrier(), cred, global_barrier(), gemv)`,
-  `BiCGK = fuse_components(onepass, global_barrier(), segment(rowred, cred_s))`, `G2` as `G1`. It contains `BicgkOnePass`, so on
-  omp its `q` is wrong too (and **`--variant all` skips it there**; an explicit `--variant naive` runs it).
+  `BiCGK = fuse_components(onepass, global_barrier(), segment(rowred, cred_s))`, `G2` as `G1`.
 * **crafted**: components written to be fused, three launches (see below). Passes `--check` on omp as well.
 
 ### What `crafted` does differently
@@ -191,8 +189,7 @@ Notes, honestly:
   tables above use one process per variant. `--variant all` is kept for `--check` and for a quick look.
 * A `--check` run is the correctness record: every variant, one process, relative L2 against the host reference below 1e-4
   at n = 2048, 4096, 8192 and 16384 (the table above lists the worst value per variant).
-* On omp, `crafted` passes `--check` at n = 2048 and 4096 (worst relative L2 about 1.7e-7); `naive` fails there (`q`, `x2`
-  and `w2` are wrong, as `onepass`'s are: it contains `BicgkOnePass`, the known omp bug).
+* On omp, `crafted` passes `--check` at n = 2048 and 4096 (worst relative L2 about 1.7e-7); `onepass` and `naive` pass it too.
 
 ## Running
 
@@ -227,8 +224,5 @@ b. **Compiler flags.** Check whether AdaptiveCpp enables fast-math or similar by
 c. **Small n.** At n = 2048 the old fused variant was much slower than unfused (about 1.7 ms vs
    0.25 ms). The packing buffers suspected then are gone; whether the new launch path (argument and
    geometry arrays, one kernel) still loses at small n is not measured.
-d. **onepass gives a wrong `q` on the omp backend** (`q[0]` right, the rest garbage). `s` and every
-   other variant are correct. Cause unknown: possibly the backend, possibly `reduce_over_group`
-   inside the per-row loop of a group-range body. Not confirmed.
 e. **parallel brings no gain over unfused.** Both products still read the matrix, and nothing was
    profiled to see whether the two kernels actually overlap.

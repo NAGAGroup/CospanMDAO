@@ -285,23 +285,21 @@ public:
     };
     static void compute_forward(cs::GroupItem<1> it, const Inputs& in, const Outputs& out) {
         const std::uint32_t n = u32(in.B.shape()[0]), R = u32(in.B.shape()[0] / out.Ps.shape()[0]);
-        const std::uint32_t blocks = n / static_cast<std::uint32_t>(it.get_local_range(0)), total_groups = (n / R) * blocks;
+        const std::uint32_t blocks = n / static_cast<std::uint32_t>(it.get_local_range(0));
         const std::uint32_t l  = static_cast<std::uint32_t>(it.get_local_id(0));
-        const std::uint32_t ng = static_cast<std::uint32_t>(it.get_group_range(0));
-        for (std::uint32_t g = static_cast<std::uint32_t>(it.get_group(0)); g < total_groups; g += ng) {
-            const std::uint32_t c = g / blocks, blk = g - c * blocks;
-            const std::uint32_t j = blk * static_cast<std::uint32_t>(it.get_local_range(0)) + l;
-            const float         pj = in.p[sycl::id<1>{j}];
-            float               ps = 0.0f;
-            for (std::uint32_t k = 0; k < R; ++k) {
-                const std::uint32_t i = c * R + k;
-                const float         b = in.B[sycl::id<2>{i, j}];
-                ps += in.r[sycl::id<1>{i}] * b;
-                const float sum = cs::reduce_over_group(it.get_group(), b * pj, sycl::plus<float>());
-                if (l == 0) out.Pq[sycl::id<2>{i, blk}] = sum;
-            }
-            out.Ps[sycl::id<2>{c, j}] = ps;
+        const std::uint32_t g  = static_cast<std::uint32_t>(it.get_group(0));  // the launch covers all (n / R) * blocks groups
+        const std::uint32_t c = g / blocks, blk = g - c * blocks;
+        const std::uint32_t j = blk * static_cast<std::uint32_t>(it.get_local_range(0)) + l;
+        const float         pj = in.p[sycl::id<1>{j}];
+        float               ps = 0.0f;
+        for (std::uint32_t k = 0; k < R; ++k) {
+            const std::uint32_t i = c * R + k;
+            const float         b = in.B[sycl::id<2>{i, j}];
+            ps += in.r[sycl::id<1>{i}] * b;
+            const float sum = cs::reduce_over_group(it.get_group(), b * pj, sycl::plus<float>());
+            if (l == 0) out.Pq[sycl::id<2>{i, blk}] = sum;
         }
+        out.Ps[sycl::id<2>{c, j}] = ps;
     }
 
     Inputs  inputs;
