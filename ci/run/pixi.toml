@@ -1,0 +1,17 @@
+# Where the win-64 test packages RUN. They are built on Win-x64-64 (Visual Studio) and installed here on Win-x64-GPU, which
+# has no compiler: ci/add-built.nu fills the `built` feature with the uploaded .conda files, and each environment adds the
+# runtime for one backend. The toolchain packages (naga-acpp-runtime, ...) come in as the test packages' dependencies.
+[workspace]
+name      = "ci-run"
+channels  = ["https://prefix.dev/jackm97/naga-labs-staging"]
+platforms = [{ platform = "win-64", archspec = "x86_64_v3", name = "win-64-v3" }]
+
+# Filled at CI time by `pixi add --feature built <path to .conda>`.
+[feature.built.dependencies]
+
+[feature.cuda.target.win-64.dependencies]
+naga-acpp-runtime-cuda = "*"
+
+[environments]
+run-omp  = ["built"]
+run-cuda = ["built", "cuda"]

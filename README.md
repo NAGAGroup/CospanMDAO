@@ -1,5 +1,7 @@
 # CospanMDAO
 
+[![CI](https://github.com/NAGAGroup/CospanMDAO/actions/workflows/ci.yml/badge.svg)](https://github.com/NAGAGroup/CospanMDAO/actions/workflows/ci.yml)
+
 **GPU-native modeling for multidisciplinary design.** Compose systems of components, connect them by shared variables,
 and run them on the GPU (or any SYCL device) through open standards: SYCL via
 [AdaptiveCpp](https://github.com/AdaptiveCpp/AdaptiveCpp). C++20, header-only, namespace `naga::cospan` (`cs::`).

@@ -1,0 +1,461 @@
+# CI: the unit tests on every platform and backend, mirroring the acpp-toolchain test-* jobs
+# (runner labels, setup-pixi version, per-step continue-on-error with a final fail-the-job step).
+#
+#   linux-64       Linux-x64-GPU   OpenMP, CUDA, OpenCL (Intel CPU runtime)   built on the GPU box
+#   linux-aarch64  linux-arm64-v32 OpenMP
+#   osx-arm64      macOS-26-xlarge OpenMP; Metal is informational
+#   win-64         Win-x64-GPU     OpenMP, CUDA                               built on Win-x64-64 (the GPU box has no VS)
+#   win-arm64      win-arm64-v32   OpenMP
+#
+# Known failures on linux-aarch64, osx-arm64, win-arm64 and Metal are excluded by exact test name from ci/exclude/*.txt
+# and listed, with their failure text, in ci/known-failures.md. linux-64 and win-64 have none.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-64:
+    runs-on: Linux-x64-GPU
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Runner core count
+        run: nproc
+      - uses: prefix-dev/setup-pixi@v0.10.0
+        with:
+          run-install: false
+      # SlabKit is a private repository and a git dependency of this one: the job's own token cannot read it.
+      - name: Let git read the private SlabKit repository
+        env:
+          SLABKIT_READ_TOKEN: ${{ secrets.SLABKIT_READ_TOKEN }}
+        run: git config --global url."https://x-access-token:${SLABKIT_READ_TOKEN}@github.com/NAGAGroup/SlabKit".insteadOf "https://github.com/NAGAGroup/SlabKit"
+      - run: nvidia-smi
+      # Builds the packages from source on this box.
+      - name: Install the default environment
+        timeout-minutes: 90
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/logs"
+          for i in 1 2; do pixi install -e default 2>&1 | tee -a "$GITHUB_WORKSPACE/logs/install-default.log" && exit 0; echo "retry $i"; sleep 30; done; exit 1
+      - name: pixi list
+        id: pixilist
+        continue-on-error: true
+        run: pixi list -e default 2>&1 | tee "$GITHUB_WORKSPACE/logs/pixi-list.txt"
+      - name: Install the CUDA environment
+        id: installcuda
+        continue-on-error: true
+        timeout-minutes: 60
+        run: pixi install -e cuda 2>&1 | tee -a "$GITHUB_WORKSPACE/logs/install-cuda.log"
+      - name: Install the OpenCL environment
+        id: installocl
+        continue-on-error: true
+        timeout-minutes: 60
+        run: pixi install -e ocl 2>&1 | tee -a "$GITHUB_WORKSPACE/logs/install-ocl.log"
+      - name: "Visible backends"
+        id: backends
+        continue-on-error: true
+        run: pixi run -e cuda acpp-info -l 2>&1 | tee -a "$GITHUB_WORKSPACE/logs/backends.log"
+      - name: "cospan-tests on OpenMP"
+        id: omp
+        continue-on-error: true
+        if: ${{ !cancelled() }}
+        timeout-minutes: 30
+        env:
+          ACPP_VISIBILITY_MASK: omp
+        run: pixi exec --spec nushell nu ci/run-catch.nu pixi.toml default cospan-tests 2>&1 | tee -a "$GITHUB_WORKSPACE/logs/omp.log"
+      - name: "cospan-tests on CUDA"
+        id: cuda
+        continue-on-error: true
+        if: ${{ !cancelled() }}
+        timeout-minutes: 30
+        env:
+          ACPP_VISIBILITY_MASK: cuda
+        run: pixi exec --spec nushell nu ci/run-catch.nu pixi.toml cuda cospan-tests 2>&1 | tee -a "$GITHUB_WORKSPACE/logs/cuda.log"
+      # Intel's CPU OpenCL runtime (conda-forge intel-opencl-rt) is the OpenCL device here, as in the toolchain's test job.
+      - name: "cospan-tests on OpenCL (Intel CPU)"
+        id: ocl
+        continue-on-error: true
+        if: ${{ !cancelled() }}
+        timeout-minutes: 30
+        env:
+          ACPP_VISIBILITY_MASK: ocl
+        run: pixi exec --spec nushell nu ci/run-catch.nu pixi.toml ocl cospan-tests 2>&1 | tee -a "$GITHUB_WORKSPACE/logs/ocl.log"
+      - name: "gemver-chain --check on OpenMP"
+        id: gemver-omp
+        continue-on-error: true
+        if: ${{ !cancelled() }}
+        timeout-minutes: 30
+        env:
+          ACPP_VISIBILITY_MASK: omp
+        run: pixi run -e default gemver-chain --check --variant all --n 2048 2>&1 | tee -a "$GITHUB_WORKSPACE/logs/gemver-omp.log"
+      - name: "gemver-chain --check on CUDA"
+        id: gemver-cuda
+        continue-on-error: true
+        if: ${{ !cancelled() }}
+        timeout-minutes: 30
+        env:
+          ACPP_VISIBILITY_MASK: cuda
+        run: pixi run -e cuda gemver-chain --check --variant all --n 2048 2>&1 | tee -a "$GITHUB_WORKSPACE/logs/gemver-cuda.log"
+      - name: "ns-residual --check on OpenMP"
+        id: ns-omp
+        continue-on-error: true
+        if: ${{ !cancelled() }}
+        timeout-minutes: 30
+        env:
+          ACPP_VISIBILITY_MASK: omp
+        run: pixi run -e default ns-residual --check 2>&1 | tee -a "$GITHUB_WORKSPACE/logs/ns-omp.log"
+      - name: "ns-residual --check on CUDA"
+        id: ns-cuda
+        continue-on-error: true
+        if: ${{ !cancelled() }}
+        timeout-minutes: 30
+        env:
+          ACPP_VISIBILITY_MASK: cuda
+        run: pixi run -e cuda ns-residual --check 2>&1 | tee -a "$GITHUB_WORKSPACE/logs/ns-cuda.log"
+      - name: Upload logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-linux-64
+          retention-days: 14
+          if-no-files-found: ignore
+          path: |
+            logs/
+            .pixi/bld/*/*/work/build/*.log
+            .pixi/bld/*/*/work/build/CMakeFiles/*.log
+      - name: Fail the job if any step failed
+        if: ${{ always() }}
+        shell: bash
+        env:
+          STEPS_JSON: ${{ toJSON(steps) }}
+        run: |
+          if printf '%s' "$STEPS_JSON" | grep -Eq '"outcome": "failure"'; then
+            echo "::error::at least one step failed; see the per-step outcomes in this log"
+            exit 1
+          fi
+
+  linux-aarch64:
+    runs-on: linux-arm64-v32
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Runner core count
+        run: nproc
+      - uses: prefix-dev/setup-pixi@v0.10.0
+        with:
+          run-install: false
+      # SlabKit is a private repository and a git dependency of this one: the job's own token cannot read it.
+      - name: Let git read the private SlabKit repository
+        env:
+          SLABKIT_READ_TOKEN: ${{ secrets.SLABKIT_READ_TOKEN }}
+        run: git config --global url."https://x-access-token:${SLABKIT_READ_TOKEN}@github.com/NAGAGroup/SlabKit".insteadOf "https://github.com/NAGAGroup/SlabKit"
+      - name: Install the default environment
+        timeout-minutes: 120
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/logs"
+          for i in 1 2; do pixi install -e default 2>&1 | tee -a "$GITHUB_WORKSPACE/logs/install-default.log" && exit 0; echo "retry $i"; sleep 30; done; exit 1
+      - name: pixi list
+        id: pixilist
+        continue-on-error: true
+        run: pixi list -e default 2>&1 | tee "$GITHUB_WORKSPACE/logs/pixi-list.txt"
+      - name: "cospan-tests on OpenMP"
+        id: omp
+        continue-on-error: true
+        if: ${{ !cancelled() }}
+        timeout-minutes: 60
+        env:
+          ACPP_VISIBILITY_MASK: omp
+        run: pixi exec --spec nushell nu ci/run-catch.nu pixi.toml default cospan-tests ci/exclude/linux-aarch64-omp.txt 2>&1 | tee -a "$GITHUB_WORKSPACE/logs/omp.log"
+      - name: Upload logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-linux-aarch64
+          retention-days: 14
+          if-no-files-found: ignore
+          path: |
+            logs/
+            .pixi/bld/*/*/work/build/*.log
+            .pixi/bld/*/*/work/build/CMakeFiles/*.log
+      - name: Fail the job if any step failed
+        if: ${{ always() }}
+        shell: bash
+        env:
+          STEPS_JSON: ${{ toJSON(steps) }}
+        run: |
+          if printf '%s' "$STEPS_JSON" | grep -Eq '"outcome": "failure"'; then
+            echo "::error::at least one step failed; see the per-step outcomes in this log"
+            exit 1
+          fi
+
+  osx-arm64:
+    runs-on: macOS-26-xlarge
+    timeout-minutes: 240
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      # macOS has no nproc; sysctl reports the same logical core count.
+      - name: Runner core count
+        run: sysctl -n hw.logicalcpu
+      - uses: prefix-dev/setup-pixi@v0.10.0
+        with:
+          run-install: false
+      # SlabKit is a private repository and a git dependency of this one: the job's own token cannot read it.
+      - name: Let git read the private SlabKit repository
+        env:
+          SLABKIT_READ_TOKEN: ${{ secrets.SLABKIT_READ_TOKEN }}
+        run: git config --global url."https://x-access-token:${SLABKIT_READ_TOKEN}@github.com/NAGAGroup/SlabKit".insteadOf "https://github.com/NAGAGroup/SlabKit"
+      - name: Install the default environment
+        timeout-minutes: 120
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/logs"
+          for i in 1 2; do pixi install -e default 2>&1 | tee -a "$GITHUB_WORKSPACE/logs/install-default.log" && exit 0; echo "retry $i"; sleep 30; done; exit 1
+      - name: pixi list
+        id: pixilist
+        continue-on-error: true
+        run: pixi list -e default 2>&1 | tee "$GITHUB_WORKSPACE/logs/pixi-list.txt"
+      - name: "cospan-tests on OpenMP"
+        id: omp
+        continue-on-error: true
+        if: ${{ !cancelled() }}
+        timeout-minutes: 60
+        env:
+          ACPP_VISIBILITY_MASK: omp
+        run: pixi exec --spec nushell nu ci/run-catch.nu pixi.toml default cospan-tests ci/exclude/osx-arm64-omp.txt 2>&1 | tee -a "$GITHUB_WORKSPACE/logs/omp.log"
+      # The Metal check is informational: this step has no id, so the fail-the-job step below never counts it.
+      - name: "cospan-tests on Metal (informational)"
+        continue-on-error: true
+        if: ${{ !cancelled() }}
+        timeout-minutes: 60
+        env:
+          ACPP_VISIBILITY_MASK: metal
+        run: pixi exec --spec nushell nu ci/run-catch.nu pixi.toml default cospan-tests ci/exclude/osx-arm64-metal.txt 2>&1 | tee -a "$GITHUB_WORKSPACE/logs/metal.log"
+      - name: Upload logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-osx-arm64
+          retention-days: 14
+          if-no-files-found: ignore
+          path: |
+            logs/
+            .pixi/bld/*/*/work/build/*.log
+            .pixi/bld/*/*/work/build/CMakeFiles/*.log
+      - name: Fail the job if any step failed
+        if: ${{ always() }}
+        shell: bash
+        env:
+          STEPS_JSON: ${{ toJSON(steps) }}
+        run: |
+          if printf '%s' "$STEPS_JSON" | grep -Eq '"outcome": "failure"'; then
+            echo "::error::at least one step failed; see the per-step outcomes in this log"
+            exit 1
+          fi
+
+  # win-64 is built on a box with Visual Studio and run on the GPU box, which has none (as in the toolchain).
+  build-win-64:
+    runs-on: Win-x64-64
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - name: Runner core count
+        run: (Get-CimInstance Win32_Processor | Measure-Object NumberOfLogicalProcessors -Sum).Sum
+      - uses: prefix-dev/setup-pixi@v0.10.0
+        with:
+          run-install: false
+      # SlabKit is a private repository and a git dependency of this one: the job's own token cannot read it.
+      - name: Let git read the private SlabKit repository
+        env:
+          SLABKIT_READ_TOKEN: ${{ secrets.SLABKIT_READ_TOKEN }}
+        run: git config --global url."https://x-access-token:$env:SLABKIT_READ_TOKEN@github.com/NAGAGroup/SlabKit".insteadOf "https://github.com/NAGAGroup/SlabKit"
+      - name: Build the packages (pixi install -e default)
+        timeout-minutes: 150
+        run: |
+          # cmd.exe's 8191-character limit: a short PATH, as the toolchain's win-64 build does.
+          $env:PATH = @(
+            "$env:SystemRoot\system32",
+            "$env:SystemRoot",
+            "$env:SystemRoot\System32\Wbem",
+            "$env:SystemRoot\System32\WindowsPowerShell\v1.0",
+            "$env:USERPROFILE\.pixi\bin",
+            "$env:ProgramFiles\Git\cmd"
+          ) -join ";"
+          foreach ($i in 1..2) { pixi install -e default; if ($LASTEXITCODE -eq 0) { exit 0 }; Write-Host "retry $i"; Start-Sleep 30 }; exit 1
+      - name: Collect the built packages
+        run: |
+          New-Item -ItemType Directory -Force -Path packages | Out-Null
+          # .pixi\bld\<package>\<hash>\output\win-64\<file>.conda: keep each build in its own folder so equal names cannot collide.
+          Get-ChildItem -Path .pixi\bld -Recurse -Filter *.conda | ForEach-Object {
+            Write-Host $_.FullName
+            $d = Join-Path packages ($_.Directory.Parent.Parent.Parent.Name + "-" + $_.Directory.Parent.Parent.Name)
+            New-Item -ItemType Directory -Force -Path $d | Out-Null
+            Copy-Item $_.FullName -Destination $d
+          }
+          Get-ChildItem packages -Recurse -Filter *.conda | Format-Table Name, Length
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages-win-64
+          retention-days: 14
+          if-no-files-found: error
+          path: packages/**
+      - name: Upload logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-build-win-64
+          retention-days: 14
+          if-no-files-found: ignore
+          path: |
+            logs/
+            .pixi/bld/*/*/work/build/*.log
+            .pixi/bld/*/*/work/build/CMakeFiles/*.log
+
+  win-64:
+    needs: [build-win-64]
+    runs-on: Win-x64-GPU
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: powershell # Windows PowerShell: this image has no pwsh, and bash is the WSL stub
+    steps:
+      - uses: actions/checkout@v4
+      - name: Runner core count
+        run: (Get-CimInstance Win32_Processor | Measure-Object NumberOfLogicalProcessors -Sum).Sum
+      - name: Update NVIDIA datacenter driver
+        run: |
+          if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) { nvidia-smi } else { Write-Host "nvidia-smi not on PATH" }
+          $ver = "553.62"
+          $url = "https://us.download.nvidia.com/tesla/$ver/$ver-data-center-tesla-desktop-winserver-2022-dch-international.exe"
+          Write-Host "Fetching $url"
+          curl.exe -sL -o driver.exe $url
+          Start-Process -FilePath .\driver.exe -ArgumentList "-s","-noreboot" -Wait
+          if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) { nvidia-smi } else { Write-Host "nvidia-smi not on PATH" }
+      - uses: prefix-dev/setup-pixi@v0.10.0
+        with:
+          run-install: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: packages-win-64
+          path: ci/run/pkgs
+      # Adds the built .conda files to ci/run's `built` feature, then installs the run environments.
+      - name: Install the run environments
+        timeout-minutes: 60
+        run: |
+          pixi exec --spec nushell nu ci/add-built.nu ci/run/pkgs
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          foreach ($e in "run-omp", "run-cuda") { pixi install --manifest-path ci/run/pixi.toml -e $e; if ($LASTEXITCODE -ne 0) { exit 1 } }
+      - name: pixi list
+        id: pixilist
+        continue-on-error: true
+        run: |
+          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\logs" | Out-Null
+          pixi list --manifest-path ci/run/pixi.toml -e run-cuda | Tee-Object -FilePath "$env:GITHUB_WORKSPACE\logs\pixi-list.txt"
+      - name: "cospan-tests on OpenMP"
+        id: omp
+        continue-on-error: true
+        if: ${{ !cancelled() }}
+        timeout-minutes: 30
+        env:
+          ACPP_VISIBILITY_MASK: omp
+        run: pixi exec --spec nushell nu ci/run-catch.nu ci/run/pixi.toml run-omp cospan-tests
+      - name: "cospan-tests on CUDA"
+        id: cuda
+        continue-on-error: true
+        if: ${{ !cancelled() }}
+        timeout-minutes: 30
+        env:
+          ACPP_VISIBILITY_MASK: cuda
+        run: pixi exec --spec nushell nu ci/run-catch.nu ci/run/pixi.toml run-cuda cospan-tests
+      - name: Upload logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-win-64
+          retention-days: 14
+          if-no-files-found: ignore
+          path: logs/
+      - name: Fail the job if any step failed
+        if: ${{ always() }}
+        shell: powershell
+        env:
+          STEPS_JSON: ${{ toJSON(steps) }}
+        run: |
+          if ($env:STEPS_JSON -match '"outcome":\s*"failure"') {
+            Write-Host "::error::at least one step failed; see the per-step outcomes in this log"
+            exit 1
+          }
+
+  win-arm64:
+    runs-on: win-arm64-v32
+    timeout-minutes: 240
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - name: Runner core count
+        run: (Get-CimInstance Win32_Processor | Measure-Object NumberOfLogicalProcessors -Sum).Sum
+      - uses: prefix-dev/setup-pixi@v0.10.0
+        with:
+          run-install: false
+      # SlabKit is a private repository and a git dependency of this one: the job's own token cannot read it.
+      - name: Let git read the private SlabKit repository
+        env:
+          SLABKIT_READ_TOKEN: ${{ secrets.SLABKIT_READ_TOKEN }}
+        run: git config --global url."https://x-access-token:$env:SLABKIT_READ_TOKEN@github.com/NAGAGroup/SlabKit".insteadOf "https://github.com/NAGAGroup/SlabKit"
+      # This box both compiles and runs (no separate GPU box exists for win-arm64).
+      - name: Install the default environment
+        timeout-minutes: 150
+        run: |
+          foreach ($i in 1..2) { pixi install -e default; if ($LASTEXITCODE -eq 0) { exit 0 }; Write-Host "retry $i"; Start-Sleep 30 }; exit 1
+      - name: pixi list
+        id: pixilist
+        continue-on-error: true
+        run: |
+          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\logs" | Out-Null
+          pixi list -e default | Tee-Object -FilePath "$env:GITHUB_WORKSPACE\logs\pixi-list.txt"
+      - name: "cospan-tests on OpenMP"
+        id: omp
+        continue-on-error: true
+        if: ${{ !cancelled() }}
+        timeout-minutes: 60
+        env:
+          ACPP_VISIBILITY_MASK: omp
+        run: pixi exec --spec nushell nu ci/run-catch.nu pixi.toml default cospan-tests ci/exclude/win-arm64-omp.txt
+      - name: Upload logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-win-arm64
+          retention-days: 14
+          if-no-files-found: ignore
+          path: |
+            logs/
+            .pixi/bld/*/*/work/build/*.log
+            .pixi/bld/*/*/work/build/CMakeFiles/*.log
+      - name: Fail the job if any step failed
+        if: ${{ always() }}
+        shell: pwsh
+        env:
+          STEPS_JSON: ${{ toJSON(steps) }}
+        run: |
+          if ($env:STEPS_JSON -match '"outcome":\s*"failure"') {
+            Write-Host "::error::at least one step failed; see the per-step outcomes in this log"
+            exit 1
+          }

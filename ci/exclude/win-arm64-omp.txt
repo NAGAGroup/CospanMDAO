@@ -1,0 +1,1 @@
+# Exact Catch2 test names to skip on this platform and backend, one per line; see ci/known-failures.md.
