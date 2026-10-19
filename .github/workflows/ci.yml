@@ -33,11 +33,6 @@ jobs:
       - uses: prefix-dev/setup-pixi@v0.10.0
         with:
           run-install: false
-      # SlabKit is a private repository and a git dependency of this one: the job's own token cannot read it.
-      - name: Let git read the private SlabKit repository
-        env:
-          SLABKIT_READ_TOKEN: ${{ secrets.SLABKIT_READ_TOKEN }}
-        run: git config --global url."https://x-access-token:${SLABKIT_READ_TOKEN}@github.com/NAGAGroup/SlabKit".insteadOf "https://github.com/NAGAGroup/SlabKit"
       - run: nvidia-smi
       # Builds the packages from source on this box.
       - name: Install the default environment
@@ -151,11 +146,6 @@ jobs:
       - uses: prefix-dev/setup-pixi@v0.10.0
         with:
           run-install: false
-      # SlabKit is a private repository and a git dependency of this one: the job's own token cannot read it.
-      - name: Let git read the private SlabKit repository
-        env:
-          SLABKIT_READ_TOKEN: ${{ secrets.SLABKIT_READ_TOKEN }}
-        run: git config --global url."https://x-access-token:${SLABKIT_READ_TOKEN}@github.com/NAGAGroup/SlabKit".insteadOf "https://github.com/NAGAGroup/SlabKit"
       - name: Install the default environment
         timeout-minutes: 120
         run: |
@@ -209,11 +199,6 @@ jobs:
       - uses: prefix-dev/setup-pixi@v0.10.0
         with:
           run-install: false
-      # SlabKit is a private repository and a git dependency of this one: the job's own token cannot read it.
-      - name: Let git read the private SlabKit repository
-        env:
-          SLABKIT_READ_TOKEN: ${{ secrets.SLABKIT_READ_TOKEN }}
-        run: git config --global url."https://x-access-token:${SLABKIT_READ_TOKEN}@github.com/NAGAGroup/SlabKit".insteadOf "https://github.com/NAGAGroup/SlabKit"
       - name: Install the default environment
         timeout-minutes: 120
         run: |
@@ -275,11 +260,6 @@ jobs:
       - uses: prefix-dev/setup-pixi@v0.10.0
         with:
           run-install: false
-      # SlabKit is a private repository and a git dependency of this one: the job's own token cannot read it.
-      - name: Let git read the private SlabKit repository
-        env:
-          SLABKIT_READ_TOKEN: ${{ secrets.SLABKIT_READ_TOKEN }}
-        run: git config --global url."https://x-access-token:$env:SLABKIT_READ_TOKEN@github.com/NAGAGroup/SlabKit".insteadOf "https://github.com/NAGAGroup/SlabKit"
       - name: Build the packages (pixi install -e default)
         timeout-minutes: 150
         run: |
@@ -410,11 +390,6 @@ jobs:
       - uses: prefix-dev/setup-pixi@v0.10.0
         with:
           run-install: false
-      # SlabKit is a private repository and a git dependency of this one: the job's own token cannot read it.
-      - name: Let git read the private SlabKit repository
-        env:
-          SLABKIT_READ_TOKEN: ${{ secrets.SLABKIT_READ_TOKEN }}
-        run: git config --global url."https://x-access-token:$env:SLABKIT_READ_TOKEN@github.com/NAGAGroup/SlabKit".insteadOf "https://github.com/NAGAGroup/SlabKit"
       # This box both compiles and runs (no separate GPU box exists for win-arm64).
       - name: Install the default environment
         timeout-minutes: 150
