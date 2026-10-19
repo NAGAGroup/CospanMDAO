@@ -54,6 +54,7 @@ solve-group = "default"
 [package]
 name    = "cospanmdao"
 version = "0.1.0"
+license = "Apache-2.0"
 
 [package.build.backend]
 name     = "pixi-build-cmake"
