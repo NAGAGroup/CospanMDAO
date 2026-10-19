@@ -4,7 +4,7 @@
 // naga/cospan/fused_component.hpp — fused groups and the descriptor helpers
 // =============================================================================
 //
-// A FUSED GROUP is semantically a component: one kernel, one submission (docs/design-review-2026-10-03.md, 11.6). Its
+// A FUSED GROUP is semantically a component: one kernel, one submission (internal/design-review-2026-10-03.md, 11.6). Its
 // stages are components whose bodies run as the stages of ONE kernel through the group launcher (group_launch.hpp):
 //   precompute   runs each stage's precompute, then builds the launcher's pointer array once;
 //   compute      the launcher describes every stage, checks the work-group shapes, uploads the stages' arguments and the

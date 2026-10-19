@@ -5,7 +5,7 @@
 // =============================================================================
 //
 // One VarMeta per variable, held by shared_ptr by EVERY instance that belongs to it
-// (docs/design-review-2026-10-03.md, section 1). It carries what the variable IS: dtype, rank, the shape
+// (internal/design-review-2026-10-03.md, section 1). It carries what the variable IS: dtype, rank, the shape
 // definition, the resolved shape, the initializer, the stale and materialized flags, and weak pointers
 // to the instances that share it and to each placement's data. It holds no memory and keeps nothing alive. It holds
 // NO EVENTS: every container keeps its own read and write lists (SlabKit's usm_vector), and a task orders itself
@@ -249,7 +249,7 @@ constexpr bool is_integer_value_dtype(DType dt) noexcept {
     return v != DType::f32 && v != DType::f64;
 }
 
-/// The per-index dimension of a ragged shape, on the device (docs/design-review-2026-10-03.md, section 10): the extents
+/// The per-index dimension of a ragged shape, on the device (internal/design-review-2026-10-03.md, section 10): the extents
 /// (counts) and their exclusive scan (the n + 1 block offsets), built by a ragged shape hook (shape_hook.hpp:
 /// counts_from / offsets_from) with a parallel scan, and read by the consumers' index arrays. The host sees only the total
 /// and a negative / invalid flag. The vectors are `mutable` so that a holder of a const pointer can register the event of
@@ -539,7 +539,7 @@ public:
     }
 
     /// Pushes `src`'s contents to every OTHER live, bound placement of this variable, in an order that crosses each context
-    /// once (r05, docs/spec/revisions/r05-*.md section 4). Every copy is a copy_from (SlabKit makes each one legal). Targets
+    /// once (r05, internal/spec/revisions/r05-*.md section 4). Every copy is a copy_from (SlabKit makes each one legal). Targets
     /// are grouped by context:
     ///   1. `src` is copied into every target in its own context; a host target there becomes `hostSrc`.
     ///   2. For each other context C, in data order: with a host placement H in C, `hostSrc` (else `src`, which then becomes
@@ -620,7 +620,7 @@ public:
     /// The first materialization has happened.
     bool is_materialized() const { return materialized; }
     /// A variable that is not materialized is always stale; a materialized one is stale after mark_stale()
-    /// until its initializer has run again (docs/design-review-2026-10-03.md, section 5).
+    /// until its initializer has run again (internal/design-review-2026-10-03.md, section 5).
     bool is_stale() const { return !is_materialized() || stale_; }
     void mark_stale() { stale_ = true; }
 

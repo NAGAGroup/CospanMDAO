@@ -4,7 +4,7 @@
 // naga/cospan/model_meta.hpp — the model-wide metadata object (r04)
 // =============================================================================
 //
-// docs/spec/revisions/r04-2026-10-11-flat-model-metadata.md. ONE object per model holds the structure:
+// internal/spec/revisions/r04-2026-10-11-flat-model-metadata.md. ONE object per model holds the structure:
 //
 //   THE TREE         Nodes, owned here. A system node holds its children in declaration order; a leaf (a component or a
 //                    fused group) has none. Each node owns its subsystem object. The run walks this tree with an

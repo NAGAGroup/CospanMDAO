@@ -2,8 +2,8 @@
 
 **What this is.** The CoSpan design as built on branch `rework-2026-10-03`. It describes what the code implements and
 nothing else. r01 (`r01-2026-09-28-the-design-as-agreed.md`) is superseded and kept as history. Authority for the
-decisions behind this text: `docs/design-review-2026-10-03.md` (sections 1 to 10; where sections 6 and 9 conflict with 10,
-section 10 wins) and D144 in `docs/phase1-decisions.md`. Every API name here is the name in `include/naga/cospan/`.
+decisions behind this text: `internal/design-review-2026-10-03.md` (sections 1 to 10; where sections 6 and 9 conflict with 10,
+section 10 wins) and D144 in `internal/phase1-decisions.md`. Every API name here is the name in `include/naga/cospan/`.
 
 Notation: `cs::` is `naga::cospan`, `sk::` is `naga::slabkit` (SlabKit owns the contracts of `sk::context`, `sk::queue`,
 `sk::unordered_queue`, `sk::usm_vector` and `sk::DevicePool`).

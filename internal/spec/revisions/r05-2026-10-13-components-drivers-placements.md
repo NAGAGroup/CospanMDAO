@@ -1,6 +1,6 @@
 # r05: Components and drivers, placements by context, push ranking (living spec)
 
-Status: **agreed design (2026-10-13), implemented on branch r04-impl (unreviewed)**. The plan this was built from is `docs/impl-plan-r05.md`. This revision sits on r04 (flat model metadata).
+Status: **agreed design (2026-10-13), implemented on branch r04-impl (unreviewed)**. The plan this was built from is `internal/impl-plan-r05.md`. This revision sits on r04 (flat model metadata).
 
 ## Purpose
 

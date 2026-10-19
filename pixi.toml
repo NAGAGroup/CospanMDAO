@@ -112,6 +112,7 @@ no-default-feature = true
 [feature.documentation.dependencies]
 sphinx          = "<9"  # breathe (latest 5.1) needs sphinx < 9; unpinned, the solver picked sphinx 9 with breathe 4.15, which fails to import
 myst-parser     = "*"
+furo            = "*"
 breathe         = "*"
 doxygen         = "*"
 sphinx-autobuild = "*"

@@ -7,7 +7,7 @@
 // Every test goes through a cospan::Model (create_model / setup / run /
 // wait / view_* / update_input). Nothing here reaches past the Model's public API.
 //
-// Reading results (docs/design-review-2026-10-03.md, section 5): run() only enqueues. A host view can be
+// Reading results (internal/design-review-2026-10-03.md, section 5): run() only enqueues. A host view can be
 // obtained only after the first forward, and it must be sync()ed before it is read. The helpers below do the
 // forward + view + sync sequence so the cases do not repeat it.
 

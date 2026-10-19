@@ -1,6 +1,6 @@
 // Fused-component and independent-children tests, every case through a cospan::Model.
 //
-// ParallelSystem and FusedSystem are gone (docs/rework-migration-2026-10-03.md). A fused group is a component built by
+// ParallelSystem and FusedSystem are gone (internal/rework-migration-2026-10-03.md). A fused group is a component built by
 // cst::fuse<seq|par>(name, connects_desc({...}), subsystem_desc<...>(...)...) and its ports are reached by path
 // ("f.a.x"); a plain System of the same children is cs::system_from(name, ...). Concurrency of independent children
 // comes from data dependencies alone (design review, section 3).

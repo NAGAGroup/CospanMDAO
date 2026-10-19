@@ -5,7 +5,7 @@
 //                           and it initializes
 //
 // (The destruction-gate and two-readers cases need a kernel held running; they were removed and wait for a test mocking
-// system, see docs/ROADMAP.md.)
+// system, see internal/ROADMAP.md.)
 
 #include <algorithm>
 

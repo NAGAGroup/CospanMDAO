@@ -464,7 +464,7 @@ The transient test reaches the transient System with `get_subsystem("tr")` (a `d
 "View composition" is tested by connecting a `Slice` on top of a promoted alias that already carries a `Slice`: the offsets add (2 + 1 = 3, elements 3..4), and the consumer's result is the check. It goes through `connect`, not through a hand-built view. r01 §8.2.
 
 ## D121 — KNOWN ISSUE: CUDA deferred-free deadlock without a pool
-A no-pool Model on CUDA hangs in the first kernel submit after an OS-route free (a transient release, or a value-driven root growing): SlabKit's free runs `cuMemFree` in an `async_host` task while the next kernel's host callback blocks the stream on that task. Not a CoSpan bug. SlabKit e5e2ac1 puts deferred frees on their own queue (the design: nothing depends on a free), which as a side effect no longer triggers the fork bug, so the tags are removed and the WeightedHistogram and `[transient]` cases run in the full CUDA suite. The fork bug is still present in naga-acpp 2026.09.29 (a kernel depending on an unfinished async_host node gets a blocking host callback in the CUDA/HIP stream, which CoSpan host components followed by a device consumer still take); the fix is committed in the fork at b04d8349 (naga/develop, unbuilt, unpushed), see the doc. A pool in `ModelConfig` is still an option. Details and stacks: `docs/known-issues/cuda-deferred-free-deadlock.md`. r01 §4, §9.
+A no-pool Model on CUDA hangs in the first kernel submit after an OS-route free (a transient release, or a value-driven root growing): SlabKit's free runs `cuMemFree` in an `async_host` task while the next kernel's host callback blocks the stream on that task. Not a CoSpan bug. SlabKit e5e2ac1 puts deferred frees on their own queue (the design: nothing depends on a free), which as a side effect no longer triggers the fork bug, so the tags are removed and the WeightedHistogram and `[transient]` cases run in the full CUDA suite. The fork bug is still present in naga-acpp 2026.09.29 (a kernel depending on an unfinished async_host node gets a blocking host callback in the CUDA/HIP stream, which CoSpan host components followed by a device consumer still take); the fix is committed in the fork at b04d8349 (naga/develop, unbuilt, unpushed), see the doc. A pool in `ModelConfig` is still an option. Details and stacks: `internal/known-issues/cuda-deferred-free-deadlock.md`. r01 §4, §9.
 Superseded by D135.
 
 ## D122 — Release without -g is the only working build for now
@@ -481,7 +481,7 @@ Four element-wise stages as a plain System and as a sequential FusedSystem (777 
 Superseded by D135.
 
 ## D126 — SlabKit repinned to the frees-lane commit
-`pixi.toml` pins slabkit to `e5e2ac15f31a88bb4a565b2eb18933f5aba140e1` (was `5d6b7b5e6cb6563cfb285361ce05686518c18f04`): deferred frees run on their own lane, `begin_item` and `open_group` do not merge it, and `wait()` and the stream's wait list do, so no kernel depends on a free (D121). Lock refreshed with `pixi lock`. The `[os-free]` tag is removed from `test_component.cpp` and `test_system.cpp`, and the CUDA verification runs the whole suite with no filter, three times. The fork's root cause is unchanged and still pending a rebuild; see `docs/known-issues/cuda-deferred-free-deadlock.md`. r01 §4, §9.
+`pixi.toml` pins slabkit to `e5e2ac15f31a88bb4a565b2eb18933f5aba140e1` (was `5d6b7b5e6cb6563cfb285361ce05686518c18f04`): deferred frees run on their own lane, `begin_item` and `open_group` do not merge it, and `wait()` and the stream's wait list do, so no kernel depends on a free (D121). Lock refreshed with `pixi lock`. The `[os-free]` tag is removed from `test_component.cpp` and `test_system.cpp`, and the CUDA verification runs the whole suite with no filter, three times. The fork's root cause is unchanged and still pending a rebuild; see `internal/known-issues/cuda-deferred-free-deadlock.md`. r01 §4, §9.
 Superseded by D135.
 
 ## D127 — StageRecord::local_off
@@ -507,7 +507,7 @@ Superseded by D135.
 A model with roots gen.y f32[100], cvt.d f64[64], a tie alias bc f32[8] and comb.o f32[16] (1008 B), two connected inputs (peers) and a connected f64 input, one tie and one promote, reports arena capacity 263152 B = 1008 + 262144 (`kArenaSlack`, D106) and 1008 B in use after setup and after a forward, on omp and on CUDA. So neither a connected input peer (D85) nor the old member roots of a tie are counted twice in this shape. The test asserts that equality and carries no `[!mayfail]`. The pool case shows `pool_bytes` 1 MiB and `pool_bytes_in_use` 1024 B for 8 floats and 12288 B for 3000 floats (node size 1024). r01 §9.
 
 ## D134 — A CUDA run of the whole suite hung once in an existing flavors case
-One of four CUDA runs of the full suite at this commit hit the 600 s timeout in `test_flavors.cpp:943` (`fused: a value-driven size driven from outside the fuse runs and follows the value, in both modes`, parallel section) before reaching the model tests; the other three passed (44 cases, 543 assertions). Not diagnosed here. That case grows a root and frees it through the free route (D125); whether the hang is related to `docs/known-issues/cuda-deferred-free-deadlock.md` is not established. No library change was made in this step.
+One of four CUDA runs of the full suite at this commit hit the 600 s timeout in `test_flavors.cpp:943` (`fused: a value-driven size driven from outside the fuse runs and follows the value, in both modes`, parallel section) before reaching the model tests; the other three passed (44 cases, 543 assertions). Not diagnosed here. That case grows a root and frees it through the free route (D125); whether the hang is related to `internal/known-issues/cuda-deferred-free-deadlock.md` is not established. No library change was made in this step.
 A later CUDA run (run 1 of a repeat set) passed the whole suite (543 assertions in 44 test cases) and then the process dumped core (SIGSEGV, exit 245) after Catch2's summary, i.e. at teardown. Undiagnosed. Both symptoms (the hang and the exit crash) were seen on naga-acpp 2026.09.29 before the fork fix, and both may be the known fork bug (a value-driven root growing in a no-pool fused wave means an OS free plus SlabKit async_host copies). The next step is to move the lock to the fixed 2026.09.29 build and see what is left.
 
 ## D135 — Synchronous frees
@@ -604,7 +604,7 @@ Superseded by D143 in its lifetime by counting, its rearm semantics and its clam
 
 6. HOST ACCESS to a released root names the root and the subsystem whose decrement freed it.
 
-Supersedes D137, the per-component wait of D135, the transient/last_user parts of D138 and the forced-transient internal roots of D140. Migration notes: docs/migration-2026-10-02.md.
+Supersedes D137, the per-component wait of D135, the transient/last_user parts of D138 and the forced-transient internal roots of D140. Migration notes: internal/migration-2026-10-02.md.
 
 ## D142 — Shape authority (Jack, 2026-10-02)
 
@@ -650,7 +650,7 @@ Supersedes: D135's queue-wait frees (the per-release stream wait and its D141 am
 
 ## D144 — The orchestration and data-model rework (2026-10-03, Jack)
 
-Implemented on branch `rework-2026-10-03`. Spec: `docs/spec/revisions/r02-2026-10-03-the-design-as-built.md`. Decisions and their reasons: `docs/design-review-2026-10-03.md` (sections 1 to 10; section 10 wins over 6 and 9).
+Implemented on branch `rework-2026-10-03`. Spec: `internal/spec/revisions/r02-2026-10-03-the-design-as-built.md`. Decisions and their reasons: `internal/design-review-2026-10-03.md` (sections 1 to 10; section 10 wins over 6 and 9).
 
 1. DATA MODEL: every input, output and alias is an instance owned by one component or System; a variable's shared metadata is one object held by every instance of the variable and holds no memory; per-device data is held by the instances on that device. Lifetime is ownership: no roots, shadows, ledgers or flags ("initialized" = some device has live data).
 2. MERGING lives in the calls: `connect` (the source's metadata wins), `tie_inputs` and `tie_outputs` (the alias's wins), `promote` (the member's wins); each call checks its own rules. The last initializer declaration wins; `Model::update_input` marks the variable stale and queues no work.

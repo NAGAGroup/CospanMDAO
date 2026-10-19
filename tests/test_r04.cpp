@@ -1,5 +1,5 @@
 // =============================================================================
-// tests/test_r04.cpp — r04: flat model metadata (docs/spec/revisions/r04-2026-10-11-flat-model-metadata.md)
+// tests/test_r04.cpp — r04: flat model metadata (internal/spec/revisions/r04-2026-10-11-flat-model-metadata.md)
 // =============================================================================
 //
 //   lifecycle   structural calls after finalize; Model::add_subsystem after setup; a second setup() resets and old handles

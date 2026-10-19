@@ -1,4 +1,4 @@
-// NOT BUILT: chunked systems are set aside pending their redesign (docs/design-review-2026-10-03.md, section 8, phase 9).
+// NOT BUILT: chunked systems are set aside pending their redesign (internal/design-review-2026-10-03.md, section 8, phase 9).
 // ChunkedSystem. Every case builds the same subsystem twice, once as a plain System and once as
 // a ChunkedSystem, and compares the outputs bitwise; host references check both.
 //

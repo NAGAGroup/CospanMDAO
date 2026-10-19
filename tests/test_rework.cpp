@@ -1,4 +1,4 @@
-// Behavior of the 2026-10-03 rework that no other test file checks (docs/design-review-2026-10-03.md, section 5).
+// Behavior of the 2026-10-03 rework that no other test file checks (internal/design-review-2026-10-03.md, section 5).
 //
 //   update_input on a free input is applied at the NEXT forward; a view synced before it shows the old value
 //   several update_input calls before one forward: the last one wins

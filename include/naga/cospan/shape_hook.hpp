@@ -4,7 +4,7 @@
 // naga/cospan/shape_hook.hpp — shape hooks: a System's contract for the shape of an input or a tie alias
 // =============================================================================
 //
-// docs/design-review-2026-10-03.md, sections 10 and 11.5. Each System::shape_hook(target, <one descriptor per dimension>)
+// internal/design-review-2026-10-03.md, sections 10 and 11.5. Each System::shape_hook(target, <one descriptor per dimension>)
 // call creates ONE templated pseudo-component (ShapeHookStep<descriptor types...>) that has only a forward. It sets the
 // dimensions of its target that are not as_is; those dimensions are unspecified in the definition and owned by this hook
 // alone. The target is an input, an input or output tie alias, or an ordinary untied output (for which the hook runs before

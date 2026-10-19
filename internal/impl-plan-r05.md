@@ -35,11 +35,11 @@ One pass of edits, then one gate.
 
 ## B. CoSpan: spec and roadmap, before the code
 
-- **Spec revision.** Write docs/spec/revisions/r05-2026-10-13-components-drivers-placements.md, containing every section C rule below as the agreed design, including:
+- **Spec revision.** Write internal/spec/revisions/r05-2026-10-13-components-drivers-placements.md, containing every section C rule below as the agreed design, including:
   - the push ranking;
   - the SlabKit rule;
   - the WSL2/Windows caveat: CUDA there lacks concurrent managed access, so the host must not touch shared memory while any kernel runs.
-- **Roadmap.** Add to docs/ROADMAP.md, under the path to public release: "C++20 audit: use concepts and constraints instead of static_assert throughout."
+- **Roadmap.** Add to internal/ROADMAP.md, under the path to public release: "C++20 audit: use concepts and constraints instead of static_assert throughout."
 
 ## C. CoSpan code
 

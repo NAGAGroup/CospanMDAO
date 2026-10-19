@@ -5,7 +5,7 @@
 // =============================================================================
 //
 // A System never does work and never runs: it GROUPS leaves and DECLARES wiring. It has only setup() (run_setup below)
-// plus the declaration calls; there is no prepare_forward and no forward (docs/spec/revisions/r04-...). The run
+// plus the declaration calls; there is no prepare_forward and no forward (internal/spec/revisions/r04-...). The run
 // walks the model's tree (model.hpp); everything a System declares is recorded in the model-wide metadata
 // (model_meta.hpp) and nothing is replayed.
 //

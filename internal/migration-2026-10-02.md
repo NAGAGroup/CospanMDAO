@@ -1,4 +1,4 @@
-> **Superseded by docs/rework-migration-2026-10-03.md and spec r02** (docs/spec/revisions/r02-2026-10-03-the-design-as-built.md). Kept as history.
+> **Superseded by internal/rework-migration-2026-10-03.md and spec r02** (internal/spec/revisions/r02-2026-10-03-the-design-as-built.md). Kept as history.
 
 # Migration notes, 2026-10-02 (for nlmflbm-light-transport)
 

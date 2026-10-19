@@ -2,7 +2,7 @@
 // wait / view_* / update_input); the only reach past those is the Model's own retrieval
 // (root().instance_at, get_subsystem).
 //
-// Reading results (docs/design-review-2026-10-03.md, section 5): forward() only enqueues; a host view is obtained
+// Reading results (internal/design-review-2026-10-03.md, section 5): forward() only enqueues; a host view is obtained
 // after the first forward and sync()ed before it is read (cst::synced_output and friends do both).
 //
 //   1. Sellar forward   the same Systems templated on the dtype, run in f32 and f64

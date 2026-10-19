@@ -5,7 +5,7 @@
 // =============================================================================
 //
 // connect, promote, tie_inputs, tie_outputs and the declaration of an initial value, as free functions in
-// naga::cospan::detail over the instances of instance.hpp (docs/design-review-2026-10-03.md, sections 1 and 2).
+// naga::cospan::detail over the instances of instance.hpp (internal/design-review-2026-10-03.md, sections 1 and 2).
 // A call merges the shared variable metadata (VarMeta) of the instances it joins; there is no other record of the
 // wiring, and nothing is ever unregistered (an instance that goes away just expires from its variable).
 //
@@ -184,7 +184,7 @@ inline void merge_definitions(const WiringSite& site, const char* verb, VarMeta&
 // Initializers
 // -----------------------------------------------------------------------------
 
-// THE LAST DECLARATION WINS (docs/design-review-2026-10-03.md, section 2). A parent's setup runs after its children's,
+// THE LAST DECLARATION WINS (internal/design-review-2026-10-03.md, section 2). A parent's setup runs after its children's,
 // so a tie's, a promotion's or a System's initializer replaces the members'; tied members and promotions may carry their
 // own initializers. There is no level comparison and no conflict error: the incoming declaration always replaces what is
 // held. Only DECLARED initializers take part (VarMeta::init is empty for an input that declared none, which gets the

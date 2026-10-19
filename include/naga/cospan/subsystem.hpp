@@ -8,7 +8,7 @@
 // forward-declared). A Subsystem is a node of the model's tree: a Component or a FusedGroup (a LEAF: the node that does
 // work) or a System (the node that groups leaves and declares wiring).
 //
-// r04 (docs/spec/revisions/r04-2026-10-11-flat-model-metadata.md). The model owns every subsystem object through its
+// r04 (internal/spec/revisions/r04-2026-10-11-flat-model-metadata.md). The model owns every subsystem object through its
 // ModelMeta (model_meta.hpp). A subsystem is given its FULL RESOLVED NAME (the root's is "") and a pointer to the
 // metadata when it is registered, BEFORE its setup runs; it holds no pointer to a parent. Names are never parsed.
 //

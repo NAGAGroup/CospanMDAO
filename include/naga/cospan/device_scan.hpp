@@ -5,7 +5,7 @@
 // =============================================================================
 //
 // The scan behind a ragged shape hook (shape_hook.hpp, counts_from) runs in parallel on the device
-// (docs/design-review-2026-10-03.md, section 10): no single serial task. REDUCE-THEN-SCAN over work-groups:
+// (internal/design-review-2026-10-03.md, section 10): no single serial task. REDUCE-THEN-SCAN over work-groups:
 //
 //   (a) an nd_range kernel: each work-group scans its chunk of `wg` elements (sycl::exclusive_scan_over_group), writes the
 //       chunk-local exclusive results into `out`, and writes its chunk sum into a block-sums buffer;

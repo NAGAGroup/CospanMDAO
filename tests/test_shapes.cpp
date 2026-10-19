@@ -1,4 +1,4 @@
-// The shape model (docs/design-review-2026-10-03.md, section 10), end to end.
+// The shape model (internal/design-review-2026-10-03.md, section 10), end to end.
 //
 //   1. definition merge at setup   connect / tie merge the shape DEFINITIONS (fixed, unspecified) and throw at setup when two
 //                                  fixed values differ; promote carries no shape

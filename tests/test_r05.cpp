@@ -1,6 +1,6 @@
 // =============================================================================
 // tests/test_r05.cpp — r05: components and drivers, placements by context, push ranking
-// (docs/spec/revisions/r05-2026-10-13-components-drivers-placements.md)
+// (internal/spec/revisions/r05-2026-10-13-components-drivers-placements.md)
 // =============================================================================
 //
 //   drivers     a lone component is a leaf `c` with ports `c.x`; an error inside a component names its full path; a fused

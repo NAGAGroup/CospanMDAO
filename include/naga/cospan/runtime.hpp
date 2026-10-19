@@ -7,7 +7,7 @@
 // detail::Runtime is what the framework hands to the code that allocates and
 // initializes a variable's data: the queues to submit to and the per-device pools
 // to allocate from. It is NOT a setup context: nothing is passed down at setup
-// (docs/design-review-2026-10-03.md, section 2), and an instance or a variable
+// (internal/design-review-2026-10-03.md, section 2), and an instance or a variable
 // never stores one.
 //
 // The Model owns the Runtime and passes it down a forward. `forward` counts the Model's runs (shape sets within one forward
@@ -27,7 +27,7 @@ namespace sk = ::naga::slabkit;
 namespace detail {
 
 /// AdaptiveCpp's default device. Every instance takes it when it is declared; an outer
-/// set_device overrides it (docs/design-review-2026-10-03.md, section 2).
+/// set_device overrides it (internal/design-review-2026-10-03.md, section 2).
 inline sycl::device default_device() { return sycl::device{sycl::default_selector_v}; }
 
 struct Runtime {

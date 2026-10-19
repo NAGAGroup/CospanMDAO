@@ -1,4 +1,4 @@
-// Host access (docs/design-review-2026-10-03.md, section 11.4).
+// Host access (internal/design-review-2026-10-03.md, section 11.4).
 //
 //   1. handles       Model::get_input<DT, Rank>(path) (view, update) and get_output (view); the kind-mismatch errors
 //   2. views         a view can be made at any time: before the first forward an unconnected input shows its initialized

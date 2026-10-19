@@ -24,7 +24,13 @@ This page builds the smallest complete CoSpan application: one component that co
 name      = "getting-started"
 version   = "0.1.0"
 channels  = ["https://prefix.dev/jackm97/naga-labs-staging"]
-platforms = [{ platform = "linux-64", archspec = "x86_64_v3" }]
+platforms = [
+  { platform = "linux-64", archspec = "x86_64_v3" },
+  "linux-aarch64",
+  { platform = "osx-arm64", macos = "26.0" },
+  { platform = "win-64", archspec = "x86_64_v3" },
+  "win-arm64",
+]
 preview   = ["pixi-build"]
 
 [workspace.build-variants]
@@ -32,7 +38,7 @@ c_compiler           = ["naga-acpp-clang"]
 cxx_compiler         = ["naga-acpp-clangxx"]
 c_compiler_version   = ["2026.10.15"]
 cxx_compiler_version = ["2026.10.15"]
-naga-acpp-llvm       = ["21"]
+naga-acpp-llvm       = ["23"]
 cmake                = ["3.31.*"]
 
 [package]
@@ -54,7 +60,7 @@ getting-started = { path = "." }
 getting-started = "getting-started"
 ```
 
-The toolchain targets x86-64-v3 (Haswell, Zen and newer), and pixi needs the archspec stated to solve.
+The toolchain targets x86-64-v3 (Haswell, Zen and newer) on linux-64 and win-64 and macOS 26 on osx-arm64, and pixi needs that archspec and macOS version stated to solve.
 
 ## 2. The CMake file
 

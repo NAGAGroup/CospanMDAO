@@ -1,8 +1,8 @@
 # Migrating to the 2026-10-03 rework
 
-From the API at `c8553f6` to the final API of the rework (branch `rework-2026-10-03`). Authority: `docs/design-review-2026-10-03.md`
+From the API at `c8553f6` to the final API of the rework (branch `rework-2026-10-03`). Authority: `internal/design-review-2026-10-03.md`
 (sections 1-10 cited below as "section N"; section 10 wins over 6 and 9). The design as built is
-`docs/spec/revisions/r02-2026-10-03-the-design-as-built.md`. Everything here was checked against the headers.
+`internal/spec/revisions/r02-2026-10-03-the-design-as-built.md`. Everything here was checked against the headers.
 
 ## Adding subsystems
 

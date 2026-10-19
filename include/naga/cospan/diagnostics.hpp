@@ -3,7 +3,7 @@
 // (host-body launches). They only MEASURE: nothing in CoSpan reads them
 // to decide anything. One process-wide object of relaxed atomics, always compiled in.
 //
-// Only counters with a live caller are kept (docs/design-review-2026-10-03.md: the allocation, free, host-read,
+// Only counters with a live caller are kept (internal/design-review-2026-10-03.md: the allocation, free, host-read,
 // ragged-upload, resize, full-pass and shape-resolution counts belonged to the arena, the host read cache, the
 // ChunkedSystem and the setup-time shape pass, none of which exists now, and the chunk window went with the chunk
 // loop). A new counter is added together with its caller.

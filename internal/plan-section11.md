@@ -1,6 +1,6 @@
 # Section 11 implementation plan
 
-The authority is `docs/design-review-2026-10-03.md` section 11. Where code, older sections, spec r02, the old tests or this plan disagree with section 11, section 11 wins. Jack settled the following on 2026-10-06:
+The authority is `internal/design-review-2026-10-03.md` section 11. Where code, older sections, spec r02, the old tests or this plan disagree with section 11, section 11 wins. Jack settled the following on 2026-10-06:
 - Work on `main` and push as we go.
 - The lead chooses the user-facing spellings, extending the existing design language. Jack reviews them later.
 - The onepass OpenMP bug is out of scope; it waits for Jack.
@@ -10,7 +10,7 @@ The authority is `docs/design-review-2026-10-03.md` section 11. Where code, olde
 ## How this runs
 
 - **Phases and hand-offs.** The phases below run in order. The lead fleshes out each phase before handing it over. If a phase arrives less detailed than this plan, work from this plan plus section 11, and record every decision taken in the log.
-- **The log, `docs/impl-log-section11.md`.**
+- **The log, `internal/impl-log-section11.md`.**
   - Add an entry at the end of every phase, and whenever stopping mid-phase.
   - Every new user-facing name goes in its spelling table.
   - Anything that needs Jack's opinion goes under "Open questions for Jack", and the work continues on the most conservative reading.
@@ -223,8 +223,8 @@ Section 11.6.
 
 ## P9: Spec and close-out
 
-- **Spec.** Write `docs/spec/revisions/r03-<date>-section-11-as-built.md`: the design as built, with exact API names. Point `docs/spec/README.md` at r03 as current.
-- **Design review.** Update the status line in `docs/design-review-2026-10-03.md`.
+- **Spec.** Write `internal/spec/revisions/r03-<date>-section-11-as-built.md`: the design as built, with exact API names. Point `internal/spec/README.md` at r03 as current.
+- **Design review.** Update the status line in `internal/design-review-2026-10-03.md`.
 - **Final gate**, as described above.
 - **Final log entry.** Test counts, every spelling decision, and the open questions for Jack.
 

@@ -4,8 +4,8 @@ Messy by design. Checkboxes, notes, strike-throughs welcome. Each item points at
 
 ## Status and next
 
-- [x] **The 2026-10-03 rework is done**: branch `rework-2026-10-03`, last commit before the docs commit `2e8e223` (default and cuda suites green; spec `docs/spec/revisions/r02-2026-10-03-the-design-as-built.md`, decision D144, migration `docs/rework-migration-2026-10-03.md`).
-- [x] **Design review section 11 implemented on main**; spec r03 (`docs/spec/revisions/r03-2026-10-06-section-11-as-built.md`).
+- [x] **The 2026-10-03 rework is done**: branch `rework-2026-10-03`, last commit before the docs commit `2e8e223` (default and cuda suites green; spec `internal/spec/revisions/r02-2026-10-03-the-design-as-built.md`, decision D144, migration `internal/rework-migration-2026-10-03.md`).
+- [x] **Design review section 11 implemented on main**; spec r03 (`internal/spec/revisions/r03-2026-10-06-section-11-as-built.md`).
 - [ ] **The chunked-systems redesign is deferred until after the public release** (decided with Jack, 2026-10-11). Chunked systems, slices and leading ranges were not ported; the old code is dead code in `include/naga/cospan/chunked_system.hpp` and in git history (`c8553f6`).
 - [ ] **Path to a public release (agreed 2026-10-11)**
   1. [ ] Documentation infrastructure, then documentation and tutorials. CoSpan gets polished along the way as rough spots show up. Tutorials target the default device.
@@ -132,7 +132,7 @@ CoSpan's differentiator is orchestration on top of AdaptiveCpp's JIT and fusion.
 
 - [ ] How the initializer and the late-holder copy register their write events as reads as well (variable.hpp, `initialize` ~1010 and `populate` ~1052), so that a later writer waits for them.
 - [ ] The test-only counter `hook_resize_notes` on VarMeta, added for one shape-hook test.
-- [ ] The spelling table of user-facing names in docs/impl-log-section11.md (Jack's review).
+- [ ] The spelling table of user-facing names in internal/impl-log-section11.md (Jack's review).
 - [ ] Whether add_subsystem should be legal outside setup, as the other wiring calls now are.
 - [ ] OpenMP:
   - gemver onepass gives a wrong q (and naive with it).

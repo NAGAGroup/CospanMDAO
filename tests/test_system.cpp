@@ -1,7 +1,7 @@
 // System tests, every case through a cospan::Model.
 //
 // Each case builds a small root System, makes a Model (create_model / setup), and checks through the Model
-// (forward / wait / view_* / update_input and the marks). Reading results (docs/design-review-2026-10-03.md, section 5):
+// (forward / wait / view_* / update_input and the marks). Reading results (internal/design-review-2026-10-03.md, section 5):
 // forward() only enqueues; a host view is obtained after the first forward and sync()ed before it is read
 // (cst::synced_output / synced_input / wait_and_view do both). The only things reached past the Model's verbs are the
 // Model's own retrieval (root().instance_at, get_subsystem) and, for the structural-call check, root() itself.

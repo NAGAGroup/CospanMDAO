@@ -5,7 +5,7 @@
 // (forward / wait / view_* / update_input). There is no driver here; the only things reached past the
 // Model's verbs are the Model's own retrieval (get_subsystem, root().instance_at).
 //
-// Reading results (docs/design-review-2026-10-03.md, section 5): forward() only enqueues; a host view is obtained
+// Reading results (internal/design-review-2026-10-03.md, section 5): forward() only enqueues; a host view is obtained
 // after the first forward and sync()ed before it is read (cst::wait_and_view / synced_input do all three).
 //
 //   index-range body, rank 1/2/3       y = 2x + 1, ragged sizes (1000, 40x30, 7x9x11)

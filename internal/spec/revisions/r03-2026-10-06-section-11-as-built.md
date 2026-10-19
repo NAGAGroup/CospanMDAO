@@ -1,8 +1,8 @@
 # CoSpan specification — r03
 
-**What this is.** The CoSpan design as built on `main` after the section 11 implementation (plan: `docs/plan-section11.md`,
-log: `docs/impl-log-section11.md`). It describes what the code does and nothing else; where the code differs from the design
-review it says so in the last section. Authority for the decisions: `docs/design-review-2026-10-03.md`, section 11 (it
+**What this is.** The CoSpan design as built on `main` after the section 11 implementation (plan: `internal/plan-section11.md`,
+log: `internal/impl-log-section11.md`). It describes what the code does and nothing else; where the code differs from the design
+review it says so in the last section. Authority for the decisions: `internal/design-review-2026-10-03.md`, section 11 (it
 supersedes sections 1 to 10 where they conflict). r02 is superseded and kept as history. Every API name is the name in
 `include/naga/cospan/`.
 

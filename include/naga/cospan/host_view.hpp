@@ -4,7 +4,7 @@
 // naga/cospan/host_view.hpp — host views of a variable
 // =============================================================================
 //
-// A HOST VIEW is an instance of the variable on a host placement (docs/design-review-2026-10-03.md, section 5): like
+// A HOST VIEW is an instance of the variable on a host placement (internal/design-review-2026-10-03.md, section 5): like
 // an input, output or alias it holds the variable's shared metadata and its host memory (a SlabKit container) by
 // shared pointer, and the metadata holds that memory weakly.
 //

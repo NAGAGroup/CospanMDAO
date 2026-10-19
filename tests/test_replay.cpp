@@ -1,4 +1,4 @@
-// NOT BUILT: chunked systems are set aside pending their redesign (docs/design-review-2026-10-03.md, section 8, phase 9).
+// NOT BUILT: chunked systems are set aside pending their redesign (internal/design-review-2026-10-03.md, section 8, phase 9).
 // ChunkedSystem topology cache: the one full-pass build, the hooks and the resize counter. The comparison with the
 // unchunked twin, the cache validity and the zero-event window are in test_chunked.cpp and test_ragged_ties.cpp,
 // next to the models they use.

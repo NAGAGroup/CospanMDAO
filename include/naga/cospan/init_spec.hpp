@@ -5,7 +5,7 @@
 // =============================================================================
 //
 // An InitSpec is the initializer a variable's shared metadata carries
-// (docs/design-review-2026-10-03.md, sections 1 and 6): a function that runs on
+// (internal/design-review-2026-10-03.md, sections 1 and 6): a function that runs on
 // one device's data of the variable and returns the EVENT of the work it enqueued,
 // plus the shape it supplies. It is split from init.hpp so that variable.hpp can
 // hold one without depending on the cs::init factories, which depend on it.

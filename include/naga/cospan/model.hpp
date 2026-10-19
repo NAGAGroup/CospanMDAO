@@ -9,7 +9,7 @@
 // pool_desc that covers it, else 0 bytes), and ONE ModelMeta (model_meta.hpp): the tree of subsystems, the flat name maps,
 // the records, the marks. It never touches a Subsystem object except through the Subsystem verbs.
 //
-// LIFECYCLE (docs/spec/revisions/r04-2026-10-11-flat-model-metadata.md)
+// LIFECYCLE (internal/spec/revisions/r04-2026-10-11-flat-model-metadata.md)
 //   created    create_model<Root>(...), then model.add_subsystem(...) (adds to the root; before setup() only).
 //   editable   after setup() (the root's setup(), depth-first): from main, through get_subsystem handles, wiring, init_input,
 //              shape hooks, depends_on, set_device, marks. Views are not allowed yet.

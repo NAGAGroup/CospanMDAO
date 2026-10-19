@@ -1,4 +1,4 @@
-// NOT BUILT: chunked systems are set aside pending their redesign (docs/design-review-2026-10-03.md, section 8, phase 9).
+// NOT BUILT: chunked systems are set aside pending their redesign (internal/design-review-2026-10-03.md, section 8, phase 9).
 // runtime leading-range views (the plumbing chunked systems use), and size-0 fixed roots.
 //
 // A consumer's connected input is pointed, between forwards, at rows / blocks [a, b) of its root through

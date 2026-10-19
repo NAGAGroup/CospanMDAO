@@ -1,4 +1,4 @@
-// P4 tests: setup, wiring and the System loop (docs/plan-section11.md P4; design review 11.2 and 11.3).
+// P4 tests: setup, wiring and the System loop (internal/plan-section11.md P4; design review 11.2 and 11.3).
 //
 //   wiring anywhere     connect, promote, tie_*, init_input after setup; two materialized variables cannot merge
 //   run-policy override a grandchild made eternal by its grandparent; applied from prepare_forward; not replayed on rearm

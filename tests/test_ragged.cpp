@@ -8,7 +8,7 @@
 //   Sum      RaggedInput -> a dense [N] output of block sums
 //
 // Everything is checked against host references, through view_output (dense) and view_ragged_* (n(), block_offsets(),
-// block(i), span()), synced after the forward (docs/design-review-2026-10-03.md, section 5).
+// block(i), span()), synced after the forward (internal/design-review-2026-10-03.md, section 5).
 //
 // PORT NOTES (design review, section 10). Ragged is RANK 2 only, a per-index dimension is declared with cs::counts / cs::offsets
 // (the length of the counts is N), there are no derived dimensions (FromInputDim, FromInputValues, ...), and an output is

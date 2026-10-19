@@ -1,6 +1,6 @@
 # Design review, started 2026-10-03
 
-Status: Section 11 implemented on main (0e47c69); spec r03 (docs/spec/revisions/r03-2026-10-06-section-11-as-built.md).
+Status: Section 11 implemented on main (0e47c69); spec r03 (internal/spec/revisions/r03-2026-10-06-section-11-as-built.md).
 Section 11 (second-round review, 2026-10-04 to 10-06) supersedes sections 1-10 and spec r02 wherever they conflict. Sections 1-10 are kept as the record of the earlier review; spec r02 is superseded. Where the code departs from section 11, spec r03 says so ("Departures from the design review").
 
 This is the working record of the design review that started 2026-10-03 (Jack and the research lead). The code at c8553f6 works, but it is being redesigned piece by piece for clarity. No new features (solvers, cycles, gradients, optimizers) come before this is done.

@@ -5,7 +5,7 @@
 // =============================================================================
 //
 // Every input, output and alias is an INSTANCE, owned by exactly one component or System through a
-// shared_ptr (docs/design-review-2026-10-03.md, section 1). Nothing outside the owner holds an instance
+// shared_ptr (internal/design-review-2026-10-03.md, section 1). Nothing outside the owner holds an instance
 // strongly, and there is no global record of anything: no roots, no shadows, no ledgers. An instance is
 // generic and passive. It holds:
 //

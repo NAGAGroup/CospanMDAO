@@ -151,12 +151,12 @@ The `dev` and `dev-cuda` environments carry the package's full dependency closur
 
 ## Documentation
 
-- **Specification:** [`docs/spec/revisions/r03-2026-10-06-section-11-as-built.md`](docs/spec/revisions/r03-2026-10-06-section-11-as-built.md)
+- **Specification:** [`internal/spec/revisions/r03-2026-10-06-section-11-as-built.md`](internal/spec/revisions/r03-2026-10-06-section-11-as-built.md)
   (r02 and r01 are superseded and kept as history).
-- **Migrating from the API before the 2026-10-03 rework:** [`docs/rework-migration-2026-10-03.md`](docs/rework-migration-2026-10-03.md).
-- **Decisions:** [`docs/phase1-decisions.md`](docs/phase1-decisions.md) (D144 is the rework) and
-  [`docs/design-review-2026-10-03.md`](docs/design-review-2026-10-03.md).
-- **Roadmap:** [`docs/ROADMAP.md`](docs/ROADMAP.md).
+- **Migrating from the API before the 2026-10-03 rework:** [`internal/rework-migration-2026-10-03.md`](internal/rework-migration-2026-10-03.md).
+- **Decisions:** [`internal/phase1-decisions.md`](internal/phase1-decisions.md) (D144 is the rework) and
+  [`internal/design-review-2026-10-03.md`](internal/design-review-2026-10-03.md).
+- **Roadmap:** [`internal/ROADMAP.md`](internal/ROADMAP.md).
 
 ## Status
 

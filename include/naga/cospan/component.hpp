@@ -4,7 +4,7 @@
 // naga/cospan/component.hpp — ComponentBase, Component<X>, CustomComponent<X> and HostComponent<X>
 // =============================================================================
 //
-// A component is the leaf that does work, and it SUBMITS ITSELF (docs/design-review-2026-10-03.md, sections 3 and
+// A component is the leaf that does work, and it SUBMITS ITSELF (internal/design-review-2026-10-03.md, sections 3 and
 // 4). Its forward is three framework-owned steps that call user hooks:
 //
 //   precompute   (1) every distinct input variable is materialized (shape hooks of the enclosing System have run);
@@ -191,7 +191,7 @@ public:
 
     // ---- declaration API (legal inside declare() only) ------------------------
     // A declaration says, per dimension, only SPECIFIED (an integer) or UNSPECIFIED (cs::unspecified); it is the
-    // component's contract (docs/design-review-2026-10-03.md, section 10). Specified forces that dimension on anything
+    // component's contract (internal/design-review-2026-10-03.md, section 10). Specified forces that dimension on anything
     // joined to it; unspecified places no constraint. There are no derived specs.
     template <DType DT, int Rank, DimSpec... Specs>
         requires(sizeof...(Specs) == Rank)
@@ -374,7 +374,7 @@ public:
 
         // (1) Every input variable is materialized (a free input takes its initializer, and its initializer's shape,
         // here), by the holder that asks: the first materialization is global, a later one checks only this holder's
-        // container. Shape hooks of the enclosing System have already run (docs/design-review-2026-10-03.md, section 10).
+        // container. Shape hooks of the enclosing System have already run (internal/design-review-2026-10-03.md, section 10).
         for (const auto& inst : order_)
             if (inst->kind == IOKind::input) inst->meta->materialize(rt, inst.get());
 

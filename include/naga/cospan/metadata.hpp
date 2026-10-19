@@ -6,7 +6,7 @@
 //
 // The declaration types: dimension specs, ragged declarations, tie shape specs, marks, initializer shapes. No storage,
 // no state. A variable's data and shared metadata live in variable.hpp, an instance in instance.hpp, and an
-// initializer in init.hpp (docs/design-review-2026-10-03.md, sections 1 and 10).
+// initializer in init.hpp (internal/design-review-2026-10-03.md, sections 1 and 10).
 //
 // THE SHAPE VOCABULARY (section 10). A declaration says, per dimension, only SPECIFIED (an integer) or UNSPECIFIED
 // (cs::unspecified). There are no derived specs. A ragged declaration is rank 2 only: a dense leading dimension plus one
@@ -157,7 +157,7 @@ struct Bounds { std::optional<std::vector<double>> lower, upper; };
 struct Scaling { std::vector<double> ref{1.0}, ref0{0.0}; };
 
 /// One mark on one variable (Model::MarkRecord aliases this type). Finalize holds the marked
-/// instance by weak pointer (docs/design-review-2026-10-03.md, section 2); slices are not ported.
+/// instance by weak pointer (internal/design-review-2026-10-03.md, section 2); slices are not ported.
 struct MarkRecord {
     Bounds                             bounds;
     std::optional<std::vector<double>> equals;  // constraints only

@@ -4,7 +4,7 @@
 // naga/cospan/init.hpp — initializers: the initial value, and the value, of a free input
 // =============================================================================
 //
-// An initializer is METADATA on a variable (docs/design-review-2026-10-03.md, sections 1, 5 and 6): it is
+// An initializer is METADATA on a variable (internal/design-review-2026-10-03.md, sections 1, 5 and 6): it is
 // declared during setup() with ComponentBase::init_input(name, init) or System::init_input(path, init), and
 // replaced at run time by Model::update_input(path, init), which also marks the variable stale. Which
 // declaration wins is simple: the LAST one (a parent's setup runs after its children's, so a tie's, promotion's or

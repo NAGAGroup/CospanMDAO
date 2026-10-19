@@ -1,7 +1,7 @@
 // What survived of the write-epoch and host-cache tests.
 //
 // The per-root write epochs, the host read cache and the counters that measured them (host_reads, host_read_hits)
-// no longer exist (docs/design-review-2026-10-03.md, sections 3 and 5): a read of a result is a host VIEW, obtained after
+// no longer exist (internal/design-review-2026-10-03.md, sections 3 and 5): a read of a result is a host VIEW, obtained after
 // a forward and sync()ed before it is read. What is left here is what those cases also proved about VALUES:
 //
 //   ties     a zeroing producer and an accumulator on one tie_outputs root give the same answer every forward

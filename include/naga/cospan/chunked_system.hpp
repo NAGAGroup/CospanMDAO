@@ -2,7 +2,7 @@
 
 // =============================================================================
 // DEAD CODE, kept for reference only. ChunkedSystem, slices and leading ranges
-// were not ported to the 2026-10-03 data model (docs/design-review-2026-10-03.md,
+// were not ported to the 2026-10-03 data model (internal/design-review-2026-10-03.md,
 // section 8, phase 9). They are being redesigned next; this header shows how the
 // old ones worked. It is not included by cospan.hpp and does not compile.
 // =============================================================================
