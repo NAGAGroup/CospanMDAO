@@ -4,10 +4,6 @@ project(cospanmdao VERSION 0.1.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# The Windows toolchain's activation puts -std=c++17 in CXXFLAGS, hence in CMAKE_CXX_FLAGS, and acpp refuses two -std options
-# ("Multiple c++ standards defined"). CMake adds the one CMAKE_CXX_STANDARD asks for, so drop the inherited one.
-string(REGEX REPLACE "(^| )-std=[^ ]+" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
-
 # AdaptiveCpp's exported acpp-rt links Threads::Threads and does not find it
 # itself (found by the tests/spike project), so Threads comes first.
 find_package(Threads REQUIRED)
