@@ -15,7 +15,7 @@ slabkit                = { git = "https://github.com/NAGAGroup/SlabKit.git", rev
 cereal                 = ">=1.3"
 catch2                 = ">=3.8"
 naga-acpp-runtime-cuda = "*"
-naga-acpp-tools        = "==2026.10.15"
+naga-acpp-tools        = "==2026.10.19"
 nushell                = ">=0.110.0,<0.111"
 
 # Compiler stems resolve to <stem>_<platform> activation packages; their
@@ -23,9 +23,9 @@ nushell                = ">=0.110.0,<0.111"
 [workspace.build-variants]
 c_compiler           = ["naga-acpp-clang"]
 cxx_compiler         = ["naga-acpp-clangxx"]
-c_compiler_version   = ["2026.10.15"]
-cxx_compiler_version = ["2026.10.15"]
-naga-acpp-llvm       = ["21"]
+c_compiler_version   = ["2026.10.19"]
+cxx_compiler_version = ["2026.10.19"]
+naga-acpp-llvm       = ["23"]
 cmake                = ["3.31.*"]
 
 # ---- default environment: the built library and its tests ------------------
@@ -87,8 +87,7 @@ cospanmdao-tests = { path = "tests" }
 [feature.dev.dependencies]
 nushell         = { workspace = true }
 naga-acpp-tools = { workspace = true }
-naga-acpp-lldb  = "==2026.10.15"  # our toolchain's debugger
-python          = "3.14.*"  # workaround: naga-acpp-lldb links libpython3.14 but declares only python >=3.8; drop when the recipe pins it
+naga-acpp-lldb  = "==2026.10.19"  # our toolchain's debugger
 
 [environments.dev]
 features = ["dev"]
