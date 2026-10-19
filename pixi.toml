@@ -3,7 +3,13 @@ authors   = ["Jack Myers <jack@myersjack.dev>"]
 name      = "cospanmdao"
 version   = "0.1.0"
 channels  = ["https://prefix.dev/jackm97/naga-labs-staging"]
-platforms = [{ platform = "linux-64", archspec = "x86_64_v3" }]
+platforms = [
+  { platform = "linux-64", archspec = "x86_64_v3", name = "linux-64-v3" },
+  "linux-aarch64",
+  { platform = "osx-arm64", macos = "26.0", name = "osx-arm64-macos26" },
+  { platform = "win-64", archspec = "x86_64_v3", name = "win-64-v3" },
+  "win-arm64",
+]
 preview   = ["pixi-build"]
 
 # One pool of specs; every table inherits with { workspace = true }.
@@ -15,8 +21,10 @@ slabkit                = { git = "https://github.com/NAGAGroup/SlabKit.git", rev
 cereal                 = ">=1.3"
 catch2                 = ">=3.8"
 naga-acpp-runtime-cuda = "*"
+naga-acpp-runtime-ocl  = "*"
+intel-opencl-rt        = "*"
 naga-acpp-tools        = "==2026.10.19"
-nushell                = ">=0.110.0,<0.111"
+nushell                = ">=0.116.1,<0.117"
 
 # Compiler stems resolve to <stem>_<platform> activation packages; their
 # run-exports bring the toolchain. The backend supplies cmake/ninja.
@@ -26,7 +34,7 @@ cxx_compiler         = ["naga-acpp-clangxx"]
 c_compiler_version   = ["2026.10.19"]
 cxx_compiler_version = ["2026.10.19"]
 naga-acpp-llvm       = ["23"]
-cmake                = ["3.31.*"]
+cmake                = ["4.4.*"]
 
 # ---- default environment: the built library and its tests ------------------
 [dependencies]
@@ -42,13 +50,30 @@ ns-residual = "ns-residual"
 # (and the cublas environment built for the cuBLAS reference: pixi run -e cublas build-cublas).
 benchmarks = "nu examples/run_benchmarks.nu"
 
-# ---- CUDA runtime, opt-in ---------------------------------------------------
-[feature.cuda.dependencies]
+# ---- backend runtimes, opt-in, gated per platform --------------------------
+# OpenMP, and Metal on macOS, come built in: they need no package.
+# CUDA is published for linux-64 and win-64 (what CI tests).
+[feature.cuda.target.linux-64.dependencies]
+naga-acpp-runtime-cuda = { workspace = true }
+
+[feature.cuda.target.win-64.dependencies]
 naga-acpp-runtime-cuda = { workspace = true }
 
 [environments.cuda]
 features = ["cuda"]
 solve-group = "default"
+
+# OpenCL on Intel's CPU runtime (conda-forge intel-opencl-rt, proprietary Intel EULA; test environments only), linux-64 only.
+# conda-forge is added to this feature alone.
+[feature.ocl]
+channels = ["conda-forge"]
+
+[feature.ocl.target.linux-64.dependencies]
+naga-acpp-runtime-ocl = { workspace = true }
+intel-opencl-rt       = { workspace = true }
+
+[environments.ocl]
+features = ["ocl"]
 
 # ---- the library package ----------------------------------------------------
 [package]
@@ -109,6 +134,10 @@ features = ["git"]
 no-default-feature = true
 
 # ---- documentation: Sphinx + Breathe over Doxygen XML ------------------------
+[feature.documentation]
+# doxygen has no win-arm64 build; feature platforms use the workspace entry names (see platforms above).
+platforms = ["linux-64-v3", "linux-aarch64", "osx-arm64-macos26", "win-64-v3"]
+
 [feature.documentation.dependencies]
 sphinx          = "<9"  # breathe (latest 5.1) needs sphinx < 9; unpinned, the solver picked sphinx 9 with breathe 4.15, which fails to import
 myst-parser     = "*"
@@ -133,6 +162,7 @@ no-default-feature = true
 # CUDA 13.3); gxx 14 is inside nvcc 13.x host-compiler support. Release builds only.
 [feature.cublas]
 channels = ["conda-forge"]
+platforms = ["linux-64-v3"]  # the workspace entry named linux-64-v3 (feature platforms use entry names; target tables use the subdir)
 
 [feature.cublas.dependencies]
 cuda-nvcc       = "13.3.*"

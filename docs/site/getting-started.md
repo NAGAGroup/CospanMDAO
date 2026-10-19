@@ -39,7 +39,7 @@ cxx_compiler         = ["naga-acpp-clangxx"]
 c_compiler_version   = ["2026.10.19"]
 cxx_compiler_version = ["2026.10.19"]
 naga-acpp-llvm       = ["23"]
-cmake                = ["3.31.*"]
+cmake                = ["4.4.*"]
 
 [package]
 name    = "getting-started"
