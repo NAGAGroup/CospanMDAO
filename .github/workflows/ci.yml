@@ -27,11 +27,12 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
       - name: Runner core count
         run: nproc
-      - uses: prefix-dev/setup-pixi@v0.10.0
+      - uses: prefix-dev/setup-pixi@v0.11.2
         with:
+          pixi-version: v0.81.0
           run-install: false
       - run: nvidia-smi
       # Builds the packages from source on this box.
@@ -113,7 +114,7 @@ jobs:
         run: pixi run -e cuda ns-residual --check 2>&1 | tee -a "$GITHUB_WORKSPACE/logs/ns-cuda.log"
       - name: Upload logs
         if: ${{ always() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: logs-linux-64
           retention-days: 14
@@ -140,11 +141,12 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
       - name: Runner core count
         run: nproc
-      - uses: prefix-dev/setup-pixi@v0.10.0
+      - uses: prefix-dev/setup-pixi@v0.11.2
         with:
+          pixi-version: v0.81.0
           run-install: false
       - name: Install the default environment
         timeout-minutes: 120
@@ -165,7 +167,7 @@ jobs:
         run: pixi exec --spec nushell nu ci/run-catch.nu pixi.toml default cospan-tests ci/exclude/linux-aarch64-omp.txt 2>&1 | tee -a "$GITHUB_WORKSPACE/logs/omp.log"
       - name: Upload logs
         if: ${{ always() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: logs-linux-aarch64
           retention-days: 14
@@ -192,12 +194,13 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
       # macOS has no nproc; sysctl reports the same logical core count.
       - name: Runner core count
         run: sysctl -n hw.logicalcpu
-      - uses: prefix-dev/setup-pixi@v0.10.0
+      - uses: prefix-dev/setup-pixi@v0.11.2
         with:
+          pixi-version: v0.81.0
           run-install: false
       - name: Install the default environment
         timeout-minutes: 120
@@ -226,7 +229,7 @@ jobs:
         run: pixi exec --spec nushell nu ci/run-catch.nu pixi.toml default cospan-tests ci/exclude/osx-arm64-metal.txt 2>&1 | tee -a "$GITHUB_WORKSPACE/logs/metal.log"
       - name: Upload logs
         if: ${{ always() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: logs-osx-arm64
           retention-days: 14
@@ -254,11 +257,12 @@ jobs:
       run:
         shell: pwsh
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
       - name: Runner core count
         run: (Get-CimInstance Win32_Processor | Measure-Object NumberOfLogicalProcessors -Sum).Sum
-      - uses: prefix-dev/setup-pixi@v0.10.0
+      - uses: prefix-dev/setup-pixi@v0.11.2
         with:
+          pixi-version: v0.81.0
           run-install: false
       - name: Build the packages (pixi install -e default)
         timeout-minutes: 150
@@ -284,7 +288,7 @@ jobs:
             Copy-Item $_.FullName -Destination $d
           }
           Get-ChildItem packages -Recurse -Filter *.conda | Format-Table Name, Length
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7.0.2
         with:
           name: packages-win-64
           retention-days: 14
@@ -292,7 +296,7 @@ jobs:
           path: packages/**
       - name: Upload logs
         if: ${{ always() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: logs-build-win-64
           retention-days: 14
@@ -310,7 +314,7 @@ jobs:
       run:
         shell: powershell # Windows PowerShell: this image has no pwsh, and bash is the WSL stub
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
       - name: Runner core count
         run: (Get-CimInstance Win32_Processor | Measure-Object NumberOfLogicalProcessors -Sum).Sum
       - name: Update NVIDIA datacenter driver
@@ -322,10 +326,11 @@ jobs:
           curl.exe -sL -o driver.exe $url
           Start-Process -FilePath .\driver.exe -ArgumentList "-s","-noreboot" -Wait
           if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) { nvidia-smi } else { Write-Host "nvidia-smi not on PATH" }
-      - uses: prefix-dev/setup-pixi@v0.10.0
+      - uses: prefix-dev/setup-pixi@v0.11.2
         with:
+          pixi-version: v0.81.0
           run-install: false
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8.0.2
         with:
           name: packages-win-64
           path: ci/run/pkgs
@@ -360,7 +365,7 @@ jobs:
         run: pixi exec --spec nushell nu ci/run-catch.nu ci/run/pixi.toml run-cuda cospan-tests
       - name: Upload logs
         if: ${{ always() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: logs-win-64
           retention-days: 14
@@ -384,11 +389,12 @@ jobs:
       run:
         shell: pwsh
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
       - name: Runner core count
         run: (Get-CimInstance Win32_Processor | Measure-Object NumberOfLogicalProcessors -Sum).Sum
-      - uses: prefix-dev/setup-pixi@v0.10.0
+      - uses: prefix-dev/setup-pixi@v0.11.2
         with:
+          pixi-version: v0.81.0
           run-install: false
       # This box both compiles and runs (no separate GPU box exists for win-arm64).
       - name: Install the default environment
@@ -411,7 +417,7 @@ jobs:
         run: pixi exec --spec nushell nu ci/run-catch.nu pixi.toml default cospan-tests ci/exclude/win-arm64-omp.txt
       - name: Upload logs
         if: ${{ always() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: logs-win-arm64
           retention-days: 14
