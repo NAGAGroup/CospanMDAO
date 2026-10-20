@@ -1,4 +1,4 @@
-// Event counters (include/naga/cospan/diagnostics.hpp).
+// Event counters (cospanmdao/include/naga/cospan/diagnostics.hpp).
 //
 // Only the counters that still have a caller exist (queue_waits, host_tasks); the chunk window and the
 // ChunkedSystem baselines that used to live here are gone with the chunked systems (dead code until their redesign).

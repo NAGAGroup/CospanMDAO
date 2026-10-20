@@ -1,4 +1,4 @@
-// The parallel exclusive scan of u64 on the device (include/naga/cospan/device_scan.hpp), against std::exclusive_scan.
+// The parallel exclusive scan of u64 on the device (cospanmdao/include/naga/cospan/device_scan.hpp), against std::exclusive_scan.
 //
 // Sizes cover: empty, one element, below / at / above one work-group (the group size is min(device max, 256)), several
 // work-groups, and enough work-groups (> 256) that the block sums are themselves scanned in more than one work-group.

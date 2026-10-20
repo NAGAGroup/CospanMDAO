@@ -7,7 +7,7 @@ and run them on the GPU (or any SYCL device) through open standards: SYCL via
 [AdaptiveCpp](https://github.com/AdaptiveCpp/AdaptiveCpp). C++20, header-only, namespace `naga::cospan` (`cs::`).
 
 CospanMDAO is part of the **NAGA ecosystem** ([NAGAGroup](https://github.com/NAGAGroup)): ecosystem code shares the
-`naga::` namespace and the `include/naga/` root.
+`naga::` namespace and the `cospanmdao/include/naga/` root.
 
 ## Lineage
 
@@ -129,7 +129,7 @@ same way on every machine.
 preview = ["pixi-build"]
 
 [dependencies]
-cospanmdao = { git = "https://github.com/NAGAGroup/CospanMDAO.git", tag = "v0.1.0" }
+cospanmdao = { git = "https://github.com/NAGAGroup/CospanMDAO.git", branch = "main", subdirectory = "cospanmdao" }
 ```
 
 then in CMake: `find_package(cospanmdao CONFIG REQUIRED)` and link `naga::cospan`. A host dependency is enough: cospanmdao
@@ -163,7 +163,7 @@ The `dev` and `dev-cuda` environments carry the package's full dependency closur
 ## Status
 
 v0.1.0. The API is not yet stable. Chunked systems, slices and leading ranges are not supported at present: they are being
-redesigned (the old code is kept as dead code in `include/naga/cospan/chunked_system.hpp`).
+redesigned (the old code is kept as dead code in `cospanmdao/include/naga/cospan/chunked_system.hpp`).
 
 ## License
 

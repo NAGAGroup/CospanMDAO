@@ -14,10 +14,10 @@ preview   = ["pixi-build"]
 
 # One pool of specs; every table inherits with { workspace = true }.
 [workspace.dependencies]
-cospanmdao             = { path = "." }
+cospanmdao             = { path = "cospanmdao" }
 cospanmdao-tests       = { path = "tests" }
 cospanmdao-examples    = { path = "examples" }
-slabkit                = { git = "https://github.com/NAGAGroup/SlabKit.git", rev = "abd53de68dbdd386f9d47b2d4d92fd8a8fa9c45f" }
+slabkit                = { git = "https://github.com/NAGAGroup/SlabKit.git", rev = "c1291a57e279b2aaa67f2fbf516abf1c8bc136e8", subdirectory = "slabkit" }
 cereal                 = ">=1.3"
 catch2                 = ">=3.8"
 naga-acpp-runtime-cuda = "*"
@@ -75,38 +75,9 @@ intel-opencl-rt       = { workspace = true }
 [environments.ocl]
 features = ["ocl"]
 
-# ---- the library package ----------------------------------------------------
-[package]
-name    = "cospanmdao"
-version = "0.1.0"
-license = "Apache-2.0"
-
-[package.build.backend]
-name     = "pixi-build-cmake"
-version  = "*"
-channels = ["https://prefix.dev/pixi-build-backends"]
-
-[package.build.config]
-# Headers are installed, not compiled; without this, editing one does not
-# invalidate pixi's build cache.
-extra-input-globs = ["include/**/*.hpp"]
-
-[package.host-dependencies]
-slabkit = { workspace = true }
-cereal  = { workspace = true }
-
-# Library with PUBLIC header deps: consumers compile against slabkit and cereal too.
-[package.run-dependencies]
-slabkit = { workspace = true }
-cereal  = { workspace = true }
-
-# A consumer that has cospanmdao only as a host dependency gets SlabKit's shared library at run time.
-[package.run-exports.weak]
-slabkit = { workspace = true }
-
 # ---- dev environment: full build closure of both packages, neither built -----
 [feature.dev.dev]
-cospanmdao       = { path = "." }
+cospanmdao       = { path = "cospanmdao" }
 cospanmdao-tests = { path = "tests" }
 
 [feature.dev.dependencies]
@@ -150,7 +121,7 @@ sphinx-autobuild = "*"
 # doxygen creates only the last directory of OUTPUT_DIRECTORY, so build/docs is made first.
 docs-doxygen = "mkdir -p build/docs && doxygen docs/Doxyfile"
 docs-build   = { cmd = "sphinx-build -b html docs/site build/docs/html", depends-on = ["docs-doxygen"] }
-docs-serve   = { cmd = "sphinx-autobuild docs/site build/docs/html --host 0.0.0.0 --port 8000 --watch include/naga/cospan --pre-build 'doxygen docs/Doxyfile'", depends-on = ["docs-doxygen"] }
+docs-serve   = { cmd = "sphinx-autobuild docs/site build/docs/html --host 0.0.0.0 --port 8000 --watch cospanmdao/include/naga/cospan --pre-build 'doxygen docs/Doxyfile'", depends-on = ["docs-doxygen"] }
 
 [environments.docs]
 features = ["documentation"]

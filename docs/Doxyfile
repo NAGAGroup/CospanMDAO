@@ -1,5 +1,5 @@
 PROJECT_NAME        = CoSpan
-INPUT               = include/naga/cospan
+INPUT               = cospanmdao/include/naga/cospan
 RECURSIVE           = YES
 FILE_PATTERNS       = *.hpp
 OUTPUT_DIRECTORY    = build/docs/doxygen

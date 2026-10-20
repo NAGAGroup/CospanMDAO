@@ -1,0 +1,27 @@
+[package]
+name    = "cospanmdao"
+version = "0.1.0"
+license = "Apache-2.0"
+
+[package.build.backend]
+name     = "pixi-build-cmake"
+version  = "*"
+channels = ["https://prefix.dev/pixi-build-backends"]
+
+[package.build.config]
+# Headers are installed, not compiled; without this, editing one does not
+# invalidate pixi's build cache.
+extra-input-globs = ["include/**/*.hpp"]
+
+[package.host-dependencies]
+slabkit = { workspace = true }
+cereal  = { workspace = true }
+
+# Library with PUBLIC header deps: consumers compile against slabkit and cereal too.
+[package.run-dependencies]
+slabkit = { workspace = true }
+cereal  = { workspace = true }
+
+# A consumer that has cospanmdao only as a host dependency gets SlabKit's shared library at run time.
+[package.run-exports.weak]
+slabkit = { workspace = true }
