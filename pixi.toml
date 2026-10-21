@@ -17,13 +17,13 @@ preview   = ["pixi-build"]
 cospanmdao             = { path = "cospanmdao" }
 cospanmdao-tests       = { path = "tests" }
 cospanmdao-examples    = { path = "examples" }
-slabkit                = { git = "https://github.com/NAGAGroup/SlabKit.git", rev = "c1291a57e279b2aaa67f2fbf516abf1c8bc136e8", subdirectory = "slabkit" }
+slabkit                = { git = "https://github.com/NAGAGroup/SlabKit.git", rev = "7bd9ceca2f83afc5e8e9853916889cb617fde509", subdirectory = "slabkit" }
 cereal                 = ">=1.3"
 catch2                 = ">=3.8"
 naga-acpp-runtime-cuda = "*"
 naga-acpp-runtime-ocl  = "*"
 intel-opencl-rt        = "*"
-naga-acpp-tools        = "==2026.10.20"
+naga-acpp-tools        = "==2026.10.21"
 nushell                = ">=0.116.1,<0.117"
 
 # Compiler stems resolve to <stem>_<platform> activation packages; their
@@ -31,8 +31,8 @@ nushell                = ">=0.116.1,<0.117"
 [workspace.build-variants]
 c_compiler           = ["naga-acpp-clang"]
 cxx_compiler         = ["naga-acpp-clangxx"]
-c_compiler_version   = ["2026.10.20"]
-cxx_compiler_version = ["2026.10.20"]
+c_compiler_version   = ["2026.10.21"]
+cxx_compiler_version = ["2026.10.21"]
 naga-acpp-llvm       = ["23"]
 cmake                = ["4.4.*"]
 
@@ -83,7 +83,7 @@ cospanmdao-tests = { path = "tests" }
 [feature.dev.dependencies]
 nushell         = { workspace = true }
 naga-acpp-tools = { workspace = true }
-naga-acpp-lldb  = "==2026.10.20"  # our toolchain's debugger
+naga-acpp-lldb  = "==2026.10.21"  # our toolchain's debugger
 
 [environments.dev]
 features = ["dev"]
