@@ -5,6 +5,10 @@
 # win-64 builds on a box with Visual Studio and runs on the GPU box, which has none: the build job uploads the .conda files
 # it produced, and this adds them to the run manifest so the run environments install them. When a package name occurs
 # more than once, the newest file wins.
+#
+# The packages are added in ONE `pixi add` call because they depend on each other (cospanmdao-examples and
+# cospanmdao-tests on cospanmdao, cospanmdao on slabkit), and pixi solves after every add: a per-package add solves before
+# the rest are present and fails with `no candidates were found` for the missing dependency.
 def main [packages: string] {
     let manifest = ($env.FILE_PWD | path join 'run' 'pixi.toml')
     let pattern = ($packages | path expand | path join '**' '*.conda' | str replace --all '\' '/')
@@ -20,7 +24,8 @@ def main [packages: string] {
     )
     for p in $newest {
         print $"pixi add --feature built ($p.name): ($p.path)"
-        ^pixi add --manifest-path $manifest --feature built --no-install $p.path
-        if $env.LAST_EXIT_CODE != 0 { error make {msg: $"add-built.nu: pixi add failed for ($p.path)"} }
     }
+    let paths = ($newest | get path)
+    ^pixi add --manifest-path $manifest --feature built --no-install ...$paths
+    if $env.LAST_EXIT_CODE != 0 { error make {msg: $"add-built.nu: pixi add failed for ($paths | str join ', ')"} }
 }
