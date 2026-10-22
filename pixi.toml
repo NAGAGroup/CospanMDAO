@@ -1,7 +1,7 @@
 [workspace]
 authors   = ["Jack Myers <jack@myersjack.dev>"]
 name      = "cospanmdao"
-version   = "0.1.0"
+version   = "0.3.0"
 channels  = ["https://prefix.dev/jackm97/naga-labs-staging"]
 platforms = [
   { platform = "linux-64", archspec = "x86_64_v3", name = "linux-64-v3" },

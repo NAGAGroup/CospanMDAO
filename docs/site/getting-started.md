@@ -18,12 +18,13 @@ This page builds the smallest complete CoSpan application: one component that co
 - **CoSpan** is a host dependency, fetched from its git repository.
 - **The build variants** select NAGA Labs' AdaptiveCpp compiler toolchain. Every CoSpan project needs this block as it is.
 - **The default environment** installs the project's own package, and one task runs it.
+- **Every device runtime** is included, for every platform it is published for, so the project runs on whatever hardware is present. Remove the runtimes for hardware you don''t have: AdaptiveCpp then stops trying to load them, and stops warning that they are missing.
 
 ```toml
 [workspace]
 name      = "getting-started"
 version   = "0.1.0"
-channels  = ["https://prefix.dev/jackm97/naga-labs-staging"]
+channels  = ["https://prefix.dev/jackm97/naga-labs-staging", "conda-forge"]
 platforms = [
   { platform = "linux-64", archspec = "x86_64_v3" },
   "linux-aarch64",
@@ -55,6 +56,31 @@ cospanmdao = { git = "https://github.com/NAGAGroup/CospanMDAO.git", subdirectory
 
 [dependencies]
 getting-started = { path = "." }
+
+# Every device runtime, on every platform it is published for: the project runs on whatever is present. Remove a
+# runtime for hardware you don''t have and AdaptiveCpp stops trying to load it (and stops warning that it is missing).
+# macOS has none to add: Metal is part of the base runtime. intel-opencl-rt is Intel''s CPU OpenCL driver, so the
+# OpenCL backend always has a device on x86-64.
+[target.linux-64.dependencies]
+naga-acpp-runtime-cuda       = "*"
+naga-acpp-runtime-level-zero = "*"
+naga-acpp-runtime-ocl        = "*"
+naga-acpp-runtime-rocm       = "*"
+intel-opencl-rt              = "*"
+
+[target.linux-aarch64.dependencies]
+naga-acpp-runtime-cuda = "*"
+naga-acpp-runtime-ocl  = "*"
+
+[target.win-64.dependencies]
+naga-acpp-runtime-cuda       = "*"
+naga-acpp-runtime-level-zero = "*"
+naga-acpp-runtime-ocl        = "*"
+naga-acpp-runtime-rocm       = "*"
+intel-opencl-rt              = "*"
+
+[target.win-arm64.dependencies]
+naga-acpp-runtime-ocl = "*"
 
 [tasks]
 getting-started = "getting-started"
