@@ -1,42 +1,35 @@
-# CospanMDAO
+# CoSpan
 
-[![CI](https://github.com/NAGAGroup/CospanMDAO/actions/workflows/ci.yml/badge.svg)](https://github.com/NAGAGroup/CospanMDAO/actions/workflows/ci.yml)
+[![CI](https://github.com/NAGALabs/CospanMDAO/actions/workflows/ci.yml/badge.svg)](https://github.com/NAGALabs/CospanMDAO/actions/workflows/ci.yml)
+[![version](https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2FNAGALabs%2FCospanMDAO%2Fmain%2Fcospanmdao%2Fpixi.toml&query=%24.package.version&label=version)](cospanmdao/pixi.toml)
+[![license](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
-**GPU-native modeling for multidisciplinary design.** Compose systems of components, connect them by shared variables,
-and run them on the GPU (or any SYCL device) through open standards: SYCL via
-[AdaptiveCpp](https://github.com/AdaptiveCpp/AdaptiveCpp). C++20, header-only, namespace `naga::cospan` (`cs::`).
+**Heterogeneous computing by composition.**
 
-CospanMDAO is part of the **NAGA ecosystem** ([NAGAGroup](https://github.com/NAGAGroup)): ecosystem code shares the
-`naga::` namespace and the `cospanmdao/include/naga/` root.
+Writing fast code for GPUs and other accelerators usually means writing two programs. One is the numerics. The other is the orchestration around them: allocating memory on each device, moving data, launching kernels, and wiring up the dependencies that keep everything in order. The orchestration is most of the code and most of the bugs, and it is why the clean design a project starts with rarely survives performance tuning.
 
-## Lineage
+CoSpan lets you write only the first program. You build your application as a model: components, each a small, self-contained piece of numerics, whose inputs and outputs you connect into shared variables. A CoSpan model is a fully declared program. Everything about how it will execute is known to the runtime before it runs, and that changes what a framework can do for you.
 
-CospanMDAO is a GPU-native successor to the ideas in [OpenMDAO](https://openmdao.org/): components declaring typed I/O,
-systems composing them with promotions and connections. The name says both halves: *cospans* are category theory's
-formalism for composing open systems along shared boundaries, and *MDAO* credits the multidisciplinary-design lineage.
+Because the whole model is known, the orchestration problems that have a right answer get the right answer automatically, and doing them by hand would not do better. Because the model is one consistent representation, harder optimizations can be written once, inside CoSpan, and apply to every model, without you thinking about them. And where the best choice depends on your problem, CoSpan gives you a simple way to make it yourself instead of guessing for you.
 
-## Core concepts
+None of this would be possible without [AdaptiveCpp](https://github.com/AdaptiveCpp/AdaptiveCpp). Its single-pass compiler keeps your kernels as portable code that is compiled, and specialized, at run time for the device that is actually present. That is what lets CoSpan be an ordinary C++ library rather than a compiler of its own, and assemble the kernels a model needs while the program runs. It is also why CoSpan runs on whatever hardware AdaptiveCpp supports: its device backends are loaded at run time, so support for new hardware arrives as a new backend, without rebuilding AdaptiveCpp, CoSpan, or your application. In AdaptiveCpp's own peer-reviewed benchmarks, its JIT-specialized code outran the vendors' compilers on their own hardware.
 
-- **Component.** A leaf that does work. It declares typed inputs and outputs (`cs::Input`, `cs::Output`), and its kernel
-  body is one function whose signature fixes its kind: index-range (one call per index), group-range (work-groups, group functions, `LocalMem` local memory), custom-op or host.
-  A group-range component always states its work-group shape (`wg_desc`), and its range must be a multiple of that shape:
-  you round it up and guard the tail, and CoSpan throws if you do not.
-- **System.** A node that orders work. It adds children with `add_subsystem`, wires them with `connect`, `promote`,
-  `tie_inputs` and `tie_outputs`, and has no I/O of its own beyond those aliases.
-- **Variable.** Everything joined by wiring is one variable. Its metadata is shared by all of its ports, and its memory lives
-  while some port on that device holds it. A connection costs nothing at run time.
-- **Shapes.** A component says per dimension only "specified" or `cs::unspecified`. A shape comes from a connection, an
-  initializer, a producer's `prepare_forward()` (`set_shape`), or a System's `shape_hook`.
-- **Run.** `Model::run()` enqueues one run and returns. Kernels are ordered by events, never by queue order, so
-  independent work overlaps. Run policy (`run_n`, `do_once`, `transient`) is set on a subsystem; a finished
-  subsystem goes out of scope and releases its data, and `Model::rearm_subsystem` brings it back.
-- **Host access.** `Model::update_input` is the only write; `view_output` gives a host view of a result after a run, and
-  `sync()` makes it current.
-- **Memory.** One [SlabKit](https://github.com/NAGAGroup/SlabKit) pool per device, sized by you, with a counted OS fallback.
+That raises a question most frameworks never have to ask. When you could hand-write a native, vendor-specific kernel instead, should you? You still can, and for vendor-specific hardware such as tensor cores you will want to. But a hand-tuned kernel is tuned for one runtime state, while CoSpan's kernels keep being specialized for the state your program is actually in. With CoSpan, it is a question worth asking.
 
-## A small example
+The result is code you can read, reuse and grow: each piece written once, small and testable, and composed into larger models without being rewritten. In our early experiments, chains of ordinary building blocks composed this way have outrun vendor libraries on the same hardware.
 
-Two copies of a component that doubles its input, connected in a chain:
+## Features
+
+- **Modeling in the OpenMDAO tradition.** Models are built from components and systems, with named, typed inputs and outputs, as in [OpenMDAO](https://openmdao.org/), the NASA framework for multidisciplinary design, analysis and optimization.
+- **Fused kernels.** Several components can run as a single kernel. Work that would otherwise be many small kernel launches, each waiting on the last, runs as one, while each component stays a small, focused unit of computation. Components that use work-groups and local memory can be fused too.
+- **Component variants.** Kernel components hold device numerics, written per element or per work-group. Host components bring host-side work into the model, ordered with everything else. Custom components give you full control, down to raw SYCL or vendor-native code.
+- **Promotions.** A system can expose inputs and outputs from deep inside it under its own names. Large nested models stay readable, and a system can present a clean interface to whatever uses it.
+- **Ties.** Inputs can be tied together, and so can outputs, making them one variable. Components developed separately stay composable, even when they have to work on the same data.
+- **Heterogeneous models.** One model can span several devices at once, from different vendors and of different kinds, with its parts placed where they run best.
+
+## A taste
+
+Two components, connected:
 
 ```cpp
 #include <naga/cospan/cospan.hpp>
@@ -48,17 +41,16 @@ class Double : public cs::Component<Double> {
 public:
     struct Inputs  { cs::Input<DType::f32, 1> x; };
     struct Outputs { cs::Output<DType::f32, 1> y; };
-    // the kernel: one work-item per element (its first parameter makes this an index-range, rank-1 body)
     static void compute_forward(sycl::id<1> i, const Inputs& in, const Outputs& out) { out.y[i] = 2.0f * in.x[i]; }
 
     Inputs  inputs;
     Outputs outputs;
 
-    void declare() override {                                  // declare I/O; allocates nothing
+    void declare() override {
         declare_input(inputs.x, "x", cs::unspecified);
         declare_output(outputs.y, "y", cs::unspecified);
     }
-    void prepare_forward() override { set_shape(outputs.y, shape_of(inputs.x)[0]); }   // the output follows the input
+    void prepare_forward() override { set_shape(outputs.y, shape_of(inputs.x)[0]); }
     std::unique_ptr<cs::LaunchDescription> define_forward() override {
         return create_launch_config(cs::range_desc(inputs.x.shape()));
     }
@@ -69,102 +61,51 @@ public:
     void setup() override {
         add_subsystem(cs::subsystem_desc<Double>("a"));
         add_subsystem(cs::subsystem_desc<Double>("b"));
-        connect("a.y", "b.x");                               // b reads what a wrote
+        connect("a.y", "b.x");
     }
 };
 
 int main() {
-    cs::Model model = cs::create_model<Chain>(
-        cs::model_config_desc{cs::pool_desc{cs::all_devices, 64u << 20}});  // a 64 MiB pool on every device
-    model.setup();                                           // wiring and shape rules are checked here
+    cs::Model model = cs::create_model<Chain>();
+    model.setup();
+    model.update_input("a.x", cs::init::from_host(std::vector<float>{1, 2, 3, 4}));
+    model.run();
 
-    model.update_input("a.x", cs::init::from_host(std::vector<float>{1, 2, 3, 4}));  // supplies a.x and its shape
-    model.run();                                         // enqueues and returns; the update is applied here
-
-    auto y = model.view_output<DType::f32, 1>("b.y");        // views are available once the model is finalized (the first run does it)
-    y.sync();                                                // wait for the data before reading
-    // y.shape()[0] == 4, y[0] == 4.0f, y[3] == 16.0f
+    auto y = model.view_output<DType::f32, 1>("b.y");
+    y.sync();   // 4 8 12 16
 }
 ```
 
-A System can also size an input from another variable. This makes `c.x` as long as `p.y`:
+## Platforms
 
-```cpp
-add_subsystem(cs::subsystem_desc<Producer>("p"));
-add_subsystem(cs::subsystem_desc<Double>("c"));
-shape_hook("c.x", cs::dim::from_shape("p.y", 0));
-```
+| | CPU | NVIDIA | AMD | Intel GPU | Apple GPU |
+|---|:---:|:---:|:---:|:---:|:---:|
+| **Linux x86-64** | ![](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2FNAGALabs%2FCospanMDAO%2Fbadges%2Flinux-64-cpu.json) | ![](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2FNAGALabs%2FCospanMDAO%2Fbadges%2Flinux-64-nvidia.json) | ![](https://img.shields.io/badge/-untested-lightgrey) | ![](https://img.shields.io/badge/-untested-lightgrey) | — |
+| **Linux ARM64** | ![](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2FNAGALabs%2FCospanMDAO%2Fbadges%2Flinux-aarch64-cpu.json) | ![](https://img.shields.io/badge/-untested-lightgrey) | — | — | — |
+| **macOS ARM64** | ![](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2FNAGALabs%2FCospanMDAO%2Fbadges%2Fosx-arm64-cpu.json) | — | — | — | ![](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2FNAGALabs%2FCospanMDAO%2Fbadges%2Fosx-arm64-apple.json) |
+| **Windows x86-64** | ![](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2FNAGALabs%2FCospanMDAO%2Fbadges%2Fwin-64-cpu.json) | ![](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2FNAGALabs%2FCospanMDAO%2Fbadges%2Fwin-64-nvidia.json) | ![](https://img.shields.io/badge/-untested-lightgrey) | ![](https://img.shields.io/badge/-untested-lightgrey) | — |
+| **Windows ARM64** | ![](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2FNAGALabs%2FCospanMDAO%2Fbadges%2Fwin-arm64-cpu.json) | — | — | — | — |
 
-### Fused groups
-
-Components with index-range or group-range bodies can run as the stages of ONE kernel launch. A *segment* is a run of consecutive
-stages that share work-groups; a bare component is a one-stage segment. Segment options pick the range
-(`range_mode::own`, the default: a stage runs for its own groups; `whole`: every stage runs for every group of the
-segment) and the local memory (`local_mem::partitioned`, the default: each stage its own slice; `shared`: one block; group-range only, as are `global_barrier` and group waits):
-
-```cpp
-add_subsystem(cs::fuse_components(
-    "f", cs::connects_desc({{"a.y", "b.x"}}),                    // connects run forward in stage order
-    cs::segment<cs::range_mode::whole>(cs::subsystem_desc<StageA>("a"),   // a and b share their groups
-                                       cs::subsystem_desc<StageB>("b")),
-    cs::segment(cs::subsystem_desc<StageC>("c"))));            // c has its own groups, in the same launch
-```
-
-`cs::global_barrier()` between two segments of work-group stages makes every group of the later segment wait for every group
-of the earlier ones. The fused-group property `cs::group_waits_enabled`
-(`cs::fuse_components<cs::group_waits_enabled>(...)`) lets stages wait for earlier groups themselves
-(`GroupItem::wait_group`, `wait_earlier_segments`) without every group being resident; a barrier implies it. See `examples/gemver-chain` for fused groups in a real chain.
-
-## Using CospanMDAO
-
-CospanMDAO is a [pixi](https://pixi.sh) **source package**: dependency management lives in pixi, not in CMake. pixi is the
-one host dependency; it builds the dependency chain (SlabKit, cereal, the AdaptiveCpp toolchain) from pinned sources, the
-same way on every machine.
-
-**From a pixi project (recommended):**
-
-```toml
-# pixi.toml
-[workspace]
-preview = ["pixi-build"]
-
-[dependencies]
-cospanmdao = { git = "https://github.com/NAGAGroup/CospanMDAO.git", branch = "main", subdirectory = "cospanmdao" }
-```
-
-then in CMake: `find_package(cospanmdao CONFIG REQUIRED)` and link `naga::cospan`. A host dependency is enough: cospanmdao
-run-exports SlabKit, so its shared library comes along at run time.
-
-**Support policy:** the pixi pipeline is the only officially supported way to build and consume CospanMDAO. Other embeddings
-may work, but issues specific to them will be closed.
-
-## Developing CospanMDAO
-
-```sh
-pixi run test                       # build and run the test suite (OpenMP host backend)
-pixi run -e cuda test               # the same on CUDA
-pixi run gemver-chain               # the GEMVER chain example (see examples/gemver-chain/README.md)
-pixi run -e cuda gemver-chain       # on CUDA
-pixi run -e dev <command>           # the dev environment: the full build closure, nothing built
-```
-
-The `dev` and `dev-cuda` environments carry the package's full dependency closure without building the package.
-`pixi run -e git setup-git` points git at the project hooks.
-
-## Documentation
-
-- **Specification:** [`internal/spec/revisions/r03-2026-10-06-section-11-as-built.md`](internal/spec/revisions/r03-2026-10-06-section-11-as-built.md)
-  (r02 and r01 are superseded and kept as history).
-- **Migrating from the API before the 2026-10-03 rework:** [`internal/rework-migration-2026-10-03.md`](internal/rework-migration-2026-10-03.md).
-- **Decisions:** [`internal/phase1-decisions.md`](internal/phase1-decisions.md) (D144 is the rework) and
-  [`internal/design-review-2026-10-03.md`](internal/design-review-2026-10-03.md).
-- **Roadmap:** [`internal/ROADMAP.md`](internal/ROADMAP.md).
+*Untested* means a runtime is available but we have no hardware to test it on.
 
 ## Status
 
-v0.1.0. The API is not yet stable. Chunked systems, slices and leading ranges are not supported at present: they are being
-redesigned (the old code is kept as dead code in `cospanmdao/include/naga/cospan/chunked_system.hpp`).
+CoSpan is early, and its API is still changing. Derivatives, solvers for coupled systems, and optimizers, the rest of what modeling frameworks like OpenMDAO provide, are not here yet. They are where CoSpan is going next.
+
+## Getting started
+
+CoSpan is a [pixi](https://pixi.sh) package:
+
+```toml
+cospanmdao = { git = "https://github.com/NAGALabs/CospanMDAO.git", branch = "main", subdirectory = "cospanmdao" }
+```
+
+The [getting-started guide](docs/site/getting-started.md) walks through a complete project, and the [documentation](docs/site/) covers the concepts in depth.
+
+## About
+
+CoSpan is developed by [NAGA Labs](https://github.com/NAGALabs), alongside [SlabKit](https://github.com/NAGALabs/SlabKit), the device-memory library it is built on. The name comes from category theory, where *cospans* describe how open systems compose along their shared boundaries.
 
 ## License
 
-Apache-2.0. Copyright 2026 Jack Myers.
+Apache-2.0. Copyright 2026 NAGA Labs LLC.
