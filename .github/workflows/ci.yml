@@ -1,5 +1,5 @@
 # CI: the unit tests on every platform and backend, mirroring the acpp-toolchain test-* jobs
-# (runner labels, setup-pixi version, per-step continue-on-error with a final fail-the-job step).
+# (runner labels, setup-pixi version). A failing step fails the job under its own name; later steps still run (if: !cancelled()).
 #
 #   linux-64       Linux-x64-GPU   OpenMP, CUDA, OpenCL (Intel CPU runtime)   built on the GPU box
 #   linux-aarch64  linux-arm64-v32 OpenMP
@@ -23,6 +23,14 @@ jobs:
   linux-64:
     runs-on: Linux-x64-GPU
     timeout-minutes: 120
+    outputs:
+      omp: ${{ steps.omp.outcome }}
+      cuda: ${{ steps.cuda.outcome }}
+      ocl: ${{ steps.ocl.outcome }}
+      gemver-omp: ${{ steps.gemver-omp.outcome }}
+      gemver-cuda: ${{ steps.gemver-cuda.outcome }}
+      ns-omp: ${{ steps.ns-omp.outcome }}
+      ns-cuda: ${{ steps.ns-cuda.outcome }}
     defaults:
       run:
         shell: bash
@@ -47,17 +55,16 @@ jobs:
         run: pixi list -e default 2>&1 | tee "$GITHUB_WORKSPACE/logs/pixi-list.txt"
       - name: Install the CUDA environment
         id: installcuda
-        continue-on-error: true
+        if: ${{ !cancelled() }}
         timeout-minutes: 60
         run: pixi install -e cuda 2>&1 | tee -a "$GITHUB_WORKSPACE/logs/install-cuda.log"
       - name: Install the OpenCL environment
         id: installocl
-        continue-on-error: true
+        if: ${{ !cancelled() }}
         timeout-minutes: 60
         run: pixi install -e ocl 2>&1 | tee -a "$GITHUB_WORKSPACE/logs/install-ocl.log"
       - name: "cospan-tests on OpenMP"
         id: omp
-        continue-on-error: true
         if: ${{ !cancelled() }}
         timeout-minutes: 30
         env:
@@ -65,7 +72,6 @@ jobs:
         run: pixi exec --spec nushell nu ci/run-catch.nu pixi.toml default cospan-tests 2>&1 | tee -a "$GITHUB_WORKSPACE/logs/omp.log"
       - name: "cospan-tests on CUDA"
         id: cuda
-        continue-on-error: true
         if: ${{ !cancelled() }}
         timeout-minutes: 30
         env:
@@ -74,7 +80,6 @@ jobs:
       # Intel's CPU OpenCL runtime (conda-forge intel-opencl-rt) is the OpenCL device here, as in the toolchain's test job.
       - name: "cospan-tests on OpenCL (Intel CPU)"
         id: ocl
-        continue-on-error: true
         if: ${{ !cancelled() }}
         timeout-minutes: 30
         env:
@@ -82,7 +87,6 @@ jobs:
         run: pixi exec --spec nushell nu ci/run-catch.nu pixi.toml ocl cospan-tests 2>&1 | tee -a "$GITHUB_WORKSPACE/logs/ocl.log"
       - name: "gemver-chain --check on OpenMP"
         id: gemver-omp
-        continue-on-error: true
         if: ${{ !cancelled() }}
         timeout-minutes: 30
         env:
@@ -90,7 +94,6 @@ jobs:
         run: pixi run -e default gemver-chain --check --variant all --n 2048 2>&1 | tee -a "$GITHUB_WORKSPACE/logs/gemver-omp.log"
       - name: "gemver-chain --check on CUDA"
         id: gemver-cuda
-        continue-on-error: true
         if: ${{ !cancelled() }}
         timeout-minutes: 30
         env:
@@ -98,7 +101,6 @@ jobs:
         run: pixi run -e cuda gemver-chain --check --variant all --n 2048 2>&1 | tee -a "$GITHUB_WORKSPACE/logs/gemver-cuda.log"
       - name: "ns-residual --check on OpenMP"
         id: ns-omp
-        continue-on-error: true
         if: ${{ !cancelled() }}
         timeout-minutes: 30
         env:
@@ -106,7 +108,6 @@ jobs:
         run: pixi run -e default ns-residual --check 2>&1 | tee -a "$GITHUB_WORKSPACE/logs/ns-omp.log"
       - name: "ns-residual --check on CUDA"
         id: ns-cuda
-        continue-on-error: true
         if: ${{ !cancelled() }}
         timeout-minutes: 30
         env:
@@ -123,20 +124,12 @@ jobs:
             logs/
             .pixi/bld/*/*/work/build/*.log
             .pixi/bld/*/*/work/build/CMakeFiles/*.log
-      - name: Fail the job if any step failed
-        if: ${{ always() }}
-        shell: bash
-        env:
-          STEPS_JSON: ${{ toJSON(steps) }}
-        run: |
-          if printf '%s' "$STEPS_JSON" | grep -Eq '"outcome": "failure"'; then
-            echo "::error::at least one step failed; see the per-step outcomes in this log"
-            exit 1
-          fi
 
   linux-aarch64:
     runs-on: linux-arm64-v32
     timeout-minutes: 180
+    outputs:
+      omp: ${{ steps.omp.outcome }}
     defaults:
       run:
         shell: bash
@@ -159,7 +152,6 @@ jobs:
         run: pixi list -e default 2>&1 | tee "$GITHUB_WORKSPACE/logs/pixi-list.txt"
       - name: "cospan-tests on OpenMP"
         id: omp
-        continue-on-error: true
         if: ${{ !cancelled() }}
         timeout-minutes: 60
         env:
@@ -176,20 +168,13 @@ jobs:
             logs/
             .pixi/bld/*/*/work/build/*.log
             .pixi/bld/*/*/work/build/CMakeFiles/*.log
-      - name: Fail the job if any step failed
-        if: ${{ always() }}
-        shell: bash
-        env:
-          STEPS_JSON: ${{ toJSON(steps) }}
-        run: |
-          if printf '%s' "$STEPS_JSON" | grep -Eq '"outcome": "failure"'; then
-            echo "::error::at least one step failed; see the per-step outcomes in this log"
-            exit 1
-          fi
 
   osx-arm64:
     runs-on: macOS-26-xlarge
     timeout-minutes: 240
+    outputs:
+      omp: ${{ steps.omp.outcome }}
+      metal: ${{ steps.metal.outcome }}
     defaults:
       run:
         shell: bash
@@ -213,7 +198,6 @@ jobs:
         run: pixi list -e default 2>&1 | tee "$GITHUB_WORKSPACE/logs/pixi-list.txt"
       - name: "cospan-tests on OpenMP"
         id: omp
-        continue-on-error: true
         if: ${{ !cancelled() }}
         timeout-minutes: 60
         env:
@@ -221,7 +205,6 @@ jobs:
         run: pixi exec --spec nushell nu ci/run-catch.nu pixi.toml default cospan-tests ci/exclude/osx-arm64-omp.txt 2>&1 | tee -a "$GITHUB_WORKSPACE/logs/omp.log"
       - name: "cospan-tests on Metal"
         id: metal
-        continue-on-error: true
         if: ${{ !cancelled() }}
         timeout-minutes: 60
         env:
@@ -238,16 +221,6 @@ jobs:
             logs/
             .pixi/bld/*/*/work/build/*.log
             .pixi/bld/*/*/work/build/CMakeFiles/*.log
-      - name: Fail the job if any step failed
-        if: ${{ always() }}
-        shell: bash
-        env:
-          STEPS_JSON: ${{ toJSON(steps) }}
-        run: |
-          if printf '%s' "$STEPS_JSON" | grep -Eq '"outcome": "failure"'; then
-            echo "::error::at least one step failed; see the per-step outcomes in this log"
-            exit 1
-          fi
 
   # win-64 is built on a box with Visual Studio and run on the GPU box, which has none (as in the toolchain).
   build-win-64:
@@ -310,6 +283,9 @@ jobs:
     needs: [build-win-64]
     runs-on: Win-x64-GPU
     timeout-minutes: 120
+    outputs:
+      omp: ${{ steps.omp.outcome }}
+      cuda: ${{ steps.cuda.outcome }}
     defaults:
       run:
         shell: powershell # Windows PowerShell: this image has no pwsh, and bash is the WSL stub
@@ -349,7 +325,6 @@ jobs:
           pixi list --manifest-path ci/run/pixi.toml -e run-cuda | Tee-Object -FilePath "$env:GITHUB_WORKSPACE\logs\pixi-list.txt"
       - name: "cospan-tests on OpenMP"
         id: omp
-        continue-on-error: true
         if: ${{ !cancelled() }}
         timeout-minutes: 30
         env:
@@ -357,7 +332,6 @@ jobs:
         run: pixi exec --spec nushell nu ci/run-catch.nu ci/run/pixi.toml run-omp cospan-tests
       - name: "cospan-tests on CUDA"
         id: cuda
-        continue-on-error: true
         if: ${{ !cancelled() }}
         timeout-minutes: 30
         env:
@@ -371,20 +345,12 @@ jobs:
           retention-days: 14
           if-no-files-found: ignore
           path: logs/
-      - name: Fail the job if any step failed
-        if: ${{ always() }}
-        shell: powershell
-        env:
-          STEPS_JSON: ${{ toJSON(steps) }}
-        run: |
-          if ($env:STEPS_JSON -match '"outcome":\s*"failure"') {
-            Write-Host "::error::at least one step failed; see the per-step outcomes in this log"
-            exit 1
-          }
 
   win-arm64:
     runs-on: win-arm64-v32
     timeout-minutes: 240
+    outputs:
+      omp: ${{ steps.omp.outcome }}
     defaults:
       run:
         shell: pwsh
@@ -409,7 +375,6 @@ jobs:
           pixi list -e default | Tee-Object -FilePath "$env:GITHUB_WORKSPACE\logs\pixi-list.txt"
       - name: "cospan-tests on OpenMP"
         id: omp
-        continue-on-error: true
         if: ${{ !cancelled() }}
         timeout-minutes: 60
         env:
@@ -426,13 +391,64 @@ jobs:
             logs/
             .pixi/bld/*/*/work/build/*.log
             .pixi/bld/*/*/work/build/CMakeFiles/*.log
-      - name: Fail the job if any step failed
-        if: ${{ always() }}
-        shell: pwsh
+
+  # The platform badges in the README read one JSON file per cell from the badges branch. A cell is passing only if every
+  # step listed for it succeeded; a skipped or missing step fails it.
+  badges:
+    needs: [linux-64, linux-aarch64, osx-arm64, win-64, win-arm64]
+    if: ${{ always() && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    permissions: { contents: write }
+    steps:
+      - name: Publish the platform badges to the badges branch
+        shell: bash
         env:
-          STEPS_JSON: ${{ toJSON(steps) }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LINUX_64_OMP: ${{ needs.linux-64.outputs.omp }}
+          LINUX_64_CUDA: ${{ needs.linux-64.outputs.cuda }}
+          LINUX_64_OCL: ${{ needs.linux-64.outputs.ocl }}
+          LINUX_64_GEMVER_OMP: ${{ needs.linux-64.outputs.gemver-omp }}
+          LINUX_64_GEMVER_CUDA: ${{ needs.linux-64.outputs.gemver-cuda }}
+          LINUX_64_NS_OMP: ${{ needs.linux-64.outputs.ns-omp }}
+          LINUX_64_NS_CUDA: ${{ needs.linux-64.outputs.ns-cuda }}
+          LINUX_AARCH64_OMP: ${{ needs.linux-aarch64.outputs.omp }}
+          OSX_ARM64_OMP: ${{ needs.osx-arm64.outputs.omp }}
+          OSX_ARM64_METAL: ${{ needs.osx-arm64.outputs.metal }}
+          WIN_64_OMP: ${{ needs.win-64.outputs.omp }}
+          WIN_64_CUDA: ${{ needs.win-64.outputs.cuda }}
+          WIN_ARM64_OMP: ${{ needs.win-arm64.outputs.omp }}
         run: |
-          if ($env:STEPS_JSON -match '"outcome":\s*"failure"') {
-            Write-Host "::error::at least one step failed; see the per-step outcomes in this log"
-            exit 1
+          set -euo pipefail
+          dir=$(mktemp -d)
+
+          # cell <name> <outcome>...: passing only if every outcome is exactly "success" (empty or skipped fails)
+          cell() {
+            local name="$1"; shift
+            local ok=1 v
+            for v in "$@"; do [ "$v" = "success" ] || ok=0; done
+            if [ "$ok" = 1 ]; then
+              printf '%s' '{"schemaVersion":1,"label":"","message":"passing","color":"brightgreen"}' > "$dir/$name.json"
+              echo "$name: passing ($*)"
+            else
+              printf '%s' '{"schemaVersion":1,"label":"","message":"failing","color":"red"}' > "$dir/$name.json"
+              echo "$name: failing ($*)"
+            fi
           }
+
+          cell linux-64-cpu "$LINUX_64_OMP" "$LINUX_64_OCL" "$LINUX_64_GEMVER_OMP" "$LINUX_64_NS_OMP"
+          cell linux-64-nvidia "$LINUX_64_CUDA" "$LINUX_64_GEMVER_CUDA" "$LINUX_64_NS_CUDA"
+          cell linux-aarch64-cpu "$LINUX_AARCH64_OMP"
+          cell osx-arm64-cpu "$OSX_ARM64_OMP"
+          cell osx-arm64-apple "$OSX_ARM64_METAL"
+          cell win-64-cpu "$WIN_64_OMP"
+          cell win-64-nvidia "$WIN_64_CUDA"
+          cell win-arm64-cpu "$WIN_ARM64_OMP"
+
+          cd "$dir"
+          git init -q
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -q -b badges
+          git add ./*.json
+          git commit -q -m "badges: ${GITHUB_SHA}"
+          git push --force "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" badges
