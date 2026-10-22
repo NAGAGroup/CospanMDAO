@@ -365,17 +365,17 @@ public:
     void setup() override { add_subsystem(cs::subsystem_desc<GrpBad>("bad")); }
 };
 
-// Three arrays of different element types and odd shapes: u8 {3}, f64 {5}, i32 {3, 2}; work-group 4, two groups.
+// Three arrays of different element types and odd shapes: u8 {3}, f32 {5}, i32 {3, 2}; work-group 4, two groups.
 class LocalMixed : public cs::Component<LocalMixed> {
 public:
     struct Inputs {};
     struct Outputs { cs::Output<DType::f32, 1> y; };
-    using Mem = cs::LocalMem<cs::LocalArray<DType::u8, 1>, cs::LocalArray<DType::f64, 1>, cs::LocalArray<DType::i32, 2>>;
+    using Mem = cs::LocalMem<cs::LocalArray<DType::u8, 1>, cs::LocalArray<DType::f32, 1>, cs::LocalArray<DType::i32, 2>>;
     static void compute_forward(cs::GroupItem<1> it, const Inputs&, const Outputs& out, Mem lm) {
         auto [a, b, c] = lm.get(it);
         const std::size_t l = it.get_local_linear_id();
         if (l < 3) a[l] = static_cast<unsigned char>(l + 1);
-        if (l < 5) b[l] = 0.5 * static_cast<double>(l);
+        if (l < 5) b[l] = 0.5f * static_cast<float>(l);
         if (l < 6) c[sycl::id<2>{l / 2, l % 2}] = static_cast<int>(10 * l);
         cs::group_barrier(it.get_group());
         out.y[it.get_global_id(0)] = static_cast<float>(a[l % 3] + b[l % 5] + c[sycl::id<2>{(l % 6) / 2, (l % 6) % 2}]);

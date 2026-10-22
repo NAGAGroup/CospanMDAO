@@ -5,7 +5,7 @@
 // Reading results (internal/design-review-2026-10-03.md, section 5): forward() only enqueues; a host view is obtained
 // after the first forward and sync()ed before it is read (cst::synced_output and friends do both).
 //
-//   1. Sellar forward   the same Systems templated on the dtype, run in f32 and f64
+//   1. Sellar forward   the same Systems templated on the dtype, run in f32
 //                       over several design points against a host reference in double
 //   2. Marks            design variables, objective, constraints: counts, bounds, and
 //                       the tied z appearing once (one record per root)
@@ -321,16 +321,16 @@ void sellar_forward(double abs_tol, double rel_tol) {
 // ---- Static memory model (case 5) ------------------------------------------------------------------
 //   gen:  y  f32[100]    400 B          (root)
 //   cvt:  a  <- gen.y    (a connected input: a peer of gen.y, no storage of its own)
-//         d  f64[64]     512 B          (root)
+//         d  i32[64]     256 B          (root)
 //   comb: b, c f32[8]    tied into the top alias "bc": one root, 32 B
 //         e  <- cvt.d    (a connected input: a peer)
 //         o  f32[16]     64 B           (root), promoted to "out" (a peer alias)
 // Distinct roots: gen.y, cvt.d, bc, comb.o.
 constexpr std::size_t kGenBytes = 100 * sizeof(float);
-constexpr std::size_t kCvtBytes = 64 * sizeof(double);
+constexpr std::size_t kCvtBytes = 64 * sizeof(std::int32_t);
 constexpr std::size_t kBcBytes  = 8 * sizeof(float);
 constexpr std::size_t kOutBytes = 16 * sizeof(float);
-constexpr std::size_t kExpectedStatic = kGenBytes + kCvtBytes + kBcBytes + kOutBytes;  // 1008
+constexpr std::size_t kExpectedStatic = kGenBytes + kCvtBytes + kBcBytes + kOutBytes;  // 752
 
 class Gen : public cs::Component<Gen> {
 public:
@@ -355,9 +355,9 @@ public:
         cs::Input<DType::f32, 1> a;
     };
     struct Outputs {
-        cs::Output<DType::f64, 1> d;
+        cs::Output<DType::i32, 1> d;
     };
-    static void compute_forward(sycl::id<1> i, const Inputs& in, const Outputs& out) { out.d[i] = 2.0 * static_cast<double>(in.a[i]); }
+    static void compute_forward(sycl::id<1> i, const Inputs& in, const Outputs& out) { out.d[i] = 2 * static_cast<std::int32_t>(in.a[i]); }
 
     Inputs  inputs;
     Outputs outputs;
@@ -376,7 +376,7 @@ public:
     struct Inputs {
         cs::Input<DType::f32, 1> b;
         cs::Input<DType::f32, 1> c;
-        cs::Input<DType::f64, 1> e;
+        cs::Input<DType::i32, 1> e;
     };
     struct Outputs {
         cs::Output<DType::f32, 1> o;
@@ -599,9 +599,8 @@ cs::Model::MemoryReport::PerDevice report_on(const cs::Model& m, const sycl::dev
 // =============================================================================================
 // 1. Sellar forward
 // =============================================================================================
-TEST_CASE("Sellar forward: f32 and f64 over several design points", "[model][sellar]") {
+TEST_CASE("Sellar forward: f32 over several design points", "[model][sellar]") {
     SECTION("f32: rel 1e-5, abs 1e-5") { tmod::sellar_forward<DType::f32>(1e-5, 1e-5); }
-    SECTION("f64: rel 1e-12") { tmod::sellar_forward<DType::f64>(1e-12, 1e-12); }
 }
 
 // =============================================================================================
@@ -823,13 +822,13 @@ TEST_CASE("Memory report: a static model computes; the pool report after setup a
 
     // The model computes what it says (so the roots really hold data).
     const auto gen = to_vector(cst::synced_output<DType::f32, 1>(model, "gen.y"));
-    const auto cvt = to_vector(cst::synced_output<DType::f64, 1>(model, "cvt.d"));
+    const auto cvt = to_vector(cst::synced_output<DType::i32, 1>(model, "cvt.d"));
     const auto out = to_vector(cst::synced_output<DType::f32, 1>(model, "out"));
     REQUIRE(gen.size() == 100);
     REQUIRE(cvt.size() == 64);
     REQUIRE(out.size() == 16);
     CHECK(gen[99] == 99.0f);
-    CHECK(cvt[63] == 126.0);
+    CHECK(cvt[63] == 126);
     for (std::size_t i = 0; i < out.size(); ++i) CHECK(out[i] == 2.0f * bc[i % 8]);  // e[0] = cvt.d[0] = 0
 
     std::printf("[memory] expected static %zu B (gen.y %zu + cvt.d %zu + bc %zu + comb.o %zu)\n"
@@ -839,7 +838,7 @@ TEST_CASE("Memory report: a static model computes; the pool report after setup a
 
     // The rule: the pool's bytes in use on a device are the sum, over the live containers on it, of each container's
     // capacity rounded up to whole nodes. The live containers after a forward are the four distinct roots (the peers
-    // cvt.a, comb.e, comb.b/c and the promoted out share their root's container): 400, 512, 32 and 64 bytes, a node each.
+    // cvt.a, comb.e, comb.b/c and the promoted out share their root's container): 400, 256, 32 and 64 bytes, a node each.
     CHECK(after_fwd.pool_bytes == (std::size_t{1} << 20));  // a pool is sized up front
     // Plus what each of the three kernel components keeps for its own launch (argument, pointer and geometry arrays).
     CHECK(after_fwd.pool_bytes_in_use == cst::pool_bytes_of(tmod::kGenBytes) + cst::pool_bytes_of(tmod::kCvtBytes) +

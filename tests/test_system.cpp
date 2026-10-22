@@ -2319,7 +2319,7 @@ TEST_CASE("alias: tie errors", "[system][alias][errors]") {
         setup_throws(
             [&](cs::System& s) {
                 two_scales(s);
-                s.tie_inputs<DType::f64, 1>({"a.x", "b.x"}, "t", cs::shape(4));
+                s.tie_inputs<DType::i32, 1>({"a.x", "b.x"}, "t", cs::shape(4));
             },
             {"dtype"});
     }

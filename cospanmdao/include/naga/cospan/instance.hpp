@@ -70,8 +70,8 @@ struct WrapperAccess {
     }
 
     template <class W, class P>
-    static void write_ragged(W& w, std::size_t n, P* data, const std::uint64_t* offsets,
-                             const std::array<std::size_t, 2>& ext, const std::array<const std::uint64_t*, 2>& per) {
+    static void write_ragged(W& w, std::size_t n, P* data, const std::uint32_t* offsets,
+                             const std::array<std::size_t, 2>& ext, const std::array<const std::uint32_t*, 2>& per) {
         w.n_       = n;
         w.data_    = data;
         w.offsets_ = offsets;
@@ -206,8 +206,8 @@ protected:
         const ResolvedShape&                s    = meta->shape;
         auto*                               base = data ? static_cast<value_type*>(data->raw()) : nullptr;
         std::array<std::size_t, 2>          ext{1, 1};
-        std::array<const std::uint64_t*, 2> per{nullptr, nullptr};
-        const std::uint64_t*                offs = nullptr;
+        std::array<const std::uint32_t*, 2> per{nullptr, nullptr};
+        const std::uint32_t*                offs = nullptr;
         if (s.ragged()) {  // rank 2: dimension 1 is per-index
             const auto* rd = dynamic_cast<const RaggedDeviceData<value_type>*>(data.get());
             if (rd != nullptr && rd->per) per[0] = rd->per->data();

@@ -1,7 +1,7 @@
 #pragma once
 
 // =============================================================================
-// naga/cospan/device_scan.hpp — a parallel exclusive scan of u64 on the device
+// naga/cospan/device_scan.hpp — a parallel exclusive scan of u32 on the device
 // =============================================================================
 //
 // The scan behind a ragged shape hook (shape_hook.hpp, counts_from) runs in parallel on the device
@@ -16,6 +16,11 @@
 // With a single work-group (n <= wg) the three steps are one kernel. The temporary block-sum buffers are usm_vectors from
 // the Runtime's allocator on the device; the final event is registered on them before they go out of scope, so their
 // free waits for the kernels that read them. n == 0 writes out[0] = 0.
+//
+// 32-bit on purpose: Metal's SIMD-group operations take no 64-bit integers, so CoSpan uses 32-bit offsets on every device
+// (the lowest common denominator). The running sums wrap past 2^32 - 1; the caller (build_column, shape_hook.hpp) detects
+// that exactly, because every input is below 2^32 and so a wrapped running sum is always a decrease, and reports it as an
+// error: ragged totals are limited to 2^32 - 1 elements.
 
 #include <algorithm>
 #include <cstddef>
@@ -38,8 +43,8 @@ inline std::size_t scan_group_size(const sycl::device& dev) {
 /// out[0..n] = the exclusive scan of in[0..n) (n + 1 outputs: out[n] is the total), after `deps`, on `dev`. `in` and
 /// `out` are device-accessible USM pointers that must stay valid until the returned event completes; they must not
 /// overlap. Returns the event of the last kernel.
-inline sycl::event exclusive_scan_u64(Runtime& rt, const sycl::device& dev, const std::vector<sycl::event>& deps,
-                                      const std::uint64_t* in, std::uint64_t* out, std::size_t n) {
+inline sycl::event exclusive_scan_u32(Runtime& rt, const sycl::device& dev, const std::vector<sycl::event>& deps,
+                                      const std::uint32_t* in, std::uint32_t* out, std::size_t n) {
     if (n == 0) return rt.uq.single_task(dev, deps, [=]() { out[0] = 0; });
 
     const std::size_t wg     = scan_group_size(dev);
@@ -48,23 +53,23 @@ inline sycl::event exclusive_scan_u64(Runtime& rt, const sycl::device& dev, cons
     if (groups == 1) {  // one work-group: scan, and the total, in one kernel
         return rt.uq.parallel_for(dev, deps, sycl::nd_range<1>{sycl::range<1>{wg}, sycl::range<1>{wg}}, [=](sycl::nd_item<1> it) {
             const std::size_t   i     = it.get_local_id(0);
-            const std::uint64_t v     = i < n ? in[i] : 0;
-            const std::uint64_t ex    = sycl::exclusive_scan_over_group(it.get_group(), v, std::uint64_t{0}, sycl::plus<std::uint64_t>{});
-            const std::uint64_t total = sycl::reduce_over_group(it.get_group(), v, sycl::plus<std::uint64_t>{});
+            const std::uint32_t v     = i < n ? in[i] : 0;
+            const std::uint32_t ex    = sycl::exclusive_scan_over_group(it.get_group(), v, std::uint32_t{0}, sycl::plus<std::uint32_t>{});
+            const std::uint32_t total = sycl::reduce_over_group(it.get_group(), v, sycl::plus<std::uint32_t>{});
             if (i < n) out[i] = ex;
             if (i == 0) out[n] = total;
         });
     }
 
-    const auto alloc = rt.allocator_for<std::uint64_t>(dev, sk::kind::device);
-    sk::usm_vector<std::uint64_t> sums(groups, alloc);       // one chunk sum per work-group
-    sk::usm_vector<std::uint64_t> block_offs(groups + 1, alloc);  // their exclusive scan; the last is the total
-    std::uint64_t*                s = sums.data();
-    std::uint64_t*                b = block_offs.data();
+    const auto alloc = rt.allocator_for<std::uint32_t>(dev, sk::kind::device);
+    sk::usm_vector<std::uint32_t> sums(groups, alloc);       // one chunk sum per work-group
+    sk::usm_vector<std::uint32_t> block_offs(groups + 1, alloc);  // their exclusive scan; the last is the total
+    std::uint32_t*                s = sums.data();
+    std::uint32_t*                b = block_offs.data();
 
     // These two are private to this call, uninitialized (every element is written before it is read), and a kernel here
     // waits on BOTH of a container's lists (an earlier kernel of this scan is a write the next one must follow).
-    const auto both = [](const sk::usm_vector<std::uint64_t>& c, std::vector<sycl::event>& into) {
+    const auto both = [](const sk::usm_vector<std::uint32_t>& c, std::vector<sycl::event>& into) {
         for (const sycl::event& e : c.read_deps()) into.push_back(e);
         for (const sycl::event& e : c.write_deps()) into.push_back(e);
     };
@@ -75,9 +80,9 @@ inline sycl::event exclusive_scan_u64(Runtime& rt, const sycl::device& dev, cons
     const sycl::event ev_a = rt.uq.parallel_for(
         dev, da, sycl::nd_range<1>{sycl::range<1>{groups * wg}, sycl::range<1>{wg}}, [=](sycl::nd_item<1> it) {
             const std::size_t   i     = it.get_global_id(0);
-            const std::uint64_t v     = i < n ? in[i] : 0;
-            const std::uint64_t ex    = sycl::exclusive_scan_over_group(it.get_group(), v, std::uint64_t{0}, sycl::plus<std::uint64_t>{});
-            const std::uint64_t chunk = sycl::reduce_over_group(it.get_group(), v, sycl::plus<std::uint64_t>{});
+            const std::uint32_t v     = i < n ? in[i] : 0;
+            const std::uint32_t ex    = sycl::exclusive_scan_over_group(it.get_group(), v, std::uint32_t{0}, sycl::plus<std::uint32_t>{});
+            const std::uint32_t chunk = sycl::reduce_over_group(it.get_group(), v, sycl::plus<std::uint32_t>{});
             if (i < n) out[i] = ex;
             if (it.get_local_id(0) == 0) s[it.get_group(0)] = chunk;
         });
@@ -86,7 +91,7 @@ inline sycl::event exclusive_scan_u64(Runtime& rt, const sycl::device& dev, cons
     // (b) the block sums, scanned the same way (recursively when they need more than one work-group)
     std::vector<sycl::event> db{ev_a};
     both(block_offs, db);
-    const sycl::event ev_b = exclusive_scan_u64(rt, dev, db, s, b, groups);
+    const sycl::event ev_b = exclusive_scan_u32(rt, dev, db, s, b, groups);
     sums.register_read(ev_b);
     block_offs.register_write(ev_b);
 

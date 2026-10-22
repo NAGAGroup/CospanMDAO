@@ -219,8 +219,8 @@ jobs:
         env:
           ACPP_VISIBILITY_MASK: omp
         run: pixi exec --spec nushell nu ci/run-catch.nu pixi.toml default cospan-tests ci/exclude/osx-arm64-omp.txt 2>&1 | tee -a "$GITHUB_WORKSPACE/logs/omp.log"
-      # The Metal check is informational: this step has no id, so the fail-the-job step below never counts it.
-      - name: "cospan-tests on Metal (informational)"
+      - name: "cospan-tests on Metal"
+        id: metal
         continue-on-error: true
         if: ${{ !cancelled() }}
         timeout-minutes: 60

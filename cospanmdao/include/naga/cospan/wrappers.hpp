@@ -279,8 +279,8 @@ namespace detail {
 /// or a per-index array (per[d-1] non-null). offsets == nullptr: a dense port, block i is row i.
 template <class T, int Rank>
 struct RaggedAccess {
-    static Block<T, Rank - 1> block(T* data, const std::uint64_t* offsets, const std::array<std::size_t, 2>& ext,
-                                    const std::array<const std::uint64_t*, 2>& per, std::size_t i) {
+    static Block<T, Rank - 1> block(T* data, const std::uint32_t* offsets, const std::array<std::size_t, 2>& ext,
+                                    const std::array<const std::uint32_t*, 2>& per, std::size_t i) {
         Block<T, Rank - 1> b;
         std::size_t        size = 1;
         for (int d = 1; d < Rank; ++d) {
@@ -316,9 +316,9 @@ struct RaggedInput {
 private:
     std::size_t                         n_       = 0;
     const value_type*                   data_    = nullptr;
-    const std::uint64_t*                offsets_ = nullptr;
+    const std::uint32_t*                offsets_ = nullptr;
     std::array<std::size_t, 2>          ext_{1, 1};
-    std::array<const std::uint64_t*, 2> per_{nullptr, nullptr};
+    std::array<const std::uint32_t*, 2> per_{nullptr, nullptr};
     friend struct detail::WrapperAccess;
 };
 
@@ -347,9 +347,9 @@ struct RaggedOutput {
 private:
     std::size_t                         n_       = 0;
     value_type*                         data_    = nullptr;
-    const std::uint64_t*                offsets_ = nullptr;
+    const std::uint32_t*                offsets_ = nullptr;
     std::array<std::size_t, 2>          ext_{1, 1};
-    std::array<const std::uint64_t*, 2> per_{nullptr, nullptr};
+    std::array<const std::uint32_t*, 2> per_{nullptr, nullptr};
     friend struct detail::WrapperAccess;
 };
 

@@ -177,12 +177,12 @@ struct DeviceData : DeviceDataBase {
 /// setting them (fill_index, a copy) is a write of theirs, which waits on both their lists.
 template <class T>
 struct RaggedDeviceData : DeviceData<T> {
-    std::optional<sk::usm_vector<std::uint64_t>> offs;
-    std::optional<sk::usm_vector<std::uint64_t>> per;
+    std::optional<sk::usm_vector<std::uint32_t>> offs;
+    std::optional<sk::usm_vector<std::uint32_t>> per;
 
     using DeviceData<T>::DeviceData;
 
-    static void append(std::vector<sycl::event>& out, const std::optional<sk::usm_vector<std::uint64_t>>& v) {
+    static void append(std::vector<sycl::event>& out, const std::optional<sk::usm_vector<std::uint32_t>>& v) {
         if (!v) return;
         const std::vector<sycl::event> e = v->read_deps();  // the index arrays' writes
         out.insert(out.end(), e.begin(), e.end());
@@ -217,7 +217,7 @@ struct RaggedDeviceData : DeviceData<T> {
 
     void bind(Runtime& rt) override {
         DeviceData<T>::bind(rt);
-        const auto alloc = rt.allocator_for<std::uint64_t>(this->key.dev, this->key.kind);
+        const auto alloc = rt.allocator_for<std::uint32_t>(this->key.dev, this->key.kind);
         if (!offs) offs.emplace(alloc);
         if (!per) per.emplace(alloc);
     }
@@ -228,8 +228,8 @@ struct RaggedDeviceData : DeviceData<T> {
     sycl::event copy_from(DeviceDataBase& src, std::span<const sycl::event> deps) override {
         const sycl::event e = DeviceData<T>::copy_from(src, deps);
         auto&             s = static_cast<RaggedDeviceData<T>&>(src);
-        const auto        assign = [](std::optional<sk::usm_vector<std::uint64_t>>& to,
-                               const std::optional<sk::usm_vector<std::uint64_t>>& from) {
+        const auto        assign = [](std::optional<sk::usm_vector<std::uint32_t>>& to,
+                               const std::optional<sk::usm_vector<std::uint32_t>>& from) {
             if (!to || !from) return;
             to->assign(*from, std::span<const sycl::event>{});
         };
@@ -257,10 +257,10 @@ constexpr bool is_integer_value_dtype(DType dt) noexcept {
 struct DeviceColumn {
     DataKey                                          key;      ///< where the column lives (the source's device)
     std::size_t                                      n = 0;    ///< the number of indices
-    mutable std::optional<sk::usm_vector<std::uint64_t>> extents;     ///< n entries
-    mutable std::optional<sk::usm_vector<std::uint64_t>> offs;        ///< n + 1 entries: the exclusive scan
-    mutable std::optional<sk::usm_vector<std::uint64_t>> neg_flag;    ///< 1 entry on the device: set (atomic OR) by a negative / invalid value
-    std::optional<sk::usm_vector<std::uint64_t>>     host_total;  ///< host kind, 2 elements: [total, negative / invalid flag]
+    mutable std::optional<sk::usm_vector<std::uint32_t>> extents;     ///< n entries (32-bit on every device)
+    mutable std::optional<sk::usm_vector<std::uint32_t>> offs;        ///< n + 1 entries: the exclusive scan
+    mutable std::optional<sk::usm_vector<std::uint32_t>> neg_flag;    ///< 1 entry on the device: bits set (atomic OR) by a bad value: shape_hook.hpp kFlagNegative / kFlagExceeds32
+    std::optional<sk::usm_vector<std::uint32_t>>     host_total;  ///< host kind, 2 elements: [total, flag word]
     std::uint64_t                                    total   = 0;     ///< read from host_total once the task is done
     std::uint64_t                                    version = 0;     ///< bumped at each rebuild
     sycl::event                                      ev;              ///< the task that built it
@@ -324,13 +324,13 @@ struct ResolvedShape {
     std::vector<std::size_t> per_index_on_host(Runtime& rt) const {
         if (!dev_per) return per_index;
         const DeviceColumn&        col = *dev_per;
-        std::vector<std::uint64_t> h(col.n);
+        std::vector<std::uint32_t> h(col.n);
         std::vector<sycl::event>   deps{col.ev};
         const std::vector<sycl::event> own = col.extents->read_deps();  // the extents' writes
         deps.insert(deps.end(), own.begin(), own.end());
         if (col.n != 0) {
             sycl::event e =
-                rt.q.copy(col.key.dev, deps, static_cast<const std::uint64_t*>(col.extents->data()), h.data(), col.n);
+                rt.q.copy(col.key.dev, deps, static_cast<const std::uint32_t*>(col.extents->data()), h.data(), col.n);
             col.extents->register_read(e);  // a later rebuild of the column waits for this read
             e.wait();
         }
@@ -1193,10 +1193,15 @@ protected:
             this->note_resize(d.offs->assign(*col.offs, std::span<const sycl::event>{dep}));  // resizes to n + 1
             return;
         }
-        const std::vector<std::uint64_t> conv(s.per_index.begin(), s.per_index.end());
-        this->note_resize(d.per->from_host(std::span<const std::uint64_t>{conv}));
-        const std::vector<std::uint64_t> offs = s.block_offsets();
-        this->note_resize(d.offs->from_host(std::span<const std::uint64_t>{offs}));
+        // The device index arrays are 32-bit on every device: a total past 2^32 - 1 elements cannot be represented.
+        const std::vector<std::uint64_t> offs64 = s.block_offsets();
+        if (!offs64.empty() && offs64.back() > 0xFFFFFFFFull)
+            throw std::invalid_argument("naga::cospan: a ragged shape has " + std::to_string(offs64.back()) +
+                                        " elements; ragged totals are limited to 2^32 - 1 elements");
+        const std::vector<std::uint32_t> conv(s.per_index.begin(), s.per_index.end());
+        this->note_resize(d.per->from_host(std::span<const std::uint32_t>{conv}));
+        const std::vector<std::uint32_t> offs(offs64.begin(), offs64.end());
+        this->note_resize(d.offs->from_host(std::span<const std::uint32_t>{offs}));
     }
 };
 

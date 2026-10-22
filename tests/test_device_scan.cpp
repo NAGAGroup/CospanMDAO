@@ -1,4 +1,4 @@
-// The parallel exclusive scan of u64 on the device (cospanmdao/include/naga/cospan/device_scan.hpp), against std::exclusive_scan.
+// The parallel exclusive scan of u32 on the device (cospanmdao/include/naga/cospan/device_scan.hpp), against std::exclusive_scan.
 //
 // Sizes cover: empty, one element, below / at / above one work-group (the group size is min(device max, 256)), several
 // work-groups, and enough work-groups (> 256) that the block sums are themselves scanned in more than one work-group.
@@ -21,7 +21,7 @@ namespace sk = naga::slabkit;
 namespace {
 
 /// Scans `values` on the default device and returns the n + 1 outputs.
-std::vector<std::uint64_t> device_scan(const std::vector<std::uint64_t>& values) {
+std::vector<std::uint32_t> device_scan(const std::vector<std::uint32_t>& values) {
     const sycl::device dev{sycl::default_selector_v};
     sk::context        ctx(dev);
     sk::queue          q{ctx, sycl::async_handler{}};
@@ -30,8 +30,8 @@ std::vector<std::uint64_t> device_scan(const std::vector<std::uint64_t>& values)
 
     const std::size_t n = values.size();
     // host-kind USM: readable by the kernels and by this thread
-    sk::usm_vector<std::uint64_t> in(n, rt.allocator_for<std::uint64_t>(dev, sk::kind::host));
-    sk::usm_vector<std::uint64_t> out(n + 1, rt.allocator_for<std::uint64_t>(dev, sk::kind::host));
+    sk::usm_vector<std::uint32_t> in(n, rt.allocator_for<std::uint32_t>(dev, sk::kind::host));
+    sk::usm_vector<std::uint32_t> out(n + 1, rt.allocator_for<std::uint32_t>(dev, sk::kind::host));
     // Size-only containers are uninitialized and submit nothing; sync() is kept so the host writes below follow any event.
     in.sync();
     for (std::size_t i = 0; i < n; ++i) in.data()[i] = values[i];
@@ -40,29 +40,29 @@ std::vector<std::uint64_t> device_scan(const std::vector<std::uint64_t>& values)
     for (const sycl::event& e : out.read_deps()) deps.push_back(e);
     for (const sycl::event& e : out.write_deps()) deps.push_back(e);
 
-    sycl::event ev = cs::detail::exclusive_scan_u64(rt, dev, deps, in.data(), out.data(), n);
+    sycl::event ev = cs::detail::exclusive_scan_u32(rt, dev, deps, in.data(), out.data(), n);
     ev.wait();
     q.wait_and_throw();
     uq.wait_and_throw();
-    return std::vector<std::uint64_t>(out.data(), out.data() + n + 1);
+    return std::vector<std::uint32_t>(out.data(), out.data() + n + 1);
 }
 
-std::vector<std::uint64_t> reference(const std::vector<std::uint64_t>& values) {
-    std::vector<std::uint64_t> out(values.size() + 1, 0);
-    std::exclusive_scan(values.begin(), values.end(), out.begin(), std::uint64_t{0});
-    out[values.size()] = std::accumulate(values.begin(), values.end(), std::uint64_t{0});
+std::vector<std::uint32_t> reference(const std::vector<std::uint32_t>& values) {
+    std::vector<std::uint32_t> out(values.size() + 1, 0);
+    std::exclusive_scan(values.begin(), values.end(), out.begin(), std::uint32_t{0});
+    out[values.size()] = std::accumulate(values.begin(), values.end(), std::uint32_t{0});
     return out;
 }
 
-std::vector<std::uint64_t> pattern(std::size_t n) {
-    std::vector<std::uint64_t> v(n);
+std::vector<std::uint32_t> pattern(std::size_t n) {
+    std::vector<std::uint32_t> v(n);
     for (std::size_t i = 0; i < n; ++i) v[i] = (i * 2654435761u + 7u) % 11u;  // small, with zeros
     return v;
 }
 
 }  // namespace
 
-TEST_CASE("device scan: exclusive scan of u64, n + 1 outputs, the last is the total", "[scan]") {
+TEST_CASE("device scan: exclusive scan of u32, n + 1 outputs, the last is the total", "[scan]") {
     for (const std::size_t n : {std::size_t{0}, std::size_t{1}, std::size_t{2}, std::size_t{37}, std::size_t{255}, std::size_t{256},
                                 std::size_t{257}, std::size_t{1000}, std::size_t{4096 + 3}}) {
         INFO("n = " << n);
@@ -79,9 +79,9 @@ TEST_CASE("device scan: more than one work-group of block sums scans them recurs
 }
 
 TEST_CASE("device scan: all zeros and a single large value", "[scan]") {
-    std::vector<std::uint64_t> zeros(700, 0);
+    std::vector<std::uint32_t> zeros(700, 0);
     CHECK(device_scan(zeros) == reference(zeros));
-    std::vector<std::uint64_t> big(700, 0);
-    big[699] = std::uint64_t{1} << 40;
+    std::vector<std::uint32_t> big(700, 0);
+    big[699] = std::uint32_t{1} << 30;
     CHECK(device_scan(big) == reference(big));
 }

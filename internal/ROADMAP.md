@@ -96,6 +96,16 @@ Topics learned while building the light-transport forcing case (2026-09-30). Eac
 - [x] ~~Internal naming: the code still calls a variable's storage record 'root' or 'shadow'.~~ Superseded: roots and shadows are gone (instances and shared metadata, D144).
 - [ ] Fork, next fork build only (not worth a build on its own): remove or demote to debug the 'Retargeting operation for a device that is not part of the queue's context' warning in include/hipSYCL/sycl/queue.hpp (submit, ~l.449). Our 2026-09-03 fix resolves retargeted operands against the retarget's context, which defaults to the target's platform default context, so the hazard it warns about is gone. SlabKit's retargeted lanes trigger it on every non-default-device operation (seen on Intel OpenCL and Level Zero, 2026-10-21).
 
+## Device capabilities (lowest common denominator for now)
+
+CoSpan targets the lowest common denominator so Metal passes: no 64-bit group operations, no 64-bit atomics and no fp64 on the device, in the library and in the tests. Users can still pick 64-bit dtypes.
+
+- [ ] Fork device queries: make AdaptiveCpp's device aspects and queries trustworthy in the NAGA fork (fp64, atomic64 and 64-bit group-operation support, for which SYCL has no aspect), and upstream the fixes.
+- [ ] Capability skips: test suites (CoSpan, SlabKit, the fork's) skip by queried device capability, never by per-platform or per-job lists; retire ci/exclude/*.txt.
+- [ ] 64-bit coverage: restore 64-bit test coverage behind capability checks, including the removed "f64: rel 1e-12" Sellar section.
+- [ ] Ragged column offset type as a template parameter (design discussion first). The user chooses the extents and offsets type; it is not hard-coded. Today it is a fixed std::uint32_t in DeviceColumn, in device_scan.hpp's exclusive_scan_u32, and in shape_hook.hpp's build_column. Width costs memory, so a problem known to stay under 2^32 − 1 elements should not pay for 64-bit offsets. A larger problem opts into 64-bit where the device supports it. This touches the column, the scan, the shape hook and every reader, so it needs a design review of shape, connection and tie semantics before any change.
+- [ ] Metal emulation: finish the Metal 64-bit emulation upstream began (atomic64 #2250, 64-bit prefix sum #2255; reductions and raw shuffles are missing); a later goal, not current work.
+
 ## After the 2026-10-01 checkpoint (D140 rework)
 
 Found while porting LRPIM onto opaque chunked systems (C2b to C2e) and measuring it. Notes dated 2026-10-01.

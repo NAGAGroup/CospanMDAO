@@ -256,6 +256,33 @@ public:
     }
 };
 
+// ---- NegU32: a u32 input of extents; counts whose running sum passes 2^32 - 1 are an error ------------------------
+
+class NegU32 : public cs::Component<NegU32> {
+public:
+    struct Inputs {
+        cs::Input<DType::u32, 1>       cnt;
+        cs::RaggedInput<DType::f32, 2> layout;
+    };
+    struct Outputs {
+        cs::RaggedOutput<DType::f32, 2> v;
+    };
+    static void compute_forward(sycl::id<1>, const Inputs&, const Outputs&) {}
+
+    Inputs  inputs;
+    Outputs outputs;
+
+    void declare() override {
+        declare_input(inputs.cnt, "cnt", 2);
+        declare_input(inputs.layout, "layout");
+        declare_output(outputs.v, "v");
+    }
+    void prepare_forward() override { set_shape(outputs.v, shape_of(inputs.layout)); }
+    std::unique_ptr<cs::LaunchDescription> define_forward() override {
+        return create_launch_config(cs::range_desc(inputs.cnt.shape()));
+    }
+};
+
 /// One child "c" whose ragged input `layout` is hooked from its own input `cnt`.
 template <class C>
 class HookedTop : public cs::System {
@@ -662,6 +689,14 @@ TEST_CASE("Ragged: declaration and binding errors", "[ragged][errors]") {
         model.update_input("c.cnt", cs::init::from_host(std::vector<std::int32_t>{1, -1, 2}));
         // (the old needle was "negative extent"; the hook says "holds a negative value; a size cannot be negative")
         trag::expect_throws([&] { model.run(); }, {"shape hook on 'c.layout'", "holds a negative value"});
+        model.wait();
+    }
+    SECTION("counts whose total exceeds 32 bits") {
+        // 4294967295 + 2 wraps a 32-bit running sum: the hook reports it, and the ragged data is never allocated.
+        cs::Model model = cs::create_model<trag::HookedTop<trag::NegU32>>(default_config());
+        model.setup();
+        model.update_input("c.cnt", cs::init::from_host(std::vector<std::uint32_t>{4294967295u, 2u}));
+        trag::expect_throws([&] { model.run(); }, {"shape hook on 'c.layout'", "limited to 2^32 - 1 elements"});
         model.wait();
     }
     SECTION("a ragged port in a fused component: refused at setup") {

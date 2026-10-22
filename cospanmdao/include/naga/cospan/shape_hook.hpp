@@ -177,11 +177,36 @@ inline std::function<std::size_t()> queue_value_read(Runtime& rt, VarMeta& m, st
     return getter;
 }
 
-/// Builds (or rebuilds) `col` from the integer variable `m`, ON THE SOURCE'S DEVICE, in parallel (section 10).
+/// The bits of a column's flag word (32-bit: CoSpan does no 64-bit atomics on a device, so that Metal can run it).
+inline constexpr std::uint32_t kFlagNegative = 1;  ///< a negative or invalid value: negative, offs[0] != 0, or decreasing offsets
+inline constexpr std::uint32_t kFlagExceeds32 = 2; ///< a value, or a total, past 2^32 - 1 (ragged totals are limited to 2^32 - 1 elements)
+
+/// flag |= bit, atomically (32-bit, relaxed, device scope).
+inline void flag_or(std::uint32_t* flag, std::uint32_t bit) {
+    sycl::atomic_ref<std::uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space> f{flag[0]};
+    f.fetch_or(bit);
+}
+
+/// A non-negative source value as a 32-bit one. A value past 2^32 - 1 (only possible for a 64-bit source dtype) sets
+/// kFlagExceeds32 and yields 0. For a source of at most 32 bits there is no 64-bit arithmetic here at all.
+template <class E>
+inline std::uint32_t narrow_u32(E v, std::uint32_t* flag) {
+    if constexpr (sizeof(E) > 4) {
+        if (v > static_cast<E>(0xFFFFFFFFu)) {
+            flag_or(flag, kFlagExceeds32);
+            return 0;
+        }
+    }
+    return static_cast<std::uint32_t>(v);
+}
+
+/// Builds (or rebuilds) `col` from the integer variable `m`, ON THE SOURCE'S DEVICE, in parallel (section 10). All of the
+/// column is 32-bit (extents, offsets, flag), on every device.
 ///   counts mode:  m is rank 1 [N] or rank 2 [N, k] (column 0): extents[i] = max(value, 0), offs = their exclusive scan
-///                 (detail::exclusive_scan_u64); a negative value sets the flag.
-///   offsets mode: m is rank 1 with N + 1 entries: offs = the values, extents[i] = offs[i + 1] - offs[i]; the flag is set by
-///                 a negative value, offs[0] != 0, or a decrease.
+///                 (detail::exclusive_scan_u32); a negative value sets bit 1 of the flag, a value past 32 bits sets bit 2, and
+///                 a final kernel sets bit 2 if the running sum wrapped (offs[i + 1] < offs[i]; exact, see device_scan.hpp).
+///   offsets mode: m is rank 1 with N + 1 entries: offs = the values, extents[i] = offs[i + 1] - offs[i]; bit 1 is set by
+///                 a negative value, offs[0] != 0, or a decrease; bit 2 by a value past 32 bits.
 /// A tiny task then copies [total, flag] to the host buffer. Returns the event of that task (also col.ev). The column's
 /// vectors are reused across forwards; `version` is bumped.
 /// `target` is the variable the hook shapes: every resize of the column's containers, and the task that writes them, is
@@ -210,10 +235,10 @@ inline sycl::event build_column(Runtime& rt, VarMeta& m, VarMeta& target, Device
     // The vectors are reused while they live on the same device; their size follows n (a resize within capacity).
     if (!(col.key.dev == dev) || !col.extents || !col.offs || !col.host_total || !col.neg_flag) {
         col.key = DataKey{dev, sk::kind::device};
-        col.extents.emplace(n, rt.allocator_for<std::uint64_t>(dev, sk::kind::device));
-        col.offs.emplace(n + 1, rt.allocator_for<std::uint64_t>(dev, sk::kind::device));
-        col.neg_flag.emplace(1, rt.allocator_for<std::uint64_t>(dev, sk::kind::device));
-        col.host_total.emplace(2, rt.allocator_for<std::uint64_t>(dev, sk::kind::host));
+        col.extents.emplace(n, rt.allocator_for<std::uint32_t>(dev, sk::kind::device));
+        col.offs.emplace(n + 1, rt.allocator_for<std::uint32_t>(dev, sk::kind::device));
+        col.neg_flag.emplace(1, rt.allocator_for<std::uint32_t>(dev, sk::kind::device));
+        col.host_total.emplace(2, rt.allocator_for<std::uint32_t>(dev, sk::kind::host));
     } else {
         // A resize that reallocates copies the old elements: its event is the container's own write (in its write list)
         // and goes into the target's slot.
@@ -225,14 +250,14 @@ inline sycl::event build_column(Runtime& rt, VarMeta& m, VarMeta& target, Device
     // The tasks below READ the source and WRITE the column's containers (right after their own fills, and after the
     // previous rebuild's readers): they wait on the source's writes and on both lists of every column container.
     std::vector<sycl::event> deps = src->read_deps();
-    for (const sk::usm_vector<std::uint64_t>* c : {&*col.extents, &*col.offs, &*col.host_total, &*col.neg_flag}) {
+    for (const sk::usm_vector<std::uint32_t>* c : {&*col.extents, &*col.offs, &*col.host_total, &*col.neg_flag}) {
         for (const std::vector<sycl::event>& v : {c->read_deps(), c->write_deps()}) deps.insert(deps.end(), v.begin(), v.end());
     }
 
-    std::uint64_t* ex   = col.extents->data();
-    std::uint64_t* of   = col.offs->data();
-    std::uint64_t* flag = col.neg_flag->data();
-    std::uint64_t* tot  = col.host_total->data();
+    std::uint32_t* ex   = col.extents->data();
+    std::uint32_t* of   = col.offs->data();
+    std::uint32_t* flag = col.neg_flag->data();
+    std::uint32_t* tot  = col.host_total->data();
     const std::size_t nn = n, kk = k, mm = count_src;
 
     sycl::event ev_read;   // the last kernel that reads the source
@@ -242,54 +267,53 @@ inline sycl::event build_column(Runtime& rt, VarMeta& m, VarMeta& target, Device
         using E     = typename decltype(tag)::type;
         const E* in = static_cast<const E*>(src->raw());
         if (!offsets_mode) {
-            // one parallel_for: extents[i] = max(data[i * k], 0), flag |= negative; then the parallel exclusive scan
+            // one parallel_for: extents[i] = max(data[i * k], 0), flag |= negative (bit 1) or exceeds 32 bits (bit 2); then the
+            // parallel exclusive scan, then one kernel that finds a wrap of the running sum (bit 2)
             ev_read = ev_zero;
             if (nn != 0) {
                 const std::vector<sycl::event> d1{ev_zero};
                 ev_read = rt.uq.parallel_for(dev, d1, sycl::range<1>{nn}, [=](sycl::id<1> id) {
                     const std::size_t i = id[0];
                     const E           v = in[i * kk];
-                    std::uint64_t     x = 0;
+                    std::uint32_t     x = 0;
                     if constexpr (std::is_signed_v<E>) {
-                        if (v < E{0}) {
-                            sycl::atomic_ref<std::uint64_t, sycl::memory_order::relaxed, sycl::memory_scope::device,
-                                             sycl::access::address_space::global_space>
-                                f{flag[0]};
-                            f.fetch_or(std::uint64_t{1});
-                        } else {
-                            x = static_cast<std::uint64_t>(v);
-                        }
+                        if (v < E{0}) flag_or(flag, kFlagNegative);
+                        else x = narrow_u32(v, flag);
                     } else {
-                        x = static_cast<std::uint64_t>(v);
+                        x = narrow_u32(v, flag);
                     }
                     ex[i] = x;
                 });
             }
             const std::vector<sycl::event> d2{ev_read};
-            ev_scan = exclusive_scan_u64(rt, dev, d2, ex, of, nn);
+            ev_scan = exclusive_scan_u32(rt, dev, d2, ex, of, nn);
+            if (nn != 0) {
+                // Each extent is below 2^32, so any wrap of the running sum shows up as exactly one decrease: exact.
+                const std::vector<sycl::event> d3{ev_scan};
+                ev_scan = rt.uq.parallel_for(dev, d3, sycl::range<1>{nn}, [=](sycl::id<1> id) {
+                    const std::size_t i = id[0];
+                    if (of[i + 1] < of[i]) flag_or(flag, kFlagExceeds32);
+                });
+            }
         } else {
-            // kernel 1 over the N + 1 entries: offs[i] = value (a negative one, or offs[0] != 0, sets the flag);
-            // kernel 2 over the N blocks: extents[i] = offs[i + 1] - offs[i] (a decrease sets the flag)
+            // kernel 1 over the N + 1 entries: offs[i] = value (a negative one, or offs[0] != 0, sets bit 1; a value past 32
+            // bits sets bit 2);
+            // kernel 2 over the N blocks: extents[i] = offs[i + 1] - offs[i] (a decrease sets bit 1)
             const std::vector<sycl::event> d1{ev_zero};
             ev_read = rt.uq.parallel_for(dev, d1, sycl::range<1>{mm}, [=](sycl::id<1> id) {
                 const std::size_t i = id[0];
                 const E           v = in[i];
-                std::uint64_t     x = 0;
+                std::uint32_t     x = 0;
                 bool              bad = false;
                 if constexpr (std::is_signed_v<E>) {
                     if (v < E{0}) bad = true;
-                    else x = static_cast<std::uint64_t>(v);
+                    else x = narrow_u32(v, flag);
                 } else {
-                    x = static_cast<std::uint64_t>(v);
+                    x = narrow_u32(v, flag);
                 }
                 if (i == 0 && x != 0) bad = true;
                 of[i] = x;
-                if (bad) {
-                    sycl::atomic_ref<std::uint64_t, sycl::memory_order::relaxed, sycl::memory_scope::device,
-                                     sycl::access::address_space::global_space>
-                        f{flag[0]};
-                    f.fetch_or(std::uint64_t{1});
-                }
+                if (bad) flag_or(flag, kFlagNegative);
             });
             ev_scan = ev_read;
             if (nn != 0) {
@@ -298,10 +322,7 @@ inline sycl::event build_column(Runtime& rt, VarMeta& m, VarMeta& target, Device
                     const std::size_t i = id[0];
                     if (of[i + 1] < of[i]) {
                         ex[i] = 0;
-                        sycl::atomic_ref<std::uint64_t, sycl::memory_order::relaxed, sycl::memory_scope::device,
-                                         sycl::access::address_space::global_space>
-                            f{flag[0]};
-                        f.fetch_or(std::uint64_t{1});
+                        flag_or(flag, kFlagNegative);
                     } else {
                         ex[i] = of[i + 1] - of[i];
                     }
@@ -430,7 +451,11 @@ public:
         if constexpr (kRagged) {
             const auto& desc = std::get<0>(ds_);
             column_->total   = column_->host_total->data()[0];
-            if (column_->host_total->data()[1] != 0)
+            const std::uint32_t flag_word = column_->host_total->data()[1];
+            if ((flag_word & kFlagNegative) == 0 && (flag_word & kFlagExceeds32) != 0)
+                throw std::invalid_argument("naga::cospan: " + who + ": '" + desc.path +
+                                            "' holds a value or a total past 2^32 - 1; ragged totals are limited to 2^32 - 1 elements");
+            if (flag_word != 0)
                 throw std::invalid_argument("naga::cospan: " + who + ": '" + desc.path + "' holds " +
                                             (std::is_same_v<std::tuple_element_t<0, std::tuple<D...>>, ragged::OffsetsFrom>
                                                  ? std::string{"offsets that are negative, do not start at 0, or decrease"}
