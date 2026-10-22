@@ -4,7 +4,7 @@
 #   linux-64       Linux-x64-GPU   OpenMP, CUDA, OpenCL (Intel CPU runtime)   built on the GPU box
 #   linux-aarch64  linux-arm64-v32 OpenMP
 #   osx-arm64      macOS-26-xlarge OpenMP, Metal
-#   win-64         Win-x64-GPU     OpenMP, CUDA                               built on Win-x64-64 (the GPU box has no VS)
+#   win-64         Win-x64-GPU     OpenMP, CUDA, OpenCL (Intel CPU)           built on Win-x64-64 (the GPU box has no VS)
 #   win-arm64      win-arm64-v32   OpenMP
 #
 # Every platform and backend must pass; nothing is excluded. ci/exclude/*.txt (all empty) and ci/known-failures.md are to be
@@ -31,6 +31,8 @@ jobs:
       gemver-cuda: ${{ steps.gemver-cuda.outcome }}
       ns-omp: ${{ steps.ns-omp.outcome }}
       ns-cuda: ${{ steps.ns-cuda.outcome }}
+      gemver-ocl: ${{ steps.gemver-ocl.outcome }}
+      ns-ocl: ${{ steps.ns-ocl.outcome }}
     defaults:
       run:
         shell: bash
@@ -113,6 +115,20 @@ jobs:
         env:
           ACPP_VISIBILITY_MASK: cuda
         run: pixi run -e cuda ns-residual --check 2>&1 | tee -a "$GITHUB_WORKSPACE/logs/ns-cuda.log"
+      - name: "gemver-chain --check on OpenCL (Intel CPU)"
+        id: gemver-ocl
+        if: ${{ !cancelled() }}
+        timeout-minutes: 30
+        env:
+          ACPP_VISIBILITY_MASK: ocl
+        run: pixi run -e ocl gemver-chain --check --variant all --n 2048 2>&1 | tee -a "$GITHUB_WORKSPACE/logs/gemver-ocl.log"
+      - name: "ns-residual --check on OpenCL (Intel CPU)"
+        id: ns-ocl
+        if: ${{ !cancelled() }}
+        timeout-minutes: 30
+        env:
+          ACPP_VISIBILITY_MASK: ocl
+        run: pixi run -e ocl ns-residual --check 2>&1 | tee -a "$GITHUB_WORKSPACE/logs/ns-ocl.log"
       - name: Upload logs
         if: ${{ always() }}
         uses: actions/upload-artifact@v7.0.2
@@ -130,6 +146,8 @@ jobs:
     timeout-minutes: 180
     outputs:
       omp: ${{ steps.omp.outcome }}
+      gemver-omp: ${{ steps.gemver-omp.outcome }}
+      ns-omp: ${{ steps.ns-omp.outcome }}
     defaults:
       run:
         shell: bash
@@ -157,6 +175,20 @@ jobs:
         env:
           ACPP_VISIBILITY_MASK: omp
         run: pixi exec --spec nushell nu ci/run-catch.nu pixi.toml default cospan-tests ci/exclude/linux-aarch64-omp.txt 2>&1 | tee -a "$GITHUB_WORKSPACE/logs/omp.log"
+      - name: "gemver-chain --check on OpenMP"
+        id: gemver-omp
+        if: ${{ !cancelled() }}
+        timeout-minutes: 60
+        env:
+          ACPP_VISIBILITY_MASK: omp
+        run: pixi run -e default gemver-chain --check --variant all --n 2048 2>&1 | tee -a "$GITHUB_WORKSPACE/logs/gemver-omp.log"
+      - name: "ns-residual --check on OpenMP"
+        id: ns-omp
+        if: ${{ !cancelled() }}
+        timeout-minutes: 60
+        env:
+          ACPP_VISIBILITY_MASK: omp
+        run: pixi run -e default ns-residual --check 2>&1 | tee -a "$GITHUB_WORKSPACE/logs/ns-omp.log"
       - name: Upload logs
         if: ${{ always() }}
         uses: actions/upload-artifact@v7.0.2
@@ -175,6 +207,10 @@ jobs:
     outputs:
       omp: ${{ steps.omp.outcome }}
       metal: ${{ steps.metal.outcome }}
+      gemver-omp: ${{ steps.gemver-omp.outcome }}
+      gemver-metal: ${{ steps.gemver-metal.outcome }}
+      ns-omp: ${{ steps.ns-omp.outcome }}
+      ns-metal: ${{ steps.ns-metal.outcome }}
     defaults:
       run:
         shell: bash
@@ -210,6 +246,34 @@ jobs:
         env:
           ACPP_VISIBILITY_MASK: metal
         run: pixi exec --spec nushell nu ci/run-catch.nu pixi.toml default cospan-tests ci/exclude/osx-arm64-metal.txt 2>&1 | tee -a "$GITHUB_WORKSPACE/logs/metal.log"
+      - name: "gemver-chain --check on OpenMP"
+        id: gemver-omp
+        if: ${{ !cancelled() }}
+        timeout-minutes: 60
+        env:
+          ACPP_VISIBILITY_MASK: omp
+        run: pixi run -e default gemver-chain --check --variant all --n 2048 2>&1 | tee -a "$GITHUB_WORKSPACE/logs/gemver-omp.log"
+      - name: "gemver-chain --check on Metal"
+        id: gemver-metal
+        if: ${{ !cancelled() }}
+        timeout-minutes: 60
+        env:
+          ACPP_VISIBILITY_MASK: metal
+        run: pixi run -e default gemver-chain --check --variant all --n 2048 2>&1 | tee -a "$GITHUB_WORKSPACE/logs/gemver-metal.log"
+      - name: "ns-residual --check on OpenMP"
+        id: ns-omp
+        if: ${{ !cancelled() }}
+        timeout-minutes: 60
+        env:
+          ACPP_VISIBILITY_MASK: omp
+        run: pixi run -e default ns-residual --check 2>&1 | tee -a "$GITHUB_WORKSPACE/logs/ns-omp.log"
+      - name: "ns-residual --check on Metal"
+        id: ns-metal
+        if: ${{ !cancelled() }}
+        timeout-minutes: 60
+        env:
+          ACPP_VISIBILITY_MASK: metal
+        run: pixi run -e default ns-residual --check 2>&1 | tee -a "$GITHUB_WORKSPACE/logs/ns-metal.log"
       - name: Upload logs
         if: ${{ always() }}
         uses: actions/upload-artifact@v7.0.2
@@ -286,6 +350,13 @@ jobs:
     outputs:
       omp: ${{ steps.omp.outcome }}
       cuda: ${{ steps.cuda.outcome }}
+      ocl: ${{ steps.ocl.outcome }}
+      gemver-omp: ${{ steps.gemver-omp.outcome }}
+      gemver-cuda: ${{ steps.gemver-cuda.outcome }}
+      gemver-ocl: ${{ steps.gemver-ocl.outcome }}
+      ns-omp: ${{ steps.ns-omp.outcome }}
+      ns-cuda: ${{ steps.ns-cuda.outcome }}
+      ns-ocl: ${{ steps.ns-ocl.outcome }}
     defaults:
       run:
         shell: powershell # Windows PowerShell: this image has no pwsh, and bash is the WSL stub
@@ -316,7 +387,7 @@ jobs:
         run: |
           pixi exec --spec nushell nu ci/add-built.nu ci/run/pkgs
           if ($LASTEXITCODE -ne 0) { exit 1 }
-          foreach ($e in "run-omp", "run-cuda") { pixi install --manifest-path ci/run/pixi.toml -e $e; if ($LASTEXITCODE -ne 0) { exit 1 } }
+          foreach ($e in "run-omp", "run-cuda", "run-ocl") { pixi install --manifest-path ci/run/pixi.toml -e $e; if ($LASTEXITCODE -ne 0) { exit 1 } }
       - name: pixi list
         id: pixilist
         continue-on-error: true
@@ -337,6 +408,55 @@ jobs:
         env:
           ACPP_VISIBILITY_MASK: cuda
         run: pixi exec --spec nushell nu ci/run-catch.nu ci/run/pixi.toml run-cuda cospan-tests
+      - name: "cospan-tests on OpenCL (Intel CPU)"
+        id: ocl
+        if: ${{ !cancelled() }}
+        timeout-minutes: 30
+        env:
+          ACPP_VISIBILITY_MASK: ocl
+        run: pixi exec --spec nushell nu ci/run-catch.nu ci/run/pixi.toml run-ocl cospan-tests
+      - name: "gemver-chain --check on OpenMP"
+        id: gemver-omp
+        if: ${{ !cancelled() }}
+        timeout-minutes: 30
+        env:
+          ACPP_VISIBILITY_MASK: omp
+        run: pixi run --manifest-path ci/run/pixi.toml -e run-omp gemver-chain --check --variant all --n 2048
+      - name: "gemver-chain --check on CUDA"
+        id: gemver-cuda
+        if: ${{ !cancelled() }}
+        timeout-minutes: 30
+        env:
+          ACPP_VISIBILITY_MASK: cuda
+        run: pixi run --manifest-path ci/run/pixi.toml -e run-cuda gemver-chain --check --variant all --n 2048
+      - name: "gemver-chain --check on OpenCL (Intel CPU)"
+        id: gemver-ocl
+        if: ${{ !cancelled() }}
+        timeout-minutes: 30
+        env:
+          ACPP_VISIBILITY_MASK: ocl
+        run: pixi run --manifest-path ci/run/pixi.toml -e run-ocl gemver-chain --check --variant all --n 2048
+      - name: "ns-residual --check on OpenMP"
+        id: ns-omp
+        if: ${{ !cancelled() }}
+        timeout-minutes: 30
+        env:
+          ACPP_VISIBILITY_MASK: omp
+        run: pixi run --manifest-path ci/run/pixi.toml -e run-omp ns-residual --check
+      - name: "ns-residual --check on CUDA"
+        id: ns-cuda
+        if: ${{ !cancelled() }}
+        timeout-minutes: 30
+        env:
+          ACPP_VISIBILITY_MASK: cuda
+        run: pixi run --manifest-path ci/run/pixi.toml -e run-cuda ns-residual --check
+      - name: "ns-residual --check on OpenCL (Intel CPU)"
+        id: ns-ocl
+        if: ${{ !cancelled() }}
+        timeout-minutes: 30
+        env:
+          ACPP_VISIBILITY_MASK: ocl
+        run: pixi run --manifest-path ci/run/pixi.toml -e run-ocl ns-residual --check
       - name: Upload logs
         if: ${{ always() }}
         uses: actions/upload-artifact@v7.0.2
@@ -351,6 +471,8 @@ jobs:
     timeout-minutes: 240
     outputs:
       omp: ${{ steps.omp.outcome }}
+      gemver-omp: ${{ steps.gemver-omp.outcome }}
+      ns-omp: ${{ steps.ns-omp.outcome }}
     defaults:
       run:
         shell: pwsh
@@ -380,6 +502,20 @@ jobs:
         env:
           ACPP_VISIBILITY_MASK: omp
         run: pixi exec --spec nushell nu ci/run-catch.nu pixi.toml default cospan-tests ci/exclude/win-arm64-omp.txt
+      - name: "gemver-chain --check on OpenMP"
+        id: gemver-omp
+        if: ${{ !cancelled() }}
+        timeout-minutes: 60
+        env:
+          ACPP_VISIBILITY_MASK: omp
+        run: pixi run -e default gemver-chain --check --variant all --n 2048
+      - name: "ns-residual --check on OpenMP"
+        id: ns-omp
+        if: ${{ !cancelled() }}
+        timeout-minutes: 60
+        env:
+          ACPP_VISIBILITY_MASK: omp
+        run: pixi run -e default ns-residual --check
       - name: Upload logs
         if: ${{ always() }}
         uses: actions/upload-artifact@v7.0.2
@@ -409,14 +545,31 @@ jobs:
           LINUX_64_OCL: ${{ needs.linux-64.outputs.ocl }}
           LINUX_64_GEMVER_OMP: ${{ needs.linux-64.outputs.gemver-omp }}
           LINUX_64_GEMVER_CUDA: ${{ needs.linux-64.outputs.gemver-cuda }}
+          LINUX_64_GEMVER_OCL: ${{ needs.linux-64.outputs.gemver-ocl }}
           LINUX_64_NS_OMP: ${{ needs.linux-64.outputs.ns-omp }}
           LINUX_64_NS_CUDA: ${{ needs.linux-64.outputs.ns-cuda }}
+          LINUX_64_NS_OCL: ${{ needs.linux-64.outputs.ns-ocl }}
           LINUX_AARCH64_OMP: ${{ needs.linux-aarch64.outputs.omp }}
+          LINUX_AARCH64_GEMVER_OMP: ${{ needs.linux-aarch64.outputs.gemver-omp }}
+          LINUX_AARCH64_NS_OMP: ${{ needs.linux-aarch64.outputs.ns-omp }}
           OSX_ARM64_OMP: ${{ needs.osx-arm64.outputs.omp }}
           OSX_ARM64_METAL: ${{ needs.osx-arm64.outputs.metal }}
+          OSX_ARM64_GEMVER_OMP: ${{ needs.osx-arm64.outputs.gemver-omp }}
+          OSX_ARM64_GEMVER_METAL: ${{ needs.osx-arm64.outputs.gemver-metal }}
+          OSX_ARM64_NS_OMP: ${{ needs.osx-arm64.outputs.ns-omp }}
+          OSX_ARM64_NS_METAL: ${{ needs.osx-arm64.outputs.ns-metal }}
           WIN_64_OMP: ${{ needs.win-64.outputs.omp }}
           WIN_64_CUDA: ${{ needs.win-64.outputs.cuda }}
+          WIN_64_OCL: ${{ needs.win-64.outputs.ocl }}
+          WIN_64_GEMVER_OMP: ${{ needs.win-64.outputs.gemver-omp }}
+          WIN_64_GEMVER_CUDA: ${{ needs.win-64.outputs.gemver-cuda }}
+          WIN_64_GEMVER_OCL: ${{ needs.win-64.outputs.gemver-ocl }}
+          WIN_64_NS_OMP: ${{ needs.win-64.outputs.ns-omp }}
+          WIN_64_NS_CUDA: ${{ needs.win-64.outputs.ns-cuda }}
+          WIN_64_NS_OCL: ${{ needs.win-64.outputs.ns-ocl }}
           WIN_ARM64_OMP: ${{ needs.win-arm64.outputs.omp }}
+          WIN_ARM64_GEMVER_OMP: ${{ needs.win-arm64.outputs.gemver-omp }}
+          WIN_ARM64_NS_OMP: ${{ needs.win-arm64.outputs.ns-omp }}
         run: |
           set -euo pipefail
           dir=$(mktemp -d)
@@ -435,14 +588,14 @@ jobs:
             fi
           }
 
-          cell linux-64-cpu "$LINUX_64_OMP" "$LINUX_64_OCL" "$LINUX_64_GEMVER_OMP" "$LINUX_64_NS_OMP"
+          cell linux-64-cpu "$LINUX_64_OMP" "$LINUX_64_OCL" "$LINUX_64_GEMVER_OMP" "$LINUX_64_NS_OMP" "$LINUX_64_GEMVER_OCL" "$LINUX_64_NS_OCL"
           cell linux-64-nvidia "$LINUX_64_CUDA" "$LINUX_64_GEMVER_CUDA" "$LINUX_64_NS_CUDA"
-          cell linux-aarch64-cpu "$LINUX_AARCH64_OMP"
-          cell osx-arm64-cpu "$OSX_ARM64_OMP"
-          cell osx-arm64-apple "$OSX_ARM64_METAL"
-          cell win-64-cpu "$WIN_64_OMP"
-          cell win-64-nvidia "$WIN_64_CUDA"
-          cell win-arm64-cpu "$WIN_ARM64_OMP"
+          cell linux-aarch64-cpu "$LINUX_AARCH64_OMP" "$LINUX_AARCH64_GEMVER_OMP" "$LINUX_AARCH64_NS_OMP"
+          cell osx-arm64-cpu "$OSX_ARM64_OMP" "$OSX_ARM64_GEMVER_OMP" "$OSX_ARM64_NS_OMP"
+          cell osx-arm64-apple "$OSX_ARM64_METAL" "$OSX_ARM64_GEMVER_METAL" "$OSX_ARM64_NS_METAL"
+          cell win-64-cpu "$WIN_64_OMP" "$WIN_64_OCL" "$WIN_64_GEMVER_OMP" "$WIN_64_NS_OMP" "$WIN_64_GEMVER_OCL" "$WIN_64_NS_OCL"
+          cell win-64-nvidia "$WIN_64_CUDA" "$WIN_64_GEMVER_CUDA" "$WIN_64_NS_CUDA"
+          cell win-arm64-cpu "$WIN_ARM64_OMP" "$WIN_ARM64_GEMVER_OMP" "$WIN_ARM64_NS_OMP"
 
           cd "$dir"
           git init -q

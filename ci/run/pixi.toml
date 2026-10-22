@@ -1,6 +1,6 @@
 # Where the win-64 test packages RUN. They are built on Win-x64-64 (Visual Studio) and installed here on Win-x64-GPU, which
 # has no compiler: ci/add-built.nu fills the `built` feature with the uploaded .conda files, and each environment adds the
-# runtime for one backend. The toolchain packages (naga-acpp-runtime, ...) come in as the test packages' dependencies.
+# runtime for one backend: OpenMP, CUDA or OpenCL (Intel CPU). The toolchain packages (naga-acpp-runtime, ...) come in as the test packages' dependencies.
 [workspace]
 name      = "ci-run"
 channels  = ["https://prefix.dev/jackm97/naga-labs-staging"]
@@ -12,6 +12,15 @@ platforms = [{ platform = "win-64", archspec = "x86_64_v3", name = "win-64-v3" }
 [feature.cuda.target.win-64.dependencies]
 naga-acpp-runtime-cuda = "*"
 
+# Intel's CPU OpenCL runtime (conda-forge intel-opencl-rt) is the OpenCL device.
+[feature.ocl]
+channels = ["conda-forge"]
+
+[feature.ocl.target.win-64.dependencies]
+naga-acpp-runtime-ocl = "*"
+intel-opencl-rt       = "*"
+
 [environments]
 run-omp  = ["built"]
 run-cuda = ["built", "cuda"]
+run-ocl  = ["built", "ocl"]
