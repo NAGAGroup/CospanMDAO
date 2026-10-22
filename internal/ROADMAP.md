@@ -94,6 +94,7 @@ Topics learned while building the light-transport forcing case (2026-09-30). Eac
 - [x] Tests from the first code commit.
 - [ ] Clean up tests/spike (tests/smoke is deleted, P8): standalone, unbuilt, and stale after D138 (they use init() hooks, initializers, EntryAccess/RootDriver). Fold anything still worth checking into the Catch2 suite, then remove them (Jack decides at cleanup time).
 - [x] ~~Internal naming: the code still calls a variable's storage record 'root' or 'shadow'.~~ Superseded: roots and shadows are gone (instances and shared metadata, D144).
+- [ ] Fork, next fork build only (not worth a build on its own): remove or demote to debug the 'Retargeting operation for a device that is not part of the queue's context' warning in include/hipSYCL/sycl/queue.hpp (submit, ~l.449). Our 2026-09-03 fix resolves retargeted operands against the retarget's context, which defaults to the target's platform default context, so the hazard it warns about is gone. SlabKit's retargeted lanes trigger it on every non-default-device operation (seen on Intel OpenCL and Level Zero, 2026-10-21).
 
 ## After the 2026-10-01 checkpoint (D140 rework)
 
