@@ -1,7 +1,7 @@
 # CoSpan
 
-[![CI](https://github.com/NAGALabs/CospanMDAO/actions/workflows/ci.yml/badge.svg)](https://github.com/NAGALabs/CospanMDAO/actions/workflows/ci.yml)
-[![version](https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2FNAGALabs%2FCospanMDAO%2Fmain%2Fcospanmdao%2Fpixi.toml&query=%24.package.version&label=version)](cospanmdao/pixi.toml)
+[![CI](https://github.com/NAGALabsOrg/CospanMDAO/actions/workflows/ci.yml/badge.svg)](https://github.com/NAGALabsOrg/CospanMDAO/actions/workflows/ci.yml)
+[![version](https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2FNAGALabsOrg%2FCospanMDAO%2Fmain%2Fcospanmdao%2Fpixi.toml&query=%24.package.version&label=version)](cospanmdao/pixi.toml)
 [![license](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
 **Heterogeneous computing by composition.**
@@ -80,11 +80,11 @@ int main() {
 
 | | CPU | NVIDIA | AMD | Intel GPU | Apple GPU |
 |---|:---:|:---:|:---:|:---:|:---:|
-| **Linux x86-64** | ![](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2FNAGALabs%2FCospanMDAO%2Fbadges%2Flinux-64-cpu.json) | ![](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2FNAGALabs%2FCospanMDAO%2Fbadges%2Flinux-64-nvidia.json) | ![](https://img.shields.io/badge/-untested-lightgrey) | ![](https://img.shields.io/badge/-untested-lightgrey) | — |
-| **Linux ARM64** | ![](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2FNAGALabs%2FCospanMDAO%2Fbadges%2Flinux-aarch64-cpu.json) | ![](https://img.shields.io/badge/-untested-lightgrey) | — | — | — |
-| **macOS ARM64** | ![](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2FNAGALabs%2FCospanMDAO%2Fbadges%2Fosx-arm64-cpu.json) | — | — | — | ![](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2FNAGALabs%2FCospanMDAO%2Fbadges%2Fosx-arm64-apple.json) |
-| **Windows x86-64** | ![](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2FNAGALabs%2FCospanMDAO%2Fbadges%2Fwin-64-cpu.json) | ![](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2FNAGALabs%2FCospanMDAO%2Fbadges%2Fwin-64-nvidia.json) | ![](https://img.shields.io/badge/-untested-lightgrey) | ![](https://img.shields.io/badge/-untested-lightgrey) | — |
-| **Windows ARM64** | ![](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2FNAGALabs%2FCospanMDAO%2Fbadges%2Fwin-arm64-cpu.json) | — | — | — | — |
+| **Linux x86-64** | ![](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2FNAGALabsOrg%2FCospanMDAO%2Fbadges%2Flinux-64-cpu.json) | ![](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2FNAGALabsOrg%2FCospanMDAO%2Fbadges%2Flinux-64-nvidia.json) | ![](https://img.shields.io/badge/-untested-lightgrey) | ![](https://img.shields.io/badge/-untested-lightgrey) | — |
+| **Linux ARM64** | ![](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2FNAGALabsOrg%2FCospanMDAO%2Fbadges%2Flinux-aarch64-cpu.json) | ![](https://img.shields.io/badge/-untested-lightgrey) | — | — | — |
+| **macOS ARM64** | ![](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2FNAGALabsOrg%2FCospanMDAO%2Fbadges%2Fosx-arm64-cpu.json) | — | — | — | ![](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2FNAGALabsOrg%2FCospanMDAO%2Fbadges%2Fosx-arm64-apple.json) |
+| **Windows x86-64** | ![](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2FNAGALabsOrg%2FCospanMDAO%2Fbadges%2Fwin-64-cpu.json) | ![](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2FNAGALabsOrg%2FCospanMDAO%2Fbadges%2Fwin-64-nvidia.json) | ![](https://img.shields.io/badge/-untested-lightgrey) | ![](https://img.shields.io/badge/-untested-lightgrey) | — |
+| **Windows ARM64** | ![](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2FNAGALabsOrg%2FCospanMDAO%2Fbadges%2Fwin-arm64-cpu.json) | — | — | — | — |
 
 *Untested* means a runtime is available but we have no hardware to test it on.
 
@@ -97,14 +97,14 @@ CoSpan is early, and its API is still changing. Derivatives, solvers for coupled
 CoSpan is a [pixi](https://pixi.sh) package:
 
 ```toml
-cospanmdao = { git = "https://github.com/NAGALabs/CospanMDAO.git", branch = "main", subdirectory = "cospanmdao" }
+cospanmdao = { git = "https://github.com/NAGALabsOrg/CospanMDAO.git", branch = "main", subdirectory = "cospanmdao" }
 ```
 
 The [getting-started guide](docs/site/getting-started.md) walks through a complete project, and the [documentation](docs/site/) covers the concepts in depth.
 
 ## About
 
-CoSpan is developed by [NAGA Labs](https://github.com/NAGALabs), alongside [SlabKit](https://github.com/NAGALabs/SlabKit), the device-memory library it is built on. The name comes from category theory, where *cospans* describe how open systems compose along their shared boundaries.
+CoSpan is developed by [NAGA Labs](https://github.com/NAGALabsOrg), alongside [SlabKit](https://github.com/NAGALabsOrg/SlabKit), the device-memory library it is built on. The name comes from category theory, where *cospans* describe how open systems compose along their shared boundaries.
 
 ## License
 

@@ -52,7 +52,7 @@ version  = "*"
 channels = ["https://prefix.dev/pixi-build-backends"]
 
 [package.host-dependencies]
-cospanmdao = { git = "https://github.com/NAGAGroup/CospanMDAO.git", subdirectory = "cospanmdao" }
+cospanmdao = { git = "https://github.com/NAGALabsOrg/CospanMDAO.git", subdirectory = "cospanmdao" }
 
 [dependencies]
 getting-started = { path = "." }
